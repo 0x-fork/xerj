@@ -34,6 +34,7 @@ use anyhow::Result;
 use calamine::{Data, DataType, Reader, Xls};
 use chrono::Timelike;
 use serde_json::{Map, Value};
+use std::io::Read;
 use std::path::Path;
 
 /// Non-empty rows searched for a header before the sheet is treated as a
@@ -47,6 +48,84 @@ const MAX_ROWS_PER_SHEET: usize = 1 << 20;
 /// Text kept from one sheet indexed as a document.
 const MAX_DOC_SHEET_BYTES: usize = 16 << 20;
 
+/// BIFF8 worksheet ceiling: 65,536 rows × 256 columns. A `DIMENSIONS` record
+/// (`0x0200`) claiming more than this is malformed or crafted — and it matters
+/// because calamine materialises a *dense* `Range` sized from that record
+/// before we ever iterate a row (`MAX_ROWS_PER_SHEET` on `range.rows()` is
+/// applied too late). An inflated dimension therefore drives an unbounded
+/// allocation that aborts the whole scan (release builds are `panic = abort`,
+/// and nothing wraps the extractor in `catch_unwind`). So we read the
+/// dimensions ourselves and refuse the file before handing it to calamine.
+const BIFF_MAX_ROWS: u32 = 65_536;
+const BIFF_MAX_COLS: u32 = 256;
+
+/// Upper bound on the Workbook stream bytes read for the dimension pre-flight.
+/// A legitimate `.xls` Workbook stream is far below this; the `take()` cap also
+/// bounds the pre-flight's own allocation regardless of what the container
+/// claims the stream length to be.
+const MAX_WORKBOOK_STREAM: u64 = 512 << 20;
+
+/// `false` ⇒ refuse the file: a `DIMENSIONS` record exceeds the BIFF8 ceiling,
+/// so calamine would over-allocate. `true` ⇒ no crafted dimension found;
+/// calamine may read it. Never panics — any CFB/IO failure returns `true` (not
+/// our gate; `Xls::new` rejects a genuinely broken file cleanly), and the read
+/// is `take()`-bounded so it cannot itself be driven to over-allocate.
+fn xls_dimensions_within_limits(path: &Path) -> bool {
+    let Ok(mut comp) = cfb::open(path) else {
+        return true;
+    };
+    let name = if comp.is_stream("Workbook") {
+        "Workbook"
+    } else if comp.is_stream("Book") {
+        "Book"
+    } else {
+        return true;
+    };
+    let Ok(stream) = comp.open_stream(name) else {
+        return true;
+    };
+    let mut buf = Vec::new();
+    if stream.take(MAX_WORKBOOK_STREAM).read_to_end(&mut buf).is_err() {
+        return true;
+    }
+    dimensions_sane(&buf)
+}
+
+/// Walk the BIFF record stream and refuse if any `DIMENSIONS` record (`0x0200`)
+/// claims a range outside the BIFF8 ceiling. Linear, bounds-checked, and
+/// terminating: every step advances past a `u16` length, so a crafted length
+/// cannot loop. Records other than `DIMENSIONS` are skipped by their length.
+fn dimensions_sane(stream: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos + 4 <= stream.len() {
+        let rectype = u16::from_le_bytes([stream[pos], stream[pos + 1]]);
+        let reclen = u16::from_le_bytes([stream[pos + 2], stream[pos + 3]]) as usize;
+        let body = pos + 4;
+        let Some(end) = body.checked_add(reclen) else {
+            break;
+        };
+        if end > stream.len() {
+            break;
+        }
+        if rectype == 0x0200 && reclen >= 14 {
+            let d = &stream[body..body + 14];
+            let rw_mic = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+            let rw_mac = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+            let col_mic = u16::from_le_bytes([d[8], d[9]]) as u32;
+            let col_mac = u16::from_le_bytes([d[10], d[11]]) as u32;
+            if rw_mac > BIFF_MAX_ROWS
+                || col_mac > BIFF_MAX_COLS
+                || rw_mac < rw_mic
+                || col_mac < col_mic
+            {
+                return false;
+            }
+        }
+        pos = end;
+    }
+    true
+}
+
 /// `name` is the file as the corpus names it (under durable preparation this is
 /// not `path`, a sealed snapshot blob); document sheets are titled from it.
 /// `per_sheet_limit` caps the rows emitted from each sheet (phase-A sampling);
@@ -58,10 +137,22 @@ pub fn extract(
     sink: Sink,
 ) -> Result<ExtractStats> {
     let mut stats = ExtractStats::default();
+    // DoS gate: calamine allocates a dense `Range` from the sheet's declared
+    // `DIMENSIONS` before any row is read, so a crafted record makes it attempt
+    // a multi-terabyte allocation and abort the process (release = panic=abort,
+    // no catch_unwind around the scan). Refuse such a file up front; the read
+    // here is bounded by `cfb`'s FAT chain, so the gate cannot itself be driven
+    // to over-allocate.
+    if !xls_dimensions_within_limits(path) {
+        stats.junk += 1;
+        return Ok(stats);
+    }
     let f = std::fs::File::open(path)?;
-    // calamine reports a malformed/truncated workbook as an error; never a
-    // panic. Treat any such failure as junk rather than propagating — a single
-    // unreadable legacy file must not abort a folder scan.
+    // A malformed/truncated workbook that still clears the dimension gate is
+    // treated as junk rather than propagating — a single unreadable legacy file
+    // must not abort a folder scan. (calamine *returns* an error for most such
+    // files, but is not panic-free on hostile input, which is why the gate
+    // above runs first.)
     let mut wb = match Xls::new(f) {
         Ok(wb) => wb,
         Err(_) => {
@@ -399,6 +490,48 @@ mod tests {
 
     fn fields(r: &RawRecord) -> Value {
         Value::Object(r.fields.clone())
+    }
+
+    /// A BIFF8 `DIMENSIONS` record (type 0x0200, len 14): rwMic, rwMac, colMic,
+    /// colMac (each last-index-plus-one), reserved.
+    fn dimensions_record(rw_mic: u32, rw_mac: u32, col_mic: u16, col_mac: u16) -> Vec<u8> {
+        let mut r = vec![0x00, 0x02, 14, 0x00]; // type 0x0200, length 14
+        r.extend_from_slice(&rw_mic.to_le_bytes());
+        r.extend_from_slice(&rw_mac.to_le_bytes());
+        r.extend_from_slice(&col_mic.to_le_bytes());
+        r.extend_from_slice(&col_mac.to_le_bytes());
+        r.extend_from_slice(&[0x00, 0x00]); // reserved
+        r
+    }
+
+    #[test]
+    fn a_real_dimension_is_accepted() {
+        // A 100-row × 10-column sheet is well within the BIFF8 ceiling.
+        assert!(dimensions_sane(&dimensions_record(0, 100, 0, 10)));
+        // And the format's own maximum is still accepted.
+        assert!(dimensions_sane(&dimensions_record(0, 65_536, 0, 256)));
+    }
+
+    #[test]
+    fn a_crafted_dimension_past_the_biff_ceiling_is_refused() {
+        // The shape of the 36 KB proof-of-concept: a DIMENSIONS claiming a vast
+        // row range, which drove calamine to attempt a ~2.1 TB Range alloc.
+        assert!(!dimensions_sane(&dimensions_record(0, 0x7FFF_FFFF, 0, 256)));
+        // An inflated column count is refused the same way.
+        assert!(!dimensions_sane(&dimensions_record(0, 100, 0, 60_000)));
+        // Inverted ranges (mac < mic) are malformed and refused.
+        assert!(!dimensions_sane(&dimensions_record(500, 100, 0, 10)));
+    }
+
+    #[test]
+    fn a_truncated_or_dimensionless_stream_is_not_mistaken_for_crafted() {
+        // No DIMENSIONS record at all: nothing to object to, let calamine try.
+        assert!(dimensions_sane(b"\x09\x08\x04\x00\x00\x00\x00\x00")); // a BOF-ish record, no 0x0200
+        // A record header whose declared length runs past the buffer end stops
+        // the walk without a panic and without a false refusal.
+        assert!(dimensions_sane(&[0x00, 0x02, 0xFF, 0xFF, 0x01]));
+        // Empty stream.
+        assert!(dimensions_sane(&[]));
     }
 
     /// Build a one-sheet `.xls` in a tempdir with `rustexcel`-free, synthetic
