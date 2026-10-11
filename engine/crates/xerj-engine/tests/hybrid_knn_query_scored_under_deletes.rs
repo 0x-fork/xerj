@@ -57,7 +57,7 @@ fn body(i: usize) -> String {
     // The lexical probe "zebra" lands on every 50th doc AND on the top vector
     // neighbour. Identical text everywhere → identical (tied) BM25, so the
     // ordering is deterministic regardless of shard/segment topology (#188).
-    if i % 50 == 0 || i == BOTH {
+    if i.is_multiple_of(50) || i == BOTH {
         "zebra lexical probe".to_string()
     } else {
         "common filler text".to_string()
