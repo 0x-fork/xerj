@@ -162,12 +162,16 @@ PAGES: dict[str, dict[str, str]] = {
     # in the post is theirs, quoted from the issues; the only XERJ-side claims
     # are the §05 registry counts (validate_hub.py run 2026-10-07: 98
     # manifests, backlog 132 rows after PR #1210, 99 live, zero session/
-    # trajectory corpora).
+    # trajectory corpora). Updated 2026-10-11 (#1138 follow-through): the
+    # thin spot the post named was closed by the donated corpus — PR #1255
+    # (70 trajectories, CC-BY-4.0) + release pack-agent-session-trajectories-
+    # 2026-10-09 — so an UPDATE note now sits under §04. The 2026-10-07 counts
+    # are left verbatim; only the dated note was added.
     "blog/eval-scars-from-agent-memory.html": dict(
         label="Guest eval scars", kind="article",
         title="Six eval scars from a production agent-memory system",
         description="Guest recipes from Chunxiao Wang (Assay): topic slicing beat token windows on recall@1 by double digits, a 0.87 classifier nearly matched by a 0.78 always-yes baseline, and the mask bug that scored every query zero. Plus the corpus gap we checked and confirmed.",
-        published="2026-10-07", updated="2026-10-07",
+        published="2026-10-07", updated="2026-10-11",
     ),
     # Exploit-hub A/B post, 2026-10-08. Every number traces to the
     # sealed-truth eval (/root/eval-holdout/EVAL-REPORT.md): 23744 route/

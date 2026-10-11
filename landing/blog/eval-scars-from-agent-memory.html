@@ -64,7 +64,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-10-07",
-  "dateModified": "2026-10-07",
+  "dateModified": "2026-10-11",
   "author": {
     "@id": "https://xerj.org/#organization"
   },
@@ -252,7 +252,15 @@
   <p class="wide">What we did about it: the wanted corpus now has a named slot in the hub backlog (<strong>agent-session-trajectories</strong>, status planned, demand-anchored to their issue), and if Assay can donate sanitized multi-session trajectories with failure turns intact, the contribution path is <a href="https://github.com/xerj-org/xerj/blob/corpus-hub/tools/xerj-code/hub/CONTRIBUTING.md" rel="external">open by pull request</a>. It would be a first-of-kind corpus at the hub. Their offer to recompute our benchmarks independently stands unaccepted for now, and it should not: an independent recompute of any number we publish is always welcome.</p>
 
   <div class="loss">
-    <strong>What is claimed here, and by whom.</strong> Claimed by our guest, from their production system, with artifacts public in their repository: every measurement in §01 through §03, quoted from issues #1118 and #1138 with light editing and linked at each section. Claimed by us: the registry counts in §04 (98 manifests, backlog 132 rows after the wishlist entry, 99 live, zero matching a session, trajectory, chat or conversation query), verified 2026-10-07 by running the hub's own validator against the corpus-hub branch; the description of our chunking and memory features, which is a description of the code as it ships. Not claimed: that we have independently reproduced any of their numbers, that our engine today serves their workload well, or that the planned corpus exists in any form. It does not. That is the point of the backlog entry.
+    <strong>What is claimed here, and by whom.</strong> Claimed by our guest, from their production system, with artifacts public in their repository: every measurement in §01 through §03, quoted from issues #1118 and #1138 with light editing and linked at each section. Claimed by us: the registry counts in §04 (98 manifests, backlog 132 rows after the wishlist entry, 99 live, zero matching a session, trajectory, chat or conversation query), verified 2026-10-07 by running the hub's own validator against the corpus-hub branch; the description of our chunking and memory features, which is a description of the code as it ships. Not claimed: that we have independently reproduced any of their numbers, that our engine today serves their workload well, or &mdash; as of the 2026-10-07 registry check above &mdash; that the planned corpus exists in any form. It did not then. See the update below for what landed after.
+  </div>
+
+  <div class="wp" style="margin-top:var(--sp-6);">
+    <div class="wh">
+      <span class="wn">UPDATE · 2026-10-11</span>
+      <span class="wm">the thin spot named in §04 has since been seeded</span>
+    </div>
+    <p>The gap this post was honest about on 2026-10-07 &mdash; zero session or trajectory corpora at the hub &mdash; is no longer zero. Chunxiao Wang donated the corpus they described, by pull request and under their own name, exactly as the invitation said it would land: <a href="https://github.com/xerj-org/xerj/pull/1255" rel="external">PR #1255</a> (merged 2026-10-08) contributed <strong>70 sanitized multi-session agent trajectories with failure turns intact</strong>, licensed CC-BY-4.0, through the <a href="https://github.com/xerj-org/xerj/blob/corpus-hub/tools/xerj-code/hub/CONTRIBUTING.md" rel="external">documented contribution path</a>. A maintainer then published the signed record pack, <a href="https://github.com/xerj-org/xerj/releases/tag/pack-agent-session-trajectories-2026-10-09" rel="external">pack-agent-session-trajectories-2026-10-09</a> (2026-10-09), with the publish wiring in <a href="https://github.com/xerj-org/xerj/pull/1264" rel="external">#1264</a>. It is the first session-trajectory corpus at the hub. The §04 counts above are left exactly as measured on 2026-10-07 and are not restated: the honest record is that the number was zero when we checked, and this note is what changed. What has <em>not</em> yet landed is the independent eval: Chunxiao's offer to recompute answers against the seeded corpus &mdash; pre-registered criteria, three-state verdicts, an UNVERIFIABLE wall &mdash; stands on their side and is not yet published. We make no claim on its result.</p>
   </div>
 
   <p class="wide">If you have production scars of your own: the same invitation stands. <a href="https://github.com/xerj-org/xerj/issues" rel="external">Open an issue</a> with what it cost you and what you measured, and if it survives our check against reality, it gets the same treatment, your name on it. The engine itself is <a href="/docs/install">one binary</a> with a <a href="/docs/quickstart">quickstart</a>, and the <a href="/docs/recipes/agentic-memory">agent-memory recipe</a> is the closest thing we ship today to what §01 describes wanting.</p>
