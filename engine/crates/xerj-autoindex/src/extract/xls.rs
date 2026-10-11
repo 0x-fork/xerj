@@ -70,7 +70,7 @@ const MAX_WORKBOOK_STREAM: u64 = 512 << 20;
 /// calamine may read it. Never panics — any CFB/IO failure returns `true` (not
 /// our gate; `Xls::new` rejects a genuinely broken file cleanly), and the read
 /// is `take()`-bounded so it cannot itself be driven to over-allocate.
-fn xls_dimensions_within_limits(path: &Path) -> bool {
+fn xls_allocations_bounded(path: &Path) -> bool {
     let Ok(mut comp) = cfb::open(path) else {
         return true;
     };
@@ -88,14 +88,31 @@ fn xls_dimensions_within_limits(path: &Path) -> bool {
     if stream.take(MAX_WORKBOOK_STREAM).read_to_end(&mut buf).is_err() {
         return true;
     }
-    dimensions_sane(&buf)
+    biff_allocations_bounded(&buf)
 }
 
-/// Walk the BIFF record stream and refuse if any `DIMENSIONS` record (`0x0200`)
-/// claims a range outside the BIFF8 ceiling. Linear, bounds-checked, and
-/// terminating: every step advances past a `u16` length, so a crafted length
-/// cannot loop. Records other than `DIMENSIONS` are skipped by their length.
-fn dimensions_sane(stream: &[u8]) -> bool {
+/// Walk the BIFF record stream and refuse the file if any record would drive
+/// calamine 0.26.1 to an unbounded allocation from attacker-controlled bytes.
+/// It is not enough to bound one record shape (an earlier version gated only
+/// the 14-byte `DIMENSIONS` and was still abortable through three other
+/// records): this covers every byte-driven allocation site audited in
+/// calamine's `xls.rs`:
+///
+///   * `DIMENSIONS` (`0x0200`), BOTH the 14-byte (BIFF8) and 10-byte (BIFF2-5)
+///     forms — `parse_dimensions` dispatches on the body length, then the
+///     caller `reserve`s `(rl-rf)*(cl-cf)` cells for a dense `Range`. We refuse
+///     a last-row past 65,536, a last-col past 256, or an inverted range (which
+///     underflows calamine's `end - start` into a vast count).
+///   * `SST` (`0x00FC`) — `Vec::with_capacity(cstUnique)` before a single
+///     string is read, and `i32::try_into::<usize>().unwrap()` which *panics*
+///     on a negative count. We refuse a negative count or one larger than the
+///     stream can hold (every SST entry costs at least a byte).
+///
+/// Linear, bounds-checked and terminating: every step advances `pos` past a
+/// `u16` length, and every slice is guarded by `end <= stream.len()`, so a
+/// crafted length can neither loop nor read out of bounds. Unrecognised records
+/// are skipped by their length.
+fn biff_allocations_bounded(stream: &[u8]) -> bool {
     let mut pos = 0usize;
     while pos + 4 <= stream.len() {
         let rectype = u16::from_le_bytes([stream[pos], stream[pos + 1]]);
@@ -107,19 +124,42 @@ fn dimensions_sane(stream: &[u8]) -> bool {
         if end > stream.len() {
             break;
         }
-        if rectype == 0x0200 && reclen >= 14 {
-            let d = &stream[body..body + 14];
-            let rw_mic = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
-            let rw_mac = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
-            let col_mic = u16::from_le_bytes([d[8], d[9]]) as u32;
-            let col_mac = u16::from_le_bytes([d[10], d[11]]) as u32;
-            if rw_mac > BIFF_MAX_ROWS
-                || col_mac > BIFF_MAX_COLS
-                || rw_mac < rw_mic
-                || col_mac < col_mic
-            {
-                return false;
+        let d = &stream[body..end];
+        match rectype {
+            // DIMENSIONS — the dense-`Range` reserve. `rl`/`cl` are last-index
+            // plus one; `rf`/`cf` are first index.
+            0x0200 => {
+                let (rf, rl, cf, cl) = if reclen >= 14 {
+                    (
+                        u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+                        u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
+                        u16::from_le_bytes([d[8], d[9]]) as u32,
+                        u16::from_le_bytes([d[10], d[11]]) as u32,
+                    )
+                } else if reclen >= 10 {
+                    (
+                        u16::from_le_bytes([d[0], d[1]]) as u32,
+                        u16::from_le_bytes([d[2], d[3]]) as u32,
+                        u16::from_le_bytes([d[4], d[5]]) as u32,
+                        u16::from_le_bytes([d[6], d[7]]) as u32,
+                    )
+                } else {
+                    // Too short for either form; calamine errors on it cleanly.
+                    (0, 0, 0, 0)
+                };
+                if rl > BIFF_MAX_ROWS || cl > BIFF_MAX_COLS || rl < rf || cl < cf {
+                    return false;
+                }
             }
+            // SST — shared-string table. `cstUnique` (a signed i32 at offset 4)
+            // sizes the Vec before any string is parsed.
+            0x00FC if reclen >= 8 => {
+                let cst_unique = i32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+                if cst_unique < 0 || cst_unique as u64 > stream.len() as u64 {
+                    return false;
+                }
+            }
+            _ => {}
         }
         pos = end;
     }
@@ -143,7 +183,7 @@ pub fn extract(
     // no catch_unwind around the scan). Refuse such a file up front; the read
     // here is bounded by `cfb`'s FAT chain, so the gate cannot itself be driven
     // to over-allocate.
-    if !xls_dimensions_within_limits(path) {
+    if !xls_allocations_bounded(path) {
         stats.junk += 1;
         return Ok(stats);
     }
@@ -507,31 +547,76 @@ mod tests {
     #[test]
     fn a_real_dimension_is_accepted() {
         // A 100-row × 10-column sheet is well within the BIFF8 ceiling.
-        assert!(dimensions_sane(&dimensions_record(0, 100, 0, 10)));
+        assert!(biff_allocations_bounded(&dimensions_record(0, 100, 0, 10)));
         // And the format's own maximum is still accepted.
-        assert!(dimensions_sane(&dimensions_record(0, 65_536, 0, 256)));
+        assert!(biff_allocations_bounded(&dimensions_record(0, 65_536, 0, 256)));
     }
 
     #[test]
     fn a_crafted_dimension_past_the_biff_ceiling_is_refused() {
         // The shape of the 36 KB proof-of-concept: a DIMENSIONS claiming a vast
         // row range, which drove calamine to attempt a ~2.1 TB Range alloc.
-        assert!(!dimensions_sane(&dimensions_record(0, 0x7FFF_FFFF, 0, 256)));
+        assert!(!biff_allocations_bounded(&dimensions_record(0, 0x7FFF_FFFF, 0, 256)));
         // An inflated column count is refused the same way.
-        assert!(!dimensions_sane(&dimensions_record(0, 100, 0, 60_000)));
+        assert!(!biff_allocations_bounded(&dimensions_record(0, 100, 0, 60_000)));
         // Inverted ranges (mac < mic) are malformed and refused.
-        assert!(!dimensions_sane(&dimensions_record(500, 100, 0, 10)));
+        assert!(!biff_allocations_bounded(&dimensions_record(500, 100, 0, 10)));
     }
 
     #[test]
     fn a_truncated_or_dimensionless_stream_is_not_mistaken_for_crafted() {
         // No DIMENSIONS record at all: nothing to object to, let calamine try.
-        assert!(dimensions_sane(b"\x09\x08\x04\x00\x00\x00\x00\x00")); // a BOF-ish record, no 0x0200
+        assert!(biff_allocations_bounded(b"\x09\x08\x04\x00\x00\x00\x00\x00")); // a BOF-ish record, no 0x0200
         // A record header whose declared length runs past the buffer end stops
         // the walk without a panic and without a false refusal.
-        assert!(dimensions_sane(&[0x00, 0x02, 0xFF, 0xFF, 0x01]));
+        assert!(biff_allocations_bounded(&[0x00, 0x02, 0xFF, 0xFF, 0x01]));
         // Empty stream.
-        assert!(dimensions_sane(&[]));
+        assert!(biff_allocations_bounded(&[]));
+    }
+
+    /// The 10-byte (BIFF2-5) `DIMENSIONS` form: type 0x0200, length 10, four
+    /// u16 fields (rf, rl, cf, cl).
+    fn dimensions_record_biff5(rf: u16, rl: u16, cf: u16, cl: u16) -> Vec<u8> {
+        let mut r = vec![0x00, 0x02, 10, 0x00]; // type 0x0200, body length 10
+        for v in [rf, rl, cf, cl] {
+            r.extend_from_slice(&v.to_le_bytes()); // 8 bytes of fields
+        }
+        r.extend_from_slice(&[0x00, 0x00]); // + 2 bytes so the body is 10, as calamine expects
+        r
+    }
+
+    /// An `SST` record (type 0x00FC): cstTotal (i32) then cstUnique (i32). The
+    /// body past the header is irrelevant to the allocation gate.
+    fn sst_record(cst_unique: i32) -> Vec<u8> {
+        let mut r = vec![0xFC, 0x00, 8, 0x00];
+        r.extend_from_slice(&0i32.to_le_bytes()); // cstTotal
+        r.extend_from_slice(&cst_unique.to_le_bytes()); // cstUnique
+        r
+    }
+
+    #[test]
+    fn the_10_byte_dimensions_form_is_also_bounded() {
+        // A real small BIFF5 sheet is accepted.
+        assert!(biff_allocations_bounded(&dimensions_record_biff5(0, 100, 0, 10)));
+        // The reviewer's bypass: rl = cl = 0xFFFF drove calamine to a ~171 GB
+        // reserve because the earlier gate only checked the 14-byte form. The
+        // 65,535-column claim is past the 256 ceiling and is now refused.
+        assert!(!biff_allocations_bounded(&dimensions_record_biff5(
+            0, 0xFFFF, 0, 0xFFFF
+        )));
+    }
+
+    #[test]
+    fn a_crafted_sst_count_is_refused() {
+        // A sane shared-string count is accepted (well under the stream length).
+        let mut benign = sst_record(3);
+        benign.extend_from_slice(&[0u8; 64]); // give the stream some length
+        assert!(biff_allocations_bounded(&benign));
+        // A huge cstUnique drove `Vec::with_capacity(~2.1e9)` → ~51 GB abort.
+        assert!(!biff_allocations_bounded(&sst_record(0x7FFF_FFFF)));
+        // A negative cstUnique made calamine `i32::try_into::<usize>().unwrap()`
+        // panic (also an abort under panic=abort).
+        assert!(!biff_allocations_bounded(&sst_record(-1)));
     }
 
     /// Build a one-sheet `.xls` in a tempdir with `rustexcel`-free, synthetic
