@@ -66,6 +66,30 @@ pub struct PlanDataset {
     /// (`install_dataset_mappings`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_analyzer: Option<String>,
+    /// Repository scope this dataset was clustered under (#1230): the
+    /// root-relative, "/"-separated path of the nearest enclosing `.git`
+    /// ancestor at genesis, or `Some("")` for the autoindex root. A `docs`
+    /// dataset is one-per-scope (`dataset::cluster`), so this is what tells two
+    /// sibling forks with byte-identical schemas apart — without it the
+    /// `--no-graph` incremental reconciler cannot say which frozen `docs`
+    /// dataset a newly added file belongs to and refuses the whole run as an
+    /// ambiguous assignment.
+    ///
+    /// Like [`Self::text_analyzer`] it rides the PLAN and NOT
+    /// [`crate::infer::FieldSpec`]: `generation_contract_identities` serializes
+    /// the schema contract through named keys (`slug`/`family`/`group`/`specs`/
+    /// `time_field`/`semantic_field`) only, so a new field here is invisible to
+    /// the identity digests and does not move any committed generation's
+    /// `schema_identity`/`index_identity` — adding it never aborts an existing
+    /// state dir on the no-change arm.
+    ///
+    /// `#[serde(default)]` so a plan frozen by a pre-#1230 build deserializes
+    /// with `None`. `None` means "scope was never recorded"; the reconciler
+    /// then falls back to its prior schema-only classification (an older plan
+    /// that hit the ambiguity simply keeps hitting it), so the fix is additive
+    /// and changes nothing for single-scope trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub sampled_records: u64,
     pub file_count: usize,
 }
@@ -1615,6 +1639,7 @@ mod sync_journal_tests {
             time_field: None,
             semantic_field: None,
             text_analyzer: None,
+            scope: None,
             sampled_records: 1,
             file_count: 0,
         });
@@ -1635,6 +1660,7 @@ mod sync_journal_tests {
                 time_field: None,
                 semantic_field: None,
                 text_analyzer: None,
+                scope: None,
                 sampled_records: 1,
                 file_count: 1,
             });
