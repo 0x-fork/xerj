@@ -935,7 +935,12 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 progress_interval = Some(Duration::from_secs(secs));
             }
             "--quiet" => quiet = true,
-            "--dataset" => dataset = it.next(),
+            "--dataset" => {
+                dataset =
+                    Some(it.next().ok_or(
+                        "--dataset needs a dataset slug: `autoindex map --dataset <SLUG>`",
+                    )?);
+            }
             "--poll-interval" => {
                 watch_flags_used.push("--poll-interval");
                 let secs: u64 = it
@@ -1350,6 +1355,16 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     .into(),
             );
         }
+        if dataset.is_some() {
+            // #1231: same accept-and-ignore class — --dataset only selects which
+            // dataset `autoindex map` prints and has no meaning for a watch.
+            return Err(
+                "--dataset selects a single dataset to show and is only supported with `autoindex \
+                 map`; an object-storage watch produces a change feed and reads no catalog. Drop \
+                 --dataset"
+                    .into(),
+            );
+        }
         if !ignore_flags_used.is_empty() {
             return Err(format!(
                 "{} apply to a folder walk, not to an object-storage watch",
@@ -1446,6 +1461,19 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             dataset,
             xerj_url_note,
         })),
+        // #1231: --dataset only selects which dataset `autoindex map` prints;
+        // it is NOT an indexing destination filter. Accepting it on the
+        // indexing/status routes and then dropping it is the silent no-op this
+        // repo refuses (#204, #279): the operator reads it as an explicit
+        // destination restriction and gets an unrestricted run instead. Only
+        // `map` reaches here with dataset still unconsumed.
+        (_, _) if dataset.is_some() => Err(format!(
+            "--dataset selects a single dataset to show and is only supported with \
+             `autoindex map`, not `autoindex {}`: it does not restrict where indexing \
+             writes. To inspect one dataset run `autoindex map --dataset <SLUG>`; to \
+             index, drop --dataset",
+            sub.as_deref().unwrap_or("<root>")
+        )),
         (Some("status"), _) if bulk_timeout_explicit => {
             Err("--bulk-timeout-secs applies only to indexing, not `autoindex status`".into())
         }
@@ -2767,6 +2795,67 @@ mod tests {
             from_env.as_deref(),
             Some("from-env"),
             "the environment is also never overwritten by discovery"
+        );
+    }
+
+    /// #1231: `--dataset` only picks which dataset `autoindex map` prints. On
+    /// the indexing and status routes it used to parse and then be dropped, so
+    /// `autoindex <root> ... --dataset repository-docs` read like an explicit
+    /// destination restriction and silently ran an unrestricted pass instead.
+    /// It must be refused there, naming the flag and the only command it works
+    /// with — and existence of the slug cannot matter, or a nonexistent one
+    /// would still start indexing.
+    #[test]
+    fn dataset_is_refused_on_indexing_and_status_but_kept_for_map() {
+        // The report's two invocations: the second only differs by --dataset,
+        // and an existing slug and a made-up one must both be refused the same
+        // way, since neither may start an indexing pass.
+        for slug in ["repository-docs", "no-such-dataset-xyz"] {
+            let text = err(&[
+                "/path/to/root",
+                "--no-graph",
+                "--no-semantic",
+                "--yes",
+                "--prefix",
+                "example",
+                "--dataset",
+                slug,
+            ]);
+            assert!(
+                text.contains("--dataset") && text.contains("autoindex map"),
+                "the refusal must name the flag and the command it belongs to: {text}"
+            );
+            assert!(
+                text.contains("does not restrict where indexing writes"),
+                "the message must correct the destination-restriction misread: {text}"
+            );
+        }
+
+        // Status reads a node and never indexes, so --dataset is equally inapt.
+        let text = err(&["status", "--dataset", "repository-docs"]);
+        assert!(
+            text.contains("--dataset") && text.contains("autoindex status"),
+            "status must refuse --dataset and name itself: {text}"
+        );
+
+        // The one route it is valid on still carries the selection through.
+        match parse(
+            ["map", "--dataset", "repository-docs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .expect("map --dataset must parse")
+        {
+            Cmd::Map(cfg) => assert_eq!(cfg.dataset.as_deref(), Some("repository-docs")),
+            other => panic!("expected a map config, got {other:?}"),
+        }
+
+        // And a bare --dataset with no slug is a usage error, not a silent all.
+        let text = err(&["map", "--dataset"]);
+        assert!(
+            text.contains("--dataset needs a dataset slug"),
+            "a valueless --dataset must be refused: {text}"
         );
     }
 }
