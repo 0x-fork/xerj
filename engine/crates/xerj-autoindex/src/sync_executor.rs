@@ -945,26 +945,85 @@ impl<'a> EsSyncBackend<'a> {
         Ok(observation)
     }
 
+    /// Page size of the `run_id`-scoped read-back walk. The engine reports the
+    /// full match count on every page, so a page shorter than this is the walk
+    /// reaching the end of the generation's documents.
+    const CATALOG_WALK_PAGE: usize = 1000;
+
+    /// The phase [`Self::catalog_generation`] surfaces itself under. A resume
+    /// that rewrote the whole catalog gives this walk a `run_id` matching every
+    /// document in the index (402,814 on the cve-records node), so the
+    /// "O(changed) by construction" invariant degenerates to O(corpus): 403
+    /// sorted pages at ~5.2 s each ≈ 35 min, during which the surface used to
+    /// show the FINISHED `finalize-catalog` ticker (every dataset already
+    /// counted done) with a `since_progress_s` that only climbed — which reads
+    /// exactly like a hang, and cost an hour of "is it deadlocked?" diagnosis
+    /// on the #1267 resume. The walk is its own phase now, with the engine's
+    /// own match total as a real denominator, so the long read-back shows a
+    /// moving bar and an ETA from its first page.
+    const CATALOG_READBACK_PHASE: &'static str = "finalize-catalog-readback";
+
     fn catalog_generation(&self, run_id: &str) -> Result<BTreeMap<String, Value>> {
+        Self::walk_run_id_pages(
+            self.pr,
+            Self::CATALOG_READBACK_PHASE,
+            Self::CATALOG_WALK_PAGE,
+            |search_after| {
+                let mut body = serde_json::json!({
+                    "size": Self::CATALOG_WALK_PAGE,
+                    "sort": [{"_id": "asc"}],
+                    "query": {"term": {"run_id": run_id}}
+                });
+                if let Some(after) = search_after {
+                    body["search_after"] = after.clone();
+                }
+                // #1212: a `search_page`, not a `search` — the engine answers a
+                // missed 30 s default deadline with a partial 200 (`timed_out`),
+                // and this walk's short-page break read one partial page as the
+                // end of the catalog: 56,441 documents observed against 58,568
+                // that were all there, on a node whose sorted pages took 11-40 s
+                // while its breaker drained. The page variant retries a timed-out
+                // page at the same continuation key instead of returning it.
+                self.es.search_page(crate::catalog::CATALOG_INDEX, &body)
+            },
+        )
+    }
+
+    /// Drive a `run_id`-scoped, `_id asc` + `search_after` generation walk to
+    /// completion, collecting `_id -> _source` for every matched document and
+    /// surfacing the walk as its own progress phase (#1267). `fetch_page` is
+    /// handed the previous page's continuation sort key (`None` for the first
+    /// page) and returns the raw search response; isolating it this way lets
+    /// the paging contract — the duplicate-id guard, the short-page terminator,
+    /// the continuation-key check, and the per-page progress ticks — be pinned
+    /// without a node, the way [`Self::rewalk_while_short`] is. `page` is the
+    /// request `size`: a page shorter than it terminates the walk, so a test
+    /// drives real multi-page paging with a handful of documents.
+    ///
+    /// The phase opens on the first page using the engine's reported match
+    /// total as the item denominator, then ticks once per collected document,
+    /// so the surface moves and carries an ETA across a walk that can run for
+    /// over half an hour. A total the engine does not report leaves the phase
+    /// without a denominator (`pct=unknown`) rather than inventing one.
+    fn walk_run_id_pages(
+        pr: &crate::progress::Progress,
+        phase: &'static str,
+        page: usize,
+        mut fetch_page: impl FnMut(Option<&Value>) -> Result<Value>,
+    ) -> Result<BTreeMap<String, Value>> {
         let mut documents = BTreeMap::new();
         let mut search_after: Option<Value> = None;
+        let mut phase_opened = false;
         loop {
-            let mut body = serde_json::json!({
-                "size": 1000,
-                "sort": [{"_id": "asc"}],
-                "query": {"term": {"run_id": run_id}}
-            });
-            if let Some(after) = &search_after {
-                body["search_after"] = after.clone();
+            let response = fetch_page(search_after.as_ref())?;
+            if !phase_opened {
+                let total = response
+                    .pointer("/hits/total/value")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                pr.phase(phase, total, 0);
+                phase_opened = true;
             }
-            // #1212: a `search_page`, not a `search` — the engine answers a
-            // missed 30 s default deadline with a partial 200 (`timed_out`),
-            // and this walk's short-page break read one partial page as the
-            // end of the catalog: 56,441 documents observed against 58,568
-            // that were all there, on a node whose sorted pages took 11-40 s
-            // while its breaker drained. The page variant retries a timed-out
-            // page at the same continuation key instead of returning it.
-            let response = self.es.search_page(crate::catalog::CATALOG_INDEX, &body)?;
             let hits = response
                 .pointer("/hits/hits")
                 .and_then(Value::as_array)
@@ -983,8 +1042,9 @@ impl<'a> EsSyncBackend<'a> {
                     documents.insert(id.clone(), source).is_none(),
                     "catalog generation query returned duplicate ID {id}"
                 );
+                pr.item_done(0);
             }
-            if hits.len() < 1000 {
+            if hits.len() < page {
                 break;
             }
             search_after = hits.last().and_then(|hit| hit.get("sort")).cloned();
@@ -5134,6 +5194,154 @@ mod tests {
         );
         assert!(verdict.is_err(), "an error is not a short walk");
         assert_eq!(refreshes.get(), 0, "no refresh over a dead transport");
+    }
+
+    // #1267: the `run_id`-scoped catalog read-back walk. On a resume that
+    // rewrote the whole catalog its `run_id` matches every document, so it
+    // runs for ~35 min — and used to do so invisibly, behind a finished
+    // `finalize-catalog` ticker that read as a hang. These pin the walk as its
+    // own phase with the engine's match total as the denominator, plus the
+    // paging contract, without a node.
+
+    /// One page of a `run_id` walk: every hit carries a `sort` key (the
+    /// continuation the next page is fetched from) and the engine reports the
+    /// full match `total` on every page, not just the first.
+    fn walk_page(total: u64, ids: &[&str]) -> Value {
+        let hits: Vec<Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({"_id": id, "_source": {"run": id}, "sort": [id]}))
+            .collect();
+        serde_json::json!({"hits": {"total": {"value": total}, "hits": hits}})
+    }
+
+    #[test]
+    fn a_run_id_walk_collects_every_page_and_opens_an_honest_phase() {
+        let (pr, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        // Page size 2: two full pages, then a short page ends the walk. The
+        // engine reports total=5 on every page.
+        let pages = std::cell::RefCell::new(vec![
+            walk_page(5, &["a", "b"]),
+            walk_page(5, &["c", "d"]),
+            walk_page(5, &["e"]),
+        ]);
+        let calls = std::cell::Cell::new(0usize);
+        let observed = EsSyncBackend::walk_run_id_pages(
+            &pr,
+            "finalize-catalog-readback",
+            2,
+            |_search_after| {
+                calls.set(calls.get() + 1);
+                Ok(pages.borrow_mut().remove(0))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            3,
+            "two full pages then one short page ends the walk"
+        );
+        assert_eq!(
+            observed.len(),
+            5,
+            "every document across every page is collected"
+        );
+        assert!(
+            observed.contains_key("e"),
+            "the short final page is not dropped"
+        );
+
+        let out = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("phase=finalize-catalog-readback"),
+            "the walk is its own phase, not a frozen finalize-catalog ticker: {out}"
+        );
+        // The denominator is the engine's own match total from page one — not
+        // the page size, not the running count — so the bar is honest from the
+        // first page instead of after 35 min of silence (#1267).
+        assert!(
+            out.contains("items=0/5"),
+            "the phase opens with the full match total as its denominator: {out}"
+        );
+    }
+
+    #[test]
+    fn the_read_back_walk_advances_its_surface_per_document() {
+        // The whole point of #1267: the walk must TICK, so a long read-back is
+        // never a stalled line. A ticker on a short cadence proves the surface
+        // reaches `items=3/3` without any item needing to "complete" a file.
+        let (pr, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_millis(40),
+        );
+        let ticker = pr.spawn_ticker();
+        // One short page (size 1000 default; 3 < 1000 ends the walk).
+        let observed = EsSyncBackend::walk_run_id_pages(
+            &pr,
+            "finalize-catalog-readback",
+            1000,
+            |_search_after| Ok(walk_page(3, &["a", "b", "c"])),
+        )
+        .unwrap();
+        assert_eq!(observed.len(), 3);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let out = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            if out.contains("phase=finalize-catalog-readback") && out.contains("items=3/3") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ticker never showed the walk advance to items=3/3: {out}"
+            );
+            std::thread::yield_now();
+        }
+        drop(ticker);
+    }
+
+    #[test]
+    fn a_duplicate_id_across_pages_fails_the_walk_loudly() {
+        let pr = crate::progress::Progress::silent();
+        let pages =
+            std::cell::RefCell::new(vec![walk_page(4, &["a", "b"]), walk_page(4, &["b", "c"])]);
+        let verdict = EsSyncBackend::walk_run_id_pages(
+            &pr,
+            "finalize-catalog-readback",
+            2,
+            |_search_after| Ok(pages.borrow_mut().remove(0)),
+        );
+        let err = verdict.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate ID b"),
+            "a document seen twice is a loud failure, never a silent overwrite: {err}"
+        );
+    }
+
+    #[test]
+    fn a_full_page_without_a_continuation_key_cannot_advance() {
+        let pr = crate::progress::Progress::silent();
+        // A full page (size 2) whose hits carry no `sort`: the walk cannot form
+        // the next `search_after` and must refuse rather than loop or truncate.
+        let page = serde_json::json!({
+            "hits": {"total": {"value": 9}, "hits": [
+                {"_id": "a", "_source": {}},
+                {"_id": "b", "_source": {}}
+            ]}
+        });
+        let verdict = EsSyncBackend::walk_run_id_pages(
+            &pr,
+            "finalize-catalog-readback",
+            2,
+            |_search_after| Ok(page.clone()),
+        );
+        let err = verdict.unwrap_err().to_string();
+        assert!(
+            err.contains("continuation sort key"),
+            "a full page with no sort key is a loud failure: {err}"
+        );
     }
 }
 
