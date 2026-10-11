@@ -1926,7 +1926,6 @@ mod tests {
     /// contract the disk flood-stage override already honours.
     #[test]
     fn memory_watermark_override_retunes_live_and_clamps() {
-        const GIB: u64 = 1024 * 1024 * 1024;
         let mut cfg = Config::default();
         cfg.limits.max_total_memtable_mb = 0; // isolate the RSS path
         cfg.limits.memory_watermark_percent = 95;
