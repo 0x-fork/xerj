@@ -101,8 +101,11 @@ tree-sitter-haskell = "0.23"
 tree-sitter-elixir = "0.3"
 # --- #295 Tier 2: common in ecosystems we already serve.
 # NOT tree-sitter-clojure: its only release (0.1.0) hard-links core ^0.25.6,
-# mutually exclusive with the core 0.26 that Tier 1's perl grammar forces —
-# revisit when a clojure release against 0.26 exists.
+# mutually exclusive with the core 0.26 that Tier 1's perl grammar forces.
+# The -orchard crate packages the same sogaiu grammar through
+# tree-sitter-language (core is a dev-dependency only), so it loads fine.
+tree-sitter-clojure-orchard = "0.2"
+tree-sitter-scheme = "0.24"
 # NOT tree-sitter-sql: 0.0.2 is immature (the issue itself says evaluate
 # first or defer) and `.sql` routing must not steal sqldump files — deferred.
 tree-sitter-erlang = "0.20"

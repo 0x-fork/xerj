@@ -1251,16 +1251,42 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     // `all_four_routes_through_the_positional_argument_stay_open` in this
     // file's tests is the guard. It is one test on purpose: three separate
     // ones would each keep passing while a merge broke the other two.
+    let used_watch_flags = || {
+        let mut u = watch_flags_used.clone();
+        u.sort_unstable();
+        u.dedup();
+        u.join(" ")
+    };
     if !watch && !watch_flags_used.is_empty() {
-        let used = {
-            let mut u = watch_flags_used.clone();
-            u.sort_unstable();
-            u.dedup();
-            u.join(" ")
-        };
+        let used = used_watch_flags();
         return Err(format!(
             "{used} only apply to a watch. Add --watch, or drop them"
         ));
+    }
+    // These flags configure the object-storage poll (`WatchCfg`); the folder
+    // watcher (#967) has no field for any of them, so accepting them on a
+    // folder root was the accept-and-ignore class (#279): `<folder> --watch
+    // --no-graph --once` committed a generation and then kept watching. A
+    // subcommand, or a missing root, keeps the refusal its own route gives.
+    if watch
+        && !watch_flags_used.is_empty()
+        && sub.is_none()
+        && root_raw.is_some()
+        && !root_is_object_url
+    {
+        let used = used_watch_flags();
+        return Err(format!(
+            "{used} configure an object-storage watch (`s3://…` or `r2://…` with --watch); a \
+             folder --watch reindexes on change until it is stopped, and its only knob is \
+             --debounce. Drop them"
+        ));
+    }
+    if watch && root_is_object_url && debounce_ms.is_some() {
+        return Err(
+            "--debounce is the folder watcher's quiet period; an object-storage watch polls on \
+             a schedule instead. Use --poll-interval"
+                .into(),
+        );
     }
     // `--watch` on a LOCAL root is #967's live-reindexing route, which landed
     // on main while this branch was open. This is where the branch used to
@@ -1764,6 +1790,41 @@ mod tests {
         // one-shot route and on the watch.
         assert!(err(&["s3://logs/", "--endpoint-url", "ftp://x"]).contains("http://"));
         assert!(err(&["s3://logs/", "--watch", "--endpoint-url", "ftp://x"]).contains("http://"));
+    }
+
+    /// Each watch route takes only the flags it reads. The object poll's knobs
+    /// have no field on the folder watcher, and `--debounce` has none on the
+    /// poll, so either one on the wrong route is refused rather than accepted
+    /// and ignored (#279). Before this, `data --watch --no-graph --once`
+    /// indexed once and then kept watching until it was killed.
+    #[test]
+    fn watch_flags_are_refused_on_the_route_that_cannot_read_them() {
+        for flags in [
+            &["--once"][..],
+            &["--max-cycles", "3"],
+            &["--poll-interval", "60"],
+            &["--events-out", "events.jsonl"],
+            &["--status-file", "status.json"],
+            &["--no-fetch"],
+        ] {
+            let mut args = vec!["data", "--watch", "--no-graph"];
+            args.extend_from_slice(flags);
+            let e = err(&args);
+            assert!(e.contains(flags[0]), "{flags:?}: {e}");
+            assert!(e.contains("object-storage watch"), "{flags:?}: {e}");
+        }
+        let e = err(&["s3://logs/", "--watch", "--debounce", "500"]);
+        assert!(e.contains("--poll-interval"), "{e}");
+
+        // The flags still reach the route that reads them.
+        assert_eq!(
+            watch(&["s3://logs/", "--watch", "--once"]).max_cycles,
+            Some(1)
+        );
+        let local = index(&["data", "--watch", "--no-graph", "--debounce", "500"]);
+        assert_eq!(local.debounce, std::time::Duration::from_millis(500));
+        // And without --watch, the existing refusal still names --watch.
+        assert!(err(&["data", "--once"]).contains("Add --watch"));
     }
 
     #[test]

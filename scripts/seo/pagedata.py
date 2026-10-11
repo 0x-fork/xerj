@@ -437,7 +437,7 @@ PAGES: dict[str, dict[str, str]] = {
     ),
     "docs/playbooks/log-analytics.html": dict(
         label="Playbook · Log analytics", kind="techarticle",
-        description="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — schema, ingest command, queries, and retention without ILM.",
+        description="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — the schema, the ingest command and the queries to copy.",
     ),
     "docs/playbooks/observability.html": dict(
         label="Playbook · Observability", kind="techarticle",

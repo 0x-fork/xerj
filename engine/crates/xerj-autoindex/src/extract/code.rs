@@ -296,6 +296,21 @@ fn registry() -> &'static [LangDef] {
                 tree_sitter_solidity::LANGUAGE.into(),
                 SOLIDITY_Q,
             ),
+            def(
+                "clojure",
+                &["clj", "cljs", "cljc"],
+                tree_sitter_clojure_orchard::LANGUAGE.into(),
+                CLOJURE_Q,
+            ),
+            // `.sls` (R6RS library) is deliberately NOT claimed: it is also a
+            // SaltStack state file, which is YAML, and a single-claimant
+            // extension is never content-probed.
+            def(
+                "scheme",
+                &["scm", "ss", "sld", "sps"],
+                tree_sitter_scheme::LANGUAGE.into(),
+                SCHEME_Q,
+            ),
         ]
     })
 }
@@ -402,7 +417,7 @@ const SIBLING_SCAN_BUDGET: usize = 256;
 const SLICE_MAX_BYTES: usize = DECL_CAP * 32;
 
 /// Does this node kind hold a declaration's IMPLEMENTATION rather than its
-/// signature? 34 grammars spell that node ~20 ways (`block`, `statement_block`,
+/// signature? 36 grammars spell that node ~20 ways (`block`, `statement_block`,
 /// `compound_statement`, `class_body`, `body_statement`, `function_body`,
 /// `declaration_list`, `field_declaration_list`, `do_block`, `suite`, …), so
 /// match the shape rather than enumerate them. A spelling this misses only
@@ -575,6 +590,129 @@ fn is_attribute_kind(kind: &str) -> bool {
         && (kind.contains("attribute") || kind.contains("annotation") || kind.contains("decorator"))
 }
 
+/// Clojure and Scheme spell every form as the same list node, so none of the
+/// shape rules above apply: there is no body kind, no container kind and no
+/// `body:` field, and the climb in `declaration_node` would run from a define
+/// inside an R6RS `(library …)` or a Clojure `(comment …)` up to the whole
+/// enclosing form. Both get the form-based rules below instead.
+fn is_lisp(lang: &str) -> bool {
+    matches!(lang, "clojure" | "scheme")
+}
+
+fn is_lisp_list(kind: &str) -> bool {
+    matches!(kind, "list_lit" | "list")
+}
+
+/// The first element of a list form. Clojure marks elements with the `value:`
+/// field (metadata and comments are children too); Scheme has no fields, so
+/// take the first named child that is not a comment.
+fn lisp_head(list: Node<'_>) -> Option<Node<'_>> {
+    list.child_by_field_name("value").or_else(|| {
+        let mut cur = list.walk();
+        let head = list
+            .named_children(&mut cur)
+            .find(|c| !c.kind().contains("comment"));
+        head
+    })
+}
+
+/// The head symbol's text without namespace or metadata: `defn` for both
+/// `(defn …)` and `(clojure.core/defn …)`.
+fn lisp_head_name<'a>(list: Node<'_>, text: &'a str) -> Option<&'a str> {
+    let head = lisp_head(list)?;
+    let name = head.child_by_field_name("name").unwrap_or(head);
+    text.get(name.byte_range())
+}
+
+/// The definition form a captured name belongs to: the nearest enclosing list
+/// whose head is not, and does not contain, the name. That is `(defn f …)` for
+/// `f`, and for Scheme's `(define (f a) …)` the outer form rather than the
+/// `(f a)` signature list.
+fn lisp_form<'t>(name: Node<'t>) -> Option<Node<'t>> {
+    let mut cur = name.parent();
+    while let Some(n) = cur {
+        if is_lisp_list(n.kind()) {
+            let head = lisp_head(n)?;
+            if head.end_byte() <= name.start_byte() || head.start_byte() >= name.end_byte() {
+                return Some(n);
+            }
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Where a Lisp definition's signature ends: after the element holding the
+/// name and, for Clojure, through a docstring, attribute map or `defmethod`
+/// dispatch value up to the parameter vector. A form on one line is its own
+/// declaration (`None`: the caller takes the whole form).
+fn lisp_head_end(decl: Node<'_>, after: usize) -> Option<usize> {
+    if decl.end_position().row == decl.start_position().row {
+        return None;
+    }
+    let mut end = None;
+    let mut cur = decl.walk();
+    for child in decl.named_children(&mut cur) {
+        let kind = child.kind();
+        if kind.contains("comment") || kind.ends_with("meta_lit") {
+            continue;
+        }
+        if end.is_none() {
+            if child.start_byte() < after && child.end_byte() >= after {
+                end = Some(child.end_byte());
+            }
+            continue;
+        }
+        match kind {
+            "str_lit" | "map_lit" | "kwd_lit" => {}
+            "vec_lit" => return Some(child.end_byte()),
+            _ => break,
+        }
+    }
+    end
+}
+
+/// Forms whose definitions are local: an internal define in a procedure body,
+/// a `defn` built inside a `let`, and anything quoted (a macro template is not
+/// a definition of this file).
+fn lisp_is_local(decl: Node<'_>, text: &str) -> bool {
+    let mut cur = decl.parent();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            "quoting_lit" | "syn_quoting_lit" | "quote" | "quasiquote" | "syntax" | "quasisyntax"
+        ) {
+            return true;
+        }
+        if is_lisp_list(n.kind())
+            && lisp_head_name(n, text).is_some_and(|h| {
+                matches!(
+                    h,
+                    "define"
+                        | "define-syntax"
+                        | "lambda"
+                        | "case-lambda"
+                        | "let"
+                        | "let*"
+                        | "letrec"
+                        | "letrec*"
+                        | "let-values"
+                        | "defn"
+                        | "defn-"
+                        | "defmacro"
+                        | "fn"
+                        | "letfn"
+                        | "loop"
+                )
+            })
+        {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
 /// The declaration node a captured NAME belongs to: climb until the parent is a
 /// scope container (a body/block/list) or the tree root. Shape-based because
 /// the capture depth of the name differs per grammar — Rust captures the
@@ -582,6 +720,9 @@ fn is_attribute_kind(kind: &str) -> bool {
 /// `field_declaration > variable_declarator > identifier`, TypeScript
 /// `export_statement > lexical_declaration > variable_declarator > identifier`.
 fn declaration_node<'t>(lang: &str, name: Node<'t>) -> Node<'t> {
+    if is_lisp(lang) {
+        return lisp_form(name).unwrap_or(name);
+    }
     let mut decl = name;
     let mut budget = SIBLING_SCAN_BUDGET;
     for _ in 0..DECL_MAX_DEPTH {
@@ -647,6 +788,9 @@ fn gap_is_blank(text: &str, from: usize, to: usize) -> bool {
 /// order, so a lambda nested deeper in the body can never win over the body
 /// itself.
 fn body_start(lang: &str, decl: Node<'_>, after: usize) -> Option<usize> {
+    if is_lisp(lang) {
+        return lisp_head_end(decl, after);
+    }
     body_by_kind(lang, decl, after)
         .or_else(|| body_by_field(decl, after).map(|b| b.start_byte()))
         .or_else(|| end_delimited_head(decl))
@@ -1003,6 +1147,9 @@ fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
             // wrong line entirely. Slice [declaration head .. body start), so
             // the unit is the complete signature rather than a fragment of it.
             let decl = declaration_node(def.name, node);
+            if is_lisp(def.name) && lisp_is_local(decl, text) {
+                continue;
+            }
             let head = declaration_head(decl, text);
             let from = snap_to_indent(text, head.start_byte());
             let to = body_start(def.name, decl, node.end_byte()).unwrap_or_else(|| decl.end_byte());
@@ -1874,6 +2021,40 @@ const SOLIDITY_Q: &str = r#"
 (modifier_definition name: (identifier) @function)
 "#;
 
+// No tags.scm in tree-sitter-clojure-orchard 0.2.8. A definition is a list
+// whose head symbol is a def form and whose next element names it; matching
+// the head's `name:` field accepts `clojure.core/defn` too, and the name's
+// sym_name leaves `^:private` metadata out. `lisp_is_local` drops quoted
+// templates and defs built inside a fn body.
+const CLOJURE_Q: &str = r#"
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @function)
+  (#any-of? @_kw "defn" "defn-" "defmulti"))
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @method)
+  (#eq? @_kw "defmethod"))
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @macro)
+  (#eq? @_kw "defmacro"))
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @const)
+  (#any-of? @_kw "def" "defonce"))
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @interface)
+  (#any-of? @_kw "defprotocol" "definterface"))
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @class)
+  (#any-of? @_kw "defrecord" "deftype" "defstruct"))
+(list_lit . value: (sym_lit name: (sym_name) @_kw) . value: (sym_lit name: (sym_name) @module)
+  (#eq? @_kw "ns"))
+"#;
+
+// tree-sitter-scheme 0.24.7 ships no tags.scm and every form is a `list`.
+// `(define (f a) …)` is a procedure, `(define x …)` a value. A library's name
+// is a list, `(my lib)`, captured whole.
+const SCHEME_Q: &str = r#"
+(list . (symbol) @_kw . (list . (symbol) @function) (#eq? @_kw "define"))
+(list . (symbol) @_kw . (symbol) @const (#eq? @_kw "define"))
+(list . (symbol) @_kw . (symbol) @macro (#any-of? @_kw "define-syntax" "define-macro"))
+(list . (symbol) @_kw . (symbol) @struct (#eq? @_kw "define-record-type"))
+(list . (symbol) @_kw . (list . (symbol) @struct) (#eq? @_kw "define-record-type"))
+(list . (symbol) @_kw . (list) @module (#any-of? @_kw "library" "define-library"))
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2545,15 +2726,15 @@ mod tests {
     /// been counted as its own language by these docs.
     #[test]
     fn documented_language_count() {
-        assert_eq!(registry().len(), 35, "registry row count changed");
+        assert_eq!(registry().len(), 37, "registry row count changed");
         let langs: std::collections::HashSet<&str> = registry()
             .iter()
             .map(|d| d.name.trim_end_matches("_interface"))
             .collect();
         assert_eq!(
             langs.len(),
-            34,
-            "docs say 34 languages; update ROADMAP.md and landing/index.html"
+            36,
+            "docs say 36 languages; update ROADMAP.md and landing/index.html"
         );
     }
 
@@ -2600,6 +2781,13 @@ mod tests {
             ("f95", "fortran"),
             ("f03", "fortran"),
             ("sol", "solidity"),
+            ("clj", "clojure"),
+            ("cljs", "clojure"),
+            ("cljc", "clojure"),
+            ("scm", "scheme"),
+            ("ss", "scheme"),
+            ("sld", "scheme"),
+            ("sps", "scheme"),
         ] {
             assert!(is_code_ext(ext), "{ext} must be recognised as code");
             let d = registry().iter().find(|d| d.exts.contains(&ext));
@@ -2611,9 +2799,10 @@ mod tests {
         }
         // Deliberately NOT claimed, each for a stated reason: fixed-form
         // Fortran would mis-parse under the free-form grammar; nim/crystal
-        // have no usable published grammar; sql routing is deferred; clojure
-        // waits on a crate release against core 0.26.
-        for ext in ["f", "nim", "cr", "sql", "clj"] {
+        // have no usable published grammar; sql routing is deferred; `.sls`
+        // is an R6RS library but also a SaltStack state file (YAML), and a
+        // single-claimant extension is never content-probed; `.edn` is data.
+        for ext in ["f", "nim", "cr", "sql", "sls", "edn"] {
             assert!(!is_code_ext(ext), "{ext} must stay unclaimed (see #295)");
         }
     }
@@ -3776,6 +3965,105 @@ mod tests {
         assert!(has(&s, "std", "const"), "got {s:?}");
         // Function-local const must stay out (source_file anchor).
         assert!(!has(&s, "local", "const"), "captured a local: {s:?}");
+    }
+
+    fn sym<'a>(s: &'a [Symbol], name: &str) -> &'a Symbol {
+        s.iter()
+            .find(|x| x.name == name)
+            .unwrap_or_else(|| panic!("no {name} in {s:?}"))
+    }
+
+    #[test]
+    fn clojure() {
+        let s = syms(
+            "clojure",
+            "(ns my.app\n  (:require [clojure.string :as str]))\n\
+             \n\
+             (def ^:private limit 10)\n\
+             \n\
+             (defn greet\n  \"Says hello.\"\n  [name]\n  (str \"hi \" name))\n\
+             \n\
+             (defn- helper [x] (inc x))\n\
+             (defmacro unless [c & body]\n  `(if ~c nil (do ~@body)))\n\
+             (defprotocol Shape\n  (area [s]))\n\
+             (defrecord Circle [r]\n  Shape\n  (area [_] (* r r)))\n\
+             (defmulti render :type)\n\
+             (defmethod render :circle [s]\n  s)\n\
+             (comment\n  (defn scratch [] 1))\n\
+             (clojure.core/defn qualified [] 2)\n",
+        );
+        assert!(has(&s, "my.app", "module"), "got {s:?}");
+        assert!(has(&s, "limit", "const"), "got {s:?}");
+        assert!(has(&s, "greet", "function"), "got {s:?}");
+        assert!(has(&s, "helper", "function"), "got {s:?}");
+        assert!(has(&s, "unless", "macro"), "got {s:?}");
+        assert!(has(&s, "Shape", "interface"), "got {s:?}");
+        assert!(has(&s, "Circle", "class"), "got {s:?}");
+        assert!(has(&s, "render", "function"), "got {s:?}");
+        assert!(has(&s, "render", "method"), "got {s:?}");
+        assert!(has(&s, "qualified", "function"), "got {s:?}");
+        // Call sites and parameters are not definitions.
+        assert!(
+            !s.iter().any(|x| x.name == "str" || x.name == "x"),
+            "got {s:?}"
+        );
+
+        // The declaration runs through the parameter vector, docstring included,
+        // and stops before the body.
+        let g = sym(&s, "greet");
+        assert_eq!(g.line, 6, "{g:?}");
+        assert_eq!(g.end_line, 9, "{g:?}");
+        assert_eq!(g.code, "(defn greet\n  \"Says hello.\"\n  [name]", "{g:?}");
+        // A one-line form is its own declaration.
+        assert_eq!(sym(&s, "helper").code, "(defn- helper [x] (inc x))");
+        assert_eq!(sym(&s, "unless").code, "(defmacro unless [c & body]");
+        assert_eq!(sym(&s, "Circle").code, "(defrecord Circle [r]");
+        // A form nested in another (here `comment`) is sliced as itself, not
+        // as the enclosing form.
+        let n = sym(&s, "scratch");
+        assert_eq!(n.code, "(defn scratch [] 1)", "{n:?}");
+        assert_eq!((n.line, n.end_line), (23, 23), "{n:?}");
+    }
+
+    #[test]
+    fn scheme() {
+        let s = syms(
+            "scheme",
+            "(library (my lib)\n  (export add)\n  (import (rnrs))\n\
+             \x20 (define (add a b)\n    (+ a b))\n\
+             \x20 (define limit 10)\n\
+             \x20 (define-syntax swap!\n    (syntax-rules ()\n      ((_ a b) (let ((t a)) (set! a b) (set! b t)))))\n\
+             \x20 (define-record-type point (fields x y)))\n\
+             (define (top x)\n  (define (inner y) y)\n  (inner x))\n",
+        );
+        assert!(has(&s, "(my lib)", "module"), "got {s:?}");
+        assert!(has(&s, "add", "function"), "got {s:?}");
+        assert!(has(&s, "limit", "const"), "got {s:?}");
+        assert!(has(&s, "swap!", "macro"), "got {s:?}");
+        assert!(has(&s, "point", "struct"), "got {s:?}");
+        assert!(has(&s, "top", "function"), "got {s:?}");
+        assert!(
+            !s.iter().any(|x| x.name == "a" || x.name == "t"),
+            "got {s:?}"
+        );
+        // An internal define is a local of its procedure, like a
+        // function-local const elsewhere.
+        assert!(
+            !s.iter().any(|x| x.name == "inner"),
+            "captured a local: {s:?}"
+        );
+
+        // Inside an R6RS `library` form a define is sliced as itself, not as
+        // the whole library.
+        let a = sym(&s, "add");
+        assert_eq!(a.code, "(define (add a b)", "{a:?}");
+        assert_eq!((a.line, a.end_line), (4, 5), "{a:?}");
+        assert_eq!(sym(&s, "limit").code, "(define limit 10)");
+        assert_eq!(sym(&s, "swap!").code, "(define-syntax swap!");
+        assert_eq!(sym(&s, "(my lib)").code, "(library (my lib)");
+        let t = sym(&s, "top");
+        assert_eq!(t.code, "(define (top x)", "{t:?}");
+        assert_eq!((t.line, t.end_line), (11, 13), "{t:?}");
     }
 
     #[test]

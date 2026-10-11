@@ -378,7 +378,8 @@ limit of 4,096.  This accommodates current and next-generation embedding models:
 | GPT-4o embeddings       | 3,072      |
 | Custom / future models  | ≤ 16,384   |
 
-Set `max_dimensions` in `xerj.toml` (default is 16,384).
+There is no enforced dimension cap: `[vector] max_dimensions` (default 16,384) is accepted
+but not wired in this build, and setting it logs a warning at startup.
 
 ## Embedding Token Limits
 
