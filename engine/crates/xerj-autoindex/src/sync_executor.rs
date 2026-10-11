@@ -972,6 +972,14 @@ impl<'a> EsSyncBackend<'a> {
                 let mut body = serde_json::json!({
                     "size": Self::CATALOG_WALK_PAGE,
                     "sort": [{"_id": "asc"}],
+                    // #1267: without this the engine caps `hits.total.value` at
+                    // the ES 8.x default 10,000 (relation `gte`), so the walk's
+                    // progress denominator froze at 10k on the 402,814-doc
+                    // catalog — the exact "stuck ticker" this phase exists to
+                    // fix. Ask for the true match count so the bar and ETA are
+                    // real. The walk still terminates on a short page, not on
+                    // the total, so this only corrects the denominator.
+                    "track_total_hits": true,
                     "query": {"term": {"run_id": run_id}}
                 });
                 if let Some(after) = search_after {
