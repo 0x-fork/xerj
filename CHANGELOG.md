@@ -7,6 +7,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.94] - 2026-10-11
+
+Window since v1.0.0-rc.93: a wave of external-contributor fixes landed
+alongside a backlog-fix sweep. Contributors in this window: Vinz2168,
+thomas-villani (Tom Villani), yogthos, and pierreaubert.
+
+### Fixed
+
+- **Hybrid `query`+`knn` kept a page-local ranking on delete-bearing indexes**
+  (issue [#1303](https://github.com/xerj-org/xerj/issues/1303), PR
+  [#1312](https://github.com/xerj-org/xerj/pull/1312)) — a single historical
+  overwrite/delete flipped the pinned-kNN compound tree off the exact
+  index-wide BM25 path onto the stored-doc page heuristic, so the lexical half
+  scored against a page sample instead of corpus-wide document frequency:
+  correct on a handful of docs, unrelated at scale. The `!deletes_present`
+  gate on the pinned-kNN FTS projection is removed; the append-only path is
+  byte-identical, with a regression test that uses enough documents that
+  page-local and corpus-wide statistics diverge.
+- **Bulk auto-id loads rejected the whole batch for one lone UTF-16 surrogate**
+  (issue [#1304](https://github.com/xerj-org/xerj/issues/1304), PR
+  [#1311](https://github.com/xerj-org/xerj/pull/1311)) — the turbo index path
+  validated each line with `serde_json` `IgnoredAny`, which does not decode
+  `\uXXXX` escapes, so a lone surrogate slipped through to the deferred
+  whole-batch `Value` parse and failed every item. The bad document is now
+  rejected per-item with a 400; the rest of the batch lands.
+- **autoindex `--watch` allowed two live owners of one journal/destination**
+  (issue [#1232](https://github.com/xerj-org/xerj/issues/1232), PR
+  [#1307](https://github.com/xerj-org/xerj/pull/1307)) — a session now holds a
+  session-long exclusive lock (`.autoindex.watch.lock`); a second watcher for
+  the same state dir is refused with a bounded, non-zero-exit message.
+- **autoindex incremental `--no-graph` reconcile aborted on sibling forks**
+  (issue [#1230](https://github.com/xerj-org/xerj/issues/1230), PR
+  [#1309](https://github.com/xerj-org/xerj/pull/1309)) — the frozen plan never
+  persisted the per-repository scope genesis clustering uses, so byte-identical
+  sibling repos could not be told apart; the scope is now persisted.
+- **Second Brain console rendered a notes/beliefs persona on non-note corpora**
+  (issue [#1100](https://github.com/xerj-org/xerj/issues/1100), PR
+  [#1310](https://github.com/xerj-org/xerj/pull/1310)) — the console now picks a
+  neutral records/active frame vs the notes persona from the real `ax_format`
+  tally, so autoindexing a code tree no longer frames it as personal notes.
+- **memtable `match`/`match_phrase` tokenized with the wrong analyzer**
+  (issue [#1280](https://github.com/xerj-org/xerj/issues/1280), PR
+  [#1295](https://github.com/xerj-org/xerj/pull/1295), thomas-villani) — the
+  memtable now tokenizes with the analyzer the segment uses, so hit sets are
+  stable across a flush.
+- **`query_string` field groups and negation** (issues
+  [#1298](https://github.com/xerj-org/xerj/issues/1298),
+  [#1299](https://github.com/xerj-org/xerj/issues/1299), PRs
+  [#1300](https://github.com/xerj-org/xerj/pull/1300),
+  [#1301](https://github.com/xerj-org/xerj/pull/1301), Vinz2168) —
+  `field:( … )` groups are scoped to the field and the classic parser builds
+  one boolean per level with correct occur semantics.
+- **A non-numeric value on a numeric field is a 400, honouring `lenient`**
+  (issue [#1284](https://github.com/xerj-org/xerj/issues/1284), PR
+  [#1293](https://github.com/xerj-org/xerj/pull/1293), Vinz2168).
+- **`highlight.fields` expands field-name patterns** (issue
+  [#1281](https://github.com/xerj-org/xerj/issues/1281), PR
+  [#1294](https://github.com/xerj-org/xerj/pull/1294), Vinz2168).
+- **`_msearch` reports the envelope-level `took`** (issue
+  [#1288](https://github.com/xerj-org/xerj/issues/1288), PR
+  [#1289](https://github.com/xerj-org/xerj/pull/1289), Vinz2168).
+- **`terms` order resolves percentile keys and rejects unknown paths** (issues
+  [#1282](https://github.com/xerj-org/xerj/issues/1282),
+  [#1283](https://github.com/xerj-org/xerj/issues/1283), PR
+  [#1290](https://github.com/xerj-org/xerj/pull/1290), Vinz2168).
+- **No empty `Warning: 299` header on every response** (issue
+  [#1285](https://github.com/xerj-org/xerj/issues/1285), PR
+  [#1291](https://github.com/xerj-org/xerj/pull/1291), Vinz2168).
+- **`embedding.timeout_ms` reaches the proxy client in milliseconds** (PR
+  [#1276](https://github.com/xerj-org/xerj/pull/1276), thomas-villani).
+- **`index.max_result_window` above 10,000 works; `limits.max_result_window`
+  is the node default** (PR
+  [#1277](https://github.com/xerj-org/xerj/pull/1277), thomas-villani).
+- **autoindex CLI argument hygiene** — `xerj def --kind/--lang` still requires
+  the name to match (PR [#1272](https://github.com/xerj-org/xerj/pull/1272)),
+  each watch route refuses flags it cannot read (PR
+  [#1273](https://github.com/xerj-org/xerj/pull/1273)), the legacy-journal
+  rebuild argv carries every index-shaping flag (PR
+  [#1274](https://github.com/xerj-org/xerj/pull/1274)), and map-only
+  `--dataset` is refused outside `autoindex map` (issue
+  [#1231](https://github.com/xerj-org/xerj/issues/1231), PR
+  [#1308](https://github.com/xerj-org/xerj/pull/1308)). thomas-villani / xerj-org.
+- **Row-exact fast aggregations under resident ghosts** (issue
+  [#1267](https://github.com/xerj-org/xerj/issues/1267), PR
+  [#1270](https://github.com/xerj-org/xerj/pull/1270)) — bounds the 803 s
+  fast-agg finalize-verify window. Partial: #1267 **stays open** for the
+  finalize-catalog read-back walk and the `size > 0` doc-lane residual,
+  which still brute-scan.
+
+### Added
+
+- **autoindex AST extraction for Clojure and Scheme** (PR
+  [#1305](https://github.com/xerj-org/xerj/pull/1305), yogthos).
+
+### Changed
+
+- **Dormant config keys named at startup** (PR
+  [#1275](https://github.com/xerj-org/xerj/pull/1275), thomas-villani) — every
+  accepted-but-unread key is announced as DORMANT at startup and no longer
+  documented as working.
+
+### Docs
+
+- Config/cluster/env/WAL docs describe the behavior the binary actually has
+  (PR [#1278](https://github.com/xerj-org/xerj/pull/1278), thomas-villani);
+  `--help` names the CORS config and the real native-port default (issue
+  [#1286](https://github.com/xerj-org/xerj/issues/1286), PR
+  [#1292](https://github.com/xerj-org/xerj/pull/1292), Vinz2168). Field reports
+  against live ES 8.13.4 and a reference-coding corpus index landed from
+  Vinz2168 (PRs [#1287](https://github.com/xerj-org/xerj/pull/1287),
+  [#1302](https://github.com/xerj-org/xerj/pull/1302)) and pierreaubert (PR
+  [#1297](https://github.com/xerj-org/xerj/pull/1297)).
+
+### Housekeeping
+
+- Landing footer/version-stamp sweep so the `Landing constants` guard on
+  `main` is green (PR [#1271](https://github.com/xerj-org/xerj/pull/1271)), and
+  the yogthos CLA signature (PR
+  [#1306](https://github.com/xerj-org/xerj/pull/1306)).
+- Closed as already-fixed on `main` after verification: the sorted-scan
+  liveness bug [#1212](https://github.com/xerj-org/xerj/issues/1212) (via
+  #1013), the raw-JSON own-field recall gap
+  [#1244](https://github.com/xerj-org/xerj/issues/1244) (via #1246/#1251), and
+  the corpus-index resume honesty bug
+  [#1173](https://github.com/xerj-org/xerj/issues/1173) (via #1174).
+
 ## [1.0.0-rc.93] - 2026-10-08
 
 ### Fixed
