@@ -72,7 +72,7 @@ pub struct PlanDataset {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_id_in_second, Journal, StateLock};
+    use super::{acquire_watch_ownership, run_id_in_second, Journal, StateLock, WATCH_OWNER_LOCK};
 
     /// `flock` ownership follows the open file description, so an inherited
     /// descriptor can unlock the acquiring parent's lock. Model that post-fork
@@ -122,6 +122,52 @@ mod tests {
         fs2::FileExt::try_lock_exclusive(&contender)
             .expect("the acquiring owner's drop must release its flock");
         fs2::FileExt::unlock(&contender).unwrap();
+    }
+
+    /// #1232: the per-pass lock is released between passes, so a second
+    /// `--watch` for the same journal/destination used to park beside the
+    /// first. A session-long ownership lock makes a second owner impossible: the
+    /// second acquisition is a bounded refusal while the first is alive, and
+    /// ownership frees as soon as the first guard drops (as it does on process
+    /// death, by the kernel).
+    #[test]
+    fn a_second_watch_owner_is_refused_until_the_first_releases() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = acquire_watch_ownership(dir.path()).expect("first watcher takes ownership");
+
+        let refusal = match acquire_watch_ownership(dir.path()) {
+            Ok(_) => panic!("a second watcher for the same state dir must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{refusal:#}");
+        assert!(
+            message.contains("already owns") && message.contains(&dir.path().display().to_string()),
+            "refusal must name the contended state dir: {message}"
+        );
+
+        drop(first);
+        let _second = acquire_watch_ownership(dir.path())
+            .expect("ownership must be reacquirable once the first owner releases");
+    }
+
+    /// The ownership lock lives in its OWN file so a watch session's own passes,
+    /// which take the per-pass lock on `.autoindex.lock`, are never blocked by
+    /// the session lock the same process already holds. Sharing one file would
+    /// deadlock the first pass against the session lock.
+    #[test]
+    fn watch_ownership_does_not_block_the_sessions_own_per_pass_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = acquire_watch_ownership(dir.path()).expect("take watch ownership");
+
+        // A pass inside the same process must still take `.autoindex.lock`.
+        let preflight = Journal::preflight(dir.path(), "root", "url", "prefix", false)
+            .expect("the per-pass lock must be free while watch ownership is held");
+
+        assert!(dir.path().join(WATCH_OWNER_LOCK).exists());
+        assert!(dir.path().join(".autoindex.lock").exists());
+        drop(preflight);
+        drop(owner);
     }
 
     #[test]
@@ -602,6 +648,70 @@ impl Drop for StateLock {
         if std::process::id() == self.owner_pid {
             let _ = fs2::FileExt::unlock(&self.file);
         }
+    }
+}
+
+/// File name of the `--watch` session ownership lock, beside `.autoindex.lock`.
+const WATCH_OWNER_LOCK: &str = ".autoindex.watch.lock";
+
+/// Session-long ownership of a `--watch` run's state directory (#1232).
+///
+/// The per-pass [`StateLock`] on `.autoindex.lock` only protects a single pass:
+/// a pass's [`Journal`] drops when the pass ends, and the watch loop then parks
+/// in its idle wait holding no lock at all. That window let a second
+/// `xerj autoindex --watch` for the same source root, endpoint, prefix and
+/// state directory complete its own initial pass and stay parked beside the
+/// first — two live owners with duplicate filesystem subscriptions doing
+/// redundant reconciliation.
+///
+/// A watch session holds this lock for its whole lifetime so only one native
+/// watcher can own a journal and destination at a time. Keep the guard alive
+/// for as long as the session runs.
+pub struct WatchOwnership {
+    _lock: StateLock,
+}
+
+/// Take session-long `--watch` ownership of `state_dir`, or refuse if another
+/// live watcher already holds it (#1232).
+///
+/// The lock lives in a SEPARATE file from the per-pass `.autoindex.lock` on
+/// purpose: the session's own passes still take that per-pass lock, and `flock`
+/// treats two open file descriptions for one path as independent even within a
+/// single process, so sharing the file would make the first pass block forever
+/// against the session lock it already holds.
+///
+/// `flock` ownership is released by the kernel on process death and by the
+/// explicit unlock on graceful drop, so a crashed or killed watcher frees
+/// ownership without leaving a stale marker and without touching any persistent
+/// data — exactly the lifecycle the report asked for. A `WouldBlock` contention
+/// becomes a clear, bounded refusal; any other error is returned as-is.
+pub fn acquire_watch_ownership(state_dir: &Path) -> Result<WatchOwnership> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create state dir {}", state_dir.display()))?;
+    let lock_path = state_dir.join(WATCH_OWNER_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open watch ownership lock {}", lock_path.display()))?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(WatchOwnership {
+            _lock: StateLock {
+                file,
+                owner_pid: std::process::id(),
+            },
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(anyhow::anyhow!(
+            "another `xerj autoindex --watch` already owns {} (same source root, endpoint, \
+             prefix and state directory). Only one native watcher may own a journal and its \
+             destination at a time — stop the other watcher, or choose a different --state-dir. \
+             Ownership frees automatically when that process exits.",
+            state_dir.display()
+        )),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("lock watch ownership {}", lock_path.display()))),
     }
 }
 
