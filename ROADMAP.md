@@ -2,11 +2,30 @@
 
 This roadmap tracks capabilities that are **planned but not yet fully implemented**, so the project's public claims stay honest about what ships today versus what is coming. Status is verified against the actual code and by real API requests to the release binary, not aspirational.
 
-Last reviewed: 2026-10-08 (against `v1.0.0-rc.93` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.93 release-cut roll:
+Last reviewed: 2026-10-11 (against `v1.0.0-rc.94` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.94 release-cut roll:
 the open-defects shortlist was re-verified against the live tracker at
-cut time — **twelve open**, the ten carried from rc.92 (#1094, #1100,
-#1122, #1170, #1173, #1108, #1110, #1183, #1212, #1226) plus #1250 and
-#1267, the slow-query population filed inside this window. #1260 was
+cut time — **nine open**: #1094, #1108, #1110, #1122, #1170, #1183,
+#1226, #1250, #1267. The window since rc.93 landed 29 merged PRs. A
+backlog-fix sweep closed six defects inside the window: the hybrid
+`query`+`knn` page-local ranking (#1303, PR
+[#1312](https://github.com/xerj-org/xerj/pull/1312)), the bulk
+lone-surrogate whole-batch rejection (#1304, PR
+[#1311](https://github.com/xerj-org/xerj/pull/1311)), the autoindex
+`--watch` double-owner (#1232, PR
+[#1307](https://github.com/xerj-org/xerj/pull/1307)), the sibling-fork
+reconcile abort (#1230, PR
+[#1309](https://github.com/xerj-org/xerj/pull/1309)), the map-only
+`--dataset` accept-and-ignore (#1231, PR
+[#1308](https://github.com/xerj-org/xerj/pull/1308)), and the
+non-note-corpus Second Brain vocabulary (#1100, PR
+[#1310](https://github.com/xerj-org/xerj/pull/1310)). Three more were
+closed as already-fixed after verification against the code: #1212 (via
+#1013), #1244 (via #1246/#1251) and #1173 (via #1174). Contributor
+fixes and field reports from Vinz2168, thomas-villani, yogthos and
+pierreaubert also landed (see CHANGELOG). The rc.93 cut's record stands
+as written: **twelve open** at that cut — the ten carried from rc.92
+(#1094, #1100, #1122, #1170, #1173, #1108, #1110, #1183, #1212, #1226)
+plus #1250 and #1267, the slow-query population filed inside that window. #1260 was
 filed and closed inside the window (PR
 [#1262](https://github.com/xerj-org/xerj/pull/1262)): the per-digest
 `bool.filter [term ax_file, exists]` probe fell off the columnar fast
