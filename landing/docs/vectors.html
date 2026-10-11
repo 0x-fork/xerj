@@ -258,11 +258,11 @@
     <div class="cell k">default_metric</div>
     <div class="cell t">enum</div>
     <div class="cell d">"cosine"</div>
-    <div class="cell dsc">"cosine" · "dot_product" · "euclidean".</div>
+    <div class="cell dsc">"cosine" · "dot_product" · "euclidean". Accepted but not wired: similarity comes from the field mapping, and a mapping without one gets cosine.</div>
   </div>
 
   <h2 id="quantization">Quantization</h2>
-  <p><strong>Quantization is off by default</strong> — <code class="inline">[vector] default_quantization = "none"</code>, full-precision f32. Opt in per field with <code class="inline">index_options.type: int8_hnsw</code> (or <code class="inline">int8_flat</code>) on the mapping, or index-wide by setting the key.</p>
+  <p><strong>Quantization is off by default</strong> — <code class="inline">[vector] default_quantization = "none"</code>, full-precision f32. Opt in per field with <code class="inline">index_options.type: int8_hnsw</code> (or <code class="inline">int8_flat</code>) on the mapping. The node-wide key is not wired as a default: only its <code class="inline">"binary"</code> refusal reads it, so <code class="inline">"scalar8"</code> there quantizes nothing.</p>
   <ul>
     <li><strong>none</strong> — full-precision f32. <em>The default.</em> Use when recall matters more than RAM.</li>
     <li><strong>scalar8</strong> — 8-bit per dimension, 1–2% recall loss. The one quantizer the serving path reads. It buys <strong>precision, not memory</strong>: the scan reads the full-precision vector from <code class="inline">_source</code> and quantizes it per query, so nothing shrinks in RAM, and a <code class="inline">scalar8</code> <code class="inline">_score</code> (and the order it produces) depends on the candidate set — see the <a href="/docs/recipes/vector-quantization">quantization recipe</a> and <a href="https://github.com/xerj-org/xerj/issues/392">#392</a>.</li>

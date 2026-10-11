@@ -37,10 +37,14 @@
 //!   segment's ghost-position bitmap is empty — per-segment admission via
 //!   `ghost_positions_for`, with the memtable views liveness-gated, the
 //!   delete-blind memtable columnar summaries switched off, and the
-//!   version-map epoch re-checked before the result is returned.  A single
-//!   superseded row in ANY segment still bails; what changed is that a
-//!   MERGED index (ghosts compacted away) re-qualifies instead of staying
-//!   disabled forever on the monotonic `ghost_events` counter.
+//!   version-map epoch re-checked before the result is returned.  A MERGED
+//!   index (ghosts compacted away) re-qualifies instead of staying disabled
+//!   forever on the monotonic `ghost_events` counter.  Since #1267 a segment
+//!   with resident ghosts is admitted for ONE provably row-exact plan — a
+//!   top-level filter plus a single plain `terms` agg — where every number
+//!   comes from the fused row pass (ghosted rows skipped) and the
+//!   live-filtered memtable walks, never from a delete-blind O(1) stat;
+//!   every other plan still bails on the first dirty bitmap.
 //! * Every non-empty segment must have a decodable `.dv` sidecar.
 //!
 //! Known accepted divergences vs brute (documented, benign for the fast-path
@@ -178,6 +182,23 @@ struct SegEntry {
     id: String,
     cols: super::Resident<super::DocValueMap>,
     docs: u32,
+    /// [#1267] This segment's ghost-position bitmap, carried only when it
+    /// is NON-empty and the admission gate let the segment through anyway
+    /// (the row-exact plan — see `try_fast_aggs`).  Bit set ⇔ the row at
+    /// that position is deleted or superseded; every row-fold in the
+    /// row-exact plan must skip set bits.  `None` = provably ghost-free,
+    /// the shape every executor was originally built under.
+    ghosts: Option<std::sync::Arc<Vec<u64>>>,
+}
+
+/// Bit `row` of a ghost-position bitmap (bit pos set ⇔ row is deleted or
+/// superseded).  Out-of-range rows are live: the bitmap is sized for the
+/// segment's row space, and a short one simply has no ghosts past its end.
+#[inline]
+fn ghost_bit(ghosts: &[u64], row: u32) -> bool {
+    ghosts
+        .get((row >> 6) as usize)
+        .is_some_and(|w| (w >> (row & 63)) & 1 != 0)
 }
 
 /// Look up a doc-value column for `field`, falling back to the `.keyword`
@@ -708,6 +729,24 @@ fn params_only(params: &Value, allowed: &[&str]) -> bool {
     }
 }
 
+/// [#1267] The one plan shape admitted with DIRTY ghost bitmaps: the aggs
+/// tree is EXACTLY one plain `terms` aggregation — a single named entry
+/// whose body is `{"terms": {...}}` and nothing else.  No sub-aggs (no
+/// `aggs` key), no metrics, no `meta`, no siblings: anything beyond the
+/// single terms body makes the shape's cost depend on an executor that may
+/// read a delete-blind whole-segment stat, so it keeps today's bail.  The
+/// caller additionally requires a top-level filter (checked before calling)
+/// so `exec_terms` routes through the fused row pass.
+fn single_plain_terms_agg(aggs_obj: &serde_json::Map<String, Value>) -> bool {
+    if aggs_obj.len() != 1 {
+        return false;
+    }
+    let Some(body) = aggs_obj.values().next().and_then(|v| v.as_object()) else {
+        return false;
+    };
+    body.len() == 1 && body.contains_key("terms")
+}
+
 impl Index {
     /// Entry point — see module docs.  Returns `Some(agg_result)` (shaped
     /// exactly like `run_aggs_with_all`'s return) or `None` to fall back.
@@ -774,14 +813,33 @@ impl Index {
         // stored doc at that row is deleted or superseded; the merge
         // survivor filter guarantees at most one live copy per id, so the
         // id-level predicate is exact and its row space IS the `.dv`
-        // column row space).  A segment with a NON-EMPTY bitmap still bails
-        // (its stats would double-count ghosts); a segment with an EMPTY
-        // bitmap is provably ghost-free — live == physical — which is
-        // exactly the invariant every executor was built under, so the
-        // row-level arithmetic runs unchanged.  Steady state after merges
-        // is clean bitmaps, so the fast path comes BACK; active rewrite
-        // windows keep falling to brute, as before.  `None` (stored
-        // section unreadable) keeps today's bail.
+        // column row space).  A segment with an EMPTY bitmap is provably
+        // ghost-free — live == physical — which is exactly the invariant
+        // every executor was built under, so the row-level arithmetic runs
+        // unchanged.  Steady state after merges is clean bitmaps, so the
+        // fast path comes BACK.  `None` (stored section unreadable) keeps
+        // today's bail.
+        //
+        // [#1267] A segment with a NON-EMPTY bitmap no longer bails every
+        // request: that was the 803,735 ms verify window.  A resumed crawl
+        // shard carries tombstones from the resume's overwrites, so EVERY
+        // one of its ~800 finalize-verify windows fell to the brute agg
+        // corpus, which materialises the whole index per window — measured
+        // live on the 53,153-doc `cves-28` shard (issue #1267).  Dirty
+        // bitmaps are now admitted for exactly one plan shape that is
+        // provably row-exact under ghosts: a top-level filter present (so
+        // `exec_terms` takes the fused row pass, never the whole-segment
+        // `per_ord_count` shortcut) plus a single plain `terms` agg — no
+        // sub-aggs, no metrics, no siblings.  Every number that shape
+        // produces comes from per-row accounting (`fused_seg_pass` skips
+        // ghosted rows; the filtered total row-scans dirty segments) and
+        // the live-filtered memtable walks.  Any other plan still bails on
+        // the first dirty bitmap, as before — the O(1) stats it would read
+        // (`per_ord_count`, `live_count`, `range_count`) count physical
+        // rows and would double-count ghosts.
+        let row_exact = top_filter.is_some() && single_plain_terms_agg(aggs_obj);
+        let mut dirty_ghosts: std::collections::HashMap<String, std::sync::Arc<Vec<u64>>> =
+            std::collections::HashMap::new();
         let mem_live_gate: Option<std::collections::HashSet<String>> = if deletes_present {
             for meta in &snap.segments {
                 if meta.doc_count == 0 {
@@ -789,7 +847,10 @@ impl Index {
                 }
                 let ghosts = self.ghost_positions_for(&meta.id, meta.doc_count)?;
                 if ghosts.iter().any(|w| *w != 0) {
-                    return None;
+                    if !row_exact {
+                        return None;
+                    }
+                    dirty_ghosts.insert(meta.id.clone(), ghosts);
                 }
             }
             // The memtable leg of the same gate: a buffered doc whose live
@@ -833,6 +894,7 @@ impl Index {
                 id: meta.id.clone(),
                 cols,
                 docs: meta.doc_count as u32,
+                ghosts: dirty_ghosts.get(&meta.id).cloned(),
             });
         }
 
@@ -867,17 +929,25 @@ impl Index {
         // Filtered `hits.total`: the number of live docs matching the query.
         // For match_all the caller derives it from segment + memtable counts
         // (and later overwrites with the delete-aware live count), so we only
-        // compute a total when a filter narrowed the corpus.  No deletes are
-        // present on the fast path (gated above), so physical row counts are
-        // exact, and each memtable doc is one hit (weights affect agg
-        // `doc_count`, not `hits.total`).
+        // compute a total when a filter narrowed the corpus.  Clean segments
+        // have live == physical (gated above), so the O(1) stats are exact;
+        // [#1267] a dirty-but-admitted segment instead counts live matching
+        // rows directly — `seg_pred_count`'s whole-segment arms
+        // (`per_ord_count`, `range_count`, `live_count`) are delete-blind
+        // and would count ghosted rows.  Each memtable doc is one hit
+        // (weights affect agg `doc_count`, not `hits.total`).
         let filtered_total: Option<u64> = match &ctx.top_filter {
             None => None,
             Some(pred) => {
                 let mut total: u64 = 0;
                 for seg in &ctx.segs {
                     let sp = resolve_pred(&seg.cols, pred, &ctx.segs, ctx.mapped_fields)?;
-                    total += seg_pred_count(&sp, seg.docs);
+                    total += match seg.ghosts.as_deref() {
+                        None => seg_pred_count(&sp, seg.docs),
+                        Some(g) => (0..seg.docs)
+                            .filter(|&row| !ghost_bit(g, row) && seg_pred_matches(&sp, row))
+                            .count() as u64,
+                    };
                 }
                 if let Some(q) = &ctx.top_filter_query {
                     // O(matching) columnar fold when the filter columnarises;
@@ -2410,7 +2480,19 @@ impl<'a> FastCtx<'a> {
             .collect();
         let th_dense = th_col.is_some_and(|n| n.null_bitmap.is_empty());
 
+        // [#1267] Ghosted rows (deleted/superseded but still resident) are
+        // skipped before ANY accounting — present only on dirty-but-admitted
+        // segments (the row-exact plan), where counting them would
+        // double-count docs the brute path no longer sees.  Hoisted beside
+        // the null probes: clean segments pay one `Option` check.
+        let seg_ghosts = seg.ghosts.as_deref();
+
         for row in 0..seg.docs {
+            if let Some(g) = seg_ghosts {
+                if ghost_bit(g, row) {
+                    continue;
+                }
+            }
             if let Some(sp) = &top_sp {
                 if !seg_pred_matches(sp, row) {
                     continue;
@@ -5992,6 +6074,7 @@ mod range_kw_tests {
             id: "seg1".to_string(),
             cols: crate::segment_cache_budget::CacheResident::uncached(m),
             docs: 2,
+            ghosts: None,
         };
         assert!(
             seg.col("extension").is_some(),
@@ -6169,6 +6252,7 @@ mod range_kw_tests {
             id: "seg1".to_string(),
             cols: crate::segment_cache_budget::CacheResident::uncached(cols),
             docs: 1,
+            ghosts: None,
         }
     }
 

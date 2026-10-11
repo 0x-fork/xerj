@@ -237,11 +237,11 @@ xerj_merge_duration_seconds_sum{index="logs"} 1847.2</pre>
   <p><strong>Fix:</strong> if it's memory — raise <code class="inline">[limits] max_query_memory_mb</code> (512 → 1024 or 2048 for aggregation-heavy workloads). If it's concurrency — raise <code class="inline">max_concurrent_searches</code>, but check that the host actually has headroom first.</p>
 
   <h2>Symptom: node RAM climbs forever</h2>
-  <p><strong>Likely cause:</strong> vector fields growing without quantization, or too many indices with large <code class="inline">flush_size_mb</code>.</p>
+  <p><strong>Likely cause:</strong> large vector fields, or too many indices with large <code class="inline">flush_size_mb</code>.</p>
   <p><strong>Check:</strong></p>
 <pre class="code">$ curl -s http://127.0.0.1:8080/v1/metrics | grep memory_usage
 xerj_memory_usage_bytes 14200000000  # 14 GB and climbing</pre>
-  <p><strong>Fix:</strong> set <code class="inline">[vector] default_quantization = "scalar8"</code> (or opt heavy fields in per-mapping) so vectors are stored as 1-byte-per-dimension codes. Or lower <code class="inline">flush_size_mb</code> so memtables don't grow unbounded.</p>
+  <p><strong>Fix:</strong> lower <code class="inline">flush_size_mb</code> so memtables don't grow unbounded, and set an explicit <code class="inline">[limits] max_process_memory_mb</code> if the automatic cap does not suit the host. Quantization is not a memory fix today: <code class="inline">scalar8</code> (opted into per field with <code class="inline">index_options</code>) shrinks the kNN scoring working set, not resident memory (<a href="https://github.com/xerj-org/xerj/issues/392">#392</a>), and the node-wide <code class="inline">[vector] default_quantization</code> key is not wired.</p>
 
   <h2>Symptom: "WAL replay failed" on restart</h2>
   <p><strong>Likely cause:</strong> the server was killed mid-fsync (power loss, OOM kill). The tail WAL file is torn.</p>

@@ -577,23 +577,6 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         anyhow::bail!("config error: {reason}");
     }
 
-    // Merge settings this build accepts but does not act on. An operator who
-    // throttles merges to protect query latency was getting no throttle and no
-    // signal (#207); the signal is the minimum. See
-    // `MergeConfig::dormant_overrides` for why these are a warning rather than
-    // the hard startup error `storage.backend` gets.
-    for (key, effect) in cfg.merge.dormant_overrides() {
-        warn!("{key} is set but has no effect in this build: {effect}");
-    }
-
-    // Same treatment for `[compression]` (#318): `level` is wired into the
-    // merge re-encode, `enabled` and `block_size_docs` are not, and an
-    // operator who set all three to trade CPU for $/GB previously got three
-    // no-ops in silence.
-    for (key, effect) in cfg.compression.dormant_overrides() {
-        warn!("{key} is set but has no effect in this build: {effect}");
-    }
-
     // Bind address override: `--bind` flag or `XERJ_BIND_ADDRESS` env (flag
     // wins). Both exist because the default is loopback (#228): without a way
     // to say "expose me" that is not a TOML file, a container image or a
@@ -1004,6 +987,23 @@ async fn build_tls_config(cfg: &Config) -> Result<Option<RustlsConfig>> {
 // Observability
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Settings this build accepts but does not act on. An operator who throttles
+/// merges to protect query latency was getting no throttle and no signal
+/// (#207); the signal is the minimum. See `MergeConfig::dormant_overrides` for
+/// why these are a warning rather than the hard startup error `storage.backend`
+/// gets. `[compression]` (#318) and the `[fts]` / `[vector]` / `[logs]` /
+/// `[indexing]` / `storage.local_cache_dir` keys that nothing reads get the
+/// same treatment — `Config::dormant_overrides` collects every section.
+///
+/// Call it after `init_tracing`. It used to run inside `load_config`, which
+/// runs before the subscriber exists, so every one of these warnings was
+/// dropped and an operator saw nothing.
+fn warn_dormant_overrides(cfg: &Config) {
+    for (key, effect) in cfg.dormant_overrides() {
+        warn!("{key} is set but has no effect in this build: {effect}");
+    }
+}
+
 fn init_tracing(logging: &xerj_common::config::LoggingConfig) {
     let mut filter = EnvFilter::try_from_env("XERJ_LOG")
         .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
@@ -1356,6 +1356,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     let mut cfg = load_config(&fake_cli)?;
     // Tracing after config so the [logging] format applies (RC4-W4 item 6).
     init_tracing(&cfg.logging);
+    warn_dormant_overrides(&cfg);
     cfg.tls.enabled = false;
     cfg.auth.enabled = false;
     cfg.cluster.enabled = false;
@@ -2317,6 +2318,7 @@ async fn async_main() -> Result<()> {
     init_tracing(&cfg.logging);
 
     info!("xerj v{} starting", env!("CARGO_PKG_VERSION"));
+    warn_dormant_overrides(&cfg);
 
     // 3a. `server.bind_address` must be an IP literal — and must be rejected
     //     *here*, ahead of the two exposure checks that follow.

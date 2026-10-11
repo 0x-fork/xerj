@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai · Docs · Playbook · Log analytics</title>
-<meta name="description" content="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — schema, ingest command, queries, and retention without ILM.">
+<meta name="description" content="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — the schema, the ingest command and the queries to copy.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -15,7 +15,7 @@
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
 <meta property="og:title" content="XERJ.ai · Docs · Playbook · Log analytics">
-<meta property="og:description" content="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — schema, ingest command, queries, and retention without ILM.">
+<meta property="og:description" content="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — the schema, the ingest command and the queries to copy.">
 <meta property="og:url" content="https://xerj.org/docs/playbooks/log-analytics">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
 <meta property="og:image:width" content="1200">
@@ -24,7 +24,7 @@
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="XERJ.ai · Docs · Playbook · Log analytics">
-<meta name="twitter:description" content="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — schema, ingest command, queries, and retention without ILM.">
+<meta name="twitter:description" content="Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — the schema, the ingest command and the queries to copy.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
 {
@@ -58,7 +58,7 @@
   "@context": "https://schema.org",
   "@type": "TechArticle",
   "headline": "XERJ.ai · Docs · Playbook · Log analytics",
-  "description": "Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — schema, ingest command, queries, and retention without ILM.",
+  "description": "Ingest Nginx, JSON, syslog or OTLP logs at line rate and query them in milliseconds — the schema, the ingest command and the queries to copy.",
   "url": "https://xerj.org/docs/playbooks/log-analytics",
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
@@ -219,7 +219,7 @@
   <h1>Playbook · Log analytics</h1>
 
 
-  <p>Ingest Nginx, JSON, syslog, or OTLP at line rate. Query hot logs in milliseconds. Cold-drop to cheap storage with ILM-free retention. This is the workload XERJ was originally built for.</p>
+  <p>Ingest Nginx, JSON, syslog, or OTLP at line rate. Query hot logs in milliseconds. Keep the volume bounded by dropping old indices yourself (see Retention). This is the workload XERJ was originally built for.</p>
 
   <h2>Schema</h2>
 <pre class="code">$ curl -sX PUT http://localhost:8080/v1/indices/logs \
@@ -277,10 +277,10 @@
 }</pre>
 
   <h2>Retention</h2>
-  <p>Per-index, in the config. No ILM policy DSL required.</p>
-<pre class="code">[logs]
-retention_days = 30
-time_partition = "1h"</pre>
+  <p>Automatic retention is <strong>not implemented in this build</strong>. The <code class="inline">[logs] retention_days</code> and <code class="inline">time_partition</code> keys are accepted and nothing reads them (setting either logs a warning at startup), so log data is kept until you delete it. Write to one index per day or week and delete the indices that fall outside your window, or run <code class="inline">_delete_by_query</code> with a <code class="inline">range</code> on the timestamp field.</p>
+<pre class="code">DELETE /logs-2026.09.01
+POST /logs/_delete_by_query
+{ "query": { "range": { "@timestamp": { "lt": "now-30d" } } } }</pre>
 
   <h2>Dashboard</h2>
   <p>Open the playground and pick <a href="/playground">LOGS · OVERVIEW</a> — nine panels with click-to-filter TopN, 1 ms date_histogram, heatmap, and drill-through to the <a href="/playground">SYSTEM · OVERVIEW</a> dashboard.</p>

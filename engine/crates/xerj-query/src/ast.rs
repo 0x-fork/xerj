@@ -1406,6 +1406,12 @@ pub struct HighlightRequest {
     /// Number of fragments to return per field (default 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number_of_fragments: Option<usize>,
+
+    /// ES `require_field_match` (default `true`): when a field PATTERN such
+    /// as `"*"` is expanded, keep only the fields the query actually targets.
+    /// `false` keeps every matching text/keyword field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_field_match: Option<bool>,
 }
 
 /// Per-field highlight options (can override the top-level defaults).

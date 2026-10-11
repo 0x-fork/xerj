@@ -219,7 +219,7 @@
   <h1>Analyzers</h1>
 
 
-  <p>An analyzer turns raw text into a token stream. Every text field has exactly one analyzer chosen at index-create time. XERJ ships four built-ins. <code class="inline">[fts] default_analyzer</code> picks which one applies unless a field overrides it.</p>
+  <p>An analyzer turns raw text into a token stream. Every text field has exactly one analyzer chosen at index-create time. XERJ ships four built-ins. A field without an analyzer of its own uses the index's <code class="inline">analysis.analyzer.default</code> when the index declares one, and <code class="inline">standard</code> otherwise. (<code class="inline">[fts] default_analyzer</code> in the node config is accepted but not wired in this build; setting it logs a warning at startup.)</p>
 
   <h2>standard</h2>
   <p>The default. Unicode-aware segmentation, lowercasing, stop-word list for English. Correct for most log and document workloads. Equivalent to ES's <code class="inline">standard</code> analyzer.</p>

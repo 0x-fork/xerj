@@ -248,7 +248,7 @@
     <li><strong>Cross-cluster search.</strong> Single-cluster only in v0.1.</li>
     <li><strong>Machine-learning jobs.</strong> Not a feature.</li>
     <li><strong>Watcher / alerting framework.</strong> Use the <code class="inline">/v1/explain-plan</code> endpoint + an external rule runner.</li>
-    <li><strong>ILM (Index Lifecycle Management).</strong> Retention is controlled per-index via <code class="inline">[logs] retention_days</code>.</li>
+    <li><strong>ILM (Index Lifecycle Management).</strong> Not executed, and there is no retention job: <code class="inline">[logs] retention_days</code> is accepted but not wired in this build. Delete old indices, or old documents with <code class="inline">_delete_by_query</code>, on your own schedule.</li>
   </ul>
 
   <h2 id="known-semantic-differences">Known semantic differences</h2>

@@ -112,6 +112,21 @@ pub struct Config {
 // value the manual impl used to build by hand.
 
 impl Config {
+    /// Every setting this build accepts but does not act on, across all
+    /// sections, in the [`MergeConfig::dormant_overrides`] shape — named only
+    /// when the operator moved one off its default. The server logs each one
+    /// at WARN on startup (the accepted-and-ignored class, #204).
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = self.storage.dormant_overrides();
+        out.extend(self.merge.dormant_overrides());
+        out.extend(self.compression.dormant_overrides());
+        out.extend(self.fts.dormant_overrides());
+        out.extend(self.vector.dormant_overrides());
+        out.extend(self.logs.dormant_overrides());
+        out.extend(self.indexing.dormant_overrides());
+        out
+    }
+
     /// Load configuration from a TOML file.
     ///
     /// Missing keys fall back to their `Default` values, so a minimal config
@@ -244,6 +259,18 @@ impl Config {
         // Vector: max_dimensions must be power-of-two-friendly and > 0
         if self.vector.max_dimensions == 0 {
             return Err(XerjError::config("vector.max_dimensions must be > 0"));
+        }
+
+        // A zero HTTP timeout fails every embedding request before it is sent
+        // (the `wal_tap.request_timeout_secs` rule).
+        if self.embedding.timeout_ms == 0 {
+            return Err(XerjError::config("embedding.timeout_ms must be at least 1"));
+        }
+
+        if !(1..=i32::MAX as usize).contains(&self.limits.max_result_window) {
+            return Err(XerjError::config(
+                "limits.max_result_window must be in 1..=2147483647",
+            ));
         }
 
         if !(1..=4096).contains(&self.embedding.onnx_scheduling_window) {
@@ -904,6 +931,23 @@ impl Default for StorageConfig {
     }
 }
 
+impl StorageConfig {
+    /// Storage settings this build accepts but does not act on, in the
+    /// [`MergeConfig::dormant_overrides`] shape. `local_cache_dir` has been
+    /// dormant since #965 (see its field docs) without being reported.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if self.local_cache_dir != StorageConfig::default().local_cache_dir {
+            out.push((
+                "storage.local_cache_dir",
+                "nothing reads it on the index path — segment families \
+                 materialize in data_dir/segments (#965)",
+            ));
+        }
+        out
+    }
+}
+
 /// Storage backend selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1217,6 +1261,12 @@ pub struct FtsConfig {
     ///
     /// Built-in analyzers: `"standard"`, `"whitespace"`, `"simple"`, `"english"`.
     /// Custom analyzers are defined at index creation time.
+    ///
+    /// **DORMANT — accepted, but nothing reads it.** A `text` field without
+    /// an analyzer of its own uses the index's `analysis.analyzer.default`
+    /// when the index declares one (#991), and `standard` otherwise; this
+    /// node-wide key never enters that choice. Reported at startup when set
+    /// (see [`FtsConfig::dormant_overrides`]).
     pub default_analyzer: String,
 }
 
@@ -1225,6 +1275,23 @@ impl Default for FtsConfig {
         Self {
             default_analyzer: "standard".into(),
         }
+    }
+}
+
+impl FtsConfig {
+    /// Full-text settings this build accepts but does not act on, in the
+    /// [`MergeConfig::dormant_overrides`] shape: named only when the operator
+    /// moved one off its default.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if self.default_analyzer != FtsConfig::default().default_analyzer {
+            out.push((
+                "fts.default_analyzer",
+                "nothing reads it — a text field uses its own analyzer, the \
+                 index's analysis.analyzer.default, or standard",
+            ));
+        }
+        out
     }
 }
 
@@ -1237,17 +1304,28 @@ impl Default for FtsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct VectorConfig {
     /// Similarity metric: `"cosine"`, `"dot_product"`, or `"euclidean"` (default: `"cosine"`).
+    ///
+    /// **DORMANT — accepted, but nothing reads it.** A `dense_vector` field
+    /// takes its `similarity` from the mapping, and a mapping without one
+    /// gets `cosine` (the ES default) whatever this says.
     pub default_metric: VectorMetric,
     /// HNSW `M` parameter — edges per node per layer (default: `16`).
     ///
     /// Higher values improve recall at the cost of memory and build time.
+    ///
+    /// **DORMANT — validated, but nothing reads it.** The graph builds with
+    /// a fixed `M = 16` (`HnswParams::new`).
     pub hnsw_m: usize,
     /// HNSW `ef_construction` — search width during index build (default: `200`).
+    ///
+    /// **DORMANT — validated, but nothing reads it.** The graph builds with
+    /// a fixed `ef_construction = 200` (`HnswParams::new`).
     pub hnsw_ef_construction: usize,
     /// HNSW `ef` — search width at query time (default: `100`).
     ///
-    /// Can be overridden per query. Must be ≥ the number of neighbours
-    /// requested (`k`).
+    /// **DORMANT — validated, but nothing reads it.** The query-time beam
+    /// width comes from the request's `num_candidates` (1.5 × `k` when
+    /// omitted), floored at `HNSW_EF_FLOOR`.
     pub hnsw_ef_search: usize,
     /// Default quantization: `"none"` (default) or `"scalar8"`. `"binary"` is
     /// **not implemented in this build** and is rejected at startup.
@@ -1262,18 +1340,77 @@ pub struct VectorConfig {
     ///   originals, so this shrinks the scoring working set, not total resident
     ///   memory. When the code store cannot serve (open-time walk not yet
     ///   converged, a publication race, coverage broken by a wrong-dimension
-    ///   write), queries fall back to the exact `_source` scan. Typically
-    ///   opted into per field via `index_options.type: int8_hnsw` on the
-    ///   mapping; this global default applies the same scheme index-wide.
+    ///   write), queries fall back to the exact `_source` scan. Opted into
+    ///   per field via `index_options.type: int8_hnsw` (or `int8_flat`) on
+    ///   the mapping.
     /// - `"binary"` — 1-bit binary quantization (~32× memory reduction) — NOT
     ///   YET IMPLEMENTED (no `BinaryQuantizer` exists).
     ///
     /// Honouring `binary` would silently store full-precision vectors while
     /// claiming a saving, so only `none` and `scalar8` are accepted (see
     /// `Config::validate`).
+    ///
+    /// **DORMANT — only the `binary` refusal reads it.** Quantization comes
+    /// from each field's `index_options`; setting `"scalar8"` here does not
+    /// quantize a field whose mapping does not ask for it.
     pub default_quantization: VectorQuantization,
     /// Maximum supported vector dimensionality (default: `16384`).
+    ///
+    /// **DORMANT — validated (must be ≥ 1), but nothing reads it.** No
+    /// mapping or document is checked against it.
     pub max_dimensions: usize,
+}
+
+impl VectorConfig {
+    /// Vector settings this build accepts but does not act on, in the
+    /// [`MergeConfig::dormant_overrides`] shape: named only when the operator
+    /// moved one off its default.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let d = VectorConfig::default();
+        let mut out = Vec::new();
+        if self.default_metric != d.default_metric {
+            out.push((
+                "vector.default_metric",
+                "nothing reads it — similarity comes from the field mapping, \
+                 cosine when the mapping omits it",
+            ));
+        }
+        if self.hnsw_m != d.hnsw_m {
+            out.push((
+                "vector.hnsw_m",
+                "nothing reads it — the HNSW graph builds with a fixed M = 16",
+            ));
+        }
+        if self.hnsw_ef_construction != d.hnsw_ef_construction {
+            out.push((
+                "vector.hnsw_ef_construction",
+                "nothing reads it — the HNSW graph builds with a fixed \
+                 ef_construction = 200",
+            ));
+        }
+        if self.hnsw_ef_search != d.hnsw_ef_search {
+            out.push((
+                "vector.hnsw_ef_search",
+                "nothing reads it — the query-time beam width comes from the \
+                 request's num_candidates",
+            ));
+        }
+        if self.default_quantization != d.default_quantization {
+            out.push((
+                "vector.default_quantization",
+                "nothing reads it — quantization comes from each field's \
+                 index_options in the mapping",
+            ));
+        }
+        if self.max_dimensions != d.max_dimensions {
+            out.push((
+                "vector.max_dimensions",
+                "nothing reads it — mappings and documents are not checked \
+                 against it",
+            ));
+        }
+        out
+    }
 }
 
 impl Default for VectorConfig {
@@ -1322,10 +1459,17 @@ pub enum VectorQuantization {
 #[serde(default, deny_unknown_fields)]
 pub struct LogsConfig {
     /// How long to retain log data before automatic deletion (default: `90` days).
+    ///
+    /// **DORMANT — accepted, but nothing reads it, and nothing deletes log
+    /// data.** `xerj_logs::RetentionPolicy` exists but is constructed only by
+    /// that crate's own tests; no server or engine code uses `xerj-logs`.
     pub retention_days: u32,
     /// Time-based partition granularity (default: `"1h"`).
     ///
     /// Supported values: `"1m"`, `"5m"`, `"15m"`, `"1h"`, `"6h"`, `"1d"`.
+    ///
+    /// **DORMANT — accepted, but nothing reads it.** Log indices are not
+    /// partitioned by time.
     pub time_partition: String,
 }
 
@@ -1335,6 +1479,34 @@ impl Default for LogsConfig {
             retention_days: 90,
             time_partition: "1h".into(),
         }
+    }
+}
+
+impl LogsConfig {
+    /// `[logs]` settings this build accepts but does not act on, in the
+    /// [`MergeConfig::dormant_overrides`] shape.
+    ///
+    /// Unlike the merge and compression knobs, the cost of ignoring these is
+    /// data, not latency: an operator who sets `retention_days = 30` to keep a
+    /// log volume bounded gets unbounded growth. They stay accepted so a
+    /// config the project handed out still boots, and are named at startup.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let d = LogsConfig::default();
+        let mut out = Vec::new();
+        if self.retention_days != d.retention_days {
+            out.push((
+                "logs.retention_days",
+                "nothing deletes log data in this build — no retention job \
+                 runs; delete old indices or documents yourself",
+            ));
+        }
+        if self.time_partition != d.time_partition {
+            out.push((
+                "logs.time_partition",
+                "nothing reads it — log indices are not partitioned by time",
+            ));
+        }
+        out
     }
 }
 
@@ -1522,10 +1694,11 @@ pub struct LimitsConfig {
     pub max_body_bytes: usize,
     /// Maximum value of `from + size` in a search request (default: `10_000`).
     ///
-    /// Mirrors Elasticsearch's `index.max_result_window`. Deep pagination past
-    /// this should use `search_after` / point-in-time cursors instead. The
-    /// limit prevents `size=2_000_000_000` from allocating 2 billion `Hit`
-    /// structs from a single HTTP POST.
+    /// The node-wide default for Elasticsearch's `index.max_result_window`:
+    /// an index whose settings carry `index.max_result_window` uses that, any
+    /// other index uses this. Deep pagination past it should use
+    /// `search_after` / point-in-time cursors instead. Must be in
+    /// `1..=2147483647` (the setting's ES range).
     pub max_result_window: usize,
     /// Maximum number of doc-references in a single `_mget` request body
     /// (default: `10_000`). Mirrors `max_result_window`.
@@ -1650,10 +1823,18 @@ pub struct IndexingConfig {
     ///
     /// Larger batches amortise WAL and fsync overhead but increase per-batch
     /// latency.  Values between 500 and 5000 work well for most workloads.
+    ///
+    /// **DORMANT — accepted, but nothing reads it.** A turbo request is
+    /// indexed as one batch, whatever its size.
     pub turbo_batch_size: usize,
     /// Enable parallel tokenisation via Rayon in turbo mode (default: `true`).
     ///
     /// Disable only for debugging or on single-core machines.
+    ///
+    /// **DORMANT — read, but a no-op.** Since M5.9 the turbo pipeline does
+    /// not pre-tokenise (the FTS index is built from stored fields at merge
+    /// time), so the `parallel` argument it feeds is unused — see the
+    /// `turbo_ingest` module docs.
     pub turbo_parallel: bool,
     /// Skip stemming and stopword removal in turbo mode for maximum speed (default: `false`).
     ///
@@ -1661,6 +1842,9 @@ pub struct IndexingConfig {
     /// normally be processed by the configured `fts.default_analyzer`.  Search
     /// recall may be reduced (e.g. "running" won't match "run"), but ingest
     /// throughput increases significantly.
+    ///
+    /// **DORMANT — read, but a no-op.** The turbo endpoint passes it to
+    /// `index_batch_turbo`, whose `_fast_analyzer` parameter is unused.
     pub turbo_fast_analyzer: bool,
 }
 
@@ -1671,6 +1855,36 @@ impl Default for IndexingConfig {
             turbo_parallel: true,
             turbo_fast_analyzer: false,
         }
+    }
+}
+
+impl IndexingConfig {
+    /// Turbo settings this build accepts but does not act on, in the
+    /// [`MergeConfig::dormant_overrides`] shape.
+    pub fn dormant_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        let d = IndexingConfig::default();
+        let mut out = Vec::new();
+        if self.turbo_batch_size != d.turbo_batch_size {
+            out.push((
+                "indexing.turbo_batch_size",
+                "nothing reads it — a turbo request is indexed as one batch",
+            ));
+        }
+        if self.turbo_parallel != d.turbo_parallel {
+            out.push((
+                "indexing.turbo_parallel",
+                "turbo ingest no longer pre-tokenises, so there is nothing to \
+                 parallelise",
+            ));
+        }
+        if self.turbo_fast_analyzer != d.turbo_fast_analyzer {
+            out.push((
+                "indexing.turbo_fast_analyzer",
+                "the turbo path ignores it — fields keep their configured \
+                 analyzers",
+            ));
+        }
+        out
     }
 }
 
@@ -2614,6 +2828,22 @@ mod tests {
     }
 
     #[test]
+    fn embedding_timeout_must_be_at_least_one_ms() {
+        assert!(Config::from_toml_str("[embedding]\ntimeout_ms = 0\n").is_err());
+        let cfg = Config::from_toml_str("[embedding]\ntimeout_ms = 900\n")
+            .expect("a sub-second timeout is a valid timeout");
+        assert_eq!(cfg.embedding.timeout_ms, 900);
+    }
+
+    #[test]
+    fn max_result_window_must_be_a_positive_es_int() {
+        assert!(Config::from_toml_str("[limits]\nmax_result_window = 0\n").is_err());
+        assert!(Config::from_toml_str("[limits]\nmax_result_window = 2147483648\n").is_err());
+        let cfg = Config::from_toml_str("[limits]\nmax_result_window = 50000\n").unwrap();
+        assert_eq!(cfg.limits.max_result_window, 50_000);
+    }
+
+    #[test]
     fn s3_backend_without_a_bucket_is_rejected() {
         // #965 wired `backend = "s3"` as a real index backend, so the old
         // refusal of the setting itself is gone. What stays refused is naming
@@ -3090,6 +3320,98 @@ mod tests {
             cfg.compression.dormant_overrides().is_empty(),
             "compression.level reaches the merge encoder, so it is not dormant"
         );
+    }
+
+    /// The rest of the accepted-and-ignored keys (#204): each one was
+    /// documented as working, validated where it has a range, and read by
+    /// nothing — measured on rc.89, `fts.default_analyzer = "whitespace"`,
+    /// `vector.default_metric = "euclidean"`, `vector.max_dimensions = 4` and
+    /// a 90→30 day `logs.retention_days` all changed nothing, with no warning.
+    /// `Config::dormant_overrides` must name each one, only when it is set,
+    /// and must stay quiet on the shipped default file.
+    #[test]
+    fn every_dormant_setting_is_named_only_when_an_operator_sets_it() {
+        assert!(
+            Config::default().dormant_overrides().is_empty(),
+            "an untouched default asks for nothing, so it must not warn"
+        );
+        let shipped = Config::from_toml_str(include_str!("../../../xerj.default.toml")).unwrap();
+        assert!(
+            shipped.dormant_overrides().is_empty(),
+            "`cp xerj.default.toml xerj.toml` must boot without warnings: {:?}",
+            shipped.dormant_overrides()
+        );
+
+        for (toml, expected) in [
+            (
+                "[fts]\ndefault_analyzer = \"whitespace\"",
+                "fts.default_analyzer",
+            ),
+            (
+                "[vector]\ndefault_metric = \"euclidean\"",
+                "vector.default_metric",
+            ),
+            ("[vector]\nhnsw_m = 32", "vector.hnsw_m"),
+            (
+                "[vector]\nhnsw_ef_construction = 400",
+                "vector.hnsw_ef_construction",
+            ),
+            ("[vector]\nhnsw_ef_search = 200", "vector.hnsw_ef_search"),
+            (
+                "[vector]\ndefault_quantization = \"scalar8\"",
+                "vector.default_quantization",
+            ),
+            ("[vector]\nmax_dimensions = 4", "vector.max_dimensions"),
+            ("[logs]\nretention_days = 30", "logs.retention_days"),
+            ("[logs]\ntime_partition = \"1d\"", "logs.time_partition"),
+            (
+                "[indexing]\nturbo_batch_size = 2000",
+                "indexing.turbo_batch_size",
+            ),
+            (
+                "[indexing]\nturbo_parallel = false",
+                "indexing.turbo_parallel",
+            ),
+            (
+                "[indexing]\nturbo_fast_analyzer = true",
+                "indexing.turbo_fast_analyzer",
+            ),
+            (
+                "[storage]\nlocal_cache_dir = \"/mnt/nvme\"",
+                "storage.local_cache_dir",
+            ),
+            // The two older sections now reach the same aggregate.
+            ("[merge]\nmin_segments = 4", "merge.min_segments"),
+            (
+                "[compression]\nblock_size_docs = 512",
+                "compression.block_size_docs",
+            ),
+        ] {
+            let cfg = Config::from_toml_str(&format!("{toml}\n")).unwrap();
+            let named: Vec<&str> = cfg
+                .dormant_overrides()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            assert_eq!(
+                named,
+                vec![expected],
+                "setting {toml:?} must be reported, and nothing else"
+            );
+        }
+
+        // Neighbours that ARE read must never be reported.
+        for toml in [
+            "[storage]\nwal_sync = \"sync\"",
+            "[embedding]\nbatch_size = 16",
+            "[limits]\nmax_fields_per_index = 50",
+        ] {
+            let cfg = Config::from_toml_str(&format!("{toml}\n")).unwrap();
+            assert!(
+                cfg.dormant_overrides().is_empty(),
+                "{toml:?} is wired, so it is not dormant"
+            );
+        }
     }
 
     /// The documented 16–4096 range was never enforced: #318's repro node

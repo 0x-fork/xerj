@@ -2,7 +2,7 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://xerj.org/</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-10</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/agent-search/</loc>
@@ -490,7 +490,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/analyzers</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-11</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/api-es-compat</loc>
@@ -518,7 +518,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/config</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-11</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/corpus-hub</loc>
@@ -542,7 +542,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/migration-from-es</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-11</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/operations</loc>
@@ -554,7 +554,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/playbooks/log-analytics</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-11</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/playbooks/observability</loc>
@@ -642,7 +642,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/troubleshooting</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-11</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/upgrades</loc>
@@ -650,7 +650,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/vectors</loc>
-    <lastmod>2026-10-08</lastmod>
+    <lastmod>2026-10-11</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/for-agents</loc>

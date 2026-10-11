@@ -5645,6 +5645,73 @@ pub(crate) fn run_index_report_watched(
     run_index_report_inner(cfg, &ScanTally::default(), Some(pass))
 }
 
+/// The argv a legacy `--no-graph` journal prints for its independent rebuild.
+///
+/// Following the printed advice must rebuild the same corpus the operator asked
+/// for, so every flag that changes what gets indexed, or how it is analyzed, is
+/// carried: the file selection (`--stub`, `--no-ignore`,
+/// `--no-default-ignores`, symlink policy, `--max-file-gb`), the per-record
+/// enrichment (`--no-semantic`, `--label`) and the dataset analyzer
+/// (`--code-analyzer`). Only the destination changes (`--state-dir`,
+/// `--prefix`). `cli::parse` reads this argv back in the tests below.
+fn legacy_rebuild_argv(cfg: &IndexCfg, state_dir: &Path, prefix: &str) -> Vec<String> {
+    let mut argv = vec![
+        "xerj".to_owned(),
+        "autoindex".to_owned(),
+        cfg.root.to_string_lossy().into_owned(),
+        "--no-graph".to_owned(),
+        "--url".to_owned(),
+        cfg.url.clone(),
+        "--state-dir".to_owned(),
+        state_dir.to_string_lossy().into_owned(),
+        "--prefix".to_owned(),
+        prefix.to_owned(),
+        "--workers".to_owned(),
+        cfg.workers.to_string(),
+        "--pdf-workers".to_owned(),
+        cfg.pdf_workers.to_string(),
+        "--pdf-timeout-secs".to_owned(),
+        cfg.pdf_timeout_secs.to_string(),
+        "--bulk-mb".to_owned(),
+        cfg.bulk_mb.to_string(),
+        "--bulk-timeout-secs".to_owned(),
+        cfg.bulk_timeout_secs.to_string(),
+        "--snapshot-max-gb".to_owned(),
+        (cfg.snapshot_max_bytes >> 30).to_string(),
+        "--max-file-gb".to_owned(),
+        cfg.max_file_gb.to_string(),
+        "--sample".to_owned(),
+        cfg.sample.to_string(),
+    ];
+    if cfg.no_semantic {
+        argv.push("--no-semantic".to_owned());
+    }
+    if cfg.follow_symlinks {
+        argv.push("--follow-symlinks".to_owned());
+    }
+    if cfg.follow_symlinks_outside_root {
+        argv.push("--follow-symlinks-outside-root".to_owned());
+    }
+    for glob in &cfg.stub_globs {
+        argv.push("--stub".to_owned());
+        argv.push(glob.clone());
+    }
+    if !cfg.ignore.enabled {
+        argv.push("--no-ignore".to_owned());
+    } else if !cfg.ignore.defaults {
+        argv.push("--no-default-ignores".to_owned());
+    }
+    if let Some(label) = &cfg.label {
+        argv.push("--label".to_owned());
+        argv.push(label.to_string_lossy().into_owned());
+    }
+    if cfg.code_analyzer == infer::CodeAnalyzer::Code {
+        argv.push("--code-analyzer".to_owned());
+        argv.push(infer::CODE_TEXT_ANALYZER.to_owned());
+    }
+    argv
+}
+
 fn run_index_report_inner(
     mut cfg: IndexCfg,
     tally: &ScanTally,
@@ -6273,43 +6340,7 @@ fn run_index_report_inner(
         } else {
             preflight.legacy_migration_reasons.join("; ")
         };
-        let mut rebuild_argv = vec![
-            "xerj".to_owned(),
-            "autoindex".to_owned(),
-            cfg.root.to_string_lossy().into_owned(),
-            "--no-graph".to_owned(),
-            "--url".to_owned(),
-            cfg.url.clone(),
-            "--state-dir".to_owned(),
-            replacement_state.to_string_lossy().into_owned(),
-            "--prefix".to_owned(),
-            replacement_prefix,
-            "--workers".to_owned(),
-            cfg.workers.to_string(),
-            "--pdf-workers".to_owned(),
-            cfg.pdf_workers.to_string(),
-            "--pdf-timeout-secs".to_owned(),
-            cfg.pdf_timeout_secs.to_string(),
-            "--bulk-mb".to_owned(),
-            cfg.bulk_mb.to_string(),
-            "--bulk-timeout-secs".to_owned(),
-            cfg.bulk_timeout_secs.to_string(),
-            "--snapshot-max-gb".to_owned(),
-            (cfg.snapshot_max_bytes >> 30).to_string(),
-            "--max-file-gb".to_owned(),
-            cfg.max_file_gb.to_string(),
-            "--sample".to_owned(),
-            cfg.sample.to_string(),
-        ];
-        if cfg.no_semantic {
-            rebuild_argv.push("--no-semantic".to_owned());
-        }
-        if cfg.follow_symlinks {
-            rebuild_argv.push("--follow-symlinks".to_owned());
-        }
-        if cfg.follow_symlinks_outside_root {
-            rebuild_argv.push("--follow-symlinks-outside-root".to_owned());
-        }
+        let rebuild_argv = legacy_rebuild_argv(&cfg, &replacement_state, &replacement_prefix);
         anyhow::bail!(
             "this state directory contains a legacy nonempty plan that cannot become generation \
              authority: {reasons}. Start an independent rebuild using this argv JSON (no shell \
@@ -11820,5 +11851,91 @@ mod bulk_pipe_tests {
             n < WORKERS * FILES_PER_WORKER,
             "{WORKERS}x{FILES_PER_WORKER} files left as {n} bodies — no coalescing happened"
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_rebuild_argv_tests {
+    use super::*;
+
+    fn parse_index(argv: &[String]) -> IndexCfg {
+        match cli::parse(argv.to_vec()).expect("the rebuild argv must parse") {
+            cli::Cmd::Index(cfg) => *cfg,
+            other => panic!("expected an index command, got {other:?}"),
+        }
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Following the printed rebuild advice must index the same corpus the same
+    /// way: read the argv back through `cli::parse` and compare every setting
+    /// that changes what is indexed or how it is analyzed.
+    fn assert_round_trip(original: &[&str]) {
+        let cfg = parse_index(&strings(original));
+        let state = Path::new("state.generation-v1");
+        let argv = legacy_rebuild_argv(&cfg, state, "ax-generation-v1");
+        assert_eq!(&argv[..2], ["xerj", "autoindex"]);
+        let rebuilt = parse_index(&argv[2..]);
+
+        assert_eq!(rebuilt.root, cfg.root);
+        assert_eq!(rebuilt.url, cfg.url);
+        assert_eq!(rebuilt.state_dir.as_deref(), Some(state));
+        assert_eq!(rebuilt.prefix, "ax-generation-v1");
+        assert!(rebuilt.no_graph);
+        assert_eq!(rebuilt.code_analyzer, cfg.code_analyzer, "{argv:?}");
+        assert_eq!(rebuilt.stub_globs, cfg.stub_globs, "{argv:?}");
+        assert_eq!(rebuilt.ignore.enabled, cfg.ignore.enabled, "{argv:?}");
+        assert_eq!(rebuilt.ignore.defaults, cfg.ignore.defaults, "{argv:?}");
+        assert_eq!(rebuilt.label, cfg.label, "{argv:?}");
+        assert_eq!(rebuilt.no_semantic, cfg.no_semantic);
+        assert_eq!(rebuilt.follow_symlinks, cfg.follow_symlinks);
+        assert_eq!(
+            rebuilt.follow_symlinks_outside_root,
+            cfg.follow_symlinks_outside_root
+        );
+        assert_eq!(rebuilt.max_file_gb, cfg.max_file_gb);
+        assert_eq!(rebuilt.sample, cfg.sample);
+        assert_eq!(rebuilt.workers, cfg.workers);
+        assert_eq!(rebuilt.bulk_mb, cfg.bulk_mb);
+    }
+
+    #[test]
+    fn rebuild_argv_carries_every_setting_that_shapes_the_index() {
+        assert_round_trip(&[
+            "data",
+            "--no-graph",
+            "--code-analyzer",
+            "code",
+            "--stub",
+            "*.bin",
+            "--stub",
+            "vendor/**",
+            "--no-default-ignores",
+            "--label",
+            "questions.json",
+            "--no-semantic",
+            "--follow-symlinks",
+            "--sample",
+            "80",
+        ]);
+        assert_round_trip(&["data", "--no-graph", "--no-ignore"]);
+    }
+
+    #[test]
+    fn rebuild_argv_for_default_settings_adds_no_optional_flags() {
+        assert_round_trip(&["data", "--no-graph"]);
+        let cfg = parse_index(&strings(&["data", "--no-graph"]));
+        let argv = legacy_rebuild_argv(&cfg, Path::new("s"), "p");
+        for flag in [
+            "--code-analyzer",
+            "--stub",
+            "--no-ignore",
+            "--no-default-ignores",
+            "--label",
+        ] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} in {argv:?}");
+        }
     }
 }

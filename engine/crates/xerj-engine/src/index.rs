@@ -6496,6 +6496,57 @@ mod semantic_deadline_regression_tests {
         );
     }
 
+    /// `index.max_result_window` above 10,000 was stored and then overruled by
+    /// the parser's hardcoded 10,000 (measured on rc.89: `from: 20000` on an
+    /// index set to 50,000 answered "from + size must be <= 10000"), and the
+    /// node's `limits.max_result_window` was read by nothing. The index
+    /// setting now governs, the node setting is the fallback, and the check
+    /// still refuses a window past either.
+    #[tokio::test]
+    async fn result_window_comes_from_the_index_setting_then_the_node_limit() {
+        let window = |from: u64, size: u64| {
+            xerj_query::parse_request(&serde_json::json!({ "from": from, "size": size }))
+                .expect("the parser no longer caps the window at 10,000")
+        };
+        let dir = TempDir::new().unwrap();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.limits.max_result_window = 50;
+        let engine_instance = Engine::new(config).expect("engine");
+        engine_instance
+            .create_index("node-limit", Schema::empty())
+            .unwrap();
+        engine_instance
+            .create_index("index-limit", Schema::empty())
+            .unwrap();
+
+        // No index setting: the node limit (50) applies.
+        let node = engine_instance.get_index("node-limit").unwrap();
+        node.search(&window(40, 10))
+            .await
+            .expect("40 + 10 fits a window of 50");
+        let err = node
+            .search(&window(45, 10))
+            .await
+            .expect_err("45 + 10 exceeds the node's window of 50");
+        assert!(err.to_string().contains("max_result_window=50"), "{err}");
+
+        // An index setting wins over the node limit, in both directions, and
+        // above the old hardcoded 10,000.
+        let idx = engine_instance.get_index("index-limit").unwrap();
+        idx.put_settings(serde_json::json!({ "index": { "max_result_window": 50_000 } }))
+            .await
+            .unwrap();
+        idx.search(&window(20_000, 10))
+            .await
+            .expect("a 50,000 index window admits from 20,000");
+        let err = idx
+            .search(&window(49_995, 10))
+            .await
+            .expect_err("49,995 + 10 exceeds the index's window of 50,000");
+        assert!(err.to_string().contains("max_result_window=50000"), "{err}");
+    }
+
     /// #312 bug 1: a single dynamic insert whose new top-level field is a nested
     /// OBJECT must count the whole subtree against `max_fields_per_index`, not as
     /// one field — otherwise one document overshoots the budget by the subtree's
@@ -8890,6 +8941,10 @@ pub struct Index {
     /// directly, which previously bypassed the limit.
     max_fields_per_index: u32,
 
+    /// Snapshot of `config.limits.max_result_window`: the `from + size`
+    /// ceiling for an index whose settings carry no `index.max_result_window`.
+    max_result_window: usize,
+
     /// Embedding backend for `semantic` / `semantic_text` (v0.7-P2).
     /// One of lexical (built-in, default), an external proxy, the built-in
     /// Candle neural BERT embedder, or the experimental ONNX Runtime backend
@@ -9584,6 +9639,7 @@ impl Index {
             compression_config: config.compression.clone(),
             embedding_config: config.embedding.clone(),
             max_fields_per_index: config.limits.max_fields_per_index,
+            max_result_window: config.limits.max_result_window,
             embedder: Arc::new(RwLock::new(effective_embedder)),
             dv_cache: Arc::new(per_index_map()),
             sort_shadow_cache: Arc::new(per_index_map()),
@@ -10030,6 +10086,7 @@ impl Index {
             compression_config: config.compression.clone(),
             embedding_config: config.embedding.clone(),
             max_fields_per_index: config.limits.max_fields_per_index,
+            max_result_window: config.limits.max_result_window,
             embedder: Arc::new(RwLock::new(effective_embedder)),
             dv_cache: Arc::new(per_index_map()),
             sort_shadow_cache: Arc::new(per_index_map()),
@@ -19554,6 +19611,57 @@ impl Index {
 
     // ── Search ────────────────────────────────────────────────────────────────
 
+    /// `from + size` against this index's result window: its
+    /// `index.max_result_window` setting, else the node's
+    /// `limits.max_result_window` (10,000 by default, the ES default).
+    ///
+    /// Called by [`Index::search`] ahead of the per-query memory guard, so an
+    /// oversized window is the 400 `illegal_argument_exception` ES returns
+    /// rather than a 429 from the guard, and again at the top of
+    /// `search_inner`, ahead of the kNN / semantic short-circuits that never
+    /// reach materialisation (hybrid legs re-enter there). The parser used to
+    /// refuse any from + size above a hardcoded 10,000, which also overrode a
+    /// larger per-index setting.
+    ///
+    /// The setting may be stored as a nested object `{index: {max_result_window}}`,
+    /// a literal-dotted key under `index`, or a top-level dotted key, depending
+    /// on the shape the caller provided. (Ids-count validation happens at the
+    /// HTTP layer where index_settings is accessible.)
+    async fn check_result_window(&self, from: usize, size: usize) -> Result<()> {
+        let max_result_window: usize = {
+            let settings = self.settings.read().await;
+            settings
+                .pointer("/index/max_result_window")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .or_else(|| {
+                    settings
+                        .get("index")
+                        .and_then(|i| i.get("index.max_result_window"))
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        })
+                })
+                .or_else(|| {
+                    settings.get("index.max_result_window").and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                })
+                .map(|v| v as usize)
+                .unwrap_or(self.max_result_window)
+        };
+        if from.saturating_add(size) > max_result_window {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::result_window_too_large(from, size, max_result_window),
+            ));
+        }
+        Ok(())
+    }
+
     /// Execute a search request against this index.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         use crate::collection_publication::ReadAdmission;
@@ -19882,6 +19990,8 @@ impl Index {
         // window (~10 MiB) is nowhere near the cap, so normal search is
         // unaffected; the guard only bites pathological windows or a
         // deliberately low operator budget.
+        self.check_result_window(request.from, request.size).await?;
+
         if let Some(g) = crate::governor::global() {
             if g.query_memory_enabled() {
                 // Conservative per-hit estimate: stored source + collector
@@ -20180,6 +20290,8 @@ impl Index {
         // size=0 is valid and means "return no hits but still run aggs / return total".
         let size = request.size;
         let from = request.from;
+
+        self.check_result_window(from, size).await?;
 
         // Resolve field aliases in the query: rewrite any alias field names to their targets.
         //
@@ -20560,45 +20672,6 @@ impl Index {
             None
         };
         let query = pinned_query.as_ref().unwrap_or(query);
-
-        // ── Max result window enforcement ──────────────────────────────────────
-        // Default max_result_window is 10,000 (matches ES default).
-        // Allow override via index setting `index.max_result_window`.
-        // The key may be stored either as nested object `{index: {max_result_window}}`
-        // or as a literal-dotted key `{index: {"index.max_result_window"}}` depending
-        // on the shape the caller provided at index creation. (Ids-count validation
-        // happens at the HTTP layer where index_settings is accessible.)
-        let max_result_window: usize = {
-            let settings = self.settings.read().await;
-            settings
-                .pointer("/index/max_result_window")
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .or_else(|| {
-                    settings
-                        .get("index")
-                        .and_then(|i| i.get("index.max_result_window"))
-                        .and_then(|v| {
-                            v.as_u64()
-                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                        })
-                })
-                .or_else(|| {
-                    settings.get("index.max_result_window").and_then(|v| {
-                        v.as_u64()
-                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                    })
-                })
-                .map(|v| v as usize)
-                .unwrap_or(10_000)
-        };
-        if from + size > max_result_window {
-            return Err(EngineError::Common(
-                xerj_common::XerjError::result_window_too_large(from, size, max_result_window),
-            ));
-        }
 
         // Fetch limit is the per-sub-source materialisation cap.  We materialise
         // at most (from + size + 100) hits with their sources, and count the
@@ -24962,7 +25035,16 @@ impl Index {
         // body for a 160-byte answer. That matters most to the callers most
         // likely to use highlighting — agents paying per token for context.
         let page = if let Some(hl_req) = &request.highlight {
-            apply_highlight(page, hl_req, query)
+            // #1281: field names may be patterns (`"*"`, `"mess*"`), which
+            // `apply_highlight` would otherwise look up as literal source keys
+            // and never find.
+            if hl_req.fields.keys().any(|f| f.contains('*')) {
+                let schema = self.schema.read().await;
+                let expanded = expand_highlight_field_patterns(hl_req, &schema.schema, query);
+                apply_highlight(page, &expanded, query)
+            } else {
+                apply_highlight(page, hl_req, query)
+            }
         } else {
             page
         };
@@ -36126,6 +36208,127 @@ fn apply_highlight(hits: Vec<Hit>, hl: &HighlightRequest, query: &QueryNode) -> 
         .collect()
 }
 
+/// Expand field-name patterns in a highlight request against the mapping
+/// (#1281).
+///
+/// ES 8.13.4 (verified) expands a pattern to the mapped `text` and `keyword`
+/// fields it matches, object sub-fields included (`obj.*` → `obj.inner`) and
+/// numeric fields excluded. With `require_field_match` (default `true`) only
+/// the fields the query targets survive: `match: {message}` + `"*"` highlights
+/// `message` alone, while a field-less `query_string` highlights them all. An
+/// explicit entry is kept as written and wins over a pattern that also covers
+/// it; the pattern's options are copied to each field it expands to.
+fn expand_highlight_field_patterns(
+    hl: &HighlightRequest,
+    schema: &Schema,
+    query: &QueryNode,
+) -> HighlightRequest {
+    fn highlightable(fields: &[FieldConfig], prefix: &str, out: &mut Vec<String>) {
+        for fc in fields {
+            let path = if prefix.is_empty() {
+                fc.name.clone()
+            } else {
+                format!("{prefix}.{}", fc.name)
+            };
+            match fc.field_type {
+                FieldType::Text | FieldType::Keyword => out.push(path),
+                // Object properties are fields of their own; a text field's
+                // `fields` are multi-fields, which this expansion skips.
+                FieldType::Object | FieldType::Nested => highlightable(&fc.fields, &path, out),
+                _ => {}
+            }
+        }
+    }
+    fn glob(pattern: &str, name: &str) -> bool {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let (first, last) = (parts[0], parts[parts.len() - 1]);
+        if !name.starts_with(first) || name.len() < first.len() + last.len() {
+            return false;
+        }
+        let mut rest = &name[first.len()..];
+        for mid in &parts[1..parts.len() - 1] {
+            match rest.find(mid) {
+                Some(at) => rest = &rest[at + mid.len()..],
+                None => return false,
+            }
+        }
+        rest.ends_with(last)
+    }
+    // Collects the field names (possibly patterns: a field-less
+    // `query_string` reaches here as `match` on `"*"`) the query targets.
+    // Returns `false` when the query targets every field outright.
+    fn spec(f: &str, out: &mut Vec<String>) -> bool {
+        out.push(f.split('^').next().unwrap_or(f).to_string());
+        true
+    }
+    fn targeted(q: &QueryNode, out: &mut Vec<String>) -> bool {
+        match q {
+            QueryNode::Term { field, .. }
+            | QueryNode::Terms { field, .. }
+            | QueryNode::Range { field, .. }
+            | QueryNode::Prefix { field, .. }
+            | QueryNode::Wildcard { field, .. }
+            | QueryNode::Match { field, .. }
+            | QueryNode::MatchPhrase { field, .. }
+            | QueryNode::MatchPhrasePrefix { field, .. }
+            | QueryNode::Fuzzy { field, .. }
+            | QueryNode::Regexp { field, .. } => {
+                out.push(field.clone());
+                true
+            }
+            QueryNode::MultiMatch { fields, .. } | QueryNode::SimpleQueryString { fields, .. } => {
+                if fields.is_empty() {
+                    return false;
+                }
+                fields.iter().all(|f| spec(f, out))
+            }
+            QueryNode::QueryString { default_field, .. } => match default_field {
+                Some(f) => spec(f, out),
+                None => false,
+            },
+            QueryNode::Bool {
+                must,
+                should,
+                must_not,
+                filter,
+                ..
+            } => must
+                .iter()
+                .chain(should)
+                .chain(must_not)
+                .chain(filter)
+                .all(|c| targeted(c, out)),
+            QueryNode::Constant { query, .. }
+            | QueryNode::Boosted { query, .. }
+            | QueryNode::Named { query, .. }
+            | QueryNode::Nested { query, .. }
+            | QueryNode::FunctionScore { query, .. } => targeted(query, out),
+            QueryNode::DisMax { queries, .. } => queries.iter().all(|c| targeted(c, out)),
+            _ => true,
+        }
+    }
+
+    let mut candidates = Vec::new();
+    highlightable(&schema.fields, "", &mut candidates);
+    if hl.require_field_match != Some(false) {
+        let mut named = Vec::new();
+        if targeted(query, &mut named) {
+            candidates.retain(|c| named.iter().any(|n| n == c || glob(n, c)));
+        }
+    }
+
+    let mut out = hl.clone();
+    out.fields.retain(|name, _| !name.contains('*'));
+    for (pattern, opts) in hl.fields.iter().filter(|(name, _)| name.contains('*')) {
+        for field in candidates.iter().filter(|c| glob(pattern, c)) {
+            out.fields
+                .entry(field.clone())
+                .or_insert_with(|| opts.clone());
+        }
+    }
+    out
+}
+
 /// Extract query terms for highlighting.
 ///
 /// Returns lowercase tokens that should be highlighted.
@@ -36920,10 +37123,28 @@ pub fn proxy_config(
         endpoint: cfg.default_endpoint.clone(),
         api_key: std::env::var("XERJ_EMBEDDING_API_KEY").ok(),
         model: cfg.default_model.clone(),
-        timeout_secs: cfg.timeout_ms / 1000,
+        timeout_ms: cfg.timeout_ms,
         max_concurrent: 4,
         max_retries: 3,
         batch_size: cfg.batch_size.max(1),
+    }
+}
+
+#[cfg(test)]
+mod proxy_config_tests {
+    /// `embedding.timeout_ms` reached the HTTP client as `timeout_ms / 1000`
+    /// whole seconds: 1500 ms became a 1 s timeout and 900 ms became 0 s, so
+    /// a provider answering in 1.2 s failed every request under a 1.5 s
+    /// setting (measured on rc.89 against a mock endpoint).
+    #[test]
+    fn embedding_timeout_reaches_the_proxy_in_milliseconds() {
+        for ms in [900, 1500, 5000] {
+            let cfg = xerj_common::config::EmbeddingConfig {
+                timeout_ms: ms,
+                ..Default::default()
+            };
+            assert_eq!(super::proxy_config(&cfg).timeout_ms, ms);
+        }
     }
 }
 
