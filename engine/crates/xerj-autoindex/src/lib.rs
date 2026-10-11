@@ -3642,6 +3642,12 @@ fn build_phase_a(
             time_field,
             semantic_field,
             text_analyzer,
+            // #1230: freeze the cluster's repository scope so the incremental
+            // reconciler can route a newly added file to the right sibling
+            // `docs` dataset when forks share a schema. `Some("")` is the root
+            // scope; it is a real recorded value, distinct from a legacy
+            // plan's `None`.
+            scope: Some(c.scope.clone()),
             sampled_records: c.records,
             file_count: c.members.len(),
         });
@@ -10596,6 +10602,7 @@ mod generation_contract_identity_tests {
             time_field: None,
             semantic_field: None,
             text_analyzer: None,
+            scope: None,
             sampled_records: 0,
             file_count: 0,
         }
@@ -10841,6 +10848,7 @@ mod stem_default_tests {
             time_field: None,
             semantic_field: Some("body".into()),
             text_analyzer: text_analyzer.map(str::to_string),
+            scope: None,
             sampled_records: 1,
             file_count: 1,
         }

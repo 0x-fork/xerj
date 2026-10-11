@@ -3238,6 +3238,7 @@ mod tests {
                 time_field: None,
                 semantic_field: None,
                 text_analyzer: None,
+                scope: None,
                 sampled_records: 1,
                 file_count: 1,
             }],
@@ -3292,6 +3293,7 @@ mod tests {
                 time_field: None,
                 semantic_field: None,
                 text_analyzer: None,
+                scope: None,
                 sampled_records: 1,
                 file_count: files.len(),
             }],
@@ -3647,6 +3649,7 @@ mod tests {
             time_field: None,
             semantic_field: None,
             text_analyzer: None,
+            scope: None,
             sampled_records: 2,
             file_count: 1,
         };

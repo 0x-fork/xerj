@@ -3155,6 +3155,7 @@ fn sweep_excluded_groups_deletes_only_the_excluded_files_documents() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -3239,6 +3240,7 @@ fn sweep_excluded_groups_invalidates_the_excluded_files_edges() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -3314,6 +3316,7 @@ fn sweep_excluded_groups_purges_the_excluded_files_alias_catalog_docs() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -3389,6 +3392,7 @@ fn sweep_excluded_groups_does_not_delete_a_sibling_corpus_catalog_doc() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -3478,6 +3482,7 @@ fn sweep_excluded_groups_scopes_on_the_keyword_corpus_scope_field() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -3588,6 +3593,7 @@ fn sweep_excluded_groups_cannot_reach_a_sibling_corpus_on_a_text_mapped_prefix()
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -4079,6 +4085,7 @@ fn sweep_excluded_groups_deletes_a_legacy_main_doc_by_id() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -4146,6 +4153,7 @@ fn sweep_excluded_groups_deletes_a_legacy_alias_doc_by_id() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -4219,6 +4227,7 @@ fn sweep_excluded_groups_invalidates_inbound_edges() {
         time_field: None,
         semantic_field: None,
         text_analyzer: None,
+        scope: None,
         sampled_records: 1,
         file_count: 1,
     });
@@ -6085,6 +6094,7 @@ mod delete_gate {
                 time_field: None,
                 semantic_field: None,
                 text_analyzer: None,
+                scope: None,
                 sampled_records: 1,
                 file_count: 1,
             }],
