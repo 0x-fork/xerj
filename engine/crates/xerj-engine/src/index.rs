@@ -21322,28 +21322,38 @@ impl Index {
         // pre-pass, both of which only need "does this project at all?". The
         // real per-segment map is resolved inside the segment loop.
         //
-        // GATED ON `!deletes_present`, exactly like `build_ids_prefilter_cached`
-        // gates the `ids` prefilter: `id_pos_map_for` keeps ONE position per
-        // `_id`, so a segment physically holding two copies of a document (an
-        // overwrite flushed alongside its predecessor) can hand back the
-        // superseded one — and an FTS leaf, unlike the stored scan, never
-        // re-reads `_id` per position to notice. With ghosts present the
-        // request keeps the #879 scan: correct, and no slower than it was.
+        // #1303: this is NO LONGER gated on `!deletes_present`. The original
+        // #892 gate kept ghost-bearing indexes on the stored-doc scan out of a
+        // concern that `id_pos_map_for` keeps ONE position per `_id` and could
+        // hand back a SUPERSEDED position (the overwrite's live copy lives in a
+        // newer segment or the memtable), which an FTS leaf — unlike the stored
+        // scan — would not re-read `_id` to notice. In practice that concern is
+        // already answered DOWNSTREAM: the scored-FTS hit walk fetches each
+        // hit's stored `_id` and runs the SAME capture-scoped liveness check
+        // the pure-lexical path uses (`captured_verdict_for_segment_hit` →
+        // `Invisible` ⇒ skip the superseded/tombstoned copy; see the walk near
+        // the `CapturedEntryVerdict` match), and the physical ghost count is
+        // subtracted from the total via the ghost-bitmap observer. So a pinned
+        // id whose position resolves to a ghost in an old segment is dropped
+        // there and emitted once, live, from the segment that holds its current
+        // copy — the identical treatment a plain `match` already gets under
+        // deletes. The per-segment `map.len() == expect_docs` guard in
+        // `id_pos_map_for` still declines a segment that physically holds
+        // duplicate ids (a rare same-flush overwrite); that lone segment falls
+        // to its stored scan as before while every other segment keeps the
+        // exact-BM25 FTS path.
         //
-        // SCOPE, stated plainly because it is easy to read this gate as a
-        // transient one: `ghost_events` is MONOTONIC (version_map.rs — never
-        // decremented, not even by the merge that purges the superseded
-        // copies), so this is a one-way door per open index, not an in-flight
-        // window. A single overwrite or delete anywhere in the index's history
-        // disables this route for the life of the open index; at re-open it
-        // re-arms only while `live < physical` still holds on disk. Only
-        // append-only indexes take the indexed route today. Widening it to
-        // ghost-bearing indexes means proving the #825 union/sum contract with
-        // tombstones present — the per-segment `map.len() == expect_docs`
-        // guard in `id_pos_map_for` already rejects a duplicate-bearing
-        // segment, but a tombstoned-yet-present row still resolves to a
-        // position, so that proof is a separate piece of work.
-        let pinned_probe: Option<PinnedIds<'_>> = if pinned_query.is_some() && !deletes_present {
+        // The gate was a real CORRECTNESS bug, not just a slow path: the whole
+        // hybrid `bool{should:[query, knn]}` `?`-aborted the FTS projection on
+        // the pinned `Ids` sub-tree and fell to the stored-doc scan, which
+        // scores a `multi_match` with a page/heuristic score instead of
+        // index-wide BM25. On any index that had ever taken an overwrite or
+        // delete (`ghost_events()` is MONOTONIC and global — the common case
+        // for a re-indexed corpus) the hybrid returned a flat, id-ordered
+        // ranking belonging to NEITHER half (#1303: `_score` ~constant,
+        // unrelated docs at the top). The append-only path was correct; the
+        // delete-bearing path is now the SAME path.
+        let pinned_probe: Option<PinnedIds<'_>> = if pinned_query.is_some() {
             Some(PinnedIds::Probe)
         } else {
             None
