@@ -1841,6 +1841,7 @@ fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
         Family::Mbox => Some(SAMPLE_LIMIT_BYTES),
         Family::Sqlite => Some(1), // signals per-table row cap inside the extractor
         Family::Xlsx => Some(1),   // likewise a per-sheet row cap
+        Family::Xls => Some(1),    // legacy workbook: same per-sheet row cap
         _ => None,                 // whole-file extractors cap themselves
     }
 }
@@ -2663,6 +2664,7 @@ fn scan_file(
             | Family::TxtProse
             | Family::Pdf
             | Family::Docx
+            | Family::Doc
             | Family::Pptx
             | Family::Epub
             | Family::Ipynb
@@ -2692,7 +2694,7 @@ fn scan_file(
     // untyped.
     let grouped_family = matches!(
         sn.family,
-        Family::SqlDump | Family::Sqlite | Family::Xlsx | Family::UnityYaml
+        Family::SqlDump | Family::Sqlite | Family::Xlsx | Family::Xls | Family::UnityYaml
     );
     let mut sink = |rec: extract::RawRecord| -> bool {
         let entry = groups.entry(rec.group.clone()).or_default();
