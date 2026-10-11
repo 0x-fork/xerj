@@ -280,7 +280,7 @@ and the console review's), the #1062 wrong-and-confident detection gate, the
 `xerj-decide-v1` Hugging Face publication (operator credentials), and the GA
 bar itself — *The road to v1.0.0 GA* below.
 
-**Open defects.** Twelve, all live on the tracker — the
+**Open defects.** Nine, all live on the tracker — the
 shortlist the release-notes gate checks. From the rc.92 window:
 [#1250](https://github.com/xerj-org/xerj/issues/1250) (multi-index
 ingest oscillates on the parent RSS breaker; root cause re-attributed
@@ -293,26 +293,17 @@ brute-pages `term run_id` + `_id` sort at ~5.2 s per 1,000-doc page —
 641 pages ≈ 35 min on the 402,814-doc catalog whenever a resume
 rewrote everything — and doc-shaped verify windows with `size > 0`
 still brute-scan the data indexes at 7–81 s per window, one exceeding
-the client's 300 s budget mid-crawl).
-[#1244](https://github.com/xerj-org/xerj/issues/1244) (the `xerj code`
-own-field recall legs and the multi-family family-route gate both
-merged in rc.92; the issue stays open until the pre-registered G7
-suites pass on the rebuilt corpora — vuln-fix-commits passed at cut
-time: 328,891 records, 97 batched windows, G7 blind-graded 4/5; the
-cve-records rebuild was in flight). From the rc.80 gate runs:
-[#1094](https://github.com/xerj-org/xerj/issues/1094) (decision
+the client's 300 s budget mid-crawl; PR
+[#1270](https://github.com/xerj-org/xerj/pull/1270) bounded the fast-agg
+verify window, the walk and doc-lane residual stay open). From the rc.80
+gate runs: [#1094](https://github.com/xerj-org/xerj/issues/1094) (decision
 flywheel write-back freezes once the history index has BM25 support).
-From the rc.80 console knowledge-surface review:
-[#1100](https://github.com/xerj-org/xerj/issues/1100) (second-brain
-belief-time frame rendered on non-note corpora). From the rc.81/82
-windows: [#1122](https://github.com/xerj-org/xerj/issues/1122) (reopened
+From the rc.81/82 windows:
+[#1122](https://github.com/xerj-org/xerj/issues/1122) (reopened
 2026-10-05 when the reference node died at its memory ceiling with no
 panic line). From the cluster-mode testing:
 [#1170](https://github.com/xerj-org/xerj/issues/1170) (the Raft ring is
-never connected to the engine) and
-[#1173](https://github.com/xerj-org/xerj/issues/1173) (resume-after-death
-crawl throughput, its honesty half shipped in rc.84). Filed from the
-corpus-program work:
+never connected to the engine). Filed from the corpus-program work:
 [#1108](https://github.com/xerj-org/xerj/issues/1108) (the #1062
 wrong-and-confident detection gate, unmeasured),
 [#1110](https://github.com/xerj-org/xerj/issues/1110) (the
@@ -325,20 +316,26 @@ read-back fix (PR
 made finalize estimate 1.1 GB against the 512 MB query-memory breaker; the
 issue stays open until a full xerj-search rebuild passes finalize-catalog
 end-to-end with the fixed client, and the #1122 memory-ceiling class stays
-its companion). From the rc.88/89 windows:
-[#1212](https://github.com/xerj-org/xerj/issues/1212) (scans silently
-truncating when a merge or flush publishes mid-walk: the engine fix is
-[#1218](https://github.com/xerj-org/xerj/pull/1218), the client legs
-[#1213](https://github.com/xerj-org/xerj/pull/1213)/[#1216](https://github.com/xerj-org/xerj/pull/1216), all in rc.89; resume3 of the
-standing rebuild aborted on exactly this short read-back, and the issue
-closes only when a rebuild completes against the released fix) and, from
-the rc.90 window,
+its companion). From the rc.90 window,
 [#1226](https://github.com/xerj-org/xerj/issues/1226) (`_refresh` /
 `delete_by_query?refresh=true` costs 5–16 s under concurrent bulk write
 load — mostly reframed by #1227: those latencies were the unconditional
 no-match flush that #1225 and #1227 removed the callers of; what stays
 open is the flush itself under concurrent bulk load, measured 14–16 s on
 the corpus-builder node).
+**Closed inside the rc.94 window and recorded in the CHANGELOG, not
+carried here:** #1100 (second-brain vocabulary gated by corpus format, PR
+[#1310](https://github.com/xerj-org/xerj/pull/1310)), #1230 (sibling-fork
+reconcile scope, PR [#1309](https://github.com/xerj-org/xerj/pull/1309)),
+#1231 (map-only `--dataset` refused, PR
+[#1308](https://github.com/xerj-org/xerj/pull/1308)), #1232 (one `--watch`
+owner per journal, PR [#1307](https://github.com/xerj-org/xerj/pull/1307)),
+#1303 (hybrid query+knn exact BM25 under deletes, PR
+[#1312](https://github.com/xerj-org/xerj/pull/1312)) and #1304 (bulk
+per-item lone-surrogate reject, PR
+[#1311](https://github.com/xerj-org/xerj/pull/1311)); and three verified
+already-fixed and closed — #1212 (via #1013), #1244 (via #1246/#1251) and
+#1173 (via #1174).
 **Closed inside the rc.93 window and recorded in the CHANGELOG, not
 carried here:** #1260 (per-digest `exists` probes fell off the
 columnar fast path: columnar `exists` + per-segment ghost-bitmap

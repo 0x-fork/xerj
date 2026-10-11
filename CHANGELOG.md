@@ -42,6 +42,11 @@ thomas-villani (Tom Villani), yogthos, and pierreaubert.
   [#1309](https://github.com/xerj-org/xerj/pull/1309)) — the frozen plan never
   persisted the per-repository scope genesis clustering uses, so byte-identical
   sibling repos could not be told apart; the scope is now persisted.
+- **Second Brain console rendered a notes/beliefs persona on non-note corpora**
+  (issue [#1100](https://github.com/xerj-org/xerj/issues/1100), PR
+  [#1310](https://github.com/xerj-org/xerj/pull/1310)) — the console now picks a
+  neutral records/active frame vs the notes persona from the real `ax_format`
+  tally, so autoindexing a code tree no longer frames it as personal notes.
 - **memtable `match`/`match_phrase` tokenized with the wrong analyzer**
   (issue [#1280](https://github.com/xerj-org/xerj/issues/1280), PR
   [#1295](https://github.com/xerj-org/xerj/pull/1295), thomas-villani) — the
@@ -87,7 +92,9 @@ thomas-villani (Tom Villani), yogthos, and pierreaubert.
 - **Row-exact fast aggregations under resident ghosts** (issue
   [#1267](https://github.com/xerj-org/xerj/issues/1267), PR
   [#1270](https://github.com/xerj-org/xerj/pull/1270)) — bounds the 803 s
-  finalize-verify window.
+  fast-agg finalize-verify window. Partial: #1267 **stays open** for the
+  finalize-catalog read-back walk and the `size > 0` doc-lane residual,
+  which still brute-scan.
 
 ### Added
 
@@ -115,6 +122,10 @@ thomas-villani (Tom Villani), yogthos, and pierreaubert.
 
 ### Housekeeping
 
+- Landing footer/version-stamp sweep so the `Landing constants` guard on
+  `main` is green (PR [#1271](https://github.com/xerj-org/xerj/pull/1271)), and
+  the yogthos CLA signature (PR
+  [#1306](https://github.com/xerj-org/xerj/pull/1306)).
 - Closed as already-fixed on `main` after verification: the sorted-scan
   liveness bug [#1212](https://github.com/xerj-org/xerj/issues/1212) (via
   #1013), the raw-JSON own-field recall gap
