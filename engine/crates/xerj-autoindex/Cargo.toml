@@ -133,6 +133,22 @@ pdf_oxide = { version = "=0.3.75", default-features = false, features = ["legacy
 csv = "1"                                        # streaming CSV with sniffed dialect
 quick-xml = "0.41"                               # XML pull parser + DOCX internals
 zip = { version = "2", default-features = false, features = ["deflate"] }  # DOCX container
+# --- Legacy Microsoft Office binary formats (OLE2 / Compound File Binary) ---
+# calamine reads the legacy BIFF `.xls` worksheet stream (it ships its own CFB
+# reader internally); pinned to 0.26.1, the last line that depends on `zip ^2`
+# so it reuses this crate's existing `zip 2` rather than pulling a second major
+# of zip into the tree. Licence: MIT. Its transitive adds are codepage (MIT,
+# for the legacy 8-bit cell codepage) and log (MIT/Apache-2.0); byteorder and
+# encoding_rs are already here.
+calamine = { version = "=0.26.1", features = ["dates"] }
+# `cfb` reads the OLE2/Compound File Binary container directly: used by the
+# content sniffer to route a `.doc`/`.xls`/other OLE2 file by its stream names,
+# and by the `.doc` extractor to pull the WordDocument + Table streams and the
+# SummaryInformation title. `open()` returns `io::Result` and treats malformed
+# or truncated input as an error (never a panic), which the fuzz-minded sniffer
+# relies on. Licence: MIT. Runtime deps (fnv, uuid) are already in the lock
+# file; web-time is a tiny wasm-time shim. Pinned exact.
+cfb = "=0.15.0"
 serde_yaml = "0.9"                               # YAML multi-doc
 # The one C dependency (bundled SQLite), isolated to this crate.
 rusqlite = { version = "0.32", features = ["bundled"] }
