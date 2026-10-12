@@ -34,6 +34,18 @@ pub enum Family {
     /// Excel workbook: one dataset per worksheet, one record per row under
     /// the sheet's header row, typed from the stored cell values.
     Xlsx,
+    /// Legacy Excel 97-2003 workbook (`.xls`, BIFF8 inside an OLE2 compound
+    /// file): same table model as [`Family::Xlsx`] — one dataset per
+    /// worksheet, one record per row under the header row — read through
+    /// calamine. Detected by the OLE2 magic plus a `Workbook`/`Book` stream,
+    /// never by extension.
+    Xls,
+    /// Legacy Word 97-2003 document (`.doc`, inside an OLE2 compound file):
+    /// the WordDocument stream's prose, recovered through the FIB piece table
+    /// (CLX in the 0Table/1Table stream), emitted as section records with the
+    /// title taken from SummaryInformation when present. Detected by the OLE2
+    /// magic plus a `WordDocument` stream, never by extension.
+    Doc,
     /// EPUB e-book: chapters in reading order (spine documents, cut at their
     /// table-of-contents anchors), with the book's metadata and each
     /// chapter's title from the table of contents.
@@ -85,6 +97,8 @@ impl Family {
             Family::Docx => "docx",
             Family::Pptx => "pptx",
             Family::Xlsx => "xlsx",
+            Family::Xls => "xls",
+            Family::Doc => "doc",
             Family::Epub => "epub",
             Family::Ipynb => "ipynb",
             Family::Man => "man",
@@ -104,6 +118,7 @@ impl Family {
             self,
             Family::Pdf
                 | Family::Docx
+                | Family::Doc
                 | Family::Pptx
                 | Family::Epub
                 | Family::Ipynb
@@ -142,6 +157,10 @@ pub struct Sniffed {
 
 /// Bytes read for ordinary classification.
 const PREFIX: usize = 8192;
+
+/// OLE2 / Compound File Binary header signature (MS-CFB §2.2). Legacy Office
+/// (`.doc`/`.xls`/`.ppt`), 1C `.epf`, MSI and others all begin with it.
+const OLE2_MAGIC: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 
 /// Bytes read when the file already carries GIF magic. A Comment Extension is
 /// unbounded by the format, so this is a budget rather than a guarantee: it
@@ -268,6 +287,31 @@ fn sniff_bytes(
         }
         let mut s = mk(Family::Binary);
         s.binary_kind = Some(kind.into());
+        return Ok(s);
+    }
+    // OLE2 / Compound File Binary (`.doc`, `.xls`, `.ppt`, 1C `.epf`, MSI, …):
+    // one 8-byte magic for a whole family of unrelated formats, so — exactly as
+    // with the zip container above — the magic alone cannot say which. Open the
+    // compound file (bounded: `cfb` reads the header, FAT and directory, never
+    // the whole file) and route by the top-level stream names a `Workbook`/
+    // `Book` stream is a legacy Excel workbook, a `WordDocument` stream a legacy
+    // Word document, anything else an OLE2 blob we name but do not parse. A
+    // crafted or truncated container must not be able to panic or hang the
+    // sniffer, so `cfb::CompoundFile::open` (which reports malformation as an
+    // `io::Err`, not a panic) is the whole mechanism and every error path lands
+    // on `Family::Binary` / `"ole2"`.
+    if prefix.starts_with(OLE2_MAGIC) {
+        if !gzip {
+            if let Ok(f) = std::fs::File::open(content_path) {
+                match ole2_family(f) {
+                    Some(Family::Xls) => return Ok(mk(Family::Xls)),
+                    Some(Family::Doc) => return Ok(mk(Family::Doc)),
+                    _ => {}
+                }
+            }
+        }
+        let mut s = mk(Family::Binary);
+        s.binary_kind = Some("ole2".into());
         return Ok(s);
     }
     // Compressed image/audio/model payloads routinely pass the NUL and
@@ -1160,6 +1204,34 @@ fn looks_like_tar_header(prefix: &[u8]) -> bool {
 /// folder of XML parts that is no more searchable than the file was. OOXML is
 /// identified by its main part; OpenDocument and EPUB by the `mimetype` member
 /// their container specs require, read through a bounded reader.
+/// Route an OLE2 / Compound File Binary container by its top-level stream
+/// names: [`Family::Xls`] for a `Workbook`/`Book` stream, [`Family::Doc`] for
+/// a `WordDocument` stream, and `None` for anything else (an unrecognised OLE2
+/// blob — PowerPoint, Visio, MSI, a 1C `.epf`, a crafted or truncated file).
+///
+/// `None` deliberately covers every failure: `cfb::CompoundFile::open` reports
+/// a malformed, truncated or cyclic container as an `io::Err` rather than a
+/// panic, and it reads only the header, FAT and directory (bounded by the file
+/// size, since a declared sector past EOF fails the read), so this is safe on
+/// hostile input and never has to open a stream to decide. The `.doc` ↔ `.xls`
+/// precedence (Word before Excel) matches real files, which carry only one of
+/// the two main streams.
+fn ole2_family<F: Read + std::io::Seek>(f: F) -> Option<Family> {
+    let comp = cfb::CompoundFile::open(f).ok()?;
+    let mut xls = false;
+    for entry in comp.read_root_storage() {
+        if !entry.is_stream() {
+            continue;
+        }
+        match entry.name() {
+            "WordDocument" => return Some(Family::Doc),
+            "Workbook" | "Book" => xls = true,
+            _ => {}
+        }
+    }
+    xls.then_some(Family::Xls)
+}
+
 fn zip_container_kind<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>) -> &'static str {
     const PARTS: &[(&str, &str)] = &[
         ("word/document.xml", "docx"),
@@ -4464,5 +4536,101 @@ mod data_container_tests {
         for k in ["zip", "png", "xlsx", "unknown", ""] {
             assert_eq!(unsupported_data_advice(k), None, "{k}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ole2_sniff_tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// Write a synthetic OLE2 compound file carrying exactly the named streams
+    /// (each with a byte of content), and return its path inside `dir`. Built
+    /// with cfb's own writer, so no real Office file is ever needed.
+    fn write_ole2(dir: &tempfile::TempDir, file: &str, streams: &[&str]) -> std::path::PathBuf {
+        let path = dir.path().join(file);
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            for name in streams {
+                let mut s = comp.create_stream(name).unwrap();
+                s.write_all(b"x").unwrap();
+                s.flush().unwrap();
+            }
+            comp.flush().unwrap();
+        }
+        path
+    }
+
+    /// A `Workbook` stream inside an OLE2 container routes to `Xls`, by content
+    /// and not by the file's extension.
+    #[test]
+    fn a_workbook_stream_is_detected_as_xls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ole2(&dir, "legacy.bin", &["Workbook"]);
+        assert_eq!(sniff(&path).unwrap().family, Family::Xls);
+        // The pre-BIFF8 name `Book` also counts.
+        let path = write_ole2(&dir, "old.bin", &["Book"]);
+        assert_eq!(sniff(&path).unwrap().family, Family::Xls);
+    }
+
+    /// A `WordDocument` stream routes to `Doc`.
+    #[test]
+    fn a_worddocument_stream_is_detected_as_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ole2(
+            &dir,
+            "report.bin",
+            &["WordDocument", "\u{5}SummaryInformation"],
+        );
+        assert_eq!(sniff(&path).unwrap().family, Family::Doc);
+    }
+
+    /// Any other OLE2 container (PowerPoint, Visio, a 1C `.epf`, …) is named
+    /// `ole2` and left for the skip report — never parsed, never a panic.
+    #[test]
+    fn an_unrecognised_ole2_container_is_named_but_not_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ole2(&dir, "deck.bin", &["PowerPoint Document"]);
+        let sn = sniff(&path).unwrap();
+        assert_eq!(sn.family, Family::Binary);
+        assert_eq!(sn.binary_kind.as_deref(), Some("ole2"));
+    }
+
+    /// The OLE2 magic followed by garbage (a truncated/crafted compound file)
+    /// must classify as binary `ole2` without panicking or hanging.
+    #[test]
+    fn a_truncated_ole2_header_is_binary_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.bin");
+        let mut bytes = OLE2_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0xFF; 600]); // nonsense header fields
+        std::fs::write(&path, &bytes).unwrap();
+        let sn = sniff(&path).unwrap();
+        assert_eq!(sn.family, Family::Binary);
+        assert_eq!(sn.binary_kind.as_deref(), Some("ole2"));
+    }
+
+    /// A `.ssc`-style spreadsheet export is a TEXT XML body, not an OLE2
+    /// container, and must stay `Xml` — pinned so the new OLE2 routing (and any
+    /// future "spreadsheet" heuristic) never steals it.
+    #[test]
+    fn an_ssc_xml_spreadsheet_body_stays_xml() {
+        let body = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            "\n",
+            r#"<spreadsheet-workbook-data version="2" generator="xerj">"#,
+            "\n  <sheet name=\"Totals\"><row><cell>Region</cell><cell>Revenue</cell></row></sheet>\n",
+            r#"</spreadsheet-workbook-data>"#,
+        );
+        let fam = sniff_bytes(
+            body.as_bytes(),
+            Path::new("export.ssc"),
+            Path::new("export.ssc"),
+            false,
+        )
+        .unwrap()
+        .family;
+        assert_eq!(fam, Family::Xml);
     }
 }
