@@ -120,6 +120,7 @@ pub fn exact_scan_bytes(
         | Family::TxtProse
         | Family::Code
         | Family::Docx
+        | Family::Doc
         | Family::Pptx
         | Family::Epub
         | Family::Ipynb
@@ -144,7 +145,7 @@ pub fn exact_scan_bytes(
         Family::UnityMeta => (size <= UNITY_META_CAP).then_some(size),
         // Row-capped per table (per sheet); bytes read bear no fixed relation
         // to `size`.
-        Family::Sqlite | Family::Xlsx => None,
+        Family::Sqlite | Family::Xlsx | Family::Xls => None,
         // Deliberately partial: `bvh::extract` stops at `Frame Time:` and
         // never pulls the motion block off disk, so `size` is not the number
         // of bytes this machine demonstrated it can chew through.
