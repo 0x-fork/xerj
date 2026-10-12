@@ -50,7 +50,10 @@ fn record(typ: u16, body: &[u8]) -> Vec<u8> {
 /// normally and reaches the hostile one that follows.
 fn bof() -> Vec<u8> {
     // vers=0x0600, dt=0x0005 (globals), rupBuild, rupYear, + reserved.
-    record(0x0809, &[0x00, 0x06, 0x05, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    record(
+        0x0809,
+        &[0x00, 0x06, 0x05, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )
 }
 
 fn drain(path: &Path) -> ExtractStats {
@@ -90,18 +93,30 @@ fn hostile_xls_yields_junk_and_the_parent_survives() {
     // 3) SST, huge cstUnique — pre-filter DoS vector.
     let mut sst_huge = vec![0u8; 8];
     sst_huge[4..8].copy_from_slice(&0x7FFF_FFFFi32.to_le_bytes());
-    let f3 = write_workbook(dir, "sst_huge.xls", &[bof(), record(0x00FC, &sst_huge)].concat());
+    let f3 = write_workbook(
+        dir,
+        "sst_huge.xls",
+        &[bof(), record(0x00FC, &sst_huge)].concat(),
+    );
 
     // 4) SST, negative cstUnique — pre-filter DoS vector (calamine's unwrap).
     let mut sst_neg = vec![0u8; 8];
     sst_neg[4..8].copy_from_slice(&(-1i32).to_le_bytes());
-    let f4 = write_workbook(dir, "sst_neg.xls", &[bof(), record(0x00FC, &sst_neg)].concat());
+    let f4 = write_workbook(
+        dir,
+        "sst_neg.xls",
+        &[bof(), record(0x00FC, &sst_neg)].concat(),
+    );
 
     // 5) Lbl (0x0018) with an 8-byte body — calamine does `&r.data[14..]`.
     let f5 = write_workbook(dir, "lbl.xls", &[bof(), record(0x0018, &[0u8; 8])].concat());
 
     // 6) ExternSheet (0x0017) with a 0-byte body — calamine read_u16 on < 2 bytes.
-    let f6 = write_workbook(dir, "externsheet.xls", &[bof(), record(0x0017, &[])].concat());
+    let f6 = write_workbook(
+        dir,
+        "externsheet.xls",
+        &[bof(), record(0x0017, &[])].concat(),
+    );
 
     for path in [&f1, &f2, &f3, &f4, &f5, &f6] {
         let stats = drain(path);

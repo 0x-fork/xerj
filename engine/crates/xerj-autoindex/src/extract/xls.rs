@@ -1306,9 +1306,17 @@ mod tests {
     #[test]
     fn parse_worker_output_reconstructs_records_and_truncation() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4"))).unwrap().as_bytes());
+        buf.extend_from_slice(
+            serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4")))
+                .unwrap()
+                .as_bytes(),
+        );
         buf.push(b'\n');
-        buf.extend_from_slice(serde_json::to_string(&WorkerLine::Rec(rec("Sales!r5"))).unwrap().as_bytes());
+        buf.extend_from_slice(
+            serde_json::to_string(&WorkerLine::Rec(rec("Sales!r5")))
+                .unwrap()
+                .as_bytes(),
+        );
         buf.push(b'\n');
         buf.extend_from_slice(
             serde_json::to_string(&WorkerLine::End { truncated: true })
@@ -1330,7 +1338,11 @@ mod tests {
     #[test]
     fn parse_worker_output_rejects_a_missing_terminator() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4"))).unwrap().as_bytes());
+        buf.extend_from_slice(
+            serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4")))
+                .unwrap()
+                .as_bytes(),
+        );
         buf.push(b'\n');
         assert!(parse_worker_output(&buf).is_err());
         // Garbage that is not our protocol is also rejected.
