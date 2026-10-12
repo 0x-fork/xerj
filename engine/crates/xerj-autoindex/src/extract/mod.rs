@@ -5,6 +5,7 @@
 pub mod bvh;
 pub mod code;
 pub mod csv_x;
+pub mod doc;
 pub mod docx;
 pub mod eml;
 pub mod epub;
@@ -22,6 +23,7 @@ pub mod sqldump;
 pub mod sqlite_x;
 pub mod txt;
 pub mod unity;
+pub mod xls;
 pub mod xlsx;
 pub mod xml_x;
 pub mod yaml_x;
@@ -214,6 +216,7 @@ pub fn extract(
         Family::Eml => eml::extract(path, sn.gzip, sink),
         Family::Mbox => mbox::extract(path, sn.gzip, limit_bytes, sink),
         Family::Docx => docx::extract(path, sink),
+        Family::Doc => doc::extract(path, sn.logical_name.as_deref().unwrap_or(path), sink),
         Family::Pptx => pptx::extract(path, sn.logical_name.as_deref().unwrap_or(path), sink),
         Family::Epub => epub::extract(path, sn.logical_name.as_deref().unwrap_or(path), sink),
         Family::Ipynb => ipynb::extract(
@@ -229,6 +232,12 @@ pub fn extract(
             sink,
         ),
         Family::Xlsx => xlsx::extract(
+            path,
+            sn.logical_name.as_deref().unwrap_or(path),
+            limit_bytes.map(|_| 500),
+            sink,
+        ),
+        Family::Xls => xls::extract(
             path,
             sn.logical_name.as_deref().unwrap_or(path),
             limit_bytes.map(|_| 500),

@@ -2,10 +2,24 @@
 
 This roadmap tracks capabilities that are **planned but not yet fully implemented**, so the project's public claims stay honest about what ships today versus what is coming. Status is verified against the actual code and by real API requests to the release binary, not aspirational.
 
-Last reviewed: 2026-10-11 (against `v1.0.0-rc.94` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.94 release-cut roll:
+Last reviewed: 2026-10-12 (against `v1.0.0-rc.95` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.95 release-cut roll:
 the open-defects shortlist was re-verified against the live tracker at
-cut time — **nine open**: #1094, #1108, #1110, #1122, #1170, #1183,
-#1226, #1250, #1267. The window since rc.93 landed 29 merged PRs. A
+cut time — **nine open** (unchanged from rc.94): #1094, #1108, #1110,
+#1122, #1170, #1183, #1226, #1250, #1267. The window since rc.94 landed
+legacy Microsoft Office support in `xerj autoindex` — `.xls` (BIFF via
+calamine) and `.doc` (Word 97+ text via the FIB piece table), with OLE2
+containers detected by content and `.epf`/others named and skipped — in
+PR [#1324](https://github.com/xerj-org/xerj/pull/1324). Because calamine
+0.26.1 is not panic-safe on hostile BIFF and the engine is `panic=abort`,
+`.xls` is parsed in an rlimit-capped `xerj __extract-xls` worker
+subprocess so a hostile spreadsheet in an untrusted dump aborts only the
+worker, never the indexer (adversarially verified against four
+allocation and two panic vectors); it was validated end-to-end against a
+real 75 GB Jira/Confluence/GitLab dump (.xls and .doc both produced
+records, nothing crashed). The rc.94 footer sweep also landed (#1325) and
+is now part of the cut recipe. No open defect closed inside this window.
+The rc.94 cut's record stands as written: the window since rc.93 landed
+29 merged PRs. A
 backlog-fix sweep closed six defects inside the window: the hybrid
 `query`+`knn` page-local ranking (#1303, PR
 [#1312](https://github.com/xerj-org/xerj/pull/1312)), the bulk
@@ -280,7 +294,7 @@ and the console review's), the #1062 wrong-and-confident detection gate, the
 `xerj-decide-v1` Hugging Face publication (operator credentials), and the GA
 bar itself — *The road to v1.0.0 GA* below.
 
-**Open defects.** Nine, all live on the tracker — the
+**Open defects.** Eight, all live on the tracker — the
 shortlist the release-notes gate checks. From the rc.92 window:
 [#1250](https://github.com/xerj-org/xerj/issues/1250) (multi-index
 ingest oscillates on the parent RSS breaker; root cause re-attributed
@@ -304,9 +318,6 @@ From the rc.81/82 windows:
 panic line). From the cluster-mode testing:
 [#1170](https://github.com/xerj-org/xerj/issues/1170) (the Raft ring is
 never connected to the engine). Filed from the corpus-program work:
-[#1108](https://github.com/xerj-org/xerj/issues/1108) (the #1062
-wrong-and-confident detection gate — now measured on rc.94 and failed
-at 0.2449 vs ≤ 5 %, published; closing on this PR),
 [#1110](https://github.com/xerj-org/xerj/issues/1110) (the
 generalization proof: second-domain pack + fresh-machine replay) and
 [#1183](https://github.com/xerj-org/xerj/issues/1183) (corpus index
