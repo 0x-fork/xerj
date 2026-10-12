@@ -26796,8 +26796,10 @@ impl Index {
 ///
 /// Derived from the SCHEMA rather than from the documents, so it is stable
 /// across flush and merge — a force-merge must not resurrect a column that
-/// flush correctly skipped. Dynamic (unmapped) fields are absent from the
-/// schema and keep today's behaviour of getting a column.
+/// flush correctly skipped. Inferred fields carry their own flag too
+/// (`dynamic_field_config*`: `Text` gets `false`, mirroring ES's dynamic
+/// mapping and the declared default), so they take this skip set rather than
+/// the builder's per-document default.
 pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String> {
     let mut skip = std::collections::HashSet::new();
     for field in &schema.fields {
@@ -44232,6 +44234,19 @@ fn dynamic_field_config_at_depth(
     let mut fc = FieldConfig::new(key.to_string(), ft);
     match fc.field_type {
         FieldType::Text => {
+            // The ES dynamic-mapping default for an inferred string's parent
+            // field is NO doc-values — only the `keyword` sub-field below
+            // carries them — and `es_properties_to_fields` already applies
+            // exactly that default to a DECLARED `text` mapping
+            // (`doc_values_default`). `FieldConfig::new` defaults the flag to
+            // true, so an INFERRED text field used to keep a doc-values column
+            // a declared one does not: the segment then answered a `terms`
+            // query from that column's whole raw values while the memtable
+            // scan answers per analyzed token, so the same query matched
+            // before `_refresh` and missed after it (and the `.dv` footprint
+            // rc.12's skip set removed for declared fields was re-paid for
+            // inferred ones).
+            fc.options.doc_values = false;
             let mut kw = FieldConfig::new("keyword".to_string(), FieldType::Keyword);
             kw.options.ignore_above = Some(DYNAMIC_KEYWORD_IGNORE_ABOVE);
             fc.fields.push(kw);

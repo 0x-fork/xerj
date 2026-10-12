@@ -1816,6 +1816,19 @@ fn main() -> Result<()> {
         std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
     }
 
+    // The isolated legacy-`.xls` BIFF reader. calamine 0.26.1 panics on crafted
+    // records (short `Lbl`/`ExternSheet`) and the release profile is
+    // `panic = abort`, so the read runs here, in a short-lived rlimit-capped
+    // child, where a crash dies with the child instead of aborting the indexer.
+    // Dispatched before the Tokio pool for the same smallness reason as the PDF
+    // worker above.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some(xerj_autoindex::extract::xls::WORKER_ARG)
+    ) {
+        std::process::exit(xerj_autoindex::extract::xls::run_worker_cli());
+    }
+
     // `xerj mcp` — MCP stdio server (newline-delimited JSON-RPC on
     // stdin/stdout), proxying to an already-running XERJ node.
     //

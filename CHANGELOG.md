@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Measured
+
+- **The #1062 wrong-and-confident detection gate was run through the real
+  `_watcher` path and it FAILS** (issue
+  [#1108](https://github.com/xerj-org/xerj/issues/1108)) — the unmeasured half
+  of the rc.80 `_watcher` work. On the rc.94 release binary, a real
+  `PUT /_watcher/watch` with `condition.xerj_decide` (one detection watch per
+  label, one-vs-rest) evaluated a 120-email boundary tier and wrote 120 fire
+  records into `.xerj_alert_fires`; the measurement reads only those fires.
+  **Wrong-and-confident = 0.2449** (24 of 98 fires with confidence ≥ 0.8 were
+  wrong) against the **≤ 0.05** bar. The confidence compared is the raw
+  `/_decide` confidence the watcher fires on; `p_cal` was absent (the vote
+  history has no labelled outcome pairs to fit), and because 18 of the 24
+  confident errors sit at raw `p` = 1.000 a monotonic `p_cal` could not change
+  the verdict anyway. Published under the loses-does-not-ship rule: the
+  `_watcher` mechanism is real, but its default vote is not good enough to ship a
+  detection watch as a "confidently correct" default, and no doc claims it is.
+  Raw results, corpus generator and harness in
+  `benchmarks/systemone-watcher-gate/`. Closes #1108.
+## [1.0.0-rc.95] - 2026-10-12
+
+Window since v1.0.0-rc.94: legacy Microsoft Office support in autoindex,
+hardened against hostile input.
+
+### Added
+
+- **Legacy Microsoft Office formats in `xerj autoindex`** (PR
+  [#1324](https://github.com/xerj-org/xerj/pull/1324)) — OLE2 Compound File
+  attachments, detected by content (never by extension), are now indexed
+  instead of dropped as binary:
+  - **`.xls`** (BIFF, via `calamine`) — one dataset per worksheet, one typed
+    record per row, mirroring the `.xlsx` extractor.
+  - **`.doc`** (Word 97+) — document text recovered through the FIB piece
+    table, titled from `SummaryInformation`. Text-only by design: no
+    formatting, tables-as-rows, headers/footers, footnotes, or pre-Word-97
+    binaries (those fall back to a lossy read or are skipped).
+  - Other OLE2 containers (e.g. `.epf` 1C data-processors) are **named and
+    skipped**, not mis-parsed.
+
+### Security
+
+- **`.xls` parsing is process-isolated** (PR
+  [#1324](https://github.com/xerj-org/xerj/pull/1324)) — `calamine` 0.26.1 is
+  not panic-safe on hostile BIFF (crafted `DIMENSIONS`/`SST` records force
+  multi-terabyte allocations; malformed `Lbl`/`ExternSheet` records panic), and
+  the engine is `panic=abort`, so a single hostile spreadsheet in an untrusted
+  dump could abort the whole indexer. The BIFF read now runs in a short-lived
+  `xerj __extract-xls` worker under `RLIMIT_AS`/`RLIMIT_CPU` + a wall-clock
+  watchdog + process-group kill; the parent reads records back as NDJSON and
+  degrades any worker crash/timeout to a skipped file, never calling `calamine`
+  on the raw bytes. A `biff_allocations_bounded` pre-filter rejects the known
+  over-allocation shapes before the spawn. Adversarially verified: the indexer
+  survives every crafted vector while benign workbooks still extract. (Windows
+  keeps the in-process pre-filter as a documented best-effort.)
+
+### Housekeeping
+
+- Landing footer version stamps swept to rc.94 (PR
+  [#1325](https://github.com/xerj-org/xerj/pull/1325)); the sweep is now part
+  of the release-cut recipe.
+
+### Known gaps
+
+- OpenDocument `.ods`/`.odt` (zip-based) are detected and **skipped** (no
+  extractor yet); `.rtf` indexes as raw text. Tracked for a follow-up.
+
 ## [1.0.0-rc.94] - 2026-10-11
 
 Window since v1.0.0-rc.93: a wave of external-contributor fixes landed
