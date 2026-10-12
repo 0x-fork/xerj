@@ -33,6 +33,7 @@ use super::{
 use anyhow::Result;
 use calamine::{Data, DataType, Reader, Xls};
 use chrono::Timelike;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::Read;
 use std::path::Path;
@@ -85,7 +86,11 @@ fn xls_allocations_bounded(path: &Path) -> bool {
         return true;
     };
     let mut buf = Vec::new();
-    if stream.take(MAX_WORKBOOK_STREAM).read_to_end(&mut buf).is_err() {
+    if stream
+        .take(MAX_WORKBOOK_STREAM)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
         return true;
     }
     biff_allocations_bounded(&buf)
@@ -166,11 +171,448 @@ fn biff_allocations_bounded(stream: &[u8]) -> bool {
     true
 }
 
+/// Hidden worker argv[1] the isolated BIFF reader is dispatched on. Reachable
+/// through the ordinary `xerj` binary (see `xerj-server/src/main.rs`), spawned
+/// via `current_exe()` — the same mechanism the PDF worker and the `xerj brain`
+/// server boot already use.
+pub const WORKER_ARG: &str = "__extract-xls";
+
+/// Test/developer hook: substitute the worker executable. Production uses
+/// `current_exe()`. A cargo test's `current_exe()` is the *test* binary, which
+/// does not carry the `__extract-xls` dispatch, so the isolation integration
+/// test points this at the built `xerj` binary — mirrors `XERJ_PDF_WORKER_BIN`.
+const WORKER_BIN_ENV: &str = "XERJ_XLS_WORKER_BIN";
+
+/// Address-space ceiling imposed on the worker (`RLIMIT_AS`). A crafted
+/// `DIMENSIONS`/`SST` that slips the pre-filter, or any other attacker-driven
+/// `Vec::with_capacity`, hits this and fails the allocation inside the worker —
+/// where it only kills the worker — instead of aborting the indexer.
+#[cfg(unix)]
+const WORKER_ADDRESS_SPACE: u64 = 2 << 30; // 2 GiB
+
+/// CPU-time ceiling imposed on the worker (`RLIMIT_CPU`, seconds). A record
+/// stream crafted to spin inside calamine is bounded here; the kernel sends
+/// `SIGXCPU` at the soft limit and `SIGKILL` at the hard limit, either of which
+/// the parent reports as junk.
+#[cfg(unix)]
+const WORKER_CPU_SECONDS: u64 = 15;
+
+/// Wall-clock backstop for the whole worker, independent of CPU time — covers a
+/// worker wedged in a blocking syscall that burns no CPU. `RLIMIT_CPU` is the
+/// primary guard; this only fires if the worker is stuck without the kernel
+/// noticing.
+#[cfg(unix)]
+const WORKER_WALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on the NDJSON the parent will buffer from one worker. A legacy
+/// `.xls` sheet is capped by the format at 65,536 rows × 256 columns, so a
+/// well-formed workbook is far below this; a worker emitting more than this is
+/// treated as junk rather than letting the parent's own memory grow unbounded
+/// on the worker's say-so.
+#[cfg(unix)]
+const MAX_WORKER_OUTPUT: usize = 128 << 20; // 128 MiB
+
+/// One line of the parent↔worker protocol. The worker serializes every produced
+/// record as a `Rec` line and closes with exactly one `End` line carrying the
+/// truncation flag; the parent parses them back into the identical records the
+/// in-process path would have emitted. Internally tagged on `k` so a record
+/// line (which never carries a `k` field) and the terminator are distinguished
+/// without a second pass.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "k")]
+enum WorkerLine {
+    /// One extracted record, byte-for-byte the `RawRecord` the sink receives.
+    #[serde(rename = "rec")]
+    Rec(RawRecord),
+    /// Terminator: the worker finished the file cleanly. Its presence is what
+    /// tells the parent the stream was not cut short by a crash mid-emit.
+    #[serde(rename = "end")]
+    End { truncated: bool },
+}
+
 /// `name` is the file as the corpus names it (under durable preparation this is
 /// not `path`, a sealed snapshot blob); document sheets are titled from it.
 /// `per_sheet_limit` caps the rows emitted from each sheet (phase-A sampling);
 /// `None` reads every row.
+///
+/// The dump being indexed is untrusted (Jira/Confluence/GitLab attachments) and
+/// calamine 0.26.1 is *not* panic-safe on hostile BIFF: beyond the allocation
+/// vectors [`xls_allocations_bounded`] pre-filters, it indexes a short `Lbl`
+/// (`0x0018`) or `ExternSheet` (`0x0017`) record straight out of bounds and
+/// panics. The engine release profile is `panic = abort` with no `catch_unwind`
+/// around the scan, so such a panic aborts the WHOLE indexer, and `catch_unwind`
+/// cannot help under `panic = abort`. So on unix the actual BIFF read runs in a
+/// short-lived child process under `RLIMIT_AS`/`RLIMIT_CPU`: a panic, abort,
+/// OOM-kill or runaway there dies with the child and is counted as junk, and the
+/// parent never calls calamine on the raw file itself. Non-unix keeps the
+/// in-process bounded path as a documented best-effort (the dump is Linux).
 pub fn extract(
+    path: &Path,
+    name: &Path,
+    per_sheet_limit: Option<u64>,
+    sink: Sink,
+) -> Result<ExtractStats> {
+    // Cheap pre-filter, kept from #1324: refuse the whole crafted-allocation
+    // class before paying to spawn a worker at all. It is a pre-filter now, not
+    // the whole defence — the worker's rlimits catch what byte-walking a record
+    // stream cannot (every other allocation site, and the out-of-bounds panics).
+    if !xls_allocations_bounded(path) {
+        let mut stats = ExtractStats::default();
+        stats.junk += 1;
+        return Ok(stats);
+    }
+    #[cfg(unix)]
+    {
+        extract_isolated(path, name, per_sheet_limit, sink)
+    }
+    #[cfg(not(unix))]
+    {
+        // No `setrlimit`/`pre_exec` here; best-effort in-process read bounded by
+        // the pre-filter above. Documented: the production dump is Linux.
+        extract_in_process(path, name, per_sheet_limit, sink)
+    }
+}
+
+/// Parent side of the isolation: spawn `current_exe() __extract-xls <path>
+/// <name> <limit>`, read its NDJSON, and deliver the records to `sink` exactly
+/// as the in-process path would. Any abnormal exit — non-zero, signal
+/// (SIGABRT/SIGKILL/SIGXCPU), wall-clock timeout, over-cap output, a line that
+/// will not parse, or a missing `End` terminator — becomes `junk += 1` and
+/// `Ok`, so one hostile file is skipped and the scan continues. All-or-nothing:
+/// records are buffered and only delivered once the worker has closed cleanly,
+/// so a worker that crashes mid-file indexes nothing from it (no partial rows).
+#[cfg(unix)]
+fn extract_isolated(
+    path: &Path,
+    name: &Path,
+    per_sheet_limit: Option<u64>,
+    sink: Sink,
+) -> Result<ExtractStats> {
+    let mut stats = ExtractStats::default();
+    match run_worker(path, name, per_sheet_limit) {
+        Ok((records, truncated)) => {
+            for rec in records {
+                stats.records += 1;
+                if !sink(rec) {
+                    // Sampling stop: the caller has what it wanted. Success.
+                    return Ok(stats);
+                }
+            }
+            if stats.records == 0 {
+                // Clean run that produced nothing (unreadable-but-not-crafted
+                // workbook, or an empty one) — junk, mirroring the in-process
+                // `records == 0` rule.
+                stats.junk += 1;
+            } else {
+                stats.truncated = truncated;
+            }
+        }
+        // Crash / timeout / protocol failure: skip the file, keep scanning.
+        Err(_) => stats.junk += 1,
+    }
+    Ok(stats)
+}
+
+/// Run one worker to completion and return its buffered records plus the
+/// truncation flag, or an error describing why the file could not be trusted.
+#[cfg(unix)]
+fn run_worker(
+    path: &Path,
+    name: &Path,
+    per_sheet_limit: Option<u64>,
+) -> Result<(Vec<RawRecord>, bool)> {
+    use anyhow::{anyhow, Context};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::var_os(WORKER_BIN_ENV)
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+        .context("locate the xerj binary for isolated .xls extraction")?;
+
+    let mut command = Command::new(exe);
+    command
+        .arg(WORKER_ARG)
+        .arg(path.as_os_str())
+        .arg(name.as_os_str())
+        .arg(match per_sheet_limit {
+            Some(n) => n.to_string(),
+            None => "none".to_string(),
+        })
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe libc (`setpgid`, `setrlimit`). Its own process group so
+    // the parent can reap the whole tree; the rlimits cap the child's blast
+    // radius to itself.
+    unsafe {
+        command.pre_exec(worker_pre_exec);
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn the isolated .xls reader for {}", path.display()))?;
+    let pid = child.id();
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    // Read on a thread so the wall-clock watchdog below can act even if the
+    // worker stalls with the pipe open.
+    let reader = std::thread::spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT));
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                kill_group(pid);
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(e)
+                    .with_context(|| format!("monitor the .xls reader for {}", path.display()));
+            }
+        }
+        if started.elapsed() >= WORKER_WALL_TIMEOUT {
+            kill_group(pid);
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(anyhow!(
+                "isolated .xls reader for {} exceeded the {}s wall-clock limit",
+                path.display(),
+                WORKER_WALL_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // Reap any stragglers left in the group, then collect the output.
+    kill_group(pid);
+    let captured = reader
+        .join()
+        .map_err(|_| anyhow!("the .xls reader output thread panicked"))??;
+    if captured.overflow {
+        return Err(anyhow!(
+            "isolated .xls reader for {} produced more than {} MiB of output",
+            path.display(),
+            MAX_WORKER_OUTPUT >> 20
+        ));
+    }
+    if !status.success() {
+        return Err(anyhow!(
+            "isolated .xls reader for {} exited abnormally ({status})",
+            path.display()
+        ));
+    }
+    parse_worker_output(&captured.bytes).with_context(|| {
+        format!(
+            "parse the isolated .xls reader output for {}",
+            path.display()
+        )
+    })
+}
+
+/// Parse the worker's NDJSON into the records and truncation flag. A clean run
+/// ends with exactly one `End` line; its absence means the stream was cut short
+/// (a crash the exit status somehow did not surface) and is an error.
+#[cfg(unix)]
+fn parse_worker_output(bytes: &[u8]) -> Result<(Vec<RawRecord>, bool)> {
+    use anyhow::anyhow;
+    let mut records = Vec::new();
+    let mut ended: Option<bool> = None;
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if ended.is_some() {
+            return Err(anyhow!("trailing output after the .xls reader terminator"));
+        }
+        match serde_json::from_slice::<WorkerLine>(line)? {
+            WorkerLine::Rec(rec) => records.push(rec),
+            WorkerLine::End { truncated } => ended = Some(truncated),
+        }
+    }
+    match ended {
+        Some(truncated) => Ok((records, truncated)),
+        None => Err(anyhow!("the .xls reader did not emit a terminator")),
+    }
+}
+
+/// Pre-exec child setup: own process group + address-space and CPU-time caps.
+/// Runs in the forked child; only async-signal-safe libc calls.
+#[cfg(unix)]
+fn worker_pre_exec() -> std::io::Result<()> {
+    // SAFETY: `setpgid`/`setrlimit` are async-signal-safe and documented here.
+    unsafe {
+        if libc::setpgid(0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    set_worker_rlimits()
+}
+
+/// Apply `RLIMIT_AS` and `RLIMIT_CPU` to the current process. Used by
+/// [`worker_pre_exec`] (parent-forked child) and again by the worker itself at
+/// entry (belt-and-suspenders, in case it was spawned some other way).
+///
+/// Only ever *lowers* a limit: an unprivileged process cannot raise its hard
+/// limit, so the target is clamped to whatever was inherited. This matters when
+/// the indexer already runs under a tighter cgroup or `ulimit -v` — trying to
+/// set a higher ceiling there would `EPERM` and fail the whole spawn, turning
+/// every `.xls` (benign included) into junk.
+#[cfg(unix)]
+fn set_worker_rlimits() -> std::io::Result<()> {
+    // Set `$res`'s soft/hard limits to the requested values, each capped at the
+    // inherited hard limit so the call never tries to RAISE a ceiling (which an
+    // unprivileged process may not do, and which would `EPERM` the whole spawn).
+    // A macro, not a function, so the resource constant is passed straight to
+    // libc without naming its type — that type is `__rlimit_resource_t` on
+    // glibc but `c_int` on macOS/BSD.
+    macro_rules! clamp {
+        ($res:expr, $soft:expr, $hard:expr) => {{
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: plain libc FFI over an out-param `rlimit`.
+            if unsafe { libc::getrlimit($res, &mut current) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let ceiling = current.rlim_max; // inherited hard limit (maybe RLIM_INFINITY)
+            let want_hard = ($hard as libc::rlim_t).min(ceiling);
+            let want_soft = ($soft as libc::rlim_t).min(want_hard);
+            let limit = libc::rlimit {
+                rlim_cur: want_soft,
+                rlim_max: want_hard,
+            };
+            // SAFETY: as above; cur <= max <= inherited max, so this only lowers.
+            if unsafe { libc::setrlimit($res, &limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }};
+    }
+    clamp!(libc::RLIMIT_AS, WORKER_ADDRESS_SPACE, WORKER_ADDRESS_SPACE);
+    // Soft limit sends SIGXCPU; hard limit (a touch higher) escalates to SIGKILL.
+    clamp!(libc::RLIMIT_CPU, WORKER_CPU_SECONDS, WORKER_CPU_SECONDS + 2);
+    Ok(())
+}
+
+/// SIGKILL the worker's whole process group (negative pid). Best effort.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    // SAFETY: plain libc FFI; an already-dead group is a harmless ESRCH.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+struct Captured {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+/// Read `input` to EOF, keeping at most `cap` bytes and flagging overflow.
+/// Keeps draining past the cap so the child never blocks on a full pipe.
+#[cfg(unix)]
+fn read_capped(mut input: impl Read, cap: usize) -> Result<Captured> {
+    use anyhow::Context;
+    let mut bytes = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0u8; 64 << 10];
+    loop {
+        let n = input
+            .read(&mut chunk)
+            .context("read isolated .xls reader output")?;
+        if n == 0 {
+            break;
+        }
+        if !overflow {
+            let room = cap.saturating_sub(bytes.len());
+            let take = room.min(n);
+            bytes.extend_from_slice(&chunk[..take]);
+            overflow |= take < n;
+        }
+    }
+    Ok(Captured { bytes, overflow })
+}
+
+/// Hidden same-binary worker entry point (`xerj __extract-xls <path> <name>
+/// <limit|none>`). One invocation reads one workbook and streams its records as
+/// NDJSON on stdout. If calamine panics/aborts here, this process dies and the
+/// parent handles it; nothing in the parent ever touches the raw file.
+pub fn run_worker_cli() -> i32 {
+    // Re-apply the resource caps the parent set via `pre_exec`, so the worker is
+    // bounded even if it was launched directly (tests, a future caller).
+    #[cfg(unix)]
+    if let Err(e) = set_worker_rlimits() {
+        eprintln!(".xls worker could not set its resource limits: {e}");
+        // Not fatal: the parent's `pre_exec` is the authoritative cap.
+    }
+
+    let mut args = std::env::args_os().skip(2);
+    let (Some(path), Some(name), Some(limit)) = (args.next(), args.next(), args.next()) else {
+        eprintln!(".xls worker protocol error: expected <path> <name> <limit>");
+        return 2;
+    };
+    if args.next().is_some() {
+        eprintln!(".xls worker protocol error: unexpected trailing arguments");
+        return 2;
+    }
+    let per_sheet_limit = match limit.to_string_lossy().as_ref() {
+        "none" => None,
+        other => match other.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!(".xls worker protocol error: bad limit {other:?}");
+                return 2;
+            }
+        },
+    };
+
+    let path = std::path::PathBuf::from(path);
+    let name = std::path::PathBuf::from(name);
+
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut write_err = false;
+    let mut emit = |rec: RawRecord| -> bool {
+        if serde_json::to_writer(&mut out, &WorkerLine::Rec(rec)).is_err()
+            || out.write_all(b"\n").is_err()
+        {
+            write_err = true;
+            return false;
+        }
+        true
+    };
+
+    match extract_in_process(&path, &name, per_sheet_limit, &mut emit) {
+        Ok(stats) => {
+            if write_err {
+                return 1;
+            }
+            let end = WorkerLine::End {
+                truncated: stats.truncated,
+            };
+            if serde_json::to_writer(&mut out, &end).is_err()
+                || out.write_all(b"\n").is_err()
+                || out.flush().is_err()
+            {
+                return 1;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!(".xls worker failed: {e:#}");
+            1
+        }
+    }
+}
+
+/// The in-process BIFF read. On unix this runs *inside the worker*; on non-unix
+/// it is the whole (best-effort) path. It still runs the allocation pre-filter
+/// itself, so it is self-contained wherever it is called from.
+fn extract_in_process(
     path: &Path,
     name: &Path,
     per_sheet_limit: Option<u64>,
@@ -549,26 +991,39 @@ mod tests {
         // A 100-row × 10-column sheet is well within the BIFF8 ceiling.
         assert!(biff_allocations_bounded(&dimensions_record(0, 100, 0, 10)));
         // And the format's own maximum is still accepted.
-        assert!(biff_allocations_bounded(&dimensions_record(0, 65_536, 0, 256)));
+        assert!(biff_allocations_bounded(&dimensions_record(
+            0, 65_536, 0, 256
+        )));
     }
 
     #[test]
     fn a_crafted_dimension_past_the_biff_ceiling_is_refused() {
         // The shape of the 36 KB proof-of-concept: a DIMENSIONS claiming a vast
         // row range, which drove calamine to attempt a ~2.1 TB Range alloc.
-        assert!(!biff_allocations_bounded(&dimensions_record(0, 0x7FFF_FFFF, 0, 256)));
+        assert!(!biff_allocations_bounded(&dimensions_record(
+            0,
+            0x7FFF_FFFF,
+            0,
+            256
+        )));
         // An inflated column count is refused the same way.
-        assert!(!biff_allocations_bounded(&dimensions_record(0, 100, 0, 60_000)));
+        assert!(!biff_allocations_bounded(&dimensions_record(
+            0, 100, 0, 60_000
+        )));
         // Inverted ranges (mac < mic) are malformed and refused.
-        assert!(!biff_allocations_bounded(&dimensions_record(500, 100, 0, 10)));
+        assert!(!biff_allocations_bounded(&dimensions_record(
+            500, 100, 0, 10
+        )));
     }
 
     #[test]
     fn a_truncated_or_dimensionless_stream_is_not_mistaken_for_crafted() {
         // No DIMENSIONS record at all: nothing to object to, let calamine try.
-        assert!(biff_allocations_bounded(b"\x09\x08\x04\x00\x00\x00\x00\x00")); // a BOF-ish record, no 0x0200
-        // A record header whose declared length runs past the buffer end stops
-        // the walk without a panic and without a false refusal.
+        assert!(biff_allocations_bounded(
+            b"\x09\x08\x04\x00\x00\x00\x00\x00"
+        )); // a BOF-ish record, no 0x0200
+            // A record header whose declared length runs past the buffer end stops
+            // the walk without a panic and without a false refusal.
         assert!(biff_allocations_bounded(&[0x00, 0x02, 0xFF, 0xFF, 0x01]));
         // Empty stream.
         assert!(biff_allocations_bounded(&[]));
@@ -597,7 +1052,9 @@ mod tests {
     #[test]
     fn the_10_byte_dimensions_form_is_also_bounded() {
         // A real small BIFF5 sheet is accepted.
-        assert!(biff_allocations_bounded(&dimensions_record_biff5(0, 100, 0, 10)));
+        assert!(biff_allocations_bounded(&dimensions_record_biff5(
+            0, 100, 0, 10
+        )));
         // The reviewer's bypass: rl = cl = 0xFFFF drove calamine to a ~171 GB
         // reserve because the earlier gate only checked the 14-byte form. The
         // 65,535-column claim is past the 256 ceiling and is now refused.
@@ -804,5 +1261,83 @@ mod tests {
         let cell = date_cell(1, &d).unwrap();
         assert_eq!(cell.kind, Kind::Date);
         assert_eq!(cell.value, json!("2025-07-01"));
+    }
+
+    fn rec(locator: &str) -> RawRecord {
+        let mut fields = Map::new();
+        fields.insert("Region".into(), Value::String("EMEA".into()));
+        fields.insert("Revenue".into(), Value::Number(1250.into()));
+        RawRecord {
+            fields,
+            locator: locator.to_string(),
+            group: Some("Sales".into()),
+            origin: FieldOrigin::Data,
+        }
+    }
+
+    /// The parent reconstructs the worker's records byte-for-byte: a `Rec` line
+    /// round-trips every field, the locator, the group and the origin, and the
+    /// `End` line is not mistaken for a record.
+    #[test]
+    fn worker_line_rec_and_end_round_trip() {
+        let line = serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4"))).unwrap();
+        // A record line carries no discriminator a RawRecord could own.
+        assert!(line.contains("\"k\":\"rec\""));
+        match serde_json::from_str::<WorkerLine>(&line).unwrap() {
+            WorkerLine::Rec(r) => {
+                assert_eq!(r.locator, "Sales!r4");
+                assert_eq!(r.group.as_deref(), Some("Sales"));
+                assert_eq!(r.origin, FieldOrigin::Data);
+                assert_eq!(r.fields["Region"], json!("EMEA"));
+                assert_eq!(r.fields["Revenue"], json!(1250));
+            }
+            WorkerLine::End { .. } => panic!("record line decoded as terminator"),
+        }
+        let end = serde_json::to_string(&WorkerLine::End { truncated: true }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<WorkerLine>(&end).unwrap(),
+            WorkerLine::End { truncated: true }
+        ));
+    }
+
+    /// The NDJSON parser rebuilds the record list and the truncation flag, and
+    /// tolerates the blank splits a trailing newline produces.
+    #[cfg(unix)]
+    #[test]
+    fn parse_worker_output_reconstructs_records_and_truncation() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4"))).unwrap().as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(serde_json::to_string(&WorkerLine::Rec(rec("Sales!r5"))).unwrap().as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(
+            serde_json::to_string(&WorkerLine::End { truncated: true })
+                .unwrap()
+                .as_bytes(),
+        );
+        buf.push(b'\n');
+        let (records, truncated) = parse_worker_output(&buf).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].locator, "Sales!r4");
+        assert_eq!(records[1].locator, "Sales!r5");
+        assert!(truncated);
+    }
+
+    /// A stream cut short before the terminator — exactly the shape of a worker
+    /// that crashed mid-emit after flushing a record — is an error, so the
+    /// parent discards the partial file rather than indexing half of it.
+    #[cfg(unix)]
+    #[test]
+    fn parse_worker_output_rejects_a_missing_terminator() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(serde_json::to_string(&WorkerLine::Rec(rec("Sales!r4"))).unwrap().as_bytes());
+        buf.push(b'\n');
+        assert!(parse_worker_output(&buf).is_err());
+        // Garbage that is not our protocol is also rejected.
+        assert!(parse_worker_output(b"{not json}\n").is_err());
+        // A clean empty run (no rows, just a terminator) is valid and empty.
+        let end = serde_json::to_string(&WorkerLine::End { truncated: false }).unwrap();
+        let (records, truncated) = parse_worker_output(end.as_bytes()).unwrap();
+        assert!(records.is_empty() && !truncated);
     }
 }
