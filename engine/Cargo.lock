@@ -7614,6 +7614,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xerj-hub"
+version = "1.0.0-rc.95"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "xerj-common",
+]
+
+[[package]]
 name = "xerj-logs"
 version = "1.0.0-rc.95"
 dependencies = [
