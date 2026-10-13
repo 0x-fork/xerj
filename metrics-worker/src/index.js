@@ -113,7 +113,7 @@ a{color:var(--accent)}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script>
 (async function(){
-  var h = await fetch('data.json').then(function(r){return r.json()});
+  var h = await fetch('data.json'+location.search).then(function(r){return r.json()});
   var days = Object.keys(h.days||{}).sort();
   var rows = days.map(function(d){return h.days[d]});
   function col(k){return rows.map(function(r){return r[k]||0})}
@@ -141,16 +141,18 @@ export default {
   },
   async fetch(req, env) {
     const url = new URL(req.url);
+    // Everything here is PRIVATE: every route requires ?key=REFRESH_KEY. The
+    // cron recorder does not use these routes, so the data is never public.
+    if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
+      return new Response("forbidden - private metrics endpoint", { status: 403 });
+    }
     if (url.pathname === "/data.json") {
       const hist = await loadHistory(env);
       return new Response(JSON.stringify(hist), {
-        headers: { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "max-age=300" },
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
     }
     if (url.pathname === "/refresh") {
-      if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
-        return new Response("forbidden", { status: 403 });
-      }
       const hist = await snapshot(env);
       return new Response(JSON.stringify({ ok: true, days: Object.keys(hist.days).length, updated: hist.updated }), {
         headers: { "content-type": "application/json" },
