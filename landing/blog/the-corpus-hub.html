@@ -187,9 +187,11 @@
   the material for <em>reference coding</em>, where an agent reads how three other engines solved
   the problem before writing a fourth. <strong>Record packs</strong> are structured data you
   curate — the first is 1,950 Rust vulnerability advisories identity-resolved across osv.dev and
-  RustSec, rebuilt and signed daily. One command each:</p>
+  RustSec, rebuilt and signed daily. From manifest to answer, with a local node running
+  (<code class="inline">--from</code> reads a local file, so the manifest is downloaded first):</p>
 
-  <pre class="code"><span class="prompt">$</span> xerj corpus add --from https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/xerj-storage.json
+  <pre class="code"><span class="prompt">$</span> curl -fsSLO https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/xerj-storage.json
+<span class="prompt">$</span> xerj corpus add --from ./xerj-storage.json
 <span class="prompt">$</span> xerj corpus index xerj-storage
 <span class="prompt">$</span> xerj code xerj-storage "flush epoch crash recovery"</pre>
 

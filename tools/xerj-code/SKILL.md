@@ -68,14 +68,45 @@ Enterprise Edition** parts — check the header/path first. Read the design,
 write our own implementation. Each manifest's `review.use` field says which
 bucket a repo is in; `hub/README.md` explains the three.
 
+## Hub corpus or local corpus
+
+Two kinds of corpus sit on the same local node. Each answers a different kind
+of question:
+
+| | hub corpus | local corpus |
+|---|---|---|
+| what it holds | public material at a pinned commit: a library's source, a standard, a regulation, an advisory feed | files only this machine has: the project you are working in, private documents, exports |
+| use it when | you need a detail you cannot quote exactly from memory | the answer is in your own files |
+| add it | `xerj corpus add --from ./<slug>.json`, then `xerj corpus index <slug>` | `xerj autoindex <folder>` |
+| query it | `xerj code <slug> "<question>"` · MCP `xerj_code_search` | `xerj search "<words>"` · `xerj def "<symbol>"` · MCP `xerj_search` |
+
+Use neither for a fact you can already state exactly: on memorised content
+retrieval is overhead (see the status note above).
+
+A hub manifest comes from a checkout of the `corpus-hub` branch
+(`tools/xerj-code/hub/<slug>.json`) or, without a checkout, from its raw URL.
+Both `corpus index` and `code` talk to a running node:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/<slug>.json
+xerj corpus add --from ./<slug>.json   # last line: next: xerj corpus index <slug>
+xerj corpus index <slug>               # ends: corpus '<slug>' searchable: <N> records
+xerj code <slug> "<question>"          # passages headed by file path and line
+```
+
+`--from` reads a local file: v1.0.0-rc.95 does not fetch a URL, and passing one
+answers `no such manifest`.
+
 ## Choosing a corpus for the project at hand
 
 The four engine corpora above are this repository's standing set. The full
-live catalogue — every corpus pinned, licence-reviewed and **G7-graded**
-(a five-question retrieval gate whose suite was pre-registered *before*
-retrieval ran) — is browsable at **[hub.xerj.org](https://hub.xerj.org)**
-and queryable live with `xerj corpus list --url <node>`. Pick by the
-project's domain, not by size:
+live catalogue is browsable at **[hub.xerj.org](https://hub.xerj.org)**, with
+one line per corpus in [hub.xerj.org/llms.txt](https://hub.xerj.org/llms.txt);
+what a node has loaded is `xerj corpus list --url <node>`. Every corpus is
+pinned to a commit with its licence recorded per source. **G7** (a
+five-question retrieval gate whose suite was pre-registered *before* retrieval
+ran) has been graded for some corpora and not others, and each hub page says
+which. Pick by the project's domain, not by size:
 
 | the project is… | start with | why |
 |---|---|---|
