@@ -1090,6 +1090,93 @@ fn cpp_declarator_is_const_qualified(node: tree_sitter::Node, source: &[u8]) -> 
     false
 }
 
+/// The literal value of a constant / macro / field declaration, or `None` for
+/// anything else (a function, a type, a declaration with no initialiser).
+///
+/// Applied to a definition's declaration text (the `code` slice of a [`Symbol`],
+/// which is `DefRecord.text`). The per-language rules are fixed by
+/// `docs/CORPUS_HUB_V2_IMPLEMENTATION.md` step 3. The captured value is trimmed
+/// and loses a trailing `;` or `,`.
+pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
+    fn clean(s: &str) -> Option<String> {
+        let v = s.trim().trim_end_matches([';', ',']).trim();
+        (!v.is_empty()).then(|| v.to_string())
+    }
+    use std::sync::OnceLock;
+    static C_DEFINE: OnceLock<regex::Regex> = OnceLock::new();
+    static C_CONST: OnceLock<regex::Regex> = OnceLock::new();
+    static RUST: OnceLock<regex::Regex> = OnceLock::new();
+    static GO: OnceLock<regex::Regex> = OnceLock::new();
+    static UPPER: OnceLock<regex::Regex> = OnceLock::new();
+    match lang {
+        "c" | "cpp" | "objc" => {
+            let def = C_DEFINE
+                .get_or_init(|| regex::Regex::new(r"(?m)^\s*#\s*define\s+(\w+)\s+(.+?)\s*(?:/[/*].*)?$").unwrap());
+            if let Some(c) = def.captures(decl) {
+                if let Some(v) = clean(&c[2]) {
+                    return Some(v);
+                }
+            }
+            let cst = C_CONST.get_or_init(|| {
+                regex::Regex::new(r"\b(?:static\s+)?const\s+\w[\w\s\*]*\b(\w+)\s*=\s*(.+?)\s*;").unwrap()
+            });
+            cst.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        "rust" => {
+            let re = RUST.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(\w+)\s*:\s*[^=]+=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        "go" => {
+            let re = GO.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:const\s+)?(\w+)\s*(?:[\w.\[\]*]+\s+)?=\s*(.+?)\s*$").unwrap()
+            });
+            re.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        "python" | "ruby" | "bash" | "sh" | "shell" => {
+            let re =
+                UPPER.get_or_init(|| regex::Regex::new(r"(?m)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$").unwrap());
+            re.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        _ => None,
+    }
+}
+
+/// Every definition in one file, as [`DefRecord`]s for the hub pack's defs index.
+///
+/// `file_rel` is the path relative to the corpus root (forward slashes), `lang`
+/// is a registry language name (`registry()`), `text` is the file's decoded
+/// contents. Unknown languages yield no records. The declaration text is capped
+/// at 400 chars; constants and macros carry their value ([`extract_value`]).
+pub fn definitions(file_rel: &str, lang: &str, text: &str) -> Vec<xerj_common::hub::DefRecord> {
+    let Some(def) = registry().iter().find(|d| d.name == lang) else {
+        return Vec::new();
+    };
+    parse_symbols(def, text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let decl: String = if s.code.chars().count() > 400 {
+                s.code.chars().take(400).collect()
+            } else {
+                s.code
+            };
+            let value = extract_value(lang, &decl);
+            xerj_common::hub::DefRecord {
+                symbol: s.name,
+                kind: s.kind,
+                lang: lang.to_string(),
+                file: file_rel.to_string(),
+                line: s.line as u32,
+                text: decl,
+                value,
+            }
+        })
+        .collect()
+}
+
 fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut parser = Parser::new();
     parser.set_language(&def.language).ok()?;
