@@ -13,11 +13,11 @@
 //! pack build/pull (Step 2), definitions (Step 3), catalogue + sketch (Step 4),
 //! router + ask (Step 5). Alongside them this file re-exports the shared types.
 
-pub mod sketch;
 pub mod catalogue;
 pub mod node;
 pub mod pack;
 pub mod router;
+pub mod sketch;
 
 pub use xerj_common::hub::{
     render, Answer, AnswerMode, AnsweredFrom, Catalogue, CatalogueEntry, DefRecord, Hit,
