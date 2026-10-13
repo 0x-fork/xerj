@@ -136,9 +136,12 @@ section{margin-bottom:40px}
 .leg{display:flex;flex-direction:column;gap:1px;background:var(--z-line);border:1px solid var(--z-line)}
 .lt{background:var(--z-bg);padding:11px 13px;cursor:pointer;display:flex;align-items:center;gap:9px;user-select:none}
 .lt:hover{background:#fff}.lt .sw{width:12px;height:12px;flex:0 0 12px;border-radius:2px}
-.lt .tx{flex:1;min-width:0}.lt .nm{font-family:var(--fda);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--z-mute);line-height:1.2}
-.lt .vl{font-family:var(--fd);font-weight:800;font-size:22px;line-height:1.05;color:var(--z-ink)}
-.lt.off{opacity:.38}.lt.off .vl{text-decoration:line-through}
+.lt .nm{flex:1;min-width:0;font-family:var(--fda);font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--z-mute);line-height:1.25}
+.lt .vl{font-family:var(--fd);font-weight:800;font-size:19px;line-height:1;color:var(--z-ink);text-align:right;white-space:nowrap;margin-left:auto}
+.lt.off{opacity:.4}.lt.off .vl{text-decoration:line-through}
+.legwrap{display:flex;flex-direction:column;gap:12px}
+.logtog{display:flex;align-items:center;gap:8px;font-family:var(--fda);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--z-mute);cursor:pointer;padding-left:2px}
+.logtog input{accent-color:var(--z-accent);cursor:pointer}
 .chartbox{position:relative;height:430px}
 .grid2{display:grid;grid-template-columns:1.5fr 1fr;gap:32px;align-items:start}
 .mapbox{position:relative;height:440px}
@@ -159,7 +162,7 @@ code{font-family:var(--fm);font-size:.92em;background:var(--z-faint);padding:1px
 <p class="sub" id="upd">loading&hellip;</p>
 <div class="stats" id="stats"></div>
 <section><div class="sh"><h2>Activity over time</h2><span class="hint">click a tile to toggle its series</span></div>
-<div class="actrow"><div class="leg" id="leg"></div><div class="chartbox"><canvas id="ts"></canvas></div></div></section>
+<div class="actrow"><div class="legwrap"><div class="leg" id="leg"></div><label class="logtog"><input type="checkbox" id="logscale"> Log scale</label></div><div class="chartbox"><canvas id="ts"></canvas></div></div></section>
 <section><div class="sh"><h2>Where installs come from</h2><span class="hint" id="geoh"></span></div>
 <div class="grid2"><div class="mapbox"><canvas id="map"></canvas></div><div class="toplist" id="top"></div></div></section>
 <section><div class="sh"><h2>How installs arrive</h2><span class="hint" id="uah"></span></div>
@@ -191,17 +194,24 @@ function render(){
    {lbl:'repo views / day',k:'views',c:C.cmp,ax:'yL',tot:sum('views')},
    {lbl:'unique cloners / day',k:'cloneUniques',c:C.warn,ax:'yL',dash:[4,3],off:true,tot:sum('cloneUniques')},
    {lbl:'unique viewers / day',k:'viewUniques',c:'#9ab0c6',ax:'yL',dash:[4,3],off:true,tot:sum('viewUniques')},
-   {lbl:'stars (total)',k:'cumStars',c:'#b0724e',ax:'yL',tot:T.stars},
+   {lbl:'stars (total)',k:'cumStars',c:'#b0724e',ax:'yL',off:true,tot:T.stars},
    {lbl:'installs / day',k:'installs',c:C.ok,ax:'yR',tot:sum('installs')},
    {lbl:'new stars / day',k:'newStars',c:C.bad,ax:'yR',dash:[2,2],off:true,tot:sum('newStars')}
   ];
-  var dsets=defs.map(function(d){return {label:d.lbl,data:col(d.k),borderColor:d.c,backgroundColor:d.c,yAxisID:d.ax,borderWidth:2,pointRadius:0,pointHoverRadius:3,tension:.25,spanGaps:true,borderDash:d.dash||[],hidden:!!d.off,fill:false}});
-  if(tsChart)tsChart.destroy();
-  tsChart=new Chart(document.getElementById('ts'),{type:'line',data:{labels:labels,datasets:dsets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
-    scales:{x:{grid:grid,ticks:tick},yL:{position:'left',beginAtZero:true,grid:grid,ticks:tick,title:{display:true,text:'clones / views / stars',color:C.mute,font:{size:10}}},yR:{position:'right',beginAtZero:true,grid:{drawOnChartArea:false},ticks:tick,title:{display:true,text:'installs / new stars',color:C.mute,font:{size:10}}}},
-    plugins:{legend:{display:false},tooltip:{backgroundColor:'#fff',titleColor:C.ink,bodyColor:C.ink,borderColor:C.line,borderWidth:1}}}});
-  // tile legend
-  document.getElementById('leg').innerHTML=defs.map(function(d,i){return '<div class="lt'+(d.off?' off':'')+'" data-i="'+i+'"><span class="sw" style="background:'+d.c+'"></span><span class="tx"><span class="nm">'+d.lbl+'</span><span class="vl">'+fmt(d.tot)+'</span></span></div>'}).join('');
+  if(!tsChart){
+    var lt=document.getElementById('logscale').checked?'logarithmic':'linear';
+    var dsets=defs.map(function(d){return {label:d.lbl,data:col(d.k),backgroundColor:d.c,borderColor:d.c,yAxisID:d.ax,borderWidth:0,borderRadius:0,categoryPercentage:0.9,barPercentage:1,hidden:!!d.off}});
+    tsChart=new Chart(document.getElementById('ts'),{type:'bar',data:{labels:labels,datasets:dsets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      scales:{x:{grid:grid,ticks:tick},yL:{type:lt,position:'left',beginAtZero:true,grid:grid,ticks:tick,title:{display:true,text:'clones / views / stars',color:C.mute,font:{size:10}}},yR:{type:lt,position:'right',beginAtZero:true,grid:{drawOnChartArea:false},ticks:tick,title:{display:true,text:'installs / new stars',color:C.mute,font:{size:10}}}},
+      plugins:{legend:{display:false},tooltip:{backgroundColor:'#fff',titleColor:C.ink,bodyColor:C.ink,borderColor:C.line,borderWidth:1}}}});
+  }else{
+    tsChart.data.labels=labels;
+    defs.forEach(function(d,i){tsChart.data.datasets[i].data=col(d.k)});
+    tsChart.update();
+  }
+  // tile legend: shows totals (right-aligned) and the CURRENT toggle state,
+  // which survives live refreshes because the chart is updated in place.
+  document.getElementById('leg').innerHTML=defs.map(function(d,i){var off=!tsChart.isDatasetVisible(i);return '<div class="lt'+(off?' off':'')+'" data-i="'+i+'"><span class="sw" style="background:'+d.c+'"></span><span class="nm">'+d.lbl+'</span><span class="vl">'+fmt(d.tot)+'</span></div>'}).join('');
   [].forEach.call(document.querySelectorAll('.lt'),function(el){el.onclick=function(){var i=+el.dataset.i;var vis=tsChart.isDatasetVisible(i);tsChart.setDatasetVisibility(i,!vis);tsChart.update();el.classList.toggle('off',vis)}});
   // installers
   var uf=DATA.uaCounts||{};var ufa=Object.keys(uf).map(function(k){return {name:k,count:uf[k]}}).sort(function(a,b){return b.count-a.count});
@@ -239,6 +249,7 @@ function drawMap(cs,cmax){
 function footer(){document.getElementById('foot').innerHTML='GitHub stars/forks/releases from the API; clones, views and uniques from the traffic API (14-day window, snapshotted '+(DATA.cadence||'daily')+' so history persists). Website installs are the /get request log in R2 — country from Cloudflare geo, no IP, no cookie, no identifier (so no per-visitor dedup). Private dashboard, key-gated.';}
 function fetchData(){return fetch('data.json'+KEYQ).then(function(r){return r.json()}).then(function(d){DATA=d;lastFetch=Date.now();render();footer()}).catch(function(e){document.getElementById('upd').textContent='fetch error: '+e})}
 fetchData();
+document.getElementById('logscale').onchange=function(){var t=this.checked?'logarithmic':'linear';if(tsChart){tsChart.options.scales.yL.type=t;tsChart.options.scales.yR.type=t;tsChart.update();}};
 setInterval(function(){var f=document.getElementById('fresh');if(f)f.textContent='view refreshed '+ago(lastFetch);document.getElementById('live').textContent='live';},1000);
 setInterval(fetchData,60000);
 </script></body></html>`;
