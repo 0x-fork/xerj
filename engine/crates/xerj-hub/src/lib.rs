@@ -11,8 +11,9 @@
 //!
 //! Modules are added step by step per the implementation plan:
 //! pack build/pull (Step 2), definitions (Step 3), catalogue + sketch (Step 4),
-//! router + ask (Step 5). This file carries only the shared re-exports until
-//! those land.
+//! router + ask (Step 5). Alongside them this file re-exports the shared types.
+
+pub mod sketch;
 
 pub use xerj_common::hub::{
     render, Answer, AnswerMode, AnsweredFrom, Catalogue, CatalogueEntry, DefRecord, Hit,

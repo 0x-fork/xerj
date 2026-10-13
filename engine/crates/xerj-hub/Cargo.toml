@@ -11,6 +11,7 @@ xerj-common = { path = "../xerj-common" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 anyhow.workspace = true
+base64 = "0.23.1"
 
 [dev-dependencies]
 tempfile.workspace = true

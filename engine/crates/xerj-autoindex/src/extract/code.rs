@@ -1090,6 +1090,97 @@ fn cpp_declarator_is_const_qualified(node: tree_sitter::Node, source: &[u8]) -> 
     false
 }
 
+/// The literal value of a constant / macro / field declaration, or `None` for
+/// anything else (a function, a type, a declaration with no initialiser).
+///
+/// Applied to a definition's declaration text (the `code` slice of a [`Symbol`],
+/// which is `DefRecord.text`). The per-language rules are fixed by
+/// `docs/CORPUS_HUB_V2_IMPLEMENTATION.md` step 3. The captured value is trimmed
+/// and loses a trailing `;` or `,`.
+pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
+    fn clean(s: &str) -> Option<String> {
+        let v = s.trim().trim_end_matches([';', ',']).trim();
+        (!v.is_empty()).then(|| v.to_string())
+    }
+    use std::sync::OnceLock;
+    static C_DEFINE: OnceLock<regex::Regex> = OnceLock::new();
+    static C_CONST: OnceLock<regex::Regex> = OnceLock::new();
+    static RUST: OnceLock<regex::Regex> = OnceLock::new();
+    static GO: OnceLock<regex::Regex> = OnceLock::new();
+    static UPPER: OnceLock<regex::Regex> = OnceLock::new();
+    match lang {
+        "c" | "cpp" | "objc" => {
+            let def = C_DEFINE.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*#\s*define\s+(\w+)\s+(.+?)\s*(?:/[/*].*)?$").unwrap()
+            });
+            if let Some(c) = def.captures(decl) {
+                if let Some(v) = clean(&c[2]) {
+                    return Some(v);
+                }
+            }
+            let cst = C_CONST.get_or_init(|| {
+                regex::Regex::new(r"\b(?:static\s+)?const\s+\w[\w\s\*]*\b(\w+)\s*=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            cst.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        "rust" => {
+            let re = RUST.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(\w+)\s*:\s*[^=]+=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        "go" => {
+            let re = GO.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:const\s+)?(\w+)\s*(?:[\w.\[\]*]+\s+)?=\s*(.+?)\s*$")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        "python" | "ruby" | "bash" | "sh" | "shell" => {
+            let re = UPPER.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$").unwrap()
+            });
+            re.captures(decl).and_then(|c| clean(&c[2]))
+        }
+        _ => None,
+    }
+}
+
+/// Every definition in one file, as [`DefRecord`]s for the hub pack's defs index.
+///
+/// `file_rel` is the path relative to the corpus root (forward slashes), `lang`
+/// is a registry language name (`registry()`), `text` is the file's decoded
+/// contents. Unknown languages yield no records. The declaration text is capped
+/// at 400 chars; constants and macros carry their value ([`extract_value`]).
+pub fn definitions(file_rel: &str, lang: &str, text: &str) -> Vec<xerj_common::hub::DefRecord> {
+    let Some(def) = registry().iter().find(|d| d.name == lang) else {
+        return Vec::new();
+    };
+    parse_symbols(def, text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let decl: String = if s.code.chars().count() > 400 {
+                s.code.chars().take(400).collect()
+            } else {
+                s.code
+            };
+            let value = extract_value(lang, &decl);
+            xerj_common::hub::DefRecord {
+                symbol: s.name,
+                kind: s.kind,
+                lang: lang.to_string(),
+                file: file_rel.to_string(),
+                line: s.line as u32,
+                text: decl,
+                value,
+            }
+        })
+        .collect()
+}
+
 fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut parser = Parser::new();
     parser.set_language(&def.language).ok()?;
@@ -4203,5 +4294,55 @@ mod tests {
         assert!(has(&s, "mint", "function"), "got {s:?}");
         assert!(has(&s, "onlyOwner", "function"), "got {s:?}");
         assert!(has(&s, "min", "function"), "got {s:?}");
+    }
+
+    /// The five literal cases fixed by `docs/CORPUS_HUB_V2_IMPLEMENTATION.md`
+    /// step 3: each value regex returns exactly this string (trailing comment
+    /// and `;`/`,` removed), and a bare signature is not a value.
+    #[test]
+    fn extract_value_literals() {
+        // C `#define` with a trailing block comment: the token, comment dropped.
+        assert_eq!(
+            extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
+            Some("0".to_string())
+        );
+        // Rust `pub(crate) const` with a typed initialiser: the whole RHS.
+        assert_eq!(
+            extract_value(
+                "rust",
+                "pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);"
+            ),
+            Some("Duration::from_secs(30)".to_string())
+        );
+        // C `#define` whose value is a parenthesised conditional expression.
+        assert_eq!(
+            extract_value("c", "#define MDB_MAXKEYSIZE ((MDB_DEVEL) ? 0 : 511)"),
+            Some("((MDB_DEVEL) ? 0 : 511)".to_string())
+        );
+        // Go const-block line: the shift expression, no trailing semicolon.
+        assert_eq!(
+            extract_value("go", "batchSize = 16 << 20"),
+            Some("16 << 20".to_string())
+        );
+        // A function signature carries no value.
+        assert_eq!(extract_value("rust", "fn main() {"), None);
+    }
+
+    /// `definitions` turns parsed symbols into `DefRecord`s: a `const` carries
+    /// its literal value and the 1-based line its name sits on; a function none.
+    #[test]
+    fn definitions_rust_const_and_fn() {
+        // `pub const LIMIT` on line 1, `fn helper` on line 2.
+        let src = "pub const LIMIT: u32 = 128;\nfn helper() {}\n";
+        let defs = definitions("src/lib.rs", "rust", src);
+        let Some(limit) = defs.iter().find(|d| d.symbol == "LIMIT") else {
+            panic!("no LIMIT def in {defs:?}");
+        };
+        assert_eq!(limit.value, Some("128".to_string()), "got {limit:?}");
+        assert_eq!(limit.line, 1, "got {limit:?}");
+        // The function declaration, if captured, has no value.
+        if let Some(helper) = defs.iter().find(|d| d.symbol == "helper") {
+            assert_eq!(helper.value, None, "got {helper:?}");
+        }
     }
 }
