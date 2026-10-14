@@ -23,6 +23,7 @@ pub mod node;
 pub mod pack;
 pub mod router;
 pub mod sketch;
+pub mod sync;
 
 pub use xerj_common::hub::{
     render, Answer, AnswerMode, AnsweredFrom, Catalogue, CatalogueEntry, DefRecord, Hit,

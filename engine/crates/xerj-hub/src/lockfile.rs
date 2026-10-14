@@ -14,9 +14,9 @@
 //! - the `xerj hub status` data model + plain-text renderer
 //!   ([`gather_status`] / [`render_status`]).
 //!
-//! `xerj hub sync` is **DEFERRED (step 8b)**: it needs the step-2 pull/restore
-//! path another agent is building, so [`sync`] returns an explanatory error
-//! rather than faking a no-op. See its doc comment.
+//! `xerj hub sync` is not here: it drives the pull path, so it lives next to the
+//! other subcommands that do (`crate::sync`). This module only owns the on-disk
+//! layout names it shares (`packs/`, `pack.json`, `last_used`, `last_sync`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -238,23 +238,34 @@ fn question_asks_for_current(question: &str) -> bool {
 // xerj hub status
 // ---------------------------------------------------------------------------
 
-const PACKS_DIR: &str = "packs";
-const PACK_MANIFEST_FILE: &str = "pack.json";
-const LAST_USED_FILE: &str = "last_used";
+pub(crate) const PACKS_DIR: &str = "packs";
+pub(crate) const PACK_MANIFEST_FILE: &str = "pack.json";
+pub(crate) const LAST_USED_FILE: &str = "last_used";
 const NODE_PID_FILE: &str = "node.pid";
 const NODE_PORT_FILE: &str = "node.port";
 const CONFIG_FILE: &str = "config.toml";
-const LAST_SYNC_FILE: &str = "last_sync";
+pub(crate) const LAST_SYNC_FILE: &str = "last_sync";
 const CATALOGUE_FILE: &str = "catalogue.json";
 
 /// The default value reported for the `hosted` setting when `config.toml` is
 /// absent or does not set it.
 const DEFAULT_HOSTED: &str = "auto";
 
-/// The default hub root, `~/.xerj/hub`. `status` takes the root as a parameter
-/// (so tests inject a temp dir); callers that want the real location pass this.
+/// The default hub root: `XERJ_HUB_HOME` when set (the override every `xerj hub`
+/// subcommand honours), else `~/.xerj/hub`. `status` takes the root as a
+/// parameter (so tests inject a temp dir); callers that want the real location
+/// pass this.
 pub fn default_hub_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
+    hub_root_from(&|key| std::env::var_os(key))
+}
+
+/// [`default_hub_root`] over an injectable environment, so the rule is testable
+/// without mutating the process-global one.
+pub(crate) fn hub_root_from(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(h) = env("XERJ_HUB_HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(h);
+    }
+    let home = env("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".xerj").join("hub")
@@ -444,26 +455,6 @@ pub fn render_status(status: &HubStatus) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// xerj hub sync — DEFERRED (step 8b): needs step-2 pull
-// ---------------------------------------------------------------------------
-
-/// `xerj hub sync` — **DEFERRED (step 8b): needs step-2 pull**.
-///
-/// The full sync (refresh the catalogue; for every cached pack whose catalogue
-/// pin is newer, pull the new pin and remove the old dir after the new one is
-/// restored; verify signatures; prune to the disk budget; write
-/// `~/.xerj/hub/last_sync`) all hinges on the step-2 pull/restore path another
-/// agent is building. Rather than fake a no-op sync, this returns an error that
-/// names the dependency, so a caller cannot mistake "nothing happened" for a
-/// successful refresh. Wire the real body here once `pack::pull` lands.
-pub fn sync(_hub_root: &Path) -> Result<()> {
-    anyhow::bail!(
-        "xerj hub sync is not implemented yet: it depends on the step-2 pull/restore path \
-         (deferred to step 8b)"
-    )
-}
-
-// ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
 
@@ -480,7 +471,7 @@ fn read_trimmed(path: &Path) -> Option<String> {
 
 /// Total size in bytes of a directory tree (files only; symlinks skipped so a
 /// cycle cannot hang the walk).
-fn dir_size(dir: &Path) -> u64 {
+pub(crate) fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -539,7 +530,7 @@ fn days_ago(age: Option<i64>) -> String {
 }
 
 /// Human-readable byte size, e.g. `0 B`, `512 B`, `2.0 MB`.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
     let mut unit = 0;
@@ -868,10 +859,33 @@ mod tests {
     }
 
     #[test]
-    fn sync_is_deferred() {
-        let tmp = tempdir().unwrap();
-        let err = sync(tmp.path()).unwrap_err().to_string();
-        assert!(err.contains("step-2"), "err was: {err}");
+    fn hub_root_honours_the_override_then_home() {
+        use std::ffi::OsString;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| -> Option<OsString> {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| OsString::from(*v))
+            }
+        };
+        // XERJ_HUB_HOME wins — the same override `xerj hub pull` honours, so a
+        // sync and the pulls it drives always look at one cache.
+        assert_eq!(
+            hub_root_from(&env(&[("XERJ_HUB_HOME", "/srv/hub"), ("HOME", "/home/u")])),
+            PathBuf::from("/srv/hub")
+        );
+        // An EMPTY override is not an override.
+        assert_eq!(
+            hub_root_from(&env(&[("XERJ_HUB_HOME", ""), ("HOME", "/home/u")])),
+            PathBuf::from("/home/u/.xerj/hub")
+        );
+        assert_eq!(
+            hub_root_from(&env(&[("HOME", "/home/u")])),
+            PathBuf::from("/home/u/.xerj/hub")
+        );
+        // No HOME at all degrades to a relative path, never a panic.
+        assert_eq!(hub_root_from(&env(&[])), PathBuf::from("./.xerj/hub"));
     }
 
     // ---- small helpers ---------------------------------------------------
