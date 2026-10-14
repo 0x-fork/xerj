@@ -364,6 +364,25 @@ pub fn load_catalogue(hub_url: &str, cache_dir: &Path, offline: bool) -> Result<
     }
 }
 
+/// Ask the hub for the catalogue NOW, ignoring the 24 h freshness window that
+/// [`load_catalogue`] honours. `xerj hub sync` calls this: a sync that trusted a
+/// young cache would never see a pin that moved this morning.
+///
+/// The request is still conditional (`If-None-Match` from `catalogue.etag`, so an
+/// unchanged catalogue costs a 304) and the detached signature is still verified
+/// BEFORE the fetched bytes replace the cache. Unlike [`load_catalogue`] it does
+/// not fall back to the cached copy on failure: the caller asked "is there
+/// something newer?", and answering from a stale copy would be a wrong "no". On
+/// any network, signature or parse failure the error is returned and the cache
+/// is left exactly as it was.
+pub fn refresh_catalogue(hub_url: &str, cache_dir: &Path) -> Result<Catalogue> {
+    fetch_and_store(
+        hub_url,
+        &cache_dir.join(CACHE_FILE),
+        &cache_dir.join(ETAG_FILE),
+    )
+}
+
 /// Read and validate the cached catalogue, or `None` if it is missing,
 /// unreadable, unparsable or a format version this client does not speak.
 fn read_cached(cache_file: &Path) -> Option<Catalogue> {
@@ -885,6 +904,71 @@ mod tests {
         // the verified bytes are now cached, byte-for-byte
         let on_disk = fs::read(cache.path().join(CACHE_FILE)).unwrap();
         assert_eq!(on_disk, good_bytes);
+    }
+
+    #[test]
+    fn refresh_ignores_a_young_cache_and_fetches_the_newer_catalogue() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fx = tempfile::tempdir().unwrap();
+        let inputs = two_inputs(fx.path());
+
+        // A YOUNG cache holding yesterday's catalogue: `load_catalogue` trusts it.
+        let (old_seed, _old_public) = keypair();
+        let (old_cat, old_sig) =
+            build_catalogue(&inputs, "2026-10-13T00:00:00Z", &old_seed).unwrap();
+        let old_bytes = canonical_json(&old_cat).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        seed_cache(cache.path(), &old_bytes, &old_sig);
+
+        // The hub now serves a newer catalogue, signed by the key the client trusts.
+        let (new_seed, new_public) = keypair();
+        let (new_cat, new_sig) =
+            build_catalogue(&inputs, "2026-10-14T00:00:00Z", &new_seed).unwrap();
+        let new_bytes = canonical_json(&new_cat).unwrap();
+        let (url, handle) = spawn_hub(new_bytes.clone(), new_sig);
+
+        std::env::set_var("XERJ_HUB_PUBKEY", &new_public);
+        let trusted = load_catalogue(&url, cache.path(), false).expect("young cache is served");
+        assert_eq!(
+            trusted.generated_at, "2026-10-13T00:00:00Z",
+            "load_catalogue trusts a young cache without asking the hub"
+        );
+        let refreshed = refresh_catalogue(&url, cache.path()).expect("forced refresh");
+        std::env::remove_var("XERJ_HUB_PUBKEY");
+        handle.join().unwrap();
+
+        assert_eq!(
+            refreshed.generated_at, "2026-10-14T00:00:00Z",
+            "refresh_catalogue asked the hub despite the young cache"
+        );
+        let on_disk = fs::read(cache.path().join(CACHE_FILE)).unwrap();
+        assert_eq!(on_disk, new_bytes, "the verified bytes replaced the cache");
+    }
+
+    #[test]
+    fn refresh_reports_a_tampered_catalogue_instead_of_serving_the_cache() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fx = tempfile::tempdir().unwrap();
+        let (good_bytes, good_sig, public) = fixture_bytes(fx.path());
+        let cache = tempfile::tempdir().unwrap();
+        seed_cache(cache.path(), &good_bytes, &good_sig);
+
+        let mut tampered = good_bytes.clone();
+        tampered[good_bytes.len() / 2] ^= 0x01;
+        let (url, handle) = spawn_hub(tampered, good_sig.clone());
+
+        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        let err = refresh_catalogue(&url, cache.path())
+            .expect_err("a refresh that cannot be verified is an error, not a stale answer");
+        std::env::remove_var("XERJ_HUB_PUBKEY");
+        handle.join().unwrap();
+
+        assert!(
+            format!("{err:#}").contains("signature"),
+            "the error names the signature check: {err:#}"
+        );
+        let on_disk = fs::read(cache.path().join(CACHE_FILE)).unwrap();
+        assert_eq!(on_disk, good_bytes, "the cache is untouched");
     }
 
     #[test]

@@ -42,6 +42,9 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
 
   build-pack <slug> --registry <dir> --out <dir> --url <node> --sign-key <seed-file>
         Build a signed, pre-indexed pack from a registry manifest (CI).
+  sync [--url <node>] | sync --install-timer
+        Refresh the catalogue and bring every cached pack up to its pin;
+        --install-timer schedules that every 6 hours (see `xerj hub sync -h`).
   pull <slug> [--quiet] [--url <node>]
         Download, verify and restore a pack, then `xerj code <slug>` works.
 
@@ -57,6 +60,7 @@ pub fn run_hub_cli(args: &[String]) -> i32 {
     let rest = &args[1..];
     match sub.as_str() {
         "build-pack" => run_build_pack(rest),
+        "sync" => crate::sync::run_sync(rest),
         "pull" => run_pull(rest),
         "-h" | "--help" | "help" => {
             println!("{HUB_USAGE}");
