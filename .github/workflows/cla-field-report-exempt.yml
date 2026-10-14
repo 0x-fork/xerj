@@ -55,7 +55,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
-      - name: Provide verification/cla-signed for a field-report-only PR
+      - name: Provide verification/cla-signed for a field-report-only or self-CLA-signature PR
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -71,6 +71,14 @@ jobs:
               -f description="Field-report-only PR: CLA gate waived for user-feedback/16-agent-field-reports/*.md" \
               -f target_url="https://github.com/${REPO}/blob/main/user-feedback/16-agent-field-reports/README.md" \
               || echo "note: could not post the status (insufficient token permissions?). cla-bot remains authoritative."
+          elif python3 scripts/check_cla_coauthors.py --is-self-cla-signature --pr "$PR_NUMBER" --changed-files "$FILES"; then
+            echo "PR #${PR_NUMBER} is a valid self-CLA signature in .contributors; posting verification/cla-signed=success."
+            gh api -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+              -f context=verification/cla-signed \
+              -f state=success \
+              -f description="CLA signature PR: author added own login to .contributors per CLA.md" \
+              -f target_url="https://github.com/${REPO}/blob/main/CLA.md" \
+              || echo "note: could not post the status (insufficient token permissions?). cla-bot remains authoritative."
           else
-            echo "PR #${PR_NUMBER} touches non-field-report paths; leaving verification/cla-signed to cla-bot."
+            echo "PR #${PR_NUMBER} is neither field-report-only nor a self-CLA signature; leaving verification/cla-signed to cla-bot."
           fi

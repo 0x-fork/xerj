@@ -21,6 +21,7 @@ from check_cla_coauthors import (
     FIELD_REPORT_DIR,
     check_commits,
     is_field_report_only,
+    is_self_cla_signature,
     noreply_login,
     parse_coauthors,
 )
@@ -213,6 +214,133 @@ class FieldReportExemptionTests(unittest.TestCase):
         )
 
 
+class SelfClaSignatureTests(unittest.TestCase):
+    """Self-signing .contributors PRs (e.g. #1375, #1366, #1355, #1342) deadlock
+    on cla-bot because cla-bot reads .contributors from `main`. The narrow
+    self-signature predicate satisfies `verification/cla-signed` only when a PR
+    exclusively adds its own author to .contributors."""
+
+    BASE = ["xerj-org", "dependabot[bot]", "buger"]
+    COMMITS = [
+        {
+            "sha": "9bd098c0",
+            "message": "chore: add todie to .contributors (CLA signature)",
+            "author_login": "todie",
+        }
+    ]
+
+    def test_valid_self_signature_passes(self):
+        self.assertTrue(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["todie"],
+                pr_author="todie",
+                commits=self.COMMITS,
+                resolve=no_network,
+            )
+        )
+
+    def test_case_insensitive_author_match_passes(self):
+        self.assertTrue(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["todie"],
+                pr_author="Todie",
+                commits=self.COMMITS,
+                resolve=no_network,
+            )
+        )
+
+    def test_touching_any_other_file_is_rejected(self):
+        self.assertFalse(
+            is_self_cla_signature(
+                paths=[".contributors", "engine/src/lib.rs"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["todie"],
+                pr_author="todie",
+                commits=self.COMMITS,
+                resolve=no_network,
+            )
+        )
+
+    def test_adding_another_user_is_rejected(self):
+        self.assertFalse(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["someone-else"],
+                pr_author="todie",
+                commits=self.COMMITS,
+                resolve=no_network,
+            )
+        )
+
+    def test_adding_self_plus_another_user_is_rejected(self):
+        self.assertFalse(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["todie", "someone-else"],
+                pr_author="todie",
+                commits=self.COMMITS,
+                resolve=no_network,
+            )
+        )
+
+    def test_removing_existing_contributor_is_rejected(self):
+        self.assertFalse(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=["xerj-org", "dependabot[bot]", "todie"],
+                pr_author="todie",
+                commits=self.COMMITS,
+                resolve=no_network,
+            )
+        )
+
+    def test_commit_by_different_author_is_rejected(self):
+        commits = [
+            {
+                "sha": "9bd098c0",
+                "message": "chore: add todie to .contributors",
+                "author_login": "other-user",
+            }
+        ]
+        self.assertFalse(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["todie"],
+                pr_author="todie",
+                commits=commits,
+                resolve=no_network,
+            )
+        )
+
+    def test_unsigned_coauthor_trailer_is_rejected(self):
+        commits = [
+            {
+                "sha": "9bd098c0",
+                "message": "chore: add todie to .contributors\n\n"
+                "Co-authored-by: Unsigned <99+unsigned@users.noreply.github.com>",
+                "author_login": "todie",
+            }
+        ]
+        self.assertFalse(
+            is_self_cla_signature(
+                paths=[".contributors"],
+                base_contributors=self.BASE,
+                head_contributors=self.BASE + ["todie"],
+                pr_author="todie",
+                commits=commits,
+                resolve=no_network,
+            )
+        )
+
+
 class WiringTests(unittest.TestCase):
     """A checker CI never runs is not a gate (cf. the #207 lesson)."""
 
@@ -238,13 +366,14 @@ class WiringTests(unittest.TestCase):
 
     def test_a_separate_job_provides_the_field_report_status(self):
         # cla-bot cannot path-scope itself, so the required `verification/cla-signed`
-        # status for a strictly field-report-only PR is provided by a dedicated
-        # workflow, guarded by the same predicate.
+        # status for a strictly field-report-only PR (or a self-CLA signature PR)
+        # is provided by a dedicated workflow, guarded by the same predicates.
         wf = REPO_ROOT / ".github" / "workflows" / "cla-field-report-exempt.yml"
         self.assertTrue(wf.exists(), "field-report exemption workflow missing")
         text = wf.read_text()
         self.assertIn("verification/cla-signed", text)
         self.assertIn("--is-field-report-only", text)
+        self.assertIn("--is-self-cla-signature", text)
         # It must never run the PR's own code under the elevated token.
         self.assertIn("pull_request_target", text)
         self.assertIn("base.sha", text)
