@@ -182,13 +182,16 @@ fn build_entry(input: &CorpusBuildInput) -> Result<CatalogueEntry> {
                 path.display()
             )
         })?;
-        let spdx = review.spdx.trim().to_string();
+        // Most restrictive class across all repos — a single GPL/mixed sub-repo
+        // must not be masked by a permissive sibling. `licence_spdx` must name
+        // the SAME repo whose class wins: otherwise a GPL sub-repo behind a
+        // permissive FIRST sibling emits {licence_spdx:"MIT", licence_class:
+        // ApproachOnly} — a correct verdict with a misleading SPDX, so step 5's
+        // warning reads "approach-only licence (MIT)". Take both from that repo.
+        let (class, spdx) = most_restrictive_class(&m.repos, path)?;
         if spdx.is_empty() {
             bail!("manifest {}: empty review.spdx", path.display());
         }
-        // Most restrictive class across all repos — a single GPL/mixed sub-repo
-        // must not be masked by a permissive sibling.
-        let class = most_restrictive_class(&m.repos, path)?;
         (spdx, class, first.sha.trim().to_string(), review.at.clone())
     };
 
@@ -277,8 +280,14 @@ fn restrictiveness(c: LicenceClass) -> u8 {
     }
 }
 
-fn most_restrictive_class(repos: &[ManifestRepo], path: &Path) -> Result<LicenceClass> {
-    let mut worst: Option<LicenceClass> = None;
+/// The most restrictive licence class across all repos, paired with the SPDX id
+/// of the FIRST repo that attains it. "most restrictive wins" so a single
+/// GPL/mixed sub-repo is never masked by a permissive sibling, and returning
+/// that repo's SPDX too keeps `licence_spdx` and `licence_class` describing one
+/// and the same repo. Fail-closed: a repo with no review, or an unknown
+/// `review.use`, is an error — never a silently-permissive default.
+fn most_restrictive_class(repos: &[ManifestRepo], path: &Path) -> Result<(LicenceClass, String)> {
+    let mut worst: Option<(LicenceClass, String)> = None;
     for repo in repos {
         let review = repo
             .review
@@ -291,10 +300,15 @@ fn most_restrictive_class(repos: &[ManifestRepo], path: &Path) -> Result<Licence
                 review.use_
             )
         })?;
-        worst = Some(match worst {
-            Some(w) if restrictiveness(w) >= restrictiveness(class) => w,
-            _ => class,
-        });
+        // Strictly-more-restrictive replaces; a tie keeps the earlier repo, so
+        // `worst` is set by the FIRST repo reaching the maximum restrictiveness.
+        let more_restrictive = match &worst {
+            Some((w, _)) => restrictiveness(class) > restrictiveness(*w),
+            None => true,
+        };
+        if more_restrictive {
+            worst = Some((class, review.spdx.trim().to_string()));
+        }
     }
     worst.ok_or_else(|| anyhow!("manifest {}: no repos to classify", path.display()))
 }
@@ -695,6 +709,54 @@ mod tests {
         let (seed, _public) = keypair();
         let (cat, _sig) = build_catalogue(&[input], "2026-10-14T00:00:00Z", &seed).unwrap();
         assert_eq!(cat.corpora[0].licence_class, LicenceClass::ApproachOnly);
+    }
+
+    #[test]
+    fn licence_spdx_follows_most_restrictive_repo() {
+        // A multi-repo manifest whose FIRST repo is permissive (MIT) and whose
+        // second is restrictive (GPL). `licence_class` already followed the most
+        // restrictive repo; `licence_spdx` must now name that SAME repo, so the
+        // entry is {GPL-3.0-only, ApproachOnly}, not {MIT, ApproachOnly}.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("multi.json");
+        let json = serde_json::json!({
+            "corpus": "multi",
+            "cloned_at": "2026-10-02T00:49:45Z",
+            "repos": [
+                {
+                    "repo": "permissive",
+                    "sha": "1111111111111111111111111111111111111111",
+                    "review": { "spdx": "MIT", "use": "adapt-with-attribution", "at": "2026-10-02" }
+                },
+                {
+                    "repo": "restrictive",
+                    "sha": "2222222222222222222222222222222222222222",
+                    "review": { "spdx": "GPL-3.0-only", "use": "approach-only", "at": "2026-10-02" }
+                }
+            ]
+        });
+        fs::write(&p, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let input = CorpusBuildInput {
+            manifest_path: p,
+            domain: "DB".into(),
+            refresh_cadence_days: 7,
+            pack_bytes: 1,
+            pack_url: "u".into(),
+            pack_sha256: "d".repeat(64),
+            sig_url: "s".into(),
+            quality_grade: None,
+            terms: vec![],
+            pin_sha: String::new(),
+            ask_for: "x".into(),
+        };
+        let (seed, _public) = keypair();
+        let (cat, _sig) = build_catalogue(&[input], "2026-10-14T00:00:00Z", &seed).unwrap();
+        let e = &cat.corpora[0];
+        assert_eq!(e.licence_class, LicenceClass::ApproachOnly);
+        assert_eq!(e.licence_spdx, "GPL-3.0-only");
+        // the pin sha still comes from the FIRST repo — unchanged by this fix.
+        assert_eq!(e.pin_sha, "1111111111111111111111111111111111111111");
     }
 
     /// Build a catalogue, return `(bytes, sig, pubkey)` ready to seed a cache.
