@@ -361,6 +361,7 @@ client appears in a source file this list does not account for:
 | **`xerj autoindex s3://`** (client, not the node) — `--endpoint-url`, `AWS_*` | S3 requests to the configured endpoint: bucket and key names and the credentials; the objects travel INTO the machine, and their text then goes to the node URL you gave the client | While that command runs | Off: only when you pass an `s3://` root |
 | **`xerj autoindex s3:// --watch`** (client, not the node) — `--interval`, `--endpoint-url`, `AWS_*` | The same S3 requests as above, repeated every interval: a `ListObjectsV2` page per cycle plus a GET per changed object. Billed to the operator's object-store account, so the run keeps a spend ledger and stops at its budget | Every `--interval` while the watch runs | Off: only with `--watch` on an `s3://` root |
 | **`xerj corpus build`** (client, not the node) — recipe `[[sources]]` `url` | HTTPS GETs to the source URLs your recipe names (one per `http-zip` source per build, plus the `git clone`/`fetch` a `git` source runs). Records travel INTO the machine; no document text and no credentials are sent upstream — it is a read-only fetch | While `xerj corpus build` runs | Off: only when a recipe declares an `http-zip` or `git` source |
+| **`xerj hub pull`** (client, not the node) — `XERJ_HUB_URL` | GETs to the hub (`https://hub.xerj.org` unless `XERJ_HUB_URL` names another): the signed corpus catalogue (a conditional GET that carries the ETag of your cached copy, when there is one) and its `.sig`, then the one pack you named and its `.sig`. The requests name the catalogue and that pack, so the hub can see which corpus you pulled. Packs travel INTO the machine; no document text, no query text and no credentials are sent upstream — it is a read-only fetch. The pack is then restored into the node URL you gave the client | While `xerj hub pull` runs; a catalogue cached within the last 24 hours is reused without a request | Off: only when you run `xerj hub pull` |
 
 A node started with the defaults opens none of these connections, and makes no
 telemetry, update-check or licence call. Two things outside the node complete
@@ -371,8 +372,8 @@ the picture:
   [air-gapped recipe](./recipes/air-gapped-deployment.md) names the three pages
   that link the fonts, and a blocked request falls back to system fonts.
 - **The command-line clients in the same binary** (`xerj autoindex`,
-  `xerj mcp`, `xerj search` and the others) send what they read to the node URL
-  you give them, `http://localhost:9200` unless you say otherwise.
+  `xerj mcp`, `xerj search`, `xerj hub` and the others) send what they read to
+  the node URL you give them, `http://localhost:9200` unless you say otherwise.
   `xerj feedback --open-pr` runs your `gh` to open a GitHub pull request with
   the report it drafted; without that flag it does nothing over the network.
 
