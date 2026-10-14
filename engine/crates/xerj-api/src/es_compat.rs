@@ -10205,6 +10205,82 @@ fn search_actor_class(size: usize, index: &str) -> &'static str {
     }
 }
 
+/// How a search the node issues to ITSELF differs from one that arrived over
+/// HTTP. Only [`crate::hub_api`]'s in-process caller sets it, around the one
+/// internal request it makes; a request off the wire cannot carry it, because it
+/// is a task-local and not a header, a parameter or a body field.
+///
+/// Both effects exist because the hosted hub's routes are public and a pack's
+/// contents are not the operator's: neither may be a lever on the node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InProcessSearch {
+    /// Do not append this search to the audit ring. The ring is a bounded piece
+    /// of operator evidence shared by the whole node (4,096 entries); a public
+    /// route that appended one entry per request would let a crowd of strangers
+    /// age every earlier entry out of it. The HTTP access log still records the
+    /// request.
+    pub skip_audit: bool,
+    /// A fan-out over several indices skips an index whose search fails — it
+    /// is counted in `_shards.failed` and logged — instead of failing the whole
+    /// request. One pack with an unusable mapping must not take `search` down
+    /// for every other pack. When EVERY index fails the first failure is still
+    /// returned, so an outage never reads as "no results".
+    pub skip_failed_indices: bool,
+}
+
+tokio::task_local! {
+    static IN_PROCESS_SEARCH: InProcessSearch;
+}
+
+/// Run `fut` — the whole internal request, handler included — with `mode`
+/// installed. Same shape as `xerj_engine::index_guard::scoped`, and for the same
+/// reason: the handler reads it on the task that drives `fut`.
+pub(crate) async fn scoped_in_process_search<F>(mode: InProcessSearch, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    IN_PROCESS_SEARCH.scope(mode, fut).await
+}
+
+/// The mode the current request runs under; the default (a request off the
+/// wire, or engine-internal work) changes nothing.
+fn in_process_search() -> InProcessSearch {
+    IN_PROCESS_SEARCH.try_with(|m| *m).unwrap_or_default()
+}
+
+/// Bookkeeping for [`InProcessSearch::skip_failed_indices`]: how many indices a
+/// fan-out tried, how many failed, and the first failure to report if all did.
+#[derive(Default)]
+struct SkippedIndices {
+    searched: u32,
+    failed: u32,
+    first_failure: Option<Response>,
+}
+
+impl SkippedIndices {
+    /// One more index was attempted.
+    fn attempt(&mut self) {
+        self.searched += 1;
+    }
+
+    /// An attempted index failed with `why`; keep the first such response.
+    fn skip(&mut self, why: impl FnOnce() -> Response) {
+        self.failed += 1;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(why());
+        }
+    }
+
+    /// The failure to answer with when nothing at all could be searched.
+    fn all_failed(self) -> Option<Response> {
+        if self.failed > 0 && self.failed == self.searched {
+            self.first_failure
+        } else {
+            None
+        }
+    }
+}
+
 async fn search_impl(
     state: AppState,
     index: String,
@@ -10213,6 +10289,9 @@ async fn search_impl(
     body: EsSearchJson,
 ) -> Response {
     let started = Instant::now();
+    // Read once, before the first `.await`: what the in-process hub caller asked
+    // of this search. A request off the wire gets the default and is unaffected.
+    let in_process = in_process_search();
     // Closed-index handling is deferred to after index resolution below so
     // `ignore_unavailable` / `expand_wildcards` are honored per ES semantics.
 
@@ -12546,12 +12625,27 @@ async fn search_impl(
     // and excess searches queue on that semaphore deadline-aware exactly as
     // they did when this loop issued them one at a time.
     let mut spawned_searches = Vec::with_capacity(index_names.len());
+    // Only used when an in-process caller asked to have failing indices skipped.
+    let mut skipped = SkippedIndices::default();
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
             Ok(i) => i,
             Err(e) => {
                 if search_ignore_unavailable || search_allow_no_indices {
                     // Silently skip; behaves like an empty index.
+                    continue;
+                }
+                if in_process.skip_failed_indices {
+                    // An index that is listed but cannot be opened is one bad
+                    // index, not a reason to refuse the rest.
+                    tracing::warn!(
+                        index = %idx_name,
+                        error = ?e.to_string().chars().take(300).collect::<String>(),
+                        "in-process search: index unavailable, skipping it"
+                    );
+                    skipped.attempt();
+                    skipped.skip(|| ApiError::new(xerj_common::XerjError::from(e)).into_response());
+                    shards_failed_count += 1;
                     continue;
                 }
                 let mut api_err = ApiError::new(xerj_common::XerjError::from(e));
@@ -12651,6 +12745,7 @@ async fn search_impl(
             }
             idx.search(&req_clone).await
         }));
+        skipped.attempt();
         spawned_searches.push((idx_name, search_task));
     }
 
@@ -12663,9 +12758,29 @@ async fn search_impl(
 
         match search_result {
             Err(join_err) => {
+                if in_process.skip_failed_indices {
+                    tracing::warn!(index = %idx_name, "in-process search: index search panicked, skipping it");
+                    skipped.skip(|| search_task_panic_response(join_err, idx_name));
+                    shards_failed_count += 1;
+                    continue;
+                }
                 return search_task_panic_response(join_err, idx_name);
             }
-            Ok(Err(e)) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Ok(Err(e)) => {
+                if in_process.skip_failed_indices {
+                    // The engine's own words can quote the query; bound and
+                    // escape them before they reach the log.
+                    tracing::warn!(
+                        index = %idx_name,
+                        error = ?e.to_string().chars().take(300).collect::<String>(),
+                        "in-process search: index search failed, skipping it"
+                    );
+                    skipped.skip(|| ApiError::new(xerj_common::XerjError::from(e)).into_response());
+                    shards_failed_count += 1;
+                    continue;
+                }
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
             Ok(Ok(result)) => {
                 // A Painless resource limit tripped somewhere in scoring or
                 // aggregation. Those paths have no error channel, so they
@@ -12748,6 +12863,13 @@ async fn search_impl(
                 }
             }
         }
+    }
+
+    // Skipping a bad index is isolation, not a way to hide an outage: when every
+    // index that was tried failed there is nothing to answer from, and the first
+    // failure is the answer.
+    if let Some(failure) = skipped.all_failed() {
+        return failure;
     }
 
     // ── Post-merge `auto_date_histogram` re-coordination ────────────────────
@@ -13315,29 +13437,35 @@ async fn search_impl(
     // "anonymous" until issue #329 — the API-key operations had been passing a
     // real `principal.label()` since #201, so the plumbing existed and this one
     // site simply did not use it.
-    state.engine.audit.append_as(
-        // #1109: the machine/user split is decided HERE, server-side, from
-        // what the request itself is — never from anything a client can set
-        // (the spoofable `X-Xerj-Internal` header was considered and
-        // rejected during #1107, and that decision stands). See
-        // `search_actor_class` for exactly which requests are machine.
-        search_actor_class(body.size, index.as_str()),
-        "search",
-        principal.label(),
-        index.as_str(),
-        "ok",
-        // `size=` is the requested page size. A `size:0` search asks for no
-        // hits — it is a counting probe (autoindex's verification reads back
-        // exact group counts that way), not someone looking for documents,
-        // and `xerj gain` needs exactly that distinction to report a hit
-        // rate that is about people (#1105).
-        &format!(
-            "took={}ms hits={} size={}",
-            took_ms,
-            merged_hits.len(),
-            body.size
-        ),
-    );
+    //
+    // Not for a search the hosted hub issues to itself (`InProcessSearch`): that
+    // is a public read, and one audit entry per request would let anyone age the
+    // operator's evidence out of the ring.
+    if !in_process.skip_audit {
+        state.engine.audit.append_as(
+            // #1109: the machine/user split is decided HERE, server-side, from
+            // what the request itself is — never from anything a client can set
+            // (the spoofable `X-Xerj-Internal` header was considered and
+            // rejected during #1107, and that decision stands). See
+            // `search_actor_class` for exactly which requests are machine.
+            search_actor_class(body.size, index.as_str()),
+            "search",
+            principal.label(),
+            index.as_str(),
+            "ok",
+            // `size=` is the requested page size. A `size:0` search asks for no
+            // hits — it is a counting probe (autoindex's verification reads back
+            // exact group counts that way), not someone looking for documents,
+            // and `xerj gain` needs exactly that distinction to report a hit
+            // rate that is about people (#1105).
+            &format!(
+                "took={}ms hits={} size={}",
+                took_ms,
+                merged_hits.len(),
+                body.size
+            ),
+        );
+    }
 
     // ES semantics: when the sort has any non-score key, `max_score` is null
     // (scores aren't tracked during field-sorted execution unless

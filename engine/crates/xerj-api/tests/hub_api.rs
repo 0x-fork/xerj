@@ -23,6 +23,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,33 @@ const ADMIN_KEY: &str = "hub-test-admin-key";
 const PIN_SHA: &str = "0774d05537f9762f838f7ab541b7765f1a729cb5";
 const PIN_DATE: &str = "2026-10-02";
 
+/// `(slug, ledger index_prefix)`: pack-supplied build prefixes that are NOT
+/// `xc-<that slug>-b<digits>`. Every one uses only characters a URL path can
+/// carry, so the character-set guard alone does not stop them; each one is a way
+/// to aim `<prefix>*` at somebody else's indices.
+const HOSTILE_PREFIXES: [(&str, &str); 8] = [
+    // `xc-*`: every hub index on the node.
+    ("evil-bare", "xc-"),
+    ("evil-wild", "xc-*"),
+    // Another corpus's real build (the excluded one), and one no entry lists.
+    ("evil-other", "xc-mini-closed-b1"),
+    ("evil-orphan", "xc-orphan-b1"),
+    // A comma list is two index expressions in one.
+    ("evil-list", "xc-evil-list-b1,xc-mini-closed-b1"),
+    // Not a build prefix: a whole index name, and a name with no build at all.
+    ("evil-tail", "xc-evil-tail-b1-defs"),
+    ("evil-nobuild", "xc-evil-nobuild"),
+    ("evil-empty", ""),
+];
+
+/// Every slug whose ledger must be refused, `HOSTILE_PREFIXES` plus the one with
+/// no `index_prefix` field.
+fn hostile_slugs() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = HOSTILE_PREFIXES.iter().map(|(s, _)| *s).collect();
+    v.push("evil-legacy");
+    v
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The shared fixture: ledgers + catalogue, written once
 // ─────────────────────────────────────────────────────────────────────────────
@@ -55,6 +83,9 @@ struct Fixture {
 }
 
 static FIXTURE: OnceLock<Fixture> = OnceLock::new();
+
+/// Source of fresh client addresses for [`Hub::stranger`].
+static NEXT_PEER: AtomicU32 = AtomicU32::new(1);
 
 fn entry(slug: &str, spdx: &str, class: LicenceClass) -> CatalogueEntry {
     CatalogueEntry {
@@ -132,7 +163,67 @@ fn fixture() -> &'static Fixture {
             "MIT",
             "adapt-with-attribution",
         );
-        let bytes = catalogue_bytes(vec![
+        // Ledgers whose pack-supplied `index_prefix` is not `xc-<own slug>-b<digits>`.
+        // Each is built from characters the URL guard accepts, and each points at
+        // indices that belong to somebody else.
+        for (slug, prefix) in HOSTILE_PREFIXES {
+            led(slug, prefix, "MIT", "adapt-with-attribution");
+        }
+        // No `index_prefix` at all: `query_prefix` falls back to the ledger's own
+        // `prefix`, which here is the bare namespace.
+        {
+            let state_dir = home.join("state");
+            std::fs::create_dir_all(&state_dir).expect("state dir");
+            std::fs::write(
+                state_dir.join("evil-legacy.json"),
+                format!(
+                    "{{\"corpus\":\"evil-legacy\",\"indexed_at\":\"2026-10-01T00:00:00Z\",\
+                     \"prefix\":\"xc-\",\"url\":\"http://x\",\"autoindex_exit\":0,\
+                     \"salvaged\":false,\"source\":\"hubpack\",\"pin_sha\":\"{PIN_SHA}\",\
+                     \"pin_date\":\"{PIN_DATE}\",\"licence_spdx\":\"MIT\",\
+                     \"licence_class\":\"adapt-with-attribution\"}}\n"
+                ),
+            )
+            .expect("legacy ledger");
+        }
+        // The two sides of "either can refuse" the other way round, plus both
+        // directions of "the stricter class wins".
+        led(
+            "cat-closed",
+            "xc-cat-closed-b1",
+            "MIT",
+            "adapt-with-attribution",
+        );
+        led("gplish", "xc-gplish-b1", "MIT", "adapt-with-attribution");
+        led(
+            "ledger-gpl",
+            "xc-ledger-gpl-b1",
+            "AGPL-3.0-only",
+            "approach-only",
+        );
+        // Corpora used by the failure-isolation tests: indices exist only on the
+        // nodes of the tests that create them.
+        led(
+            "longbody",
+            "xc-longbody-b1",
+            "MIT",
+            "adapt-with-attribution",
+        );
+        led("noindex", "xc-noindex-b1", "MIT", "adapt-with-attribution");
+        led("big", "xc-big-b1", "MIT", "adapt-with-attribution");
+        led(
+            "bodyonly",
+            "xc-bodyonly-b1",
+            "MIT",
+            "adapt-with-attribution",
+        );
+        // Well-formed until `rewrite_flip_ledger` replaces it mid-request.
+        led("flip", "xc-flip-b1", "MIT", "adapt-with-attribution");
+        // One corpus with an index that cannot be searched next to a good one,
+        // and one whose every index cannot.
+        led("mixed", "xc-mixed-b1", "MIT", "adapt-with-attribution");
+        led("allbad", "xc-allbad-b1", "MIT", "adapt-with-attribution");
+        let mut entries = vec![
             entry("mini-c", "MIT", LicenceClass::AdaptWithAttribution),
             entry("mini-gpl", "GPL-3.0-only", LicenceClass::ApproachOnly),
             entry("mini-closed", "LicenseRef-Closed", LicenceClass::Excluded),
@@ -141,7 +232,25 @@ fn fixture() -> &'static Fixture {
             entry("badprefix", "MIT", LicenceClass::AdaptWithAttribution),
             // Listed, but no ledger and no indices on any test node.
             entry("ghost", "MIT", LicenceClass::AdaptWithAttribution),
-        ]);
+            // The catalogue refuses it; this node's ledger would serve it.
+            entry("cat-closed", "LicenseRef-Closed", LicenceClass::Excluded),
+            // The catalogue says approach-only; the ledger says permissive.
+            entry("gplish", "GPL-3.0-only", LicenceClass::ApproachOnly),
+            // The catalogue says permissive; the ledger says approach-only.
+            entry("ledger-gpl", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("longbody", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("noindex", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("big", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("bodyonly", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("flip", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("mixed", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("allbad", "MIT", LicenceClass::AdaptWithAttribution),
+            entry("evil-legacy", "MIT", LicenceClass::AdaptWithAttribution),
+        ];
+        for (slug, _) in HOSTILE_PREFIXES {
+            entries.push(entry(slug, "MIT", LicenceClass::AdaptWithAttribution));
+        }
+        let bytes = catalogue_bytes(entries);
         let catalogue = dir.join("catalogue.json");
         std::fs::write(&catalogue, &bytes).expect("catalogue file");
         std::env::set_var("XERJ_CODE_HOME", &home);
@@ -322,6 +431,62 @@ impl Hub {
         let addr: SocketAddr = format!("{peer}:40000").parse().expect("peer");
         req.extensions_mut().insert(ConnectInfo(addr));
         self.send(req).await
+    }
+
+    /// A GET from a fresh client address each time, so the per-address rate
+    /// limit never fires: for tests that send many requests and are about
+    /// something else.
+    async fn stranger(&self, path: &str) -> Reply {
+        let n = NEXT_PEER.fetch_add(1, Ordering::Relaxed);
+        let peer = format!("10.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255);
+        self.get_from(path, &peer, None).await
+    }
+
+    /// `stranger`, presenting `ApiKey <encoded>`.
+    async fn stranger_with_key(&self, path: &str, encoded: &str) -> Reply {
+        let n = NEXT_PEER.fetch_add(1, Ordering::Relaxed);
+        let peer = format!("10.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255);
+        let mut req = Self::req("GET", path)
+            .header(header::AUTHORIZATION, format!("ApiKey {encoded}"))
+            .body(Body::empty())
+            .unwrap();
+        let addr: SocketAddr = format!("{peer}:40000").parse().expect("peer");
+        req.extensions_mut().insert(ConnectInfo(addr));
+        self.send(req).await
+    }
+
+    /// Mint an API key (as the admin) that may read only `patterns`; returns the
+    /// `encoded` value to present as `ApiKey <encoded>`.
+    async fn mint_read_key(&self, name: &str, patterns: &[&str]) -> String {
+        let r = self
+            .admin(
+                "POST",
+                "/_security/api_key",
+                Some(&json!({
+                    "name": name,
+                    "role_descriptors": { "r": { "indices": [
+                        { "names": patterns, "privileges": ["read"] }
+                    ]}}
+                })),
+            )
+            .await;
+        assert!(r.status.is_success(), "mint {name}: {:?}", r.json());
+        r.json()["encoded"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no encoded key in {:?}", r.json()))
+            .to_string()
+    }
+
+    /// A direct (non-hub) `POST /{index}/_search` presenting `ApiKey <encoded>`.
+    async fn direct_search_with_key(&self, index: &str, encoded: &str) -> Reply {
+        self.send(
+            Self::req("POST", &format!("/{index}/_search"))
+                .header(header::AUTHORIZATION, format!("ApiKey {encoded}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"query": {"match_all": {}}}).to_string()))
+                .unwrap(),
+        )
+        .await
     }
 
     /// A request of any method as if it arrived from `peer`.
@@ -560,13 +725,53 @@ async fn seed(h: &Hub) {
         .await;
     assert!(alias.status.is_success(), "alias: {:?}", alias.json());
 
+    // ── corpora whose catalogue entry and node ledger disagree about the licence ──
+    //
+    // Each gets a docs index (`frobnicate …`) and a defs index, so every route
+    // has something of theirs to find.
+    for (slug, limit) in [
+        ("ledger-closed", "LEDGER_CLOSED_LIMIT"),
+        ("cat-closed", "CAT_CLOSED_LIMIT"),
+        ("gplish", "GPLISH_LIMIT"),
+        ("ledger-gpl", "LEDGER_GPL_LIMIT"),
+    ] {
+        h.create(&format!("xc-{slug}-b1-defs"), defs_mapping())
+            .await;
+        h.bulk(
+            &format!("xc-{slug}-b1-defs"),
+            &[def(
+                limit,
+                "define",
+                "limits.h",
+                3,
+                &format!("#define {limit} 9"),
+                Some("9"),
+            )],
+        )
+        .await;
+        h.create(&format!("xc-{slug}-b1-docs"), docs_mapping())
+            .await;
+        h.bulk(
+            &format!("xc-{slug}-b1-docs"),
+            &[json!({"ax_path": format!("{slug}/s.c"),
+                     "body": format!("frobnicate {slug} text frobnicate"),
+                     "defs": format!("function {slug}_fn"),
+                     "symbols": [{"name": format!("{slug}_fn"), "kind": "function", "line": 1}]})],
+        )
+        .await;
+    }
+
     // Searchable now, not after the next refresh tick.
     let r = h
         .admin(
             "POST",
             "/xc-mini-c-b1-defs,xc-mini-c-b1-docs,xc-mini-gpl-b2-defs,xc-mini-gpl-b2-docs,\
              xc-mini-closed-b1-defs,xc-mini-closed-b1-docs,xc-orphan-b1-docs,\
-             xc-leaky-b1-docs,secret-notes/_refresh",
+             xc-leaky-b1-docs,secret-notes,\
+             xc-ledger-closed-b1-defs,xc-ledger-closed-b1-docs,\
+             xc-cat-closed-b1-defs,xc-cat-closed-b1-docs,\
+             xc-gplish-b1-defs,xc-gplish-b1-docs,\
+             xc-ledger-gpl-b1-defs,xc-ledger-gpl-b1-docs/_refresh",
             None,
         )
         .await;
@@ -828,14 +1033,70 @@ async fn code_max_tokens_holds_the_answer_and_says_so() {
     }
     let r = h.get("/_hub/v1/code/mini-c?q=x&mode=nope").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    // The other arms are accepted; the answer warns that it cannot say which ran.
-    let r = h.get("/_hub/v1/code/mini-c?q=mini_hash&mode=hybrid").await;
-    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
-    assert!(r
-        .answer()
-        .warnings
-        .iter()
-        .any(|w| w.contains("semantic/hybrid")));
+    // The other arms are accepted (what they do is pinned in
+    // `semantic_and_hybrid_say_what_they_actually_do`).
+    for mode in ["semantic", "hybrid"] {
+        let r = h
+            .get(&format!("/_hub/v1/code/mini-c?q=mini_hash&mode={mode}"))
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{mode}: {:?}", r.json());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn semantic_and_hybrid_say_what_they_actually_do() {
+    // The fixture corpus maps `body` as plain text: it has no `semantic_text`
+    // index for a vector arm to search.
+    let h = hub(Opts::new(false, false)).await;
+    let bm25 = h
+        .get("/_hub/v1/code/mini-c?q=mini_hash+unsigned")
+        .await
+        .answer();
+    assert!(!bm25.hits.is_empty());
+    assert!(bm25.warnings.is_empty(), "{:?}", bm25.warnings);
+
+    // `semantic` over a corpus with no semantic index finds NOTHING; it does not
+    // fall back to BM25 (that is what `hybrid` does). The answer must say so.
+    let sem = h
+        .get("/_hub/v1/code/mini-c?q=mini_hash+unsigned&mode=semantic")
+        .await;
+    assert_eq!(sem.status, StatusCode::OK, "{:?}", sem.json());
+    let sem = sem.answer();
+    assert!(
+        sem.hits.is_empty(),
+        "the premise: semantic returns no hits here: {:#?}",
+        sem.hits
+    );
+    let said = sem.warnings.join(" | ");
+    assert!(!said.is_empty(), "an empty semantic answer explains itself");
+    assert!(
+        !said.contains("falls back to BM25"),
+        "semantic does not fall back, and must not claim to: {said}"
+    );
+    assert!(
+        said.contains("semantic_text") && said.contains("no hits"),
+        "names why it is empty: {said}"
+    );
+
+    // `hybrid` over the same corpus answers from BM25 alone, and says that is
+    // what happened.
+    let hyb = h
+        .get("/_hub/v1/code/mini-c?q=mini_hash+unsigned&mode=hybrid")
+        .await
+        .answer();
+    assert!(
+        !hyb.hits.is_empty(),
+        "hybrid degrades to BM25 and still answers"
+    );
+    let said = hyb.warnings.join(" | ");
+    assert!(
+        said.contains("BM25") && said.contains("semantic_text"),
+        "names the arm it used and the mapping it lacked: {said}"
+    );
+    assert_ne!(
+        sem.warnings, hyb.warnings,
+        "the two modes behave differently, so they are described differently"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1216,10 +1477,28 @@ async fn unauthenticated_hub_traffic_cannot_write_the_audit_ring() {
     let h = hub(Opts::new(true, true)).await;
     let audit = &h.state.engine.audit;
 
+    // The operator's evidence: whatever is in the ring before any stranger
+    // arrives (the seeding above wrote real entries).
+    let before = audit.next_seq();
+    let evidence = audit.snapshot();
+    assert!(
+        !evidence.is_empty(),
+        "fixture sanity: the ring holds the operator's own entries"
+    );
+    let unchanged = |what: &str| {
+        assert_eq!(audit.next_seq(), before, "{what}: the sequence moved");
+        let now = audit.snapshot();
+        assert_eq!(now.len(), evidence.len(), "{what}: the ring changed size");
+        assert_eq!(
+            now.iter().map(|e| e.hash.as_str()).collect::<Vec<_>>(),
+            evidence.iter().map(|e| e.hash.as_str()).collect::<Vec<_>>(),
+            "{what}: the ring's entries changed"
+        );
+    };
+
     // A flood of non-GET requests to the public paths and of 401s elsewhere
     // leaves nothing: the audit layer records unauthenticated write-shaped
     // requests, and it must not see these.
-    let before = audit.next_seq();
     // 4 rounds x 13 hub requests = 52, inside the 60-a-minute budget, so each
     // one reaches the layer that would have recorded it.
     for _ in 0..4 {
@@ -1232,20 +1511,61 @@ async fn unauthenticated_hub_traffic_cannot_write_the_audit_ring() {
         h.get("/_cluster/health").await;
         h.get(FOUR[0]).await;
     }
-    assert_eq!(
-        audit.next_seq(),
-        before,
-        "no entry from unauthenticated hub traffic"
-    );
+    unchanged("write-shaped and unauthenticated requests");
 
-    // A hosted search is the one thing that does append: the `_search` handler
-    // audits itself, unconditionally (documented in hub_api.rs).
-    h.get(FOUR[1]).await;
+    // The reads themselves. Every valid `def`, `code` and `search` GET is served
+    // by the node's own `_search` handler, which audits what it serves; the hub's
+    // in-process call must not. Distinct client addresses, so the rate limit
+    // does not stand in the way: this is what a crowd of strangers sends.
+    let reads = [
+        "/_hub/v1/def/mini-c/MINI_LIMIT",
+        "/_hub/v1/code/mini-c?q=mini_hash+unsigned",
+        "/_hub/v1/search?q=frobnicate",
+    ];
+    // More reads than the ring holds (4,096): had each one appended an entry,
+    // not one of the operator's entries would be left.
+    let mut sent = 0usize;
+    for round in 0..1400 {
+        for path in reads {
+            let r = h.stranger(path).await;
+            assert_eq!(r.status, StatusCode::OK, "round {round} {path}");
+            sent += 1;
+        }
+    }
+    assert!(sent > xerj_engine::audit::DEFAULT_AUDIT_CAPACITY, "{sent}");
+    unchanged("4,200 anonymous def/code/search reads");
+
+    // The same holds for a caller who does present the key: the hub's reads are
+    // not a source of audit entries in either mode.
+    for path in reads {
+        assert_eq!(h.get_keyed(path).await.status, StatusCode::OK);
+    }
+    unchanged("keyed hub reads");
+
+    // The suppression belongs to the hub's in-process call and nothing else: a
+    // direct `_search` by the operator is still audited.
+    let r = h
+        .direct_search_with_key("xc-mini-c-b1-docs", ADMIN_KEY)
+        .await;
+    assert!(r.status.is_success(), "{:?}", r.json());
     let after = audit.snapshot();
     let new: Vec<_> = after.iter().filter(|e| e.seq >= before).collect();
-    assert!(
-        !new.is_empty() && new.iter().all(|e| e.op == "search"),
-        "{new:?}"
+    assert_eq!(new.len(), 1, "exactly the direct search: {new:?}");
+    assert_eq!(new[0].op, "search");
+    assert_eq!(new[0].resource, "xc-mini-c-b1-docs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keyed_node_does_not_audit_hub_reads_either() {
+    let h = hub(Opts::new(false, true)).await;
+    let before = h.state.engine.audit.next_seq();
+    for path in FOUR {
+        assert_eq!(h.get_keyed(path).await.status, StatusCode::OK, "{path}");
+    }
+    assert_eq!(
+        h.state.engine.audit.next_seq(),
+        before,
+        "a hub read is not an audited data-path operation"
     );
 }
 
@@ -1682,6 +2002,905 @@ async fn a_full_house_is_a_503_with_retry_after_and_recovers() {
     // Free again: the query runs (the node has no indices, so the corpus is
     // known to the ledger but not loaded — a 404, not a 503).
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Responses too large for the in-process cap
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The hub's routes alone over `state`, with the in-process limits lowered.
+fn lowered(
+    state: &AppState,
+    response_cap_bytes: usize,
+    fields_failure_ttl: Duration,
+) -> (axum::Router, std::sync::Arc<hub_api::HubShared>) {
+    let shared = hub_api::HubShared::with_tuning(
+        state.clone(),
+        hub_api::Tuning {
+            response_cap_bytes,
+            fields_failure_ttl,
+            ..Default::default()
+        },
+    );
+    (hub_api::routes(shared.clone()), shared)
+}
+
+async fn get_on(app: &axum::Router, path: &str) -> Reply {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .expect("response");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    Reply {
+        status,
+        headers,
+        body,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_wide_mapping_over_the_cap_is_a_503_not_an_empty_search() {
+    let h = hub(Opts::new(true, true)).await;
+    // Premise: with the production cap the same node searches fine.
+    let ok = h.stranger("/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert!(!ok.json()["corpora"].as_array().unwrap().is_empty());
+
+    // What a pack with enormous mappings does at 16 MiB, in miniature: the
+    // node-wide `xc-*` mapping is one byte too large for the cap on a single
+    // in-process response (and everything else on the node still fits).
+    let mapping = h.admin("GET", "/xc-*/_mapping", None).await;
+    let cap = mapping.body.len() - 1;
+    assert!(cap > 2048, "fixture sanity: a {cap}-byte mapping");
+    let ttl = Duration::from_millis(600);
+    let (app, shared) = lowered(&h.state, cap, ttl);
+
+    let r = get_on(&app, "/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(
+        r.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreadable mapping is an outage, not 'no results': {:?}",
+        r.json()
+    );
+    assert_eq!(r.json()["error"]["type"], json!("hub_unavailable"));
+    let text = String::from_utf8_lossy(&r.body).to_string();
+    for leaked in [cap.to_string().as_str(), "bytes", "mapping", "xc-", "over"] {
+        assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+    }
+    assert_ne!(r.json(), json!({"corpora": []}));
+
+    // The failure is remembered: a burst of requests does not repeat the
+    // expensive read (each repeat costs seconds at the real size).
+    for _ in 0..6 {
+        let r = get_on(&app, "/_hub/v1/search?q=frobnicate").await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(
+        shared.mapping_reads_for_test(),
+        1,
+        "seven requests, one read of the mappings"
+    );
+
+    // …but not for long: a transient fault clears itself, and the read is
+    // tried again once the memory expires.
+    tokio::time::sleep(ttl + Duration::from_millis(300)).await;
+    let r = get_on(&app, "/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        shared.mapping_reads_for_test(),
+        2,
+        "read again after the ttl"
+    );
+
+    // Routes about one corpus do not read the node-wide mapping and are not
+    // taken down with `search`.
+    let r = get_on(&app, "/_hub/v1/def/mini-c/MINI_LIMIT").await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn records_too_big_to_return_together_shrink_the_window_and_say_so() {
+    let h = hub(Opts::new(false, false)).await;
+    // Two records of ~48 KiB that both match; `code` asks the engine for whole
+    // records, ten of them at once even for k=1.
+    let filler = "int x; ".repeat(48 * 1024 / 7);
+    h.create("xc-big-b1-docs", docs_mapping()).await;
+    h.bulk(
+        "xc-big-b1-docs",
+        &[
+            json!({"ax_path": "big/a.c", "title": "a.c",
+                   "body": format!("needleword alpha {filler}"), "defs": "function needleword"}),
+            json!({"ax_path": "big/b.c", "title": "b.c",
+                   "body": format!("needleword beta {filler}"), "defs": "function needleword"}),
+        ],
+    )
+    .await;
+    h.admin("POST", "/xc-big-b1-docs/_refresh", None).await;
+
+    // Premise: with the production cap both fit, and nothing is cut.
+    let whole = h.get("/_hub/v1/code/big?q=needleword&k=1").await;
+    assert_eq!(whole.status, StatusCode::OK, "{:?}", whole.json());
+    let whole = whole.answer();
+    assert_eq!(whole.hits.len(), 1);
+    assert!(!whole.truncated, "{:?}", whole.warnings);
+    assert!(whole.warnings.is_empty(), "{:?}", whole.warnings);
+
+    // With the cap below two records (what two 9 MiB records do to 16 MiB), the
+    // answer is built from fewer candidates and says so — not a 503.
+    let (app, _shared) = lowered(&h.state, 64 * 1024, Duration::from_secs(15));
+    for k in [1, 2, 5] {
+        let r = get_on(&app, &format!("/_hub/v1/code/big?q=needleword&k={k}")).await;
+        assert_eq!(
+            r.status,
+            StatusCode::OK,
+            "k={k}: records that do not fit together must not be a 503: {:?}",
+            r.json()
+        );
+        let a = r.answer();
+        assert_eq!(a.corpus, "big");
+        assert_eq!(a.hits.len(), 1, "k={k}: the one record that fits");
+        assert!(
+            a.hits[0].file == "big/a.c" || a.hits[0].file == "big/b.c",
+            "{:?}",
+            a.hits[0]
+        );
+        assert!(a.hits[0].score > 0.0);
+        assert!(a.truncated, "k={k}: the answer is cut and says so");
+        assert!(
+            a.warnings.iter().any(|w| w.contains("too large")),
+            "k={k}: {:?}",
+            a.warnings
+        );
+    }
+
+    // A single record over the cap cannot be returned at all, and that is a
+    // fixed 503 rather than a made-up answer.
+    let (tiny, _shared) = lowered(&h.state, 8 * 1024, Duration::from_secs(15));
+    let r = get_on(&tiny, "/_hub/v1/code/big?q=needleword&k=1").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", r.json());
+    assert_eq!(r.json()["error"]["type"], json!("hub_unavailable"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What a pack's own ledger cannot talk the node into
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Text that lives only in somebody else's indices: the excluded corpus, an
+/// index no catalogue entry lists, and the private index behind an alias.
+const OTHER_PEOPLES_DATA: [&str; 6] = [
+    "closed text",
+    "orphan text",
+    "CLOSED_LIMIT",
+    "mini-closed/",
+    "orphan/",
+    "hunter2",
+];
+
+fn assert_no_leak(what: &str, r: &Reply) {
+    let text = String::from_utf8_lossy(&r.body);
+    for needle in OTHER_PEOPLES_DATA {
+        assert!(
+            !text.contains(needle),
+            "{what} leaked {needle:?} (status {}): {text}",
+            r.status
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ledger_prefix_that_is_not_the_corpus_own_build_is_never_queried() {
+    // A public node: the stranger is exactly who this guards against.
+    let h = hub(Opts::new(true, true)).await;
+
+    // Premises. A well-formed corpus answers; and the data a hostile prefix
+    // would reach is really on this node (without these the test proves nothing).
+    let ok = h.stranger("/_hub/v1/code/mini-c?q=frobnicate&k=20").await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.json());
+    assert!(!ok.answer().hits.is_empty());
+    for (index, needle) in [
+        ("xc-mini-closed-b1-docs", "closed text"),
+        ("xc-orphan-b1-docs", "orphan text"),
+        ("xc-mini-closed-b1-defs", "CLOSED_LIMIT"),
+    ] {
+        let r = h
+            .admin(
+                "POST",
+                &format!("/{index}/_search"),
+                Some(&json!({"query": {"match_all": {}}})),
+            )
+            .await;
+        assert!(
+            String::from_utf8_lossy(&r.body).contains(needle),
+            "fixture sanity: {index} holds {needle:?}"
+        );
+    }
+
+    // Every way a ledger can name a prefix that is not `xc-<its own slug>-b<n>`.
+    // Each is refused before any query, with the same fixed 503, and none of
+    // them reads another corpus.
+    for slug in hostile_slugs() {
+        for path in [
+            format!("/_hub/v1/code/{slug}?q=frobnicate&k=20"),
+            format!("/_hub/v1/code/{slug}?q=closed"),
+            format!("/_hub/v1/code/{slug}?q=orphan"),
+            format!("/_hub/v1/code/{slug}?q=frobnicate&mode=hybrid"),
+            format!("/_hub/v1/def/{slug}/CLOSED_LIMIT"),
+            format!("/_hub/v1/def/{slug}/MINI_LIMIT"),
+        ] {
+            let r = h.stranger(&path).await;
+            assert_no_leak(&path, &r);
+            assert_eq!(
+                r.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {:?}",
+                r.json()
+            );
+            assert_eq!(
+                r.json()["error"]["type"],
+                json!("hub_unavailable"),
+                "{path}"
+            );
+            let text = String::from_utf8_lossy(&r.body).to_string();
+            for leaked in ["xc-", "prefix", "ledger", "state", slug] {
+                assert!(!text.contains(leaked), "{path} said {leaked:?}: {text}");
+            }
+        }
+    }
+
+    // `search` does not list them either, and still lists the honest corpora.
+    let r = h.stranger("/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    assert_no_leak("search", &r);
+    let slugs: Vec<String> = r.json()["corpora"]
+        .as_array()
+        .expect("corpora")
+        .iter()
+        .map(|c| c["slug"].as_str().unwrap().to_string())
+        .collect();
+    assert!(slugs.contains(&"mini-c".to_string()), "{slugs:?}");
+    for slug in hostile_slugs() {
+        assert!(!slugs.contains(&slug.to_string()), "{slug} in {slugs:?}");
+    }
+}
+
+/// While armed, [`rewrite_flip_ledger`] does what a `xerj hub pull` landing at
+/// the worst moment would.
+static FLIP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Replace the `flip` corpus's ledger with one naming the whole namespace. Run
+/// by the hub right after the ledger passed its check and before the shared
+/// query pipeline reads it a second time.
+fn rewrite_flip_ledger(root: &std::path::Path, slug: &str) {
+    if slug == "flip" && FLIP_ARMED.load(Ordering::SeqCst) {
+        write_hubpack_state(
+            root,
+            slug,
+            "http://x",
+            "xc-",
+            PIN_SHA,
+            PIN_DATE,
+            "MIT",
+            "adapt-with-attribution",
+        )
+        .expect("rewrite the ledger");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ledger_that_changes_after_it_was_checked_still_cannot_leave_its_build() {
+    // The `def` and `code` pipelines read the ledger themselves, a second time,
+    // to decide what to query. Checking the first read is not enough if the
+    // second can differ (a `xerj hub pull` landing mid-request).
+    let h = hub(Opts::new(true, true)).await;
+    h.create("xc-flip-b1-docs", docs_mapping()).await;
+    h.bulk(
+        "xc-flip-b1-docs",
+        &[json!({"ax_path": "flip/f.c", "body": "frobnicate flip text"})],
+    )
+    .await;
+    h.admin("POST", "/xc-flip-b1-docs/_refresh", None).await;
+    let shared = hub_api::HubShared::with_tuning(
+        h.state.clone(),
+        hub_api::Tuning {
+            after_ledger_check: Some(rewrite_flip_ledger),
+            ..Default::default()
+        },
+    );
+    let app: axum::Router = hub_api::routes(shared);
+    let ledger = std::path::PathBuf::from(std::env::var("XERJ_CODE_HOME").unwrap())
+        .join("state")
+        .join("flip.json");
+
+    // Premise: with the ledger as written, the corpus answers from its own data.
+    FLIP_ARMED.store(false, Ordering::SeqCst);
+    let r = get_on(&app, "/_hub/v1/code/flip?q=frobnicate&k=20").await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    let hits = r.answer().hits;
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter().all(|x| x.file.starts_with("flip/")),
+        "{hits:#?}"
+    );
+
+    // Armed: the ledger names `xc-` by the time the pipeline reads it. Without
+    // the pin that is every hub index; with it, a refusal.
+    FLIP_ARMED.store(true, Ordering::SeqCst);
+    for path in [
+        "/_hub/v1/code/flip?q=frobnicate&k=20",
+        "/_hub/v1/code/flip?q=closed",
+        "/_hub/v1/def/flip/CLOSED_LIMIT",
+    ] {
+        let r = get_on(&app, path).await;
+        assert_no_leak(path, &r);
+        assert_eq!(
+            r.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: {:?}",
+            r.json()
+        );
+        assert_eq!(r.json()["error"]["type"], json!("hub_unavailable"));
+    }
+    let on_disk = std::fs::read_to_string(&ledger).expect("ledger");
+    assert!(
+        on_disk.contains("\"index_prefix\":\"xc-\""),
+        "premise: the ledger really was replaced mid-request: {on_disk}"
+    );
+
+    // Put it back for anything that runs after this.
+    FLIP_ARMED.store(false, Ordering::SeqCst);
+    write_hubpack_state(
+        ledger.parent().and_then(|p| p.parent()).unwrap(),
+        "flip",
+        "http://x",
+        "xc-flip-b1",
+        PIN_SHA,
+        PIN_DATE,
+        "MIT",
+        "adapt-with-attribution",
+    )
+    .expect("restore the ledger");
+}
+
+#[test]
+fn only_the_exact_build_prefix_shape_is_accepted_for_a_ledger() {
+    // `xc-<slug>-b<digits>` for the corpus's OWN slug, in every accepted shape:
+    // digits of any length, slugs containing `-`, `.`, `_` and `+`.
+    for (slug, prefix) in [
+        ("mini-c", "xc-mini-c-b1"),
+        ("mini-c", "xc-mini-c-b20260921"),
+        ("mini-gpl", "xc-mini-gpl-b2"),
+        ("rust-vulns", "xc-rust-vulns-b1700000000"),
+        ("c++", "xc-c++-b3"),
+        ("a.b_c", "xc-a.b_c-b0"),
+        // A slug that itself ends in a build-like token is still that slug.
+        ("lib-b2", "xc-lib-b2-b7"),
+    ] {
+        assert!(
+            hub_api::valid_build_prefix(prefix, slug),
+            "{prefix} for {slug}"
+        );
+    }
+    for (slug, prefix) in [
+        ("mini-c", "xc-"),
+        ("mini-c", "xc-*"),
+        ("mini-c", "xc-mini-c"),
+        ("mini-c", "xc-mini-c-b"),
+        ("mini-c", "xc-mini-c-b1x"),
+        ("mini-c", "xc-mini-c-bx1"),
+        ("mini-c", "xc-mini-c-b1-defs"),
+        ("mini-c", "xc-mini-c-b1*"),
+        ("mini-c", "xc-mini-c-b1,xc-mini-closed-b1"),
+        ("mini-c", "xc-mini-c-b1 "),
+        ("mini-c", " xc-mini-c-b1"),
+        ("mini-c", "XC-mini-c-b1"),
+        ("mini-c", "xc-MINI-C-b1"),
+        ("mini-c", "xc-mini-gpl-b2"),
+        ("mini-c", "xc-mini-closed-b1"),
+        ("mini-c", "xc-mini-c-b-1"),
+        ("mini-c", "xc-mini-c-b+1"),
+        ("mini-c", "xc-mini-c-b١"),
+        ("mini-c", ""),
+        ("mini-c", "mini-c-b1"),
+        ("mini", "xc-mini-c-b1"),
+    ] {
+        assert!(
+            !hub_api::valid_build_prefix(prefix, slug),
+            "{prefix:?} must not be accepted for {slug}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_key_sees_the_hub_through_its_own_grants_only() {
+    // A keyed, non-public node: callers are principals with grants, and the hub
+    // routes must not widen what a grant allows.
+    let h = hub(Opts::new(false, true)).await;
+
+    // A tenant key with nothing under `xc-*`.
+    let tenant = h.mint_read_key("tenant-a", &["tenant-a-*"]).await;
+    let direct = h.direct_search_with_key("xc-mini-c-b1-docs", &tenant).await;
+    assert_eq!(
+        direct.status,
+        StatusCode::FORBIDDEN,
+        "premise: the ordinary API refuses this key the corpus: {:?}",
+        direct.json()
+    );
+    let r = h
+        .stranger_with_key("/_hub/v1/code/mini-c?q=frobnicate", &tenant)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{:?}", r.json());
+    assert_eq!(r.json()["error"]["type"], json!("corpus_not_loaded"));
+    let r = h
+        .stranger_with_key("/_hub/v1/def/mini-c/MINI_LIMIT", &tenant)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{:?}", r.json());
+    assert_eq!(r.json()["error"]["type"], json!("corpus_not_loaded"));
+    let r = h
+        .stranger_with_key("/_hub/v1/search?q=frobnicate", &tenant)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(
+        r.json(),
+        json!({"corpora": []}),
+        "the key sees none of the hub, so `search` finds none of it"
+    );
+    for text in ["mini-c", "frobnicate the buffer", "MINI_LIMIT", "128"] {
+        assert!(
+            !String::from_utf8_lossy(&r.body).contains(text),
+            "{text} reached a key that holds nothing under xc-*"
+        );
+    }
+
+    // A key granted ONE corpus sees that corpus through the hub, and no other:
+    // the hub narrows to its own namespace, it does not widen to it.
+    let mini = h.mint_read_key("mini-reader", &["xc-mini-c-*"]).await;
+    let ok = h.direct_search_with_key("xc-mini-c-b1-docs", &mini).await;
+    assert!(ok.status.is_success(), "premise: granted: {:?}", ok.json());
+    let no = h.direct_search_with_key("xc-mini-gpl-b2-docs", &mini).await;
+    assert_eq!(no.status, StatusCode::FORBIDDEN, "premise: not granted");
+
+    let r = h
+        .stranger_with_key("/_hub/v1/code/mini-c?q=mini_hash+unsigned", &mini)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    assert!(!r.answer().hits.is_empty(), "its own corpus is answered");
+    let r = h
+        .stranger_with_key("/_hub/v1/def/mini-c/MINI_LIMIT", &mini)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(r.answer().hits.len(), 1);
+    for path in [
+        "/_hub/v1/code/mini-gpl?q=frobnicate",
+        "/_hub/v1/def/mini-gpl/GPL_LIMIT",
+    ] {
+        let r = h.stranger_with_key(path, &mini).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}: {:?}", r.json());
+        assert_eq!(r.json()["error"]["type"], json!("corpus_not_loaded"));
+    }
+    let r = h
+        .stranger_with_key("/_hub/v1/search?q=frobnicate", &mini)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    let slugs: Vec<String> = r.json()["corpora"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["slug"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(slugs, ["mini-c"], "only the granted corpus is searched");
+
+    // The admin key is unrestricted, and it is the same hub: both corpora.
+    let r = h.get_keyed("/_hub/v1/search?q=frobnicate").await;
+    let all: Vec<String> = r.json()["corpora"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["slug"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        all.contains(&"mini-c".to_string()) && all.contains(&"mini-gpl".to_string()),
+        "{all:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_caller_neither_reads_nor_poisons_the_shared_field_list() {
+    // `search` learns which of body/defs/symbol_text exist from the node's
+    // mappings and reuses that for a minute. A caller who sees only part of the
+    // node reads a different list; it must not be shared in either direction.
+    async fn node() -> (Hub, String) {
+        let h = hub(Opts::new(false, true)).await;
+        h.create(
+            "xc-bodyonly-b1-docs",
+            json!({"properties": {"body": {"type": "text"}, "ax_path": {"type": "keyword"}}}),
+        )
+        .await;
+        h.bulk(
+            "xc-bodyonly-b1-docs",
+            &[json!({"ax_path": "bodyonly/b.c", "body": "frobnicate quasar nebula"})],
+        )
+        .await;
+        h.admin("POST", "/xc-bodyonly-b1-docs/_refresh", None).await;
+        let key = h.mint_read_key("bodyonly", &["xc-bodyonly-*"]).await;
+        (h, key)
+    }
+    let slugs = |r: &Reply| -> Vec<String> {
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        r.json()["corpora"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["slug"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // The operator searches first, so the shared list names all three fields; the
+    // scoped key (whose only index maps `body`) must not borrow it.
+    let (h, key) = node().await;
+    assert!(slugs(&h.get_keyed("/_hub/v1/search?q=frobnicate").await).contains(&"mini-c".into()));
+    let r = h
+        .stranger_with_key("/_hub/v1/search?q=frobnicate+quasar", &key)
+        .await;
+    assert_eq!(
+        slugs(&r),
+        ["bodyonly"],
+        "the scoped key finds its own corpus"
+    );
+
+    // The scoped key searches first; the operator must not inherit its view,
+    // where only `body` exists: a definition name lives in `symbol_text`.
+    let (h, key) = node().await;
+    let r = h
+        .stranger_with_key("/_hub/v1/search?q=frobnicate+quasar", &key)
+        .await;
+    assert_eq!(slugs(&r), ["bodyonly"]);
+    let admin = slugs(&h.get_keyed("/_hub/v1/search?q=MINI_LIMIT").await);
+    assert_eq!(
+        admin.first().map(String::as_str),
+        Some("mini-c"),
+        "a definition is found through `symbol_text`: {admin:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stricter_of_the_catalogue_and_the_ledger_governs_every_route() {
+    let h = hub(Opts::new(false, false)).await;
+    let note = |spdx: &str| format!("approach-only licence ({spdx}): read, do not copy");
+
+    // Premises: these corpora are really indexed, so an absence below is the
+    // licence rule at work and not an empty fixture.
+    for slug in ["ledger-closed", "cat-closed", "gplish", "ledger-gpl"] {
+        let r = h
+            .admin(
+                "POST",
+                &format!("/xc-{slug}-b1-docs/_search"),
+                Some(&json!({"query": {"match": {"body": "frobnicate"}}})),
+            )
+            .await;
+        assert!(
+            String::from_utf8_lossy(&r.body).contains(&format!("{slug} text")),
+            "fixture sanity: {slug} is indexed"
+        );
+    }
+
+    // Either side can refuse: catalogue-servable but ledger-excluded, and the
+    // other way round. Same 404 everywhere, and `search` never returns a hit.
+    for slug in ["ledger-closed", "cat-closed"] {
+        for path in [
+            format!("/_hub/v1/def/{slug}/X"),
+            format!("/_hub/v1/code/{slug}?q=frobnicate"),
+        ] {
+            let r = h.get(&path).await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(
+                r.json()["error"]["type"],
+                json!("resource_not_found_exception"),
+                "{path}: refusals look alike"
+            );
+        }
+    }
+    for q in ["frobnicate", "ledger-closed", "cat-closed"] {
+        let r = h.get(&format!("/_hub/v1/search?q={q}&k=10")).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let text = String::from_utf8_lossy(&r.body).to_string();
+        assert!(
+            !text.contains("ledger-closed") && !text.contains("cat-closed"),
+            "search q={q} returned a refused corpus: {text}"
+        );
+        assert!(
+            !text.contains("ledger-closed text") && !text.contains("cat-closed text"),
+            "search q={q}: {text}"
+        );
+    }
+
+    // Approach-only on EITHER side is approach-only: the header says so, the
+    // licence it names is the one that decided, and every hit carries the note.
+    for (slug, spdx, symbol) in [
+        ("gplish", "GPL-3.0-only", "GPLISH_LIMIT"),
+        ("ledger-gpl", "AGPL-3.0-only", "LEDGER_GPL_LIMIT"),
+    ] {
+        let d = h.get(&format!("/_hub/v1/def/{slug}/{symbol}")).await;
+        assert_eq!(d.status, StatusCode::OK, "{:?}", d.json());
+        let d = d.answer();
+        assert_eq!(d.licence_class, LicenceClass::ApproachOnly, "{slug} def");
+        assert_eq!(d.licence_spdx, spdx, "{slug} def");
+        assert_eq!(d.hits.len(), 1, "{slug} def");
+        assert_eq!(
+            d.hits[0].licence_warning.as_deref(),
+            Some(note(spdx).as_str())
+        );
+
+        let c = h.get(&format!("/_hub/v1/code/{slug}?q=frobnicate")).await;
+        assert_eq!(c.status, StatusCode::OK, "{:?}", c.json());
+        let c = c.answer();
+        assert_eq!(c.licence_class, LicenceClass::ApproachOnly, "{slug} code");
+        assert_eq!(c.licence_spdx, spdx, "{slug} code");
+        assert!(!c.hits.is_empty(), "{slug} code");
+        assert!(
+            c.hits
+                .iter()
+                .all(|x| x.licence_warning.as_deref() == Some(note(spdx).as_str())),
+            "{slug} code: {:#?}",
+            c.hits
+        );
+
+        // `def` and `code` describe the corpus identically (the pin test's rule).
+        assert_eq!(
+            (&d.corpus, &d.licence_spdx, d.licence_class),
+            (&c.corpus, &c.licence_spdx, c.licence_class)
+        );
+
+        let r = h.get("/_hub/v1/search?q=frobnicate&k=10").await;
+        let rows = r.json()["corpora"].as_array().cloned().unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["slug"] == slug)
+            .unwrap_or_else(|| panic!("{slug} missing from search: {rows:?}"));
+        assert_eq!(
+            row["best_hit"]["licence_warning"],
+            json!(note(spdx)),
+            "{slug} search"
+        );
+    }
+
+    // And the permissive corpora are untouched by all this.
+    let c = h
+        .get("/_hub/v1/code/mini-c?q=mini_hash+unsigned")
+        .await
+        .answer();
+    assert_eq!(c.licence_class, LicenceClass::AdaptWithAttribution);
+    assert!(c.hits.iter().all(|x| x.licence_warning.is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_bad_index_does_not_take_search_down_for_everyone() {
+    let h = hub(Opts::new(true, true)).await;
+    let slugs_of = |r: &Reply| -> Vec<String> {
+        r.json()["corpora"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no corpora in {:?}", r.json()))
+            .iter()
+            .map(|c| c["slug"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let baseline = h.stranger("/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(baseline.status, StatusCode::OK);
+    let good = slugs_of(&baseline);
+    assert!(good.contains(&"mini-c".to_string()), "{good:?}");
+
+    // ── A corpus that maps `body` as a number ──────────────────────────────────
+    // Its `defs` is ordinary text. A lenient clause skips the numeric field and
+    // still searches `defs`, so this corpus is FOUND; a strict one fails the whole
+    // index, and the corpus is missing.
+    h.create(
+        "xc-longbody-b1-docs",
+        json!({"properties": {
+            "body": {"type": "long"},
+            "defs": {"type": "text"},
+            "ax_path": {"type": "keyword"}}}),
+    )
+    .await;
+    h.bulk(
+        "xc-longbody-b1-docs",
+        &[json!({"ax_path": "longbody/n.c", "body": 5, "defs": "function frobnicate numbers"})],
+    )
+    .await;
+    h.admin("POST", "/xc-longbody-b1-docs/_refresh", None).await;
+    // Premise: the engine itself refuses a text query against that field when the
+    // clause is not lenient, and accepts it when it is — so the hub must ask.
+    let strict = h
+        .admin(
+            "POST",
+            "/xc-*/_search",
+            Some(&json!({"query": {"multi_match": {
+                "query": "frobnicate", "fields": ["body"], "lenient": false}}})),
+        )
+        .await;
+    assert!(
+        !strict.status.is_success(),
+        "premise: a strict multi_match over a long field fails the fan-out: {:?}",
+        strict.json()
+    );
+    for q in ["frobnicate", "frobnicate+buffer", "mini_clamp"] {
+        let r = h.stranger(&format!("/_hub/v1/search?q={q}")).await;
+        assert_eq!(
+            r.status,
+            StatusCode::OK,
+            "q={q} with a long-mapped body somewhere on the node: {:?}",
+            r.json()
+        );
+    }
+    let with_long = slugs_of(&h.stranger("/_hub/v1/search?q=frobnicate").await);
+    let as_set = |v: &[String]| v.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    let mut want = as_set(&good);
+    want.insert("longbody".to_string());
+    assert_eq!(
+        as_set(&with_long),
+        want,
+        "the honest corpora are answered exactly as before, and the numeric one is \
+         searched through its text field (lenient), not dropped: {with_long:?}"
+    );
+    // A query that happens to be a number is no problem for the numeric field.
+    let r = h.stranger("/_hub/v1/search?q=5").await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+
+    // ── A corpus whose `body` cannot be searched at all ────────────────────────
+    // Lenient does not help here (the engine refuses a NAMED unsearchable field),
+    // so this is the failure the per-index isolation exists for.
+    h.create(
+        "xc-noindex-b1-docs",
+        json!({"properties": {
+            "body": {"type": "text", "index": false},
+            "ax_path": {"type": "keyword"}}}),
+    )
+    .await;
+    h.bulk(
+        "xc-noindex-b1-docs",
+        &[json!({"ax_path": "noindex/n.c", "body": "frobnicate hidden away"})],
+    )
+    .await;
+    h.admin("POST", "/xc-noindex-b1-docs/_refresh", None).await;
+    let direct = h
+        .admin(
+            "POST",
+            "/xc-*/_search",
+            Some(&json!({"query": {"multi_match": {
+                "query": "frobnicate", "fields": ["body"], "lenient": true}}})),
+        )
+        .await;
+    assert!(
+        !direct.status.is_success(),
+        "premise: even a lenient clause fails the whole fan-out on an unsearchable field: {:?}",
+        direct.json()
+    );
+    let r = h.stranger("/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "one corpus it cannot search must not 503 the rest: {:?}",
+        r.json()
+    );
+    let after = slugs_of(&r);
+    assert_eq!(
+        as_set(&after),
+        want,
+        "the bad corpus is skipped, the rest are kept: {after:?}"
+    );
+    assert!(!after.contains(&"noindex".to_string()));
+
+    // The other routes are about one corpus each and are untouched.
+    let r = h
+        .stranger("/_hub/v1/code/mini-c?q=mini_hash+unsigned")
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(!r.answer().hits.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_skips_an_index_it_cannot_search_and_says_so() {
+    let h = hub(Opts::new(true, true)).await;
+    let unsearchable = json!({"properties": {
+        "body": {"type": "text", "index": false},
+        "ax_path": {"type": "keyword"}}});
+
+    // `mixed`: one good index and one whose `body` cannot be searched.
+    h.create("xc-mixed-b1-docs", docs_mapping()).await;
+    h.bulk(
+        "xc-mixed-b1-docs",
+        &[json!({"ax_path": "mixed/good.c", "body": "frobnicate the good text"})],
+    )
+    .await;
+    h.create("xc-mixed-b1-extra", unsearchable.clone()).await;
+    h.bulk(
+        "xc-mixed-b1-extra",
+        &[json!({"ax_path": "mixed/bad.c", "body": "frobnicate the hidden text"})],
+    )
+    .await;
+    h.admin("POST", "/xc-mixed-b1-docs,xc-mixed-b1-extra/_refresh", None)
+        .await;
+    let strict = h
+        .admin(
+            "POST",
+            "/xc-mixed-b1*/_search",
+            Some(&json!({"query": {"multi_match": {"query": "frobnicate", "fields": ["body"]}}})),
+        )
+        .await;
+    assert!(
+        !strict.status.is_success(),
+        "premise: one unsearchable index fails the whole direct fan-out: {:?}",
+        strict.json()
+    );
+
+    let r = h.stranger("/_hub/v1/code/mixed?q=frobnicate").await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "one bad index must not be a 503 for its corpus: {:?}",
+        r.json()
+    );
+    let a = r.answer();
+    assert!(!a.hits.is_empty());
+    assert!(
+        a.hits.iter().all(|x| x.file == "mixed/good.c"),
+        "the answer is from the index that could be searched: {:#?}",
+        a.hits
+    );
+    assert!(
+        a.warnings
+            .iter()
+            .any(|w| w.starts_with("1 of this corpus's indices could not be searched")),
+        "a partial answer says so: {:?}",
+        a.warnings
+    );
+    // A corpus whose indices all search fine carries no such warning.
+    let ok = h
+        .stranger("/_hub/v1/code/mini-c?q=mini_hash+unsigned")
+        .await
+        .answer();
+    assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+
+    // `allbad`: nothing could be searched, so there is no answer to give.
+    h.create("xc-allbad-b1-docs", unsearchable).await;
+    h.bulk(
+        "xc-allbad-b1-docs",
+        &[json!({"ax_path": "allbad/b.c", "body": "frobnicate hidden"})],
+    )
+    .await;
+    h.admin("POST", "/xc-allbad-b1-docs/_refresh", None).await;
+    let r = h.stranger("/_hub/v1/code/allbad?q=frobnicate").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", r.json());
+    assert_eq!(r.json()["error"]["type"], json!("hub_unavailable"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn when_every_searched_index_fails_search_says_so_instead_of_an_empty_answer() {
+    // Nothing but an unsearchable corpus on the node: "no results" would be a lie.
+    let h = bare(&Opts::new(true, true));
+    h.create(
+        "xc-noindex-b1-docs",
+        json!({"properties": {
+            "body": {"type": "text", "index": false},
+            "ax_path": {"type": "keyword"}}}),
+    )
+    .await;
+    h.bulk(
+        "xc-noindex-b1-docs",
+        &[json!({"ax_path": "noindex/n.c", "body": "frobnicate hidden away"})],
+    )
+    .await;
+    h.admin("POST", "/xc-noindex-b1-docs/_refresh", None).await;
+    let r = h.stranger("/_hub/v1/search?q=frobnicate").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", r.json());
+    assert_eq!(r.json()["error"]["type"], json!("hub_unavailable"));
+    let text = String::from_utf8_lossy(&r.body).to_string();
+    for leaked in ["noindex", "body", "unsearchable", "xc-", "HTTP"] {
+        assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

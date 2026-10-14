@@ -65,30 +65,79 @@
 //! * the private router offers three read routes and nothing else, which is a
 //!   smaller surface than "the admin key against the whole API".
 //!
-//! Three further guards bound what a hosted query can touch, even if a bug let
-//! an unexpected name through: [`InProcessNode`] refuses any index expression
-//! that is not made of `xc-` names in a conservative character set, every call
-//! runs under an engine-level [`index_guard`] that hides every index outside
-//! `xc-*`, and the corpus name is checked against the catalogue before any
-//! filesystem path is built from it.
+//! Four further guards bound what a hosted query can touch, even if a bug let
+//! an unexpected name through:
+//!
+//! * [`InProcessNode`] refuses any index expression that is not made of `xc-`
+//!   names in a conservative character set;
+//! * every call runs under an engine-level [`index_guard`] that hides every
+//!   index outside `xc-*` AND every index the caller's own request could not
+//!   see. `HubVisibility` is the INTERSECTION of the hub namespace and the rule
+//!   `authz_middleware` installed for the caller, captured before the work leaves
+//!   the request's task: a key scoped to `tenant-a-*` is refused a corpus here
+//!   exactly as it is by `_search`, and a hosted route is never a way to widen a
+//!   grant;
+//! * the ledger's `index_prefix` is pack-supplied text, so it is checked against
+//!   the exact shape `xc-<slug>-b<digits>` for the corpus being asked about
+//!   ([`valid_build_prefix`]) before any query is built from it, and a `def` or
+//!   `code` request is then pinned to that build (`InProcessNode::pin_to_build`):
+//!   the node refuses an index expression outside it, whatever the shared
+//!   pipeline goes on to compute from its own second read of the ledger;
+//! * the corpus name is checked against the catalogue before any filesystem path
+//!   is built from it.
+//!
+//! The licence is decided the same way on every route: the STRICTER of the
+//! catalogue's class and the corpus's own ledger's ([`effective_licence`]); either
+//! can refuse (`excluded`), and either can require the read-do-not-copy warning
+//! (`approach-only`).
 //!
 //! The `XcHttp` methods are synchronous and the handlers async, so each query
 //! runs on the blocking pool (`run_query`) under a global concurrency cap
 //! ([`MAX_CONCURRENT_QUERIES`], `503` + `Retry-After` when full) and a wall
 //! clock timeout ([`QUERY_TIMEOUT`], `504`).
 //!
+//! ## What the in-process call changes about the search it makes
+//!
+//! The hub's call sets `es_compat::InProcessSearch`, a task-local that a request
+//! off the wire cannot carry, and nothing else does:
+//!
+//! * **It is not audited.** The node's `_search` handler appends every search to
+//!   the audit ring — 4,096 entries shared by the whole node — so one entry per
+//!   public request would let a crowd of strangers age the operator's evidence out
+//!   of it. The HTTP access log is the record of hub reads. (The audit LAYER in
+//!   `router.rs` is skipped for the public routes for the same reason.)
+//! * **A failing index is skipped, not fatal.** `search` fans out over every pack
+//!   on the node, and the engine used to fail the whole request on the first index
+//!   that errored: one pack with an unusable mapping took `search` down for every
+//!   other pack. The index is skipped (logged, counted in `_shards.failed`); when
+//!   EVERY index fails the first failure is the answer, so an outage is a `503`
+//!   and never an empty list. `search` also sends `lenient`, which removes the
+//!   commonest cause (a pack that maps `body` as a number) at the source.
+//! * **An oversized response shrinks the window.** One in-process response is
+//!   capped at 16 MiB (`MAX_INTERNAL_RESPONSE_BYTES`). `code` fetches whole records, ten
+//!   times the `k` asked for, so two very large records overflow it even at
+//!   `k=1`; the search is retried with half the window until it fits, and the
+//!   answer says it was built from fewer candidates (`truncated: true`). A
+//!   mapping read that overflows is a different matter — see `search` below.
+//!
 //! ## Known limits, stated so they are not rediscovered
 //!
-//! * Every hosted search appends an entry to the node's audit ring (the
-//!   `_search` handler does so unconditionally). On a dedicated hub node that is
-//!   harmless; on a node that also holds data worth auditing, a flood of
-//!   rate-limited-but-distinct clients can age out older entries.
 //! * `Answer.answered_from` is always `hosted` here: that is where the answer
 //!   came from as far as the client is concerned, even though the server read a
 //!   local pack.
 //! * The shared query pipeline's JSON output does not report which arms ran for
 //!   `mode=semantic|hybrid` (its "BM25 only" note is prose-only), so those
-//!   modes carry a warning saying so instead of a silent fallback.
+//!   modes carry a warning saying what each one DOES instead: `semantic` over a
+//!   corpus with no `semantic_text` mapping returns no hits (it does not fall
+//!   back), `hybrid` answers from BM25 alone.
+//! * `search` reads the node-wide mappings to learn which of `body`, `defs` and
+//!   `symbol_text` exist (this engine collapses a multi-token query to zero hits
+//!   when a named field is mapped nowhere). If that read fails — typically
+//!   because the mappings of every pack together are larger than the response
+//!   cap — `search` is a `503`, not `{"corpora":[]}`, and the failure is
+//!   remembered for a few seconds (`SEARCH_FIELDS_FAILURE_TTL`) so it is not recomputed by every
+//!   request. A caller that runs under a visibility rule of its own reads (and
+//!   shares) nothing from that cache.
 //! * `search` queries `xc-*`, not the plan's `xc-*-docs,xc-*-defs`. This engine
 //!   resolves index-name wildcards only as `*`, `prefix*` or `*suffix`
 //!   (`glob_match_simple`, `es_compat.rs`), so a `*` in the middle of a name
@@ -103,7 +152,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::{Body, Bytes};
@@ -178,6 +228,19 @@ const SEARCH_FIELDS: [&str; 3] = ["body", "defs", "symbol_text"];
 const SEARCH_POOL: usize = 100;
 /// How long a resolved `search` field list is reused.
 const SEARCH_FIELDS_TTL: Duration = Duration::from_secs(60);
+/// How long a FAILED read of the `search` field list is remembered. Short, so a
+/// transient fault clears itself quickly; not zero, because the usual cause is a
+/// node-wide mapping too large to read (see [`HubShared::search_fields_blocking`])
+/// and that read costs seconds every time it is repeated.
+const SEARCH_FIELDS_FAILURE_TTL: Duration = Duration::from_secs(15);
+/// The `size` an Elasticsearch-style search has when its body names none.
+const DEFAULT_SEARCH_SIZE: u64 = 10;
+/// How many times, in all, one hosted request may halve a search window because
+/// the response did not fit the cap. Each try is a whole search that is thrown
+/// away, so the budget is per request and not per search: a pipeline that
+/// searches three times (`hybrid`) gets no more tries than one that searches
+/// once. Seven halvings take the largest window (200) down to one.
+const MAX_WINDOW_SHRINKS: usize = 7;
 /// Longest excerpt carried by a `search` best hit built from a docs record.
 const EXCERPT_CHARS: usize = 240;
 /// `_source` fields `search` asks the engine for — everything a best hit needs,
@@ -212,19 +275,74 @@ pub struct HubShared {
     limiter: RateLimiter,
     slots: Arc<tokio::sync::Semaphore>,
     catalogue: Mutex<Option<CachedCatalogue>>,
-    search_fields: Mutex<Option<(Instant, Vec<&'static str>)>>,
+    /// What the last read of the node-wide mappings found, and when. Shared by
+    /// callers who run under no visibility rule of their own; see
+    /// [`HubShared::search_fields_blocking`].
+    search_fields: Mutex<Option<(Instant, FieldsRead)>>,
+    tuning: Tuning,
+    /// How many times the node-wide mappings were read for `search`.
+    mapping_reads: AtomicU64,
+}
+
+/// The outcome of reading the node-wide mappings for `search`.
+enum FieldsRead {
+    Resolved(Vec<&'static str>),
+    /// The read failed. The detail is for the log; the client gets the fixed 503.
+    Failed(String),
+}
+
+/// Limits a test may lower so that a failure which needs 16 MiB in production
+/// needs a few KiB in a test. Production always uses [`Tuning::default`]; there
+/// is no way to set this over HTTP or from configuration.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Tuning {
+    /// Cap on any single in-process response, in bytes.
+    pub response_cap_bytes: usize,
+    /// How long a failed read of the `search` field list is remembered.
+    pub fields_failure_ttl: Duration,
+    /// Called with the ledger root and the slug right after a `def`/`code`
+    /// request's ledger passed the build-prefix check and before the shared
+    /// pipeline reads it again: the instant at which a `xerj hub pull` landing
+    /// mid-request would change what that second read finds.
+    pub after_ledger_check: Option<fn(&FsPath, &str)>,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            response_cap_bytes: MAX_INTERNAL_RESPONSE_BYTES,
+            fields_failure_ttl: SEARCH_FIELDS_FAILURE_TTL,
+            after_ledger_check: None,
+        }
+    }
 }
 
 impl HubShared {
     /// State for one router, over the node's [`AppState`].
     pub fn new(app: AppState) -> Arc<Self> {
+        Self::with_tuning(app, Tuning::default())
+    }
+
+    /// Test seam: [`HubShared::new`] with lowered limits. Not reachable over
+    /// HTTP.
+    #[doc(hidden)]
+    pub fn with_tuning(app: AppState, tuning: Tuning) -> Arc<Self> {
         Arc::new(Self {
             app,
             limiter: RateLimiter::new(RATE_LIMIT, RATE_WINDOW, MAX_TRACKED_CLIENTS),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_QUERIES)),
             catalogue: Mutex::new(None),
             search_fields: Mutex::new(None),
+            tuning,
+            mapping_reads: AtomicU64::new(0),
         })
+    }
+
+    /// Test seam: how many times `search` has read the node-wide mappings.
+    #[doc(hidden)]
+    pub fn mapping_reads_for_test(&self) -> u64 {
+        self.mapping_reads.load(Ordering::Relaxed)
     }
 
     /// Test seam: take `n` query slots, as `n` slow queries would. Not
@@ -289,13 +407,15 @@ impl HubShared {
         }
     }
 
-    /// `Ok` when `slug` is a corpus the catalogue lists and permits serving,
-    /// else the response to send instead.
+    /// The catalogue's rule for `slug` when it lists the corpus and permits
+    /// serving it, else the response to send instead.
     ///
     /// Everything that is not a servable corpus — a malformed name, a name the
     /// catalogue does not list, a listed name with the `excluded` licence class
-    /// — is the same `404`: the caller learns nothing about which it was.
-    async fn resolve_corpus(self: &Arc<Self>, slug: &str) -> Result<(), Response> {
+    /// — is the same `404`: the caller learns nothing about which it was. The
+    /// rule is the catalogue's half of the licence decision; the corpus's own
+    /// ledger is the other half, and [`corpus_facts`] takes the stricter.
+    async fn resolve_corpus(self: &Arc<Self>, slug: &str) -> Result<CorpusRule, Response> {
         if !valid_slug(slug) {
             return Err(unknown_corpus());
         }
@@ -315,7 +435,7 @@ impl HubShared {
             }
         };
         match index.corpora.get(slug) {
-            Some(rule) if rule.licence_class != LicenceClass::Excluded => Ok(()),
+            Some(rule) if rule.licence_class != LicenceClass::Excluded => Ok(rule.clone()),
             _ => Err(unknown_corpus()),
         }
     }
@@ -329,32 +449,64 @@ impl HubShared {
     /// union — the same gate the CLI applies — and the answer is reused for
     /// [`SEARCH_FIELDS_TTL`], since reading the mappings of every pack is far
     /// more expensive than a search. Blocking.
-    fn search_fields_blocking(&self, node: &InProcessNode) -> Vec<&'static str> {
-        {
-            let cache = self.search_fields.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((at, fields)) = cache.as_ref() {
-                if at.elapsed() < SEARCH_FIELDS_TTL {
-                    return fields.clone();
+    ///
+    /// `Err` is a read that FAILED, and `search` answers it with the fixed 503:
+    /// an unreadable mapping is an outage, not "no results". The usual cause is
+    /// a node-wide mapping bigger than the cap on one in-process response
+    /// (16 MiB: a few hundred wide indices will do it), and reading it costs
+    /// seconds each time, so a failure is remembered for
+    /// [`Tuning::fields_failure_ttl`] — short, so a transient fault clears
+    /// itself — and the read is single-flight: the lock is held while the
+    /// mappings are read, so a crowd of requests arriving together waits for one
+    /// read instead of making sixteen.
+    ///
+    /// A caller running under a visibility rule of its own sees only its slice
+    /// of the node, so what it reads is not shared and what others read is not
+    /// reused for it: it neither reads nor writes the cache.
+    fn search_fields_blocking(&self, node: &InProcessNode) -> Result<Vec<&'static str>, String> {
+        if node.is_guarded() {
+            return self.read_search_fields(node).map(Option::unwrap_or_default);
+        }
+        let mut cache = self.search_fields.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, read)) = cache.as_ref() {
+            match read {
+                FieldsRead::Resolved(fields) if at.elapsed() < SEARCH_FIELDS_TTL => {
+                    return Ok(fields.clone());
                 }
+                FieldsRead::Failed(why) if at.elapsed() < self.tuning.fields_failure_ttl => {
+                    return Err(why.clone());
+                }
+                _ => {}
             }
         }
-        let path = format!("/{SEARCH_INDEX_EXPR}/_mapping");
-        let fields = match node.get_mapping(&path) {
-            Ok(mapping) => mapped_search_fields(&mapping),
+        match self.read_search_fields(node) {
+            Ok(Some(fields)) => {
+                *cache = Some((Instant::now(), FieldsRead::Resolved(fields.clone())));
+                Ok(fields)
+            }
             // No `xc-*` index yet: nothing to search, and not an error. Not
             // remembered, so the first pack restored is searchable on the next
             // request rather than a minute later.
-            Err(e) if e.contains("__404__") => return Vec::new(),
-            // A failed read is not remembered either: one transient fault must
-            // not blank `search` for the whole TTL.
-            Err(e) => {
-                tracing::warn!(error = ?truncate_chars(&e, 500), "hub search: cannot read mappings");
-                return Vec::new();
+            Ok(None) => Ok(Vec::new()),
+            Err(why) => {
+                *cache = Some((Instant::now(), FieldsRead::Failed(why.clone())));
+                Err(why)
             }
-        };
-        *self.search_fields.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((Instant::now(), fields.clone()));
-        fields
+        }
+    }
+
+    /// One read of the node-wide mappings, as the caller sees them. `Ok(None)`:
+    /// there is no `xc-*` index at all.
+    fn read_search_fields(
+        &self,
+        node: &InProcessNode,
+    ) -> Result<Option<Vec<&'static str>>, String> {
+        self.mapping_reads.fetch_add(1, Ordering::Relaxed);
+        match node.get_mapping(&format!("/{SEARCH_INDEX_EXPR}/_mapping")) {
+            Ok(mapping) => Ok(Some(mapped_search_fields(&mapping))),
+            Err(e) if e.contains("__404__") => Ok(None),
+            Err(e) => Err(format!("cannot read the node-wide mappings: {e}")),
+        }
     }
 }
 
@@ -614,17 +766,30 @@ async fn rate_limit(State(shared): State<Arc<HubShared>>, req: Request, next: Ne
 // The in-process XcHttp
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Engine-level visibility for hosted queries: `xc-*` indices only.
+/// Engine-level visibility for hosted queries: `xc-*` indices only, and only
+/// those the caller could already see.
 ///
 /// Installed around every internal call. The engine consults it at the
 /// funnel every name passes through (`Engine::get_index`, `list_indices`), so
 /// an alias, a wildcard or a bug upstream of this module still cannot reach an
 /// index outside the hub namespace.
-struct HubVisibility;
+///
+/// It is the INTERSECTION of two rules and a replacement for neither. The hub
+/// namespace is one. The other is `outer`: the rule the caller's own request was
+/// running under, which `authz_middleware` installs for every principal that is
+/// not the superuser (an API key's grants). A key scoped to `tenant-a-*` is
+/// refused `xc-mini-c-b1-docs` by the ordinary API, and must be refused it here
+/// too — a hosted route is a different way to ask the engine, not a different
+/// set of rights. With no `outer` the caller is unrestricted (the superuser, an
+/// open-mode node, or a `hub.public` request, which skips authorization) and
+/// only the namespace applies.
+struct HubVisibility {
+    outer: Option<Arc<dyn IndexVisibility>>,
+}
 
 impl IndexVisibility for HubVisibility {
     fn visible(&self, index: &str) -> bool {
-        index.starts_with("xc-")
+        index.starts_with("xc-") && self.outer.as_ref().is_none_or(|rule| rule.visible(index))
     }
 }
 
@@ -662,18 +827,114 @@ fn hub_index_expr_ok(expr: &str) -> bool {
 pub struct InProcessNode {
     router: Router,
     rt: tokio::runtime::Handle,
-    /// The caller's `Authorization` header, forwarded only so the audit entry a
-    /// search writes names the right principal. The private router has no
+    /// The caller's `Authorization` header, forwarded so the internal request
+    /// carries the principal it came from. The private router has no
     /// authentication layer; nothing here grants anything.
     auth: Option<HeaderValue>,
+    /// Cap on any single response read back from the engine, in bytes.
+    cap: usize,
+    /// The visibility rule the caller's own request was running under, captured
+    /// on the request's task before the work moved to the blocking pool (a
+    /// task-local does not follow a `spawn_blocking`). `None`: unrestricted.
+    outer: Option<Arc<dyn IndexVisibility>>,
+    /// When set, only index expressions that begin with this build prefix are
+    /// sent: see [`InProcessNode::pin_to_build`].
+    scope: OnceLock<String>,
+    /// How many candidate records the last search that had to be cut back to fit
+    /// the response cap was limited to; 0 when none was.
+    cut_to: AtomicUsize,
+    /// The most indices any one search of this request skipped because they
+    /// failed (`_shards.failed`); 0 when none did.
+    skipped: AtomicU64,
+    /// Halvings of a search window this request may still spend
+    /// ([`MAX_WINDOW_SHRINKS`] in all).
+    shrinks_left: AtomicUsize,
+}
+
+/// Why an internal request produced no response.
+enum SendError {
+    /// The response was larger than the cap on one in-process response.
+    TooLarge,
+    /// Anything else; the text is for the log.
+    Failed(String),
+}
+
+impl SendError {
+    fn describe(self, cap: usize) -> String {
+        match self {
+            SendError::TooLarge => format!("internal response over {cap} bytes"),
+            SendError::Failed(why) => why,
+        }
+    }
 }
 
 impl InProcessNode {
-    fn new(app: &AppState, auth: Option<HeaderValue>) -> Self {
+    fn new(
+        app: &AppState,
+        auth: Option<HeaderValue>,
+        cap: usize,
+        outer: Option<Arc<dyn IndexVisibility>>,
+    ) -> Self {
         Self {
             router: internal_router(app),
             rt: tokio::runtime::Handle::current(),
             auth,
+            cap,
+            outer,
+            scope: OnceLock::new(),
+            cut_to: AtomicUsize::new(0),
+            skipped: AtomicU64::new(0),
+            shrinks_left: AtomicUsize::new(MAX_WINDOW_SHRINKS),
+        }
+    }
+
+    /// Spend one of this request's window halvings; `false` when none are left.
+    fn take_shrink(&self) -> bool {
+        self.shrinks_left
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    /// How many of the indices a search covered could not be searched and were
+    /// skipped (see [`es_compat::InProcessSearch::skip_failed_indices`]).
+    fn skipped_indices(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
+    }
+
+    /// Is the caller running under a visibility rule of its own?
+    fn is_guarded(&self) -> bool {
+        self.outer.is_some()
+    }
+
+    /// Confine this node to ONE corpus build: from now on an index expression is
+    /// sent only if every comma-separated part begins with `prefix`.
+    ///
+    /// `prefix` is the build prefix [`valid_build_prefix`] accepted. The `def`
+    /// and `code` pipelines re-read the corpus's ledger themselves to decide
+    /// what to query, so validating the ledger once, up front, would not stop a
+    /// ledger that changed in between (a `xerj hub pull` landing mid-request)
+    /// from aiming a query somewhere else. Pinning the node makes the validated
+    /// prefix the only thing that request can address, whatever the pipeline
+    /// then computes. Set once; a second call changes nothing.
+    fn pin_to_build(&self, prefix: &str) {
+        let _ = self.scope.set(prefix.to_string());
+    }
+
+    /// [`hub_index_expr_ok`], and inside the build this node is pinned to.
+    fn expr_ok(&self, expr: &str) -> bool {
+        hub_index_expr_ok(expr)
+            && self.scope.get().is_none_or(|pinned| {
+                expr.split(',')
+                    .all(|part| part.starts_with(pinned.as_str()))
+            })
+    }
+
+    /// The number of candidate records the answer was cut back to because the
+    /// full window did not fit the response cap, if it was.
+    fn window_cut_to(&self) -> Option<usize> {
+        match self.cut_to.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
         }
     }
 
@@ -682,7 +943,7 @@ impl InProcessNode {
         method: Method,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<(u16, Bytes), String> {
+    ) -> Result<(u16, Bytes), SendError> {
         let mut builder = Request::builder().method(method).uri(path);
         if let Some(a) = &self.auth {
             builder = builder.header(header::AUTHORIZATION, a.clone());
@@ -691,30 +952,40 @@ impl InProcessNode {
             Some(b) => builder
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(b).map_err(|e| e.to_string())?,
+                    serde_json::to_vec(b).map_err(|e| SendError::Failed(e.to_string()))?,
                 )),
             None => builder.body(Body::empty()),
         }
-        .map_err(|e| format!("cannot build the internal request: {e}"))?;
+        .map_err(|e| SendError::Failed(format!("cannot build the internal request: {e}")))?;
         let router = self.router.clone();
+        let cap = self.cap;
         let call = async move {
             let resp = match router.oneshot(req).await {
                 Ok(resp) => resp,
                 Err(never) => match never {},
             };
             let status = resp.status().as_u16();
-            let bytes = axum::body::to_bytes(resp.into_body(), MAX_INTERNAL_RESPONSE_BYTES)
+            let bytes = axum::body::to_bytes(resp.into_body(), cap)
                 .await
-                .map_err(|_| {
-                    format!("internal response over {MAX_INTERNAL_RESPONSE_BYTES} bytes")
-                })?;
-            Ok::<_, String>((status, bytes))
+                .map_err(|_| SendError::TooLarge)?;
+            Ok::<_, SendError>((status, bytes))
         };
+        // This search is the node talking to itself on behalf of a public route:
+        // it is not audited, and one bad index must not fail it for the rest.
+        let call = es_compat::scoped_in_process_search(
+            es_compat::InProcessSearch {
+                skip_audit: true,
+                skip_failed_indices: true,
+            },
+            call,
+        );
+        let guard: Arc<dyn IndexVisibility> = Arc::new(HubVisibility {
+            outer: self.outer.clone(),
+        });
         // `block_on` is legal here: this runs on a blocking-pool thread, never
         // on an async worker. The visibility guard is a task-local, so it must
         // be installed inside the future this thread drives.
-        self.rt
-            .block_on(index_guard::scoped(Arc::new(HubVisibility), call))
+        self.rt.block_on(index_guard::scoped(guard, call))
     }
 
     fn json(
@@ -722,7 +993,7 @@ impl InProcessNode {
         method: Method,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<(u16, Value), String> {
+    ) -> Result<(u16, Value), SendError> {
         let (status, bytes) = self.send(method, path, body)?;
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Ok((status, value))
@@ -734,9 +1005,12 @@ impl XcHttp for InProcessNode {
         let expr = path
             .strip_prefix('/')
             .and_then(|p| p.strip_suffix("/_mapping"))
-            .filter(|e| hub_index_expr_ok(e))
+            .filter(|e| self.expr_ok(e))
             .ok_or_else(|| "refused: not a hub mapping path".to_string())?;
-        match self.json(Method::GET, &format!("/{expr}/_mapping"), None)? {
+        match self
+            .json(Method::GET, &format!("/{expr}/_mapping"), None)
+            .map_err(|e| e.describe(self.cap))?
+        {
             (s, v) if (200..300).contains(&s) => Ok(v),
             (404, _) => Err("__404__".to_string()),
             (s, v) => Err(format!("HTTP {s}: {v}")),
@@ -744,11 +1018,14 @@ impl XcHttp for InProcessNode {
     }
 
     fn cat_indices_json(&self, pattern: &str) -> Result<Vec<String>, String> {
-        if !hub_index_expr_ok(pattern) {
+        if !self.expr_ok(pattern) {
             return Err("refused: not a hub index pattern".to_string());
         }
         let path = format!("/_cat/indices/{pattern}?format=json&h=index");
-        match self.json(Method::GET, &path, None)? {
+        match self
+            .json(Method::GET, &path, None)
+            .map_err(|e| e.describe(self.cap))?
+        {
             // A wildcard matching no index is "none", not an error.
             (404, _) => Ok(Vec::new()),
             (s, v) if (200..300).contains(&s) => v
@@ -764,14 +1041,71 @@ impl XcHttp for InProcessNode {
         }
     }
 
+    /// `POST /{index}/_search`, retried with a smaller `size` when the response
+    /// does not fit the cap on one in-process response.
+    ///
+    /// The `code` pipeline asks for whole records (the passage is cut from the
+    /// record's `body`) and for ten times the `k` it was asked for, up to 200.
+    /// Two 9 MiB records therefore overflow a 16 MiB cap even at `k=1`, and a
+    /// 503 for a question the corpus can answer is the wrong outcome. So an
+    /// overflowing search is repeated with half the window until it fits, within
+    /// a budget of [`MAX_WINDOW_SHRINKS`] halvings for the whole request (each
+    /// try is a full search that is thrown away);
+    /// [`InProcessNode::window_cut_to`] then reports that the answer was built
+    /// from fewer candidates. A window of one that still does not fit, or an
+    /// exhausted budget, is an error: there is no smaller answer to give.
     fn search(&self, index: &str, body: &Value) -> Result<Value, String> {
-        if !hub_index_expr_ok(index) {
+        if !self.expr_ok(index) {
             return Err("refused: not a hub index expression".to_string());
         }
-        match self.json(Method::POST, &format!("/{index}/_search"), Some(body))? {
-            (s, v) if (200..300).contains(&s) => Ok(v),
-            (404, _) => Err("__404__".to_string()),
-            (s, v) => Err(format!("HTTP {s}: {v}")),
+        let path = format!("/{index}/_search");
+        let mut body = std::borrow::Cow::Borrowed(body);
+        loop {
+            match self.json(Method::POST, &path, Some(&body)) {
+                Err(SendError::TooLarge) => {
+                    let size = body
+                        .get("size")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(DEFAULT_SEARCH_SIZE);
+                    if size <= 1 || !self.take_shrink() {
+                        return Err(SendError::TooLarge.describe(self.cap));
+                    }
+                    let mut smaller = body.into_owned();
+                    smaller["size"] = json!((size / 2).max(1));
+                    body = std::borrow::Cow::Owned(smaller);
+                }
+                Err(e) => return Err(e.describe(self.cap)),
+                Ok((s, v)) if (200..300).contains(&s) => {
+                    let failed = v
+                        .pointer("/_shards/failed")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if failed > 0 {
+                        self.skipped.fetch_max(failed, Ordering::Relaxed);
+                    }
+                    if matches!(body, std::borrow::Cow::Owned(_)) {
+                        let size = body
+                            .get("size")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(DEFAULT_SEARCH_SIZE);
+                        let returned = v
+                            .pointer("/hits/hits")
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len) as u64;
+                        // A window that came back FULL may have left matches
+                        // behind; one that did not returned everything there was.
+                        if returned >= size {
+                            self.cut_to.store(
+                                usize::try_from(size).unwrap_or(usize::MAX),
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    return Ok(v);
+                }
+                Ok((404, _)) => return Err("__404__".to_string()),
+                Ok((s, v)) => return Err(format!("HTTP {s}: {v}")),
+            }
         }
     }
 }
@@ -801,7 +1135,16 @@ where
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return Err(resp);
     };
-    let node = InProcessNode::new(&shared.app, headers.get(header::AUTHORIZATION).cloned());
+    // Captured HERE, on the request's own task, before the work moves to the
+    // blocking pool: the caller's visibility rule is a task-local and does not
+    // follow a `spawn_blocking`. Read inside the closure it would see nothing and
+    // silently widen the caller to the whole `xc-*` namespace.
+    let node = InProcessNode::new(
+        &shared.app,
+        headers.get(header::AUTHORIZATION).cloned(),
+        shared.tuning.response_cap_bytes,
+        index_guard::current(),
+    );
     let job = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work(&node)
@@ -837,6 +1180,27 @@ pub fn valid_slug(slug: &str) -> bool {
     slug.len() <= 64
         && bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+}
+
+/// Is `prefix` exactly `xc-<slug>-b<digits>` — the build prefix of the corpus
+/// named `slug` and of nothing else?
+///
+/// The state ledger is written by `xerj hub pull` from the pack's own manifest,
+/// so its `index_prefix` is pack-supplied text. Every `code` and `def` query is
+/// aimed at `<index_prefix>*` or `<index_prefix>-defs`, so an unchecked prefix is
+/// a way to aim a hosted query at somebody else's indices: `xc-` is every hub
+/// index on the node, `xc-mini-closed-b1` is another corpus's real build (the
+/// excluded one, say), and a comma list is two expressions in one. The character
+/// set [`hub_index_expr_ok`] allows does not stop any of those, so the shape does:
+/// the corpus's OWN slug, then `-b`, then digits to the end — no wildcard, no
+/// comma, no suffix, and no other corpus's name.
+pub fn valid_build_prefix(prefix: &str, slug: &str) -> bool {
+    valid_slug(slug)
+        && prefix
+            .strip_prefix("xc-")
+            .and_then(|rest| rest.strip_prefix(slug))
+            .and_then(|rest| rest.strip_prefix("-b"))
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Collect the query string into a map, refusing a parameter this route does
@@ -1090,17 +1454,26 @@ async fn def_route(
         Ok(k) => k,
         Err(why) => return bad_request(why),
     };
-    if let Err(resp) = shared.resolve_corpus(&slug).await {
-        return resp;
-    }
+    let rule = match shared.resolve_corpus(&slug).await {
+        Ok(rule) => rule,
+        Err(resp) => return resp,
+    };
+    let after_check = shared.tuning.after_ledger_check;
     let outcome = run_query(&shared, &headers, move |node| {
         let root = hub_root();
-        let facts = match corpus_facts(&root, &slug) {
+        let facts = match corpus_facts(&root, &slug, &rule) {
             Ok(f) => f,
-            Err(_) => return Outcome::NotLoaded,
+            Err(LedgerError::NotLoaded) => return Outcome::NotLoaded,
+            Err(LedgerError::Invalid(why)) => return Outcome::Failed(why),
         };
         if facts.licence_class == LicenceClass::Excluded {
             return Outcome::NotServed;
+        }
+        // Nothing this request sends may name an index outside the build the
+        // ledger was just checked to describe, whatever `lookup_in` then reads.
+        node.pin_to_build(&facts.index_prefix);
+        if let Some(hook) = after_check {
+            hook(&root, &slug);
         }
         // Mirror the CLI's refusals: a corpus the ledger knows but this node
         // holds no index for is "not loaded", not "no such definition".
@@ -1121,6 +1494,21 @@ async fn def_route(
             return Outcome::Failed(w.clone());
         }
         answer.answered_from = AnsweredFrom::Hosted;
+        // `lookup_in` describes the corpus from its ledger alone. This node
+        // serves it under the stricter of the ledger and the catalogue, and the
+        // header and every hit must say so (a `code` answer for the same corpus
+        // does).
+        answer.licence_class = facts.licence_class;
+        answer.licence_spdx = facts.licence_spdx.clone();
+        if let Some(note) = approach_only_note(&facts) {
+            for hit in &mut answer.hits {
+                hit.licence_warning = Some(note.clone());
+            }
+        }
+        if let Some(window) = node.window_cut_to() {
+            answer.truncated = true;
+            answer.warnings.push(window_cut_warning(window));
+        }
         Outcome::Done(Box::new(answer))
     })
     .await;
@@ -1154,18 +1542,28 @@ async fn code_route(
         Ok(m) => m,
         Err(why) => return bad_request(why),
     };
-    if let Err(resp) = shared.resolve_corpus(&slug).await {
-        return resp;
-    }
+    let rule = match shared.resolve_corpus(&slug).await {
+        Ok(rule) => rule,
+        Err(resp) => return resp,
+    };
     let width = passage_width(max_tokens);
+    let after_check = shared.tuning.after_ledger_check;
     let outcome = run_query(&shared, &headers, move |node| {
         let root = hub_root();
-        let facts = match corpus_facts(&root, &slug) {
+        let facts = match corpus_facts(&root, &slug, &rule) {
             Ok(f) => f,
-            Err(_) => return Outcome::NotLoaded,
+            Err(LedgerError::NotLoaded) => return Outcome::NotLoaded,
+            Err(LedgerError::Invalid(why)) => return Outcome::Failed(why),
         };
         if facts.licence_class == LicenceClass::Excluded {
             return Outcome::NotServed;
+        }
+        // `run_code_query` reads the ledger again to decide what to query. Pin
+        // the node to the build just validated, so nothing it computes can leave
+        // that corpus.
+        node.pin_to_build(&facts.index_prefix);
+        if let Some(hook) = after_check {
+            hook(&root, &slug);
         }
         let mut params = CodeParams::new(&slug, &query);
         params.k = k;
@@ -1191,17 +1589,23 @@ async fn code_route(
                         hit.licence_warning = Some(note.clone());
                     }
                 }
-                if mode != Mode::Bm25 {
-                    warnings.push(
-                        "mode semantic/hybrid falls back to BM25 when the corpus has no \
-                         semantic_text mapping, and this response does not say which arms ran"
-                            .to_string(),
-                    );
+                if let Some(note) = mode_warning(mode) {
+                    warnings.push(note.to_string());
                 }
-                let truncated = match max_tokens {
+                let mut truncated = match max_tokens {
                     Some(budget) => apply_token_budget(&mut hits, budget, &mut warnings),
                     None => false,
                 };
+                if let Some(window) = node.window_cut_to() {
+                    truncated = true;
+                    warnings.push(window_cut_warning(window));
+                }
+                // A miss must not read as "this code does not exist" when part
+                // of the corpus could not be searched.
+                let skipped = node.skipped_indices();
+                if skipped > 0 {
+                    warnings.push(skipped_warning(skipped));
+                }
                 Outcome::Done(Box::new(facts.into_answer(
                     AnswerMode::How,
                     hits,
@@ -1249,25 +1653,35 @@ async fn search_route(
     }
     let blocking_shared = shared.clone();
     let outcome = run_query(&shared, &headers, move |node| {
-        let fields = blocking_shared.search_fields_blocking(node);
+        // A failed read of the mappings is an outage, not an empty node.
+        let fields = blocking_shared.search_fields_blocking(node)?;
         if fields.is_empty() {
             return Ok(Vec::new());
         }
         // Only the top hits are read, never a total: with the fan-out over every
         // pack index, counting matches is work nobody asked for.
+        //
+        // `lenient`: the fan-out covers every pack on the node, and one pack that
+        // maps `body` as a number must not fail a text query for all the others
+        // (this engine answers a text query against a numeric field with a 400
+        // unless the clause is lenient). An index that still fails is skipped
+        // by the engine under [`es_compat::InProcessSearch`], not fatal.
         let body = json!({
             "size": SEARCH_POOL,
             "track_total_hits": false,
             "_source": SEARCH_SOURCE_FIELDS,
-            "query": { "multi_match": { "query": query, "fields": fields } },
+            "query": { "multi_match": { "query": query, "fields": fields, "lenient": true } },
         });
         let resp = match node.search(SEARCH_INDEX_EXPR, &body) {
             Ok(r) => r,
             Err(e) if e.contains("__404__") => return Ok(Vec::new()),
             Err(e) => return Err(format!("search failed: {e}")),
         };
+        let root = hub_root();
         let corpora = match &data.index {
-            Ok(index) => group_by_corpus(&resp, &index.corpora, k),
+            Ok(index) => group_by_corpus(&resp, &index.corpora, k, |slug, rule| {
+                servable_licence(&root, slug, rule)
+            }),
             Err(_) => Vec::new(),
         };
         Ok(corpora)
@@ -1300,6 +1714,11 @@ fn hub_root() -> PathBuf {
 /// pull wrote. Mirrors `xerj_hub::def`'s private `DefMeta` so a `def` answer
 /// and a `code` answer for the same corpus carry the same header; a test pins
 /// the two together.
+///
+/// `index_prefix` is the build prefix [`valid_build_prefix`] accepted, never
+/// what the ledger merely said. `licence_class` and `licence_spdx` are the
+/// effective licence ([`effective_licence`]): the stricter of the ledger's and
+/// the catalogue's, not the ledger's alone.
 struct CorpusFacts {
     corpus: String,
     index_prefix: String,
@@ -1310,18 +1729,141 @@ struct CorpusFacts {
     licence_class: LicenceClass,
 }
 
-fn corpus_facts(root: &FsPath, slug: &str) -> Result<CorpusFacts, String> {
-    let st = ledger::load_state(root, slug)?;
+/// Why a corpus's ledger cannot be used.
+enum LedgerError {
+    /// There is no readable ledger: the corpus is not loaded on this node.
+    NotLoaded,
+    /// A ledger that does not describe a servable pack. The detail is for the
+    /// log; the client gets the fixed 503.
+    Invalid(String),
+}
+
+/// The corpus's ledger, checked, and its licence reconciled with the
+/// catalogue's `rule`.
+///
+/// The ledger is written by `xerj hub pull` from the pack's own manifest, so
+/// nothing in it is trusted to say where to query: its build prefix must be
+/// exactly `xc-<slug>-b<digits>` ([`valid_build_prefix`]) or the corpus is
+/// refused before any query is built from it.
+fn corpus_facts(root: &FsPath, slug: &str, rule: &CorpusRule) -> Result<CorpusFacts, LedgerError> {
+    let st = ledger::load_state(root, slug).map_err(|_| LedgerError::NotLoaded)?;
+    let index_prefix = ledger::query_prefix(&st);
+    if !valid_build_prefix(&index_prefix, slug) {
+        return Err(LedgerError::Invalid(format!(
+            "the ledger for {slug} names the build prefix [{}], not xc-{slug}-b<digits>",
+            truncate_chars(&index_prefix, 80)
+        )));
+    }
     let pin_date = st.pin_date.clone().unwrap_or_default();
+    let (licence_class, licence_spdx) = effective_licence(
+        (rule.licence_class, &rule.licence_spdx),
+        (
+            parse_licence_class(st.licence_class.as_deref()),
+            st.licence_spdx.as_deref().unwrap_or_default(),
+        ),
+    );
     Ok(CorpusFacts {
         corpus: st.name(slug),
-        index_prefix: ledger::query_prefix(&st),
+        index_prefix,
         age_days: age_days_from(&pin_date, st.indexed_at.as_deref()),
         pin_sha: st.pin_sha.clone().unwrap_or_default(),
         pin_date,
-        licence_spdx: st.licence_spdx.clone().unwrap_or_default(),
-        licence_class: parse_licence_class(st.licence_class.as_deref()),
+        licence_spdx,
+        licence_class,
     })
+}
+
+/// How restrictive a class is: permissive < approach-only < excluded.
+fn licence_rank(class: LicenceClass) -> u8 {
+    match class {
+        LicenceClass::AdaptWithAttribution => 0,
+        LicenceClass::ApproachOnly => 1,
+        LicenceClass::Excluded => 2,
+    }
+}
+
+/// The licence a corpus is served under: the STRICTER of the catalogue's and the
+/// ledger's class, each given as `(class, spdx)`.
+///
+/// Both must permit serving and either can refuse — the catalogue is what the
+/// hub operator lists, the ledger is what this node's pack says about itself —
+/// so neither may loosen the other: a catalogue entry that is servable does not
+/// override a ledger that says `excluded`, and a ledger that says nothing (an
+/// absent class reads as permissive) does not override a catalogue that says
+/// `approach-only`. Every route takes its class from here, so `def`, `code` and
+/// `search` cannot disagree about the same corpus.
+///
+/// The SPDX id travels with the class that decided: the stricter side's, falling
+/// back to the other side's when it names none; on a tie the ledger's, because
+/// that is what the pack on this node says it is.
+pub fn effective_licence(
+    catalogue: (LicenceClass, &str),
+    ledger: (LicenceClass, &str),
+) -> (LicenceClass, String) {
+    let (decider, other) = if licence_rank(catalogue.0) > licence_rank(ledger.0) {
+        (catalogue, ledger)
+    } else {
+        (ledger, catalogue)
+    };
+    let spdx = if decider.1.is_empty() {
+        other.1
+    } else {
+        decider.1
+    };
+    (decider.0, spdx.to_string())
+}
+
+/// The effective licence for `search`, or `None` when the corpus must not be
+/// served from it: the stricter class is `excluded`, or the corpus's ledger
+/// cannot be used (not loaded here, or naming a build that is not its own) —
+/// the same corpora `def` and `code` answer `404`/`503` for.
+fn servable_licence(
+    root: &FsPath,
+    slug: &str,
+    rule: &CorpusRule,
+) -> Option<(LicenceClass, String)> {
+    let facts = corpus_facts(root, slug, rule).ok()?;
+    (facts.licence_class != LicenceClass::Excluded)
+        .then_some((facts.licence_class, facts.licence_spdx))
+}
+
+/// What `mode` does on a hosted corpus, for the one warning that says so. The
+/// shared query pipeline's JSON output does not report which arms ran, so the
+/// answer cannot say; it says what each mode DOES instead, and the two modes
+/// behave differently when the corpus has no `semantic_text` mapping for `body`.
+fn mode_warning(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::Bm25 => None,
+        Mode::Semantic => Some(
+            "mode=semantic searches only the indices that map `body` as semantic_text; a corpus \
+             with none returns no hits (it does not fall back to BM25), and this response does \
+             not say which indices were searched",
+        ),
+        Mode::Hybrid => Some(
+            "mode=hybrid combines BM25 with a vector search where the corpus maps `body` as \
+             semantic_text and answers from BM25 alone where it does not; this response does not \
+             say which arms ran",
+        ),
+    }
+}
+
+/// The warning for an answer from a corpus some of whose indices could not be
+/// searched (the engine skipped them rather than fail the whole request).
+fn skipped_warning(count: u64) -> String {
+    format!(
+        "{count} of this corpus's indices could not be searched and were skipped; the answer \
+         is from the rest, so a missing result may be in one of them"
+    )
+}
+
+/// The warning for an answer built from fewer candidate records than usual
+/// because the full window did not fit the response cap.
+fn window_cut_warning(window: usize) -> String {
+    format!(
+        "the matching records are too large to return together; the answer was built from the \
+         top {window} candidate record(s) instead of the usual window, so lower-ranked matches \
+         may be missing"
+    )
 }
 
 impl CorpusFacts {
@@ -1620,10 +2162,26 @@ struct BestHit {
 }
 
 /// Group a `multi_match` reply by corpus: the best hit of each, best first
-/// (ties by name), at most `want`. Hits from an index that belongs to no listed
-/// corpus, and from an `excluded` one, are skipped.
-fn group_by_corpus(resp: &Value, known: &HashMap<String, CorpusRule>, want: usize) -> Vec<BestHit> {
+/// (ties by name), at most `want`.
+///
+/// A hit's index is attributed to a corpus by `known`, the WHOLE catalogue
+/// (never a filtered subset: with `a` excluded and `a-b1` listed, the index
+/// `xc-a-b1-b2-docs` is `a`'s, and attributing it to `a-b1` would serve an
+/// excluded corpus's records under another name). What may then be served is
+/// decided by `licence`, asked once per corpus: it returns the licence class and
+/// SPDX id to serve the corpus under, or `None` to skip it. Hits from an index
+/// that belongs to no listed corpus are skipped too.
+fn group_by_corpus<F>(
+    resp: &Value,
+    known: &HashMap<String, CorpusRule>,
+    want: usize,
+    mut licence: F,
+) -> Vec<BestHit>
+where
+    F: FnMut(&str, &CorpusRule) -> Option<(LicenceClass, String)>,
+{
     let mut best: HashMap<&str, Hit> = HashMap::new();
+    let mut licences: HashMap<&str, Option<(LicenceClass, String)>> = HashMap::new();
     let rows = resp
         .pointer("/hits/hits")
         .and_then(Value::as_array)
@@ -1639,7 +2197,14 @@ fn group_by_corpus(resp: &Value, known: &HashMap<String, CorpusRule>, want: usiz
         let Some(rule) = known.get(slug) else {
             continue;
         };
-        if rule.licence_class == LicenceClass::Excluded {
+        let Some((class, spdx)) = licences
+            .entry(slug)
+            .or_insert_with(|| licence(slug, rule))
+            .as_ref()
+        else {
+            continue;
+        };
+        if *class == LicenceClass::Excluded {
             continue;
         }
         let score = row.get("_score").and_then(Value::as_f64).unwrap_or(0.0) as f32;
@@ -1655,8 +2220,8 @@ fn group_by_corpus(resp: &Value, known: &HashMap<String, CorpusRule>, want: usiz
         } else {
             doc_hit(src, score)
         };
-        if rule.licence_class == LicenceClass::ApproachOnly {
-            hit.licence_warning = Some(licence_note(&rule.licence_spdx));
+        if *class == LicenceClass::ApproachOnly {
+            hit.licence_warning = Some(licence_note(spdx));
         }
         best.insert(slug, hit);
     }
@@ -1716,5 +2281,143 @@ fn doc_hit(src: &Value, score: f32) -> Hit {
         value: None,
         score,
         licence_warning: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    /// The pin is what makes the validated build the ONLY thing a `def`/`code`
+    /// request can address, whatever the shared pipeline computes from its own
+    /// second read of a ledger that may have changed since it was checked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_pinned_to_a_build_refuses_every_expression_outside_it() {
+        let state = test_state();
+        let pinned = InProcessNode::new(&state, None, 1 << 20, None);
+        pinned.pin_to_build("xc-a-b1");
+        let unpinned = InProcessNode::new(&state, None, 1 << 20, None);
+
+        tokio::task::spawn_blocking(move || {
+            let refused =
+                |r: &Result<Value, String>| matches!(r, Err(e) if e.starts_with("refused"));
+            let outside = [
+                "xc-*",
+                "xc-",
+                "xc-b-b1*",
+                "xc-b-b1-defs",
+                "xc-a-b1*,xc-b-b1*",
+                "xc-b-b1-docs,xc-a-b1-docs",
+                "xc-a",
+                "xc-a-b",
+            ];
+            for expr in outside {
+                assert!(refused(&pinned.search(expr, &json!({}))), "search {expr}");
+                assert!(
+                    pinned
+                        .cat_indices_json(expr)
+                        .is_err_and(|e| e.starts_with("refused")),
+                    "cat {expr}"
+                );
+                assert!(
+                    refused(&pinned.get_mapping(&format!("/{expr}/_mapping"))),
+                    "mapping {expr}"
+                );
+                // Without the pin the same expressions are well-formed hub names:
+                // the pin, not the character set, is what refused them.
+                if expr != "xc-" {
+                    assert!(
+                        !refused(&unpinned.search(expr, &json!({}))),
+                        "unpinned {expr} is a legal hub expression"
+                    );
+                }
+            }
+            // Inside the build: well-formed, so the request reaches the engine,
+            // which has no such index here (a 404, not a refusal).
+            for expr in ["xc-a-b1*", "xc-a-b1-defs", "xc-a-b1-docs,xc-a-b1-defs"] {
+                let r = pinned.search(expr, &json!({}));
+                assert!(!refused(&r), "{expr}: {r:?}");
+                assert!(pinned.cat_indices_json(expr).is_ok(), "cat {expr}");
+            }
+        })
+        .await
+        .expect("blocking task");
+    }
+
+    /// Every overflow retry is a whole search that is thrown away, so a request
+    /// gets a fixed number of them however many searches its pipeline makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_has_a_fixed_budget_of_window_halvings() {
+        let state = test_state();
+        let node = InProcessNode::new(&state, None, 1 << 20, None);
+        for n in 0..MAX_WINDOW_SHRINKS {
+            assert!(node.take_shrink(), "halving {n} is within the budget");
+        }
+        assert!(!node.take_shrink(), "the budget is spent");
+        assert!(!node.take_shrink(), "and stays spent");
+        // Seven halvings are exactly what takes the widest window to one.
+        assert_eq!(
+            (0..MAX_WINDOW_SHRINKS).fold(200u64, |s, _| (s / 2).max(1)),
+            1
+        );
+        // A fresh request starts with a full budget.
+        let next = InProcessNode::new(&state, None, 1 << 20, None);
+        assert!(next.take_shrink());
+    }
+
+    #[test]
+    fn effective_licence_is_the_stricter_class_with_the_deciding_spdx() {
+        use LicenceClass::{AdaptWithAttribution as Adapt, ApproachOnly as Approach, Excluded};
+        let el = effective_licence;
+        // Agreement.
+        assert_eq!(el((Adapt, "MIT"), (Adapt, "MIT")), (Adapt, "MIT".into()));
+        assert_eq!(
+            el((Approach, "GPL-3.0-only"), (Approach, "GPL-3.0-only")),
+            (Approach, "GPL-3.0-only".into())
+        );
+        // Either side can be the stricter one, in every pair.
+        assert_eq!(
+            el((Adapt, "MIT"), (Approach, "AGPL")),
+            (Approach, "AGPL".into())
+        );
+        assert_eq!(
+            el((Approach, "GPL"), (Adapt, "MIT")),
+            (Approach, "GPL".into())
+        );
+        assert_eq!(
+            el((Adapt, "MIT"), (Excluded, "Closed")),
+            (Excluded, "Closed".into())
+        );
+        assert_eq!(
+            el((Excluded, "Closed"), (Adapt, "MIT")),
+            (Excluded, "Closed".into())
+        );
+        assert_eq!(
+            el((Approach, "GPL"), (Excluded, "Closed")),
+            (Excluded, "Closed".into())
+        );
+        assert_eq!(
+            el((Excluded, "Closed"), (Approach, "GPL")),
+            (Excluded, "Closed".into())
+        );
+        // The stricter side names no licence: the other side's id is used.
+        assert_eq!(el((Approach, "GPL"), (Adapt, "")), (Approach, "GPL".into()));
+        assert_eq!(el((Adapt, "MIT"), (Approach, "")), (Approach, "MIT".into()));
+        // A tie takes the ledger's id, else the catalogue's.
+        assert_eq!(
+            el((Adapt, "MIT"), (Adapt, "Apache-2.0")),
+            (Adapt, "Apache-2.0".into())
+        );
+        assert_eq!(el((Adapt, "MIT"), (Adapt, "")), (Adapt, "MIT".into()));
     }
 }
