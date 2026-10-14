@@ -20,6 +20,10 @@ toml.workspace = true
 sha2 = "0.10"
 tar = "0.4"
 
+# `xerj hub stop` signals exactly the PID it recorded (plan §5, §11).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 # The pack roundtrip test boots a real in-process node (ephemeral TCP port) so

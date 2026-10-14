@@ -107,6 +107,21 @@ pub fn route(
     hosted: Option<&dyn HostedSearch>,
     cached: &[String],
 ) -> Routing {
+    route_ranked(question, cwd, cat, hosted, cached).0
+}
+
+/// [`route`], plus every corpus that earned any evidence at all as
+/// `(slug, merged score)`, best first. The verdict is exactly [`route`]'s; the
+/// ranking is what a caller prints when the verdict is [`Routing::NoCorpus`] — the
+/// closest corpora, so the asker can name one with `--corpus` instead of being told
+/// only that nothing matched.
+pub fn route_ranked(
+    question: &str,
+    cwd: &Path,
+    cat: &Catalogue,
+    hosted: Option<&dyn HostedSearch>,
+    cached: &[String],
+) -> (Routing, Vec<(String, f32)>) {
     let mut evidence: Vec<Evidence> = Vec::new();
 
     // 1. Project dependencies — any corpus the project already depends on.
@@ -205,8 +220,8 @@ pub fn route(
 }
 
 /// Merge evidence by slug (max score), apply the cached bonus, and reach a
-/// verdict.
-fn decide(evidence: Vec<Evidence>, cached: &[String]) -> Routing {
+/// verdict; the ranking it was reached from comes back with it.
+fn decide(evidence: Vec<Evidence>, cached: &[String]) -> (Routing, Vec<(String, f32)>) {
     let mut best: HashMap<String, f32> = HashMap::new();
     for e in evidence {
         let score = e.score;
@@ -215,7 +230,7 @@ fn decide(evidence: Vec<Evidence>, cached: &[String]) -> Routing {
             .or_insert(score);
     }
     if best.is_empty() {
-        return Routing::NoCorpus;
+        return (Routing::NoCorpus, Vec::new());
     }
     for (slug, score) in best.iter_mut() {
         if cached.iter().any(|c| c == slug) {
@@ -237,7 +252,8 @@ fn decide(evidence: Vec<Evidence>, cached: &[String]) -> Routing {
         Some((_, second)) => top_score >= DOMINANCE * *second,
     };
     if top_score >= CONFIDENT_MIN && dominant {
-        return Routing::Confident(ranked[0].0.clone());
+        let slug = ranked[0].0.clone();
+        return (Routing::Confident(slug), ranked);
     }
 
     let candidates: Vec<String> = ranked
@@ -246,10 +262,10 @@ fn decide(evidence: Vec<Evidence>, cached: &[String]) -> Routing {
         .map(|(slug, _)| slug.clone())
         .collect();
     if candidates.len() >= 2 {
-        return Routing::Ambiguous(candidates);
+        return (Routing::Ambiguous(candidates), ranked);
     }
 
-    Routing::NoCorpus
+    (Routing::NoCorpus, ranked)
 }
 
 /// Tokenize a question into the terms matched against a sketch: each identifier

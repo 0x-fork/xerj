@@ -1,11 +1,15 @@
-//! Corpus Hub v2 — the `xerj hub …` subcommands and the `--def` code path
-//! (plan §2 builder + client, §3 `def`).
+//! Corpus Hub v2 — the `xerj hub …` subcommands, `xerj ask`, and the `--def` code
+//! path (plan §2 builder + client, §3 `def`, §5 `ask` / node, §8 `status`).
 //!
-//! Three entry points, all returning a process exit code:
+//! Entry points, all returning a process exit code:
 //!
 //! - [`run_hub_cli`] dispatches `xerj hub build-pack` (CI builds a signed,
-//!   pre-indexed pack) and `xerj hub pull` (a client downloads, verifies and
-//!   restores one). Future hub subcommands (status, sync, …) are plan §5/§8.
+//!   pre-indexed pack), `pull` (a client downloads, verifies and restores one),
+//!   `status`, `stop` (stop the automatic node) and `config hosted on|off`.
+//!   `sync`, `update` and `rm` are plan §8 and are not here.
+//! - [`run_ask`] is `xerj ask "<question>"` (and the bare `xerj "<question>"`
+//!   form, see [`is_bare_question`]): the flags are parsed here, the answer flow
+//!   itself is [`crate::ask`].
 //! - [`run_code`] is the `xerj code` front door: `--def <SYMBOL>` answers from
 //!   the corpus's `-defs` index via [`crate::def::lookup`] and the shared
 //!   renderer; everything else delegates unchanged to the existing
@@ -27,15 +31,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use xerj_common::hub::{
-    render, Answer, LicenceClass, PackIndex, PackManifest, PackSource, AUTO_PULL_MAX_BYTES,
-    DEFAULT_HUB_URL, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
+    render, Answer, CatalogueEntry, LicenceClass, PackIndex, PackManifest, PackSource,
+    AUTO_PULL_MAX_BYTES, DEFAULT_HUB_URL, DISK_BUDGET_BYTES, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
 };
 use xerj_common::xccode::manifest::read_hub_manifest;
 use xerj_common::xccode::state;
 use xerj_common::xccode::XcHttp;
 
+use crate::ask::{self, AskArgs, HostedSwitch, ModeRequest};
 use crate::catalogue::{build_catalogue, load_catalogue, CorpusBuildInput};
-use crate::node::{resolve_url, HubNode};
+use crate::flock::{held_by, FileLock, LockError};
+use crate::lockfile;
+use crate::node::{self, resolve_url, HubNode, NodeLauncher, StopOutcome};
 use crate::pack;
 
 const HUB_USAGE: &str = "usage: xerj hub <command>
@@ -44,6 +51,19 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
         Build a signed, pre-indexed pack from a registry manifest (CI).
   pull <slug> [--quiet] [--url <node>]
         Download, verify and restore a pack, then `xerj code <slug>` works.
+        Exits 2 for an unknown corpus, 3 when the pack fails verification, 5 when
+        this build has no hub public key to verify with (nothing is downloaded),
+        1 for anything else (an excluded licence and a pack over the size limit
+        are refused here too).
+  status
+        Cached packs, the automatic node, the hosted setting, catalogue age.
+  stop
+        Stop the automatic node `xerj ask` started (only that process).
+  config hosted on|off|auto
+        Whether questions may be sent to the hosted hub (default auto: off
+        inside a git repository, on elsewhere).
+
+Ask a question with `xerj ask \"<question>\"` (see `xerj ask --help`).
 
 Packs are pulled on demand and never cloned or indexed on the user's machine
 (docs/CORPUS_HUB_V2_IMPLEMENTATION.md).";
@@ -58,6 +78,9 @@ pub fn run_hub_cli(args: &[String]) -> i32 {
     match sub.as_str() {
         "build-pack" => run_build_pack(rest),
         "pull" => run_pull(rest),
+        "status" => run_status(rest),
+        "stop" => run_stop(rest),
+        "config" => run_config(rest),
         "-h" | "--help" | "help" => {
             println!("{HUB_USAGE}");
             0
@@ -460,11 +483,35 @@ fn run_pull(args: &[String]) -> i32 {
         eprintln!("xerj hub pull: <slug> is required\n\n{HUB_USAGE}");
         return 2;
     };
-    // DEFER: the client's localhost:9200 default is mandated by plan §2 ("Node
-    // for the client ... localhost:9200"); step 5's auto-spawned ~/.xerj/hub/node
-    // will own client node resolution. Unlike build-pack, pull's --url is optional.
-    let url = resolve_url(url.as_deref());
-    match pull(&slug, &url, quiet) {
+    // Everything that can refuse this pull — a malformed or unknown slug, an
+    // excluded licence, a pack over the size cap, no key to verify it with — is
+    // decided BEFORE a node is looked for or started. A doomed pull used to boot a
+    // whole node first, and only then say "no".
+    let plan = match plan_pull(&slug) {
+        Ok(p) => p,
+        Err(PullError { code, message }) => {
+            eprintln!("xerj hub pull: {message}");
+            return code;
+        }
+    };
+    // Unlike build-pack, pull's --url is optional: `--url` > `XERJ_URL` >
+    // `localhost:9200`, and when none of those answers, the automatic node
+    // (plan §5) is started or reused.
+    let launcher = match NodeLauncher::current() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("xerj hub pull: {e:#}");
+            return 1;
+        }
+    };
+    let resolved = match node::ensure_node(&hub_home(), url.as_deref(), &launcher) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("xerj hub pull: {e:#}");
+            return 1;
+        }
+    };
+    match pull_with(&plan, &resolved.url, resolved.managed, quiet) {
         Ok(Pulled::Already) => {
             if !quiet {
                 println!("{slug}: already present");
@@ -484,21 +531,24 @@ fn run_pull(args: &[String]) -> i32 {
     }
 }
 
-enum Pulled {
+pub(crate) enum Pulled {
     Already,
     Done(String),
 }
 
 /// A pull failure carrying an exit code the caller can act on: **2** = the slug
 /// is unknown or malformed; **3** = the pack failed verification (sha /
-/// signature / format, or there was no key to verify with); **1** = an
-/// infrastructure or policy failure (catalogue load, the size cap, node connect,
-/// a pull already in progress, the download, the restore, or writing the
-/// ledger). Keeping 2 and 3 exact lets a caller tell "wrong name" and "untrusted
-/// bytes" apart from "the machine or network got in the way".
-struct PullError {
-    code: i32,
-    message: String,
+/// signature / format); **5** = this build has no hub public key, so nothing can
+/// be verified (and nothing was downloaded); **1** = an infrastructure or policy
+/// failure (catalogue load, the licence or size policy, node connect, a pull
+/// already in progress, the download, the restore, or writing the ledger).
+/// Keeping 2, 3 and 5 exact lets a caller tell "wrong name", "untrusted bytes"
+/// and "this binary cannot verify anything" apart from "the machine or network
+/// got in the way".
+#[derive(Debug)]
+pub(crate) struct PullError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
 }
 impl PullError {
     fn new(code: i32, message: impl Into<String>) -> Self {
@@ -513,56 +563,100 @@ impl PullError {
 const E_INFRA: i32 = 1;
 /// The slug is unknown or malformed.
 const E_SLUG: i32 = 2;
-/// The pack failed verification (sha / signature / format / missing key).
+/// The pack failed verification (sha / signature / format).
 const E_VERIFY: i32 = 3;
+/// No hub public key is configured: the pack was never even fetched. Its own code,
+/// because it is not a verification FAILURE (the bytes were not judged and found
+/// wanting) and not a transient one (retrying cannot help): the build is missing
+/// the key.
+const E_NOKEY: i32 = ask::EXIT_NO_KEY;
 
 /// Largest signature file pull will download — an ed25519 sig is 128 hex chars,
 /// so this caps a hostile hub's "signature" far below the pack cap.
 const SIG_MAX_BYTES: u64 = 4096;
-/// A pull lock older than this is an abandoned lock from a crashed pull and is
-/// stolen, so a hard kill cannot wedge a corpus forever.
-const LOCK_STALE: Duration = Duration::from_secs(30 * 60);
+/// How long a pull waits for another pull of the same pin to finish before it
+/// gives up. A pull is a download of at most [`AUTO_PULL_MAX_BYTES`] plus a
+/// restore, so this is generous; it exists so a wedged holder cannot hang a
+/// caller (an agent's tool call) for ever.
+const PULL_LOCK_WAIT: Duration = Duration::from_secs(60);
 
-/// A best-effort cross-process mutex for one `(slug, pin)`: an atomically
-/// created `<pin8>.lock` directory. A second concurrent pull of the same pin
-/// sees it and refuses rather than racing the shared tmp/extract dirs; the guard
-/// removes it on drop (every non-crash return below). A lock left by a crash is
-/// stolen once older than [`LOCK_STALE`]. The durable lockfile is plan §8; this
-/// only closes the same-pin race.
+/// Cross-process exclusion for one `(slug, pin)`: an OS lock on `<pin8>.lock`
+/// (see [`crate::flock`]). A second concurrent pull of the same pin waits for the
+/// first (bounded by [`PULL_LOCK_WAIT`]) instead of racing it over the shared
+/// tmp/extract directories — and then finds the pack present.
+///
+/// The lock belongs to the process holding it: it is released the moment that
+/// process exits, however it exits. This used to be an atomically created
+/// directory that was only ever removed by the pull's own destructor, so a pull
+/// killed with SIGKILL, an OOM or an agent's tool timeout left the corpus
+/// un-pullable for thirty minutes, with no owner recorded and a message that
+/// named no path.
 struct PullLock {
-    path: PathBuf,
+    _lock: FileLock,
 }
 impl PullLock {
-    fn acquire(pack_dir: &Path, slug: &str, pin8: &str) -> Result<PullLock, PullError> {
+    fn acquire(
+        pack_dir: &Path,
+        slug: &str,
+        pin8: &str,
+        wait: Duration,
+        quiet: bool,
+    ) -> Result<PullLock, PullError> {
         fs::create_dir_all(pack_dir)
             .map_err(|e| PullError::new(E_INFRA, format!("create {}: {e}", pack_dir.display())))?;
         let path = pack_dir.join(format!("{pin8}.lock"));
-        // Steal an abandoned lock from a crashed pull.
-        let stale = fs::metadata(&path)
-            .ok()
-            .and_then(|md| md.modified().ok())
-            .and_then(|m| m.elapsed().ok())
-            .map(|age| age > LOCK_STALE)
-            .unwrap_or(false);
-        if stale {
-            let _ = fs::remove_dir(&path);
-        }
-        match fs::create_dir(&path) {
-            Ok(()) => Ok(PullLock { path }),
-            Err(_) => Err(PullError::new(
+        let contended = |holder| {
+            PullError::new(
                 E_INFRA,
-                format!("a pull of '{slug}' ({pin8}) is already in progress"),
-            )),
+                format!(
+                    "a pull of '{slug}' ({pin8}) is already in progress (lock {}{}) and was still \
+                     running after {}s; wait for it to finish — the lock is released the moment \
+                     that process exits, however it exits",
+                    path.display(),
+                    held_by(holder),
+                    wait.as_secs()
+                ),
+            )
+        };
+        let infra = |e: std::io::Error| {
+            PullError::new(
+                E_INFRA,
+                format!("cannot take the pull lock {}: {e}", path.display()),
+            )
+        };
+        // One immediate try, so the caller is only told it is waiting when it is.
+        match FileLock::acquire(&path, Duration::ZERO) {
+            Ok(lock) => return Ok(PullLock { _lock: lock }),
+            Err(LockError::Io(e)) => return Err(infra(e)),
+            Err(LockError::Timeout { .. }) => {}
         }
-    }
-}
-impl Drop for PullLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        if !quiet {
+            eprintln!(
+                "xerj hub: another pull of '{slug}' ({pin8}) is running; waiting up to {}s for it \
+                 (lock {})",
+                wait.as_secs(),
+                path.display()
+            );
+        }
+        match FileLock::acquire(&path, wait) {
+            Ok(lock) => Ok(PullLock { _lock: lock }),
+            Err(LockError::Timeout { holder }) => Err(contended(holder)),
+            Err(LockError::Io(e)) => Err(infra(e)),
+        }
     }
 }
 
-fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
+/// What a pull has decided before it touches a node or the disk: the catalogue
+/// entry, the pin its files are named by, and the key it will verify with.
+pub(crate) struct PullPlan {
+    entry: CatalogueEntry,
+    pin8: String,
+    pubkey: String,
+}
+
+/// Look `slug` up in the catalogue and decide whether it may be pulled at all
+/// ([`plan_pull_entry`]).
+pub(crate) fn plan_pull(slug: &str) -> Result<PullPlan, PullError> {
     // 0. Validate the slug BEFORE it is ever joined into a filesystem path. The
     //    catalogue is accepted UNVERIFIED when no hub pubkey is configured, so a
     //    hostile `slug` ("../../etc") must be rejected here, ahead of every fs op.
@@ -594,20 +688,52 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
             ),
         )
     })?;
-    // The matched entry's own slug drives the paths too; it equals `slug` (the
-    // find matched on it, already validated), but re-check defensively.
-    if !valid_slug(&entry.slug) {
+    plan_pull_entry(entry)
+}
+
+/// Everything that can refuse to pull `entry`, checked in the order that costs
+/// least and before any node, download or temp dir exists:
+///
+/// 1. its slug is safe to join into a path (the matched entry's own slug drives
+///    the paths, so it is re-checked even though the lookup matched on a valid one);
+/// 2. its pin is a commit;
+/// 3. its licence class is not `excluded` — **plan §11: an excluded corpus is never
+///    pulled.** This is enforced here, in the pull itself, and not only in the
+///    `ask` flow that decides whether to *start* one: `xerj hub pull <slug>` is a
+///    command anybody (or any agent that was handed a hint) can type, and a policy
+///    that only the caller applies is a policy the next caller forgets. There is
+///    deliberately no override flag: nothing in the plan lets a command line waive
+///    a licence class, and a flag an agent can read in `--help` is not a human
+///    decision. If an override is ever wanted it needs its own decision and its own
+///    confirmation, not a switch here;
+/// 4. its advertised size is within [`AUTO_PULL_MAX_BYTES`] — a malicious hub must
+///    not OOM the client by advertising a huge pack (decision 2). The transfer is
+///    bounded again in [`fetch_to`] in case the field lies;
+/// 5. there is a key to verify it with (exit [`E_NOKEY`]). Resolved before any temp
+///    dir exists, so a pull with no key leaves nothing to re-fetch.
+pub(crate) fn plan_pull_entry(entry: &CatalogueEntry) -> Result<PullPlan, PullError> {
+    let slug = entry.slug.as_str();
+    if !valid_slug(slug) {
         return Err(PullError::new(
             E_SLUG,
-            format!("catalogue entry has an invalid slug '{}'", entry.slug),
+            format!("catalogue entry has an invalid slug '{slug}'"),
         ));
     }
     let pin8 = pin8_of(&entry.pin_sha)
         .map_err(|e| PullError::new(E_INFRA, format!("catalogue entry for '{slug}': {e:#}")))?;
-
-    // 2. Size cap BEFORE any download — a malicious hub must not OOM the client
-    //    by advertising a huge pack (decision 2 / AUTO_PULL_MAX_BYTES). The
-    //    transfer is bounded again in `fetch_to` in case the field lies.
+    if entry.licence_class == LicenceClass::Excluded {
+        return Err(PullError::new(
+            E_INFRA,
+            format!(
+                "pack '{slug}' has an excluded licence class ({}) and is never pulled",
+                if entry.licence_spdx.is_empty() {
+                    "unknown"
+                } else {
+                    &entry.licence_spdx
+                }
+            ),
+        ));
+    }
     if entry.pack_bytes > AUTO_PULL_MAX_BYTES {
         return Err(PullError::new(
             E_INFRA,
@@ -617,24 +743,62 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
             ),
         ));
     }
+    let pubkey = hub_pubkey().map_err(|e| PullError::new(E_NOKEY, format!("{e:#}")))?;
+    Ok(PullPlan {
+        entry: entry.clone(),
+        pin8,
+        pubkey,
+    })
+}
 
-    // 3. The verifying key, resolved BEFORE any temp dir exists — a pull with no
-    //    key is a verification failure that must not leave a `.tmp` to re-fetch.
-    let pubkey = hub_pubkey().map_err(|e| PullError::new(E_VERIFY, format!("{e:#}")))?;
+/// Pull the planned corpus into the node at `url`. `managed` is true for the
+/// automatic node (started `--insecure`, so no credential is sent); `quiet`
+/// suppresses the eviction and wait notices.
+pub(crate) fn pull_with(
+    plan: &PullPlan,
+    url: &str,
+    managed: bool,
+    quiet: bool,
+) -> Result<Pulled, PullError> {
+    let entry = &plan.entry;
+    let slug = entry.slug.as_str();
+    let pin8 = plan.pin8.as_str();
+    let hub_home = hub_home();
 
-    // 4. The node (infra if unreachable).
+    // Disk budget (plan §5 step 6): make room BEFORE any download, evicting
+    // least-recently-used packs — never this slug's. Pack directories only; the
+    // node's restored indices are not touched.
+    for c in ask::evict_to_budget(&hub_home, slug, entry.pack_bytes, DISK_BUDGET_BYTES) {
+        if !quiet {
+            eprintln!(
+                "xerj hub: evicted '{}' {} ({} MB, least recently used) to stay under the {} MB \
+                 disk budget",
+                c.pack.slug,
+                c.pack.pin8,
+                ask::megabytes(c.bytes),
+                ask::megabytes(DISK_BUDGET_BYTES)
+            );
+        }
+    }
+
+    // The node (infra if unreachable).
     let root = xerj_autoindex::xc::code_root();
-    let node = HubNode::connect_with_key(url, None)
-        .map_err(|e| PullError::new(E_INFRA, format!("connect {url}: {e:#}")))?;
+    let node = if managed {
+        HubNode::connect_insecure(url)
+    } else {
+        HubNode::connect_with_key(url, None)
+    }
+    .map_err(|e| PullError::new(E_INFRA, format!("connect {url}: {e:#}")))?;
 
-    // 5. Take the per-pin lock so a concurrent pull does not race the tmp/extract
-    //    dirs; released on every return below (Drop).
+    // Take the per-pin lock so a concurrent pull does not race the tmp/extract
+    // dirs; released on every return below (Drop), and by the OS if this process
+    // dies before it gets there.
     let pack_dir = hub_home.join("packs").join(slug);
-    let _lock = PullLock::acquire(&pack_dir, slug, &pin8)?;
+    let _lock = PullLock::acquire(&pack_dir, slug, pin8, PULL_LOCK_WAIT, quiet)?;
 
-    // 6. Download pack + sig into a temp dir (size-capped). NOTHING is extracted.
+    // Download pack + sig into a temp dir (size-capped). NOTHING is extracted.
     let tmp = pack_dir.join(format!("{pin8}.tmp"));
-    let extract = pack_dir.join(pin8.clone());
+    let extract = pack_dir.join(pin8);
     let _ = fs::remove_dir_all(&tmp); // a stale temp from a crash must not poison this
     fs::create_dir_all(&tmp)
         .map_err(|e| PullError::new(E_INFRA, format!("create {}: {e}", tmp.display())))?;
@@ -655,32 +819,42 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
         }
     };
 
-    // 7. Verify sha256 THEN signature THEN format_version, extracting nothing
-    //    until all pass (plan §11). Any failure: delete the temp, exit 3.
-    let manifest =
-        match pack::read_and_verify_pack(&archive, &sig, &entry.pack_sha256, &pubkey, &extract) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&tmp);
-                // read_and_verify_pack never populates `extract` on failure; clear
-                // any half-written dir from an interrupted prior run too.
-                let _ = fs::remove_dir_all(&extract);
-                return Err(PullError::new(
-                    E_VERIFY,
-                    format!("pack verification failed: {e:#}"),
-                ));
-            }
-        };
+    // Verify sha256 THEN signature THEN format_version, extracting nothing until
+    // all pass (plan §11). Any failure: delete the temp, exit 3.
+    //
+    // The extraction goes to a staging directory inside `tmp`, never to `extract`
+    // itself, for two reasons. A pack killed mid-extraction must not leave a
+    // directory at the final path that looks complete (`pack.json`, the marker
+    // `ask` and `status` go by, used to be written before `snapshot/`). And a pull
+    // that fails — or is killed — must not delete the pack an earlier, successful
+    // pull put at `extract`: only what THIS run created is removed on failure.
+    let staging = tmp.join("extract");
+    let manifest = match pack::read_and_verify_pack(
+        &archive,
+        &sig,
+        &entry.pack_sha256,
+        &plan.pubkey,
+        &staging,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(PullError::new(
+                E_VERIFY,
+                format!("pack verification failed: {e:#}"),
+            ));
+        }
+    };
+    install_extract(&staging, &extract, &tmp)?;
     let _ = fs::remove_dir_all(&tmp);
 
-    // 8. Restore — unless the WHOLE index set is already live on this node. A
-    //    partial match (a prior partial restore, or a local `corpus index` that
-    //    produced a different build) must NOT read as a complete pack: skipping
-    //    then would leave `--def` querying a missing index and stamp the ledger
-    //    "answered from: local pack" over data that is not the pack. So the skip
-    //    requires EVERY manifest index present; a list error counts as "not
-    //    present" and restores (it never silently skips). Idempotent on a real
-    //    full match.
+    // Restore — unless the WHOLE index set is already live on this node. A partial
+    // match (a prior partial restore, or a local `corpus index` that produced a
+    // different build) must NOT read as a complete pack: skipping then would leave
+    // `--def` querying a missing index and stamp the ledger "answered from: local
+    // pack" over data that is not the pack. So the skip requires EVERY manifest
+    // index present; a list error counts as "not present" and restores (it never
+    // silently skips). Idempotent on a real full match.
     let prefix = manifest.index_prefix.clone();
     let live = node
         .cat_indices_json(&format!("{prefix}*"))
@@ -705,7 +879,7 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
         .map_err(|e| PullError::new(E_INFRA, format!("restore snapshot: {e:#}")))?;
     }
 
-    // 9. Only now — with the full set provably present — stamp the ledger.
+    // Only now — with the full set provably present — stamp the ledger.
     state::write_hubpack_state(
         &root,
         slug,
@@ -728,11 +902,39 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
     )))
 }
 
+/// Put the verified, fully extracted `staging` directory at `dest` by renaming it —
+/// one step, so `dest` is either absent or complete. A pack already at `dest`
+/// (from an earlier pull of the same pin) is moved into `scratch` first and put
+/// back if the rename fails; it is deleted with `scratch` once the new one is in
+/// place.
+fn install_extract(staging: &Path, dest: &Path, scratch: &Path) -> Result<(), PullError> {
+    let previous = scratch.join("previous");
+    let had_previous = dest.exists();
+    if had_previous {
+        fs::rename(dest, &previous).map_err(|e| {
+            PullError::new(
+                E_INFRA,
+                format!("cannot replace the pack at {}: {e}", dest.display()),
+            )
+        })?;
+    }
+    if let Err(e) = fs::rename(staging, dest) {
+        if had_previous {
+            let _ = fs::rename(&previous, dest);
+        }
+        return Err(PullError::new(
+            E_INFRA,
+            format!("cannot move the verified pack into {}: {e}", dest.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// `^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$` — a slug safe to join into a path: no
 /// `..`, no `/`, non-empty, no leading/trailing separator. This is what stops a
 /// catalogue (which may be unverified) from steering a pull's writes out of
 /// `~/.xerj/hub/packs/<slug>/`.
-fn valid_slug(s: &str) -> bool {
+pub(crate) fn valid_slug(s: &str) -> bool {
     let b = s.as_bytes();
     if b.is_empty() {
         return false;
@@ -777,6 +979,263 @@ fn fetch_to(url: &str, dest: &Path, max_bytes: u64) -> Result<u64> {
     }
     fs::write(dest, &buf).with_context(|| format!("write {}", dest.display()))?;
     Ok(buf.len() as u64)
+}
+
+// ── xerj hub status / stop / config ──────────────────────────────────────────
+
+/// `xerj hub status`: cached packs, the node, the hosted setting, last sync and
+/// catalogue age — plan §8's report, one line per item. A node record whose
+/// process is gone is cleared first so it is not reported as running.
+fn run_status(args: &[String]) -> i32 {
+    if let Some(code) = no_extra_args("status", args) {
+        return code;
+    }
+    status_in(&hub_home())
+}
+
+fn status_in(home: &Path) -> i32 {
+    node::reap_stale(home);
+    println!(
+        "{}",
+        lockfile::render_status(&lockfile::gather_status(home))
+    );
+    0
+}
+
+/// `xerj hub stop`: stop the node `xerj ask` started — exactly the PID recorded
+/// in `~/.xerj/hub/node.pid`, after confirming it is still that node.
+fn run_stop(args: &[String]) -> i32 {
+    if let Some(code) = no_extra_args("stop", args) {
+        return code;
+    }
+    stop_in(&hub_home())
+}
+
+fn stop_in(home: &Path) -> i32 {
+    match node::stop_node(home) {
+        Ok(StopOutcome::NothingRecorded) => {
+            println!("no hub node was started by xerj; nothing to stop");
+            0
+        }
+        Ok(StopOutcome::StaleRemoved { pid }) => {
+            println!("the recorded hub node (pid {pid}) is no longer running; removed its record");
+            0
+        }
+        Ok(StopOutcome::Stopped { pid }) => {
+            println!("stopped the hub node (pid {pid})");
+            0
+        }
+        Err(e) => {
+            eprintln!("xerj hub stop: {e:#}");
+            1
+        }
+    }
+}
+
+/// `-h` prints the usage; any other argument to a no-argument command is a
+/// usage error. `None` means "carry on".
+fn no_extra_args(cmd: &str, args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str) {
+        None => None,
+        Some("-h" | "--help") => {
+            println!("{HUB_USAGE}");
+            Some(0)
+        }
+        Some(other) => {
+            eprintln!("xerj hub {cmd}: unexpected argument '{other}'\n\n{HUB_USAGE}");
+            Some(2)
+        }
+    }
+}
+
+/// `xerj hub config hosted on|off|auto`.
+fn run_config(args: &[String]) -> i32 {
+    config_in(&hub_home(), args)
+}
+
+fn config_in(home: &Path, args: &[String]) -> i32 {
+    let usage = |msg: &str| {
+        eprintln!("xerj hub config: {msg}\n\n{HUB_USAGE}");
+        2
+    };
+    let value = match args {
+        [key, value] if key == "hosted" => value.as_str(),
+        [first, ..] if first == "-h" || first == "--help" => {
+            println!("{HUB_USAGE}");
+            return 0;
+        }
+        _ => return usage("expected `hosted on|off|auto`"),
+    };
+    let stored = match value {
+        "on" | "off" => Some(value),
+        "auto" => None,
+        other => return usage(&format!("hosted must be on, off or auto, not '{other}'")),
+    };
+    match ask::set_config_hosted(home, stored) {
+        Ok(()) => {
+            println!("hosted = {value}");
+            0
+        }
+        Err(e) => {
+            eprintln!("xerj hub config: {e:#}");
+            1
+        }
+    }
+}
+
+// ── xerj ask ─────────────────────────────────────────────────────────────────
+
+const ASK_USAGE: &str = "usage: xerj ask \"<question>\" [options]
+       xerj \"<question>\"            (the same, when the question contains a space)
+
+Answers from a hub corpus - pulling its pre-indexed pack the first time - and
+always names the corpus, the pinned revision and the licence.
+
+options:
+  --corpus <slug>        skip routing and ask this corpus
+  --def <SYMBOL>         exact definition lookup (file:line, declaration, value)
+  --how                  a how-does-it-work question (ranked passages)
+  --files                list the relevant files with their licences
+  --offline              never touch the network (cached catalogue and packs only)
+  --no-fetch             do not download a pack for next time
+  --hosted on|off|auto   may the question be sent to the hosted hub? (default
+                         auto: off inside a git repository, on elsewhere)
+  --max-tokens N         cap the answer at about N tokens
+  --json                 print the answer as JSON
+  --url <node>           the node that holds the packs (default: XERJ_URL, then
+                         localhost:9200, else a local node is started)
+
+exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
+unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
+(candidates are printed; re-run with --corpus <slug>); 5 this build has no hub
+public key, so no pack can be verified (nothing was downloaded)";
+
+/// The first argument of every real `xerj` subcommand.
+pub const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "index",
+    "search",
+    "def",
+    "init",
+    "gain",
+    "autoindex",
+    "brain",
+    "share",
+    "feedback",
+    "code",
+    "corpus",
+    "hub",
+    "ask",
+    "mcp",
+];
+
+/// True for `xerj "<question>"`: `argv[1]` is not a known subcommand, does not
+/// start with `-`, and contains a space (plan §5).
+pub fn is_bare_question(argv1: Option<&str>) -> bool {
+    match argv1 {
+        Some(a) => !KNOWN_SUBCOMMANDS.contains(&a) && !a.starts_with('-') && a.contains(' '),
+        None => false,
+    }
+}
+
+/// `xerj ask "<question>" [options]` — also the target of the bare
+/// `xerj "<question>"` form, whose arguments are the same minus the word `ask`.
+pub fn run_ask(args: &[String]) -> i32 {
+    let parsed = match parse_ask_args(args) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            println!("{ASK_USAGE}");
+            return 0;
+        }
+        Err(msg) => {
+            eprintln!("xerj ask: {msg}\n\n{ASK_USAGE}");
+            return ask::EXIT_USAGE;
+        }
+    };
+    let outcome = ask::run_ask(&parsed, None);
+    for line in &outcome.stderr {
+        eprintln!("{line}");
+    }
+    if !outcome.stdout.is_empty() {
+        println!("{}", outcome.stdout);
+    }
+    outcome.exit
+}
+
+/// Parse `xerj ask`'s arguments. `Ok(None)` is `--help`. Words that are not
+/// flags (or flag values) are the question, joined with spaces — so an
+/// unquoted `xerj ask how does lz4 work` still asks the whole sentence.
+pub fn parse_ask_args(args: &[String]) -> Result<Option<AskArgs>, String> {
+    let mut a = AskArgs::new(String::new());
+    let mut words: Vec<&str> = Vec::new();
+    let mut mode_flags = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let mut value = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        match flag {
+            "-h" | "--help" => return Ok(None),
+            "--corpus" => a.corpus = Some(value("--corpus")?),
+            "--def" => {
+                a.mode = ModeRequest::Def(value("--def")?);
+                mode_flags += 1;
+            }
+            "--how" => {
+                a.mode = ModeRequest::How;
+                mode_flags += 1;
+            }
+            "--files" => {
+                a.mode = ModeRequest::Files;
+                mode_flags += 1;
+            }
+            "--offline" => a.offline = true,
+            "--no-fetch" => a.no_fetch = true,
+            "--json" => a.json = true,
+            "--hosted" => {
+                a.hosted = match value("--hosted")?.as_str() {
+                    "on" => HostedSwitch::On,
+                    "off" => HostedSwitch::Off,
+                    "auto" => HostedSwitch::Auto,
+                    other => {
+                        return Err(format!("--hosted must be on, off or auto, not '{other}'"))
+                    }
+                }
+            }
+            "--max-tokens" => {
+                let v = value("--max-tokens")?;
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => a.max_tokens = Some(n),
+                    _ => return Err(format!("--max-tokens must be a positive number, got '{v}'")),
+                }
+            }
+            "--url" => a.url = Some(value("--url")?),
+            f if f.starts_with("--") => return Err(format!("unknown flag '{f}'")),
+            word => words.push(word),
+        }
+        i += 1;
+    }
+    if mode_flags > 1 {
+        return Err("--def, --how and --files are mutually exclusive".to_string());
+    }
+    if let ModeRequest::Def(sym) = &a.mode {
+        if sym.trim().is_empty() {
+            return Err("--def needs a symbol".to_string());
+        }
+    }
+    a.question = words.join(" ");
+    if a.question.trim().is_empty() {
+        // `--def SYM` alone is a complete request: the symbol is the question.
+        if let ModeRequest::Def(sym) = &a.mode {
+            a.question = sym.clone();
+        } else {
+            return Err("a question is required".to_string());
+        }
+    }
+    Ok(Some(a))
 }
 
 // ── xerj code (with --def) ───────────────────────────────────────────────────
@@ -902,7 +1361,7 @@ fn emit_answer(answer: &Answer, as_json: bool) {
 
 /// `~/.xerj/hub`, overridable by `XERJ_HUB_HOME` (tests). Never `/tmp`: the
 /// pack cache and catalogue must survive a reboot (same rule as `code_root`).
-fn hub_home() -> PathBuf {
+pub(crate) fn hub_home() -> PathBuf {
     if let Ok(h) = std::env::var("XERJ_HUB_HOME") {
         if !h.is_empty() {
             return PathBuf::from(h);
@@ -925,8 +1384,9 @@ fn hub_pubkey() -> Result<String> {
         return Ok(HUB_PUBKEY_HEX.to_string());
     }
     bail!(
-        "no hub public key configured (HUB_PUBKEY_HEX is empty and XERJ_HUB_PUBKEY is unset); \
-           cannot verify a pack signature"
+        "no hub public key is configured in this build (HUB_PUBKEY_HEX is empty and \
+         XERJ_HUB_PUBKEY is unset), so a pack's signature cannot be verified; nothing was \
+         downloaded"
     )
 }
 
@@ -1059,10 +1519,400 @@ mod tests {
         assert_eq!(rc, 2, "missing --url is a usage error");
     }
 
+    // ── xerj ask: argument parsing ───────────────────────────────────────────
+
+    fn strs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parsed(a: &[&str]) -> AskArgs {
+        parse_ask_args(&strs(a)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn ask_args_default_to_auto_everything() {
+        let a = parsed(&["how does lz4 framing work"]);
+        assert_eq!(a.question, "how does lz4 framing work");
+        assert_eq!(a.mode, ModeRequest::Auto);
+        assert_eq!(a.hosted, HostedSwitch::Auto);
+        assert!(a.corpus.is_none() && a.url.is_none() && a.max_tokens.is_none());
+        assert!(!a.offline && !a.no_fetch && !a.json);
+    }
+
+    #[test]
+    fn ask_args_take_every_documented_flag() {
+        let a = parsed(&[
+            "a question",
+            "--corpus",
+            "lz4",
+            "--offline",
+            "--no-fetch",
+            "--hosted",
+            "off",
+            "--max-tokens",
+            "80",
+            "--json",
+            "--url",
+            "http://127.0.0.1:9300",
+            "--files",
+        ]);
+        assert_eq!(a.corpus.as_deref(), Some("lz4"));
+        assert!(a.offline && a.no_fetch && a.json);
+        assert_eq!(a.hosted, HostedSwitch::Off);
+        assert_eq!(a.max_tokens, Some(80));
+        assert_eq!(a.url.as_deref(), Some("http://127.0.0.1:9300"));
+        assert_eq!(a.mode, ModeRequest::Files);
+        assert_eq!(parsed(&["q", "--how"]).mode, ModeRequest::How);
+        assert_eq!(
+            parsed(&["q", "--def", "LZ4_VERSION"]).mode,
+            ModeRequest::Def("LZ4_VERSION".into())
+        );
+    }
+
+    #[test]
+    fn unquoted_words_are_one_question_and_flags_may_come_first() {
+        let a = parsed(&["--json", "how", "does", "lz4", "work", "--corpus", "lz4"]);
+        assert_eq!(a.question, "how does lz4 work");
+        assert!(a.json);
+        // `--def SYM` alone is a complete request.
+        let a = parsed(&["--def", "LZ4_VERSION_RELEASE"]);
+        assert_eq!(a.question, "LZ4_VERSION_RELEASE");
+    }
+
+    #[test]
+    fn ask_args_reject_misuse() {
+        for (bad, why) in [
+            (vec![], "no question"),
+            (vec!["--json"], "flags only"),
+            (vec!["q", "--bogus"], "unknown flag"),
+            (vec!["q", "--corpus"], "missing value"),
+            (vec!["q", "--hosted", "maybe"], "bad hosted value"),
+            (vec!["q", "--max-tokens", "0"], "zero tokens"),
+            (vec!["q", "--max-tokens", "lots"], "non-numeric tokens"),
+            (vec!["q", "--def", "A", "--how"], "two modes"),
+            (vec!["q", "--how", "--files"], "two modes"),
+            (vec!["q", "--def", " "], "blank symbol"),
+        ] {
+            assert!(parse_ask_args(&strs(&bad)).is_err(), "{why}: {bad:?}");
+        }
+        assert!(parse_ask_args(&strs(&["--help"])).unwrap().is_none());
+        assert!(parse_ask_args(&strs(&["q", "-h"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_bare_form_needs_a_space_a_non_flag_and_a_non_subcommand() {
+        assert!(is_bare_question(Some("how does lz4 frame work")));
+        assert!(is_bare_question(Some("lz4 block")));
+        // No space: a typo'd or unknown word is not a question.
+        assert!(!is_bare_question(Some("lz4")));
+        assert!(!is_bare_question(Some("LZ4_VERSION_RELEASE")));
+        // A flag, with or without spaces, is not a question.
+        assert!(!is_bare_question(Some("--port")));
+        assert!(!is_bare_question(Some("--data-dir /x y")));
+        // Subcommands are never questions, even if one ever grew a space.
+        for sub in KNOWN_SUBCOMMANDS {
+            assert!(!is_bare_question(Some(sub)), "{sub}");
+        }
+        assert!(!is_bare_question(None));
+        assert!(!is_bare_question(Some("")));
+    }
+
+    #[test]
+    fn known_subcommands_cover_what_main_dispatches() {
+        for sub in [
+            "index",
+            "search",
+            "def",
+            "init",
+            "gain",
+            "autoindex",
+            "brain",
+            "share",
+            "feedback",
+            "code",
+            "corpus",
+            "hub",
+            "ask",
+            "mcp",
+        ] {
+            assert!(KNOWN_SUBCOMMANDS.contains(&sub), "{sub}");
+        }
+    }
+
+    // ── xerj hub status / stop / config ──────────────────────────────────────
+
+    #[test]
+    fn hub_config_writes_and_clears_the_hosted_setting() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "on"])), 0);
+        let text = fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(text.contains("hosted = \"on\""), "{text}");
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "off"])), 0);
+        assert!(fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("hosted = \"off\""));
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "auto"])), 0);
+        assert!(!fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("hosted"));
+        // Misuse is a usage error and writes nothing new.
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "sometimes"])), 2);
+        assert_eq!(config_in(home.path(), &strs(&["hosted"])), 2);
+        assert_eq!(config_in(home.path(), &strs(&["colour", "on"])), 2);
+        assert_eq!(config_in(home.path(), &strs(&[])), 2);
+    }
+
+    #[test]
+    fn hub_stop_and_status_with_nothing_running_succeed() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(stop_in(home.path()), 0);
+        assert_eq!(status_in(home.path()), 0);
+        assert!(!home.path().join("node.pid").exists());
+    }
+
+    #[test]
+    fn hub_usage_lists_the_new_commands() {
+        for word in ["status", "stop", "config hosted"] {
+            assert!(HUB_USAGE.contains(word), "{word}");
+        }
+        assert_eq!(run_hub_cli(&strs(&["status", "extra"])), 2);
+        assert_eq!(run_hub_cli(&strs(&["stop", "--bogus"])), 2);
+        assert_eq!(run_hub_cli(&strs(&["config"])), 2);
+    }
+
     // NOTE: `hub_pubkey()` reads the process-global `XERJ_HUB_PUBKEY`, which the
     // `catalogue` test module already mutates under its own `ENV_LOCK`. A unit
     // test here that set/removed that var would race those tests (lib tests share
     // one process and run in parallel, and the lock is private to that module).
-    // The empty-key path — no key => exit 3, with no `.tmp` leaked — is covered
-    // end to end by the `nokey` scenario in `tests/pack_roundtrip.rs` instead.
+    // The empty-key path — no key => its own exit code (5), with no `.tmp` leaked
+    // and no node started — is covered end to end by the `nokey` scenario in
+    // `tests/pack_roundtrip.rs` instead. Everything below refuses BEFORE the key is
+    // looked at, so it needs no environment.
+
+    // ── the pull policy lives in the pull ────────────────────────────────────
+
+    fn entry(slug: &str, class: LicenceClass, pack_bytes: u64) -> CatalogueEntry {
+        CatalogueEntry {
+            slug: slug.to_string(),
+            domain: "TEST".to_string(),
+            topics: vec![],
+            ask_for: "x".to_string(),
+            pin_sha: "0774d05537f9762f838f7ab541b7765f1a729cb5".to_string(),
+            pin_date: "2026-10-02".to_string(),
+            refresh_cadence_days: 7,
+            licence_spdx: "GPL-3.0".to_string(),
+            licence_class: class,
+            pack_bytes,
+            pack_url: "file:///nonexistent".to_string(),
+            pack_sha256: "0".repeat(64),
+            sig_url: "file:///nonexistent.sig".to_string(),
+            dependency_names: vec![],
+            quality_grade: None,
+            term_sketch: xerj_common::hub::Sketch {
+                m_bits: 64,
+                k_hashes: 7,
+                bits_base64: "AAAAAAAAAAA=".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn an_excluded_corpus_is_refused_by_pull_itself_not_only_by_the_ask_flow() {
+        // `xerj hub pull <slug>` is a command anyone can type — including from a
+        // hint an earlier run printed. Plan §11: an excluded licence class is never
+        // pulled. The refusal is the pull's, before any node, download or temp dir.
+        let err = plan_pull_entry(&entry("gpl-thing", LicenceClass::Excluded, 1024))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, 1, "a policy refusal, exit 1");
+        assert!(
+            err.message.contains("excluded licence class"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("never pulled"), "{}", err.message);
+        assert!(
+            err.message.contains("GPL-3.0"),
+            "names the licence: {}",
+            err.message
+        );
+        // Excluded wins over the size cap: the licence is the first thing said.
+        let err = plan_pull_entry(&entry("gpl-thing", LicenceClass::Excluded, u64::MAX / 2))
+            .err()
+            .expect("refused");
+        assert!(
+            err.message.contains("excluded licence class"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn pull_refuses_a_pack_over_the_cap_and_a_bad_slug_before_anything_else() {
+        let err = plan_pull_entry(&entry(
+            "big",
+            LicenceClass::AdaptWithAttribution,
+            AUTO_PULL_MAX_BYTES + 1,
+        ))
+        .err()
+        .expect("refused");
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("over the"), "{}", err.message);
+
+        let err = plan_pull_entry(&entry("../../etc", LicenceClass::AdaptWithAttribution, 1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, 2, "a malformed slug is exit 2");
+
+        let mut bad_pin = entry("ok", LicenceClass::AdaptWithAttribution, 1);
+        bad_pin.pin_sha = "not-a-commit".to_string();
+        assert_eq!(plan_pull_entry(&bad_pin).err().expect("refused").code, 1);
+    }
+
+    #[test]
+    fn approach_only_is_still_pullable_the_policy_only_stops_excluded() {
+        // The key lookup is the first thing that can still fail for these; either
+        // way the answer is not a licence refusal.
+        for class in [
+            LicenceClass::AdaptWithAttribution,
+            LicenceClass::ApproachOnly,
+        ] {
+            match plan_pull_entry(&entry("fine", class, 1024)) {
+                Ok(plan) => assert_eq!(plan.pin8, "0774d055"),
+                Err(e) => assert_eq!(
+                    e.code, E_NOKEY,
+                    "only a missing key may stop it: {}",
+                    e.message
+                ),
+            }
+        }
+    }
+
+    // ── the pull lock belongs to the process that holds it ───────────────────
+
+    #[test]
+    fn a_pull_waits_a_bounded_time_for_the_lock_and_names_it_when_it_gives_up() {
+        let packs = tempfile::tempdir().unwrap();
+        let dir = packs.path().join("lz4");
+        let held = PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let err = PullLock::acquire(&dir, "lz4", "0774d055", Duration::from_millis(300), true)
+            .err()
+            .expect("still held");
+        let waited = t0.elapsed();
+        assert_eq!(err.code, 1);
+        let lock = dir.join("0774d055.lock");
+        assert!(
+            err.message.contains(&lock.display().to_string()),
+            "the message names the lock file: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains(&format!("held by pid {}", std::process::id())),
+            "and its owner: {}",
+            err.message
+        );
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+            "bounded: {waited:?}"
+        );
+
+        // A different pin of the same corpus is a different lock.
+        let other = PullLock::acquire(&dir, "lz4", "deadbeef", Duration::ZERO, true).unwrap();
+        drop(other);
+
+        drop(held);
+        PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true)
+            .expect("free the moment the holder lets go");
+    }
+
+    #[test]
+    fn a_waiting_pull_proceeds_as_soon_as_the_other_one_finishes() {
+        let packs = tempfile::tempdir().unwrap();
+        let dir = packs.path().join("lz4");
+        let held = PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true).unwrap();
+        let waiter_dir = dir.clone();
+        let waiter = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let got = PullLock::acquire(
+                &waiter_dir,
+                "lz4",
+                "0774d055",
+                Duration::from_secs(20),
+                true,
+            );
+            (got.is_ok(), t0.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        drop(held);
+        let (got, waited) = waiter.join().unwrap();
+        assert!(got, "the second pull got the lock once the first finished");
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_lock_directory_left_by_an_older_build_does_not_block_a_pull() {
+        // The old scheme: `<pin8>.lock` was a directory, removed only by the pull's
+        // own destructor.
+        let packs = tempfile::tempdir().unwrap();
+        let dir = packs.path().join("lz4");
+        fs::create_dir_all(dir.join("0774d055.lock")).unwrap();
+        PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true)
+            .expect("the leftover directory is replaced by a lock file");
+    }
+
+    // ── installing a verified extract ────────────────────────────────────────
+
+    fn fake_extract(dir: &Path, marker: &str) {
+        fs::create_dir_all(dir.join("snapshot")).unwrap();
+        fs::write(dir.join("pack.json"), marker).unwrap();
+        fs::write(dir.join("snapshot").join("data"), marker).unwrap();
+    }
+
+    #[test]
+    fn a_verified_extract_is_renamed_into_place_and_replaces_an_older_one() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("0774d055.tmp");
+        let dest = root.path().join("0774d055");
+        let staging = scratch.join("extract");
+
+        // Nothing there yet.
+        fake_extract(&staging, "first");
+        install_extract(&staging, &dest, &scratch).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("pack.json")).unwrap(), "first");
+        assert!(!staging.exists(), "moved, not copied");
+
+        // An older extract is replaced whole: nothing of it is mixed into the new one.
+        fs::write(dest.join("stale-file"), "x").unwrap();
+        fake_extract(&staging, "second");
+        install_extract(&staging, &dest, &scratch).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("pack.json")).unwrap(),
+            "second"
+        );
+        assert!(!dest.join("stale-file").exists());
+    }
+
+    #[test]
+    fn a_failed_install_puts_the_previous_extract_back() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("0774d055.tmp");
+        fs::create_dir_all(&scratch).unwrap();
+        let dest = root.path().join("0774d055");
+        fake_extract(&dest, "verified-earlier");
+        // The staging directory is missing, so the second rename fails.
+        let err =
+            install_extract(&scratch.join("no-such-staging"), &dest, &scratch).expect_err("fails");
+        assert_eq!(err.code, 1);
+        assert_eq!(
+            fs::read_to_string(dest.join("pack.json")).unwrap(),
+            "verified-earlier",
+            "the pack an earlier pull verified is still there"
+        );
+    }
 }

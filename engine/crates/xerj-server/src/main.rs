@@ -228,6 +228,10 @@ fn help_text(feedback: bool) -> String {
                                                   of peer projects (see xerj code --help)\n\
              xerj corpus add|index|list          the corpus lifecycle behind `xerj code`\n\
                                                   (see xerj corpus --help)\n\
+             xerj ask \"<question>\"              answer a question from a hub corpus: the\n\
+                                                  pre-indexed pack is pulled the first time\n\
+                                                  (see xerj ask --help); `xerj \"<question>\"`\n\
+                                                  is the same\n\
              xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
                                                   index --help)\n\
              xerj brain <folder>                 index + browse in one command (see xerj\n\
@@ -2318,6 +2322,25 @@ async fn async_main() -> Result<()> {
         // like `corpus`.
         let args: Vec<String> = std::env::args().skip(2).collect();
         let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_hub_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("ask")) {
+        // Corpus Hub v2 answer flow (plan §5): route the question to a hub
+        // corpus, answer from its pack (pulling it the first time). Blocking
+        // HTTP + process spawn — off the runtime like `hub`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_ask(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if xerj_hub::cli::is_bare_question(argv1.as_deref()) {
+        // `xerj "how does lz4 frame work"`: argv[1] is not a subcommand, does
+        // not start with `-`, and contains a space — the same as `xerj ask`.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_ask(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);
