@@ -109,7 +109,8 @@ xerj "<question>"
 
 One line. No corpus name, no clone, no index. XERJ picks the corpus (your project's dependencies
 first), fetches its signed, pre-indexed pack on first use, and answers. Retrieval is lexical, not
-semantic: use the words and identifiers the source uses.
+semantic: use the words and identifiers the source uses. The bare form needs a space in the
+question; for a single word write `xerj ask "<word>"`.
 
 A good answer is three lines, then any `warning:` lines:
 
@@ -632,6 +633,7 @@ mod tests {
             "**LOCAL**",
             "**NEITHER**",
             r#"xerj "<question>""#,
+            r#"xerj ask "<word>""#,
             "xerj ask --def <SYMBOL>",
             "Stop only the node you started",
             "Never `pkill xerj` or `killall xerj`",
