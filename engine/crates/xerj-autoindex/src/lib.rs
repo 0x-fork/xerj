@@ -9358,16 +9358,35 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
             {"term": {"slug": slug}}
         ]}});
     }
-    let datasets = fetch(ds_query, 500, Some(json!([{"record_count": "desc"}])))?;
+    let mut datasets = fetch(ds_query, 500, Some(json!([{"record_count": "desc"}])))?;
+    if let Some(prefix) = cfg.prefix.as_deref() {
+        datasets.retain(|d| catalog::dataset_matches_prefix(d, prefix));
+    }
     if datasets.is_empty() {
-        eprintln!(
-            "no autoindex catalog found at {} (index {}) — run `xerj autoindex <folder>` first",
-            cfg.url,
-            catalog::CATALOG_INDEX
-        );
+        if let Some(prefix) = cfg.prefix.as_deref() {
+            eprintln!(
+                "no autoindex catalog found for --prefix {prefix} at {} (index {}) — run `xerj autoindex <folder> --prefix {prefix}` first",
+                cfg.url,
+                catalog::CATALOG_INDEX
+            );
+        } else {
+            eprintln!(
+                "no autoindex catalog found at {} (index {}) — run `xerj autoindex <folder>` first",
+                cfg.url,
+                catalog::CATALOG_INDEX
+            );
+        }
         return Ok(1);
     }
-    let mut runs = fetch(json!({"term": {"doc_kind": "run"}}), 50, None)?;
+    let mut runs = fetch(json!({"term": {"doc_kind": "run"}}), 500, None)?;
+    if let Some(prefix) = cfg.prefix.as_deref() {
+        runs.retain(|r| {
+            r.get("prefix")
+                .or_else(|| r.get(catalog::CORPUS_SCOPE_FIELD))
+                .and_then(Value::as_str)
+                == Some(prefix)
+        });
+    }
     runs.sort_by_key(|r| {
         std::cmp::Reverse(
             r.get("started")
@@ -9378,6 +9397,9 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
     });
     let correlations = {
         let mut all = fetch(json!({"term": {"doc_kind": "correlation"}}), 200, None)?;
+        if let Some(prefix) = cfg.prefix.as_deref() {
+            all.retain(|c| catalog::correlation_matches_prefix(c, prefix));
+        }
         // stale-correlation hygiene: catalog docs upsert by deterministic id,
         // so older runs' correlations linger — show only the latest run that
         // produced each corr_kind.
@@ -9411,20 +9433,25 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
     // since #737; on a pre-rc.68 catalog it was inferred, where a term
     // matches only while the value has no separator — the same legacy caveat
     // the scoped sweeps in `catalog.rs` document.)
-    let prefixes: Vec<String> = runs
-        .iter()
-        .filter_map(|run| run.get("prefix"))
-        .filter_map(Value::as_str)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
+    let prefixes: Vec<String> = match cfg.prefix.as_deref() {
+        Some(prefix) => vec![prefix.to_string()],
+        None => runs
+            .iter()
+            .filter_map(|run| run.get("prefix"))
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+    };
     let prefix_filter = (!prefixes.is_empty()).then(|| {
+        let mut should = Vec::with_capacity(prefixes.len() * 2);
+        for prefix in &prefixes {
+            should.push(json!({"term": {"prefix": prefix}}));
+            should.push(json!({"term": {catalog::CORPUS_SCOPE_FIELD: prefix}}));
+        }
         json!({"bool": {
-            "should": prefixes
-                .iter()
-                .map(|prefix| json!({"term": {"prefix": prefix}}))
-                .collect::<Vec<_>>(),
+            "should": should,
             "minimum_should_match": 1
         }})
     });
@@ -9432,7 +9459,7 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
     if let Some(filter) = prefix_filter.clone() {
         junk_must.push(filter);
     }
-    let junk_files = fetch(
+    let mut junk_files = fetch(
         json!({"bool": {"must": junk_must,
             "must_not": [
                 {"term": {"status": "indexed"}},
@@ -9448,7 +9475,11 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
     if let Some(filter) = prefix_filter {
         duplicate_must.push(filter);
     }
-    let duplicate_files = fetch(json!({"bool": {"must": duplicate_must}}), 500, None)?;
+    let mut duplicate_files = fetch(json!({"bool": {"must": duplicate_must}}), 500, None)?;
+    if let Some(prefix) = cfg.prefix.as_deref() {
+        junk_files.retain(|f| catalog::file_matches_prefix(f, prefix));
+        duplicate_files.retain(|f| catalog::file_matches_prefix(f, prefix));
+    }
     if cfg.json {
         println!(
             "{}",
