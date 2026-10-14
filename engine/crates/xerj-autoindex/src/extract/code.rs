@@ -1102,6 +1102,27 @@ pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
         let v = s.trim().trim_end_matches([';', ',']).trim();
         (!v.is_empty()).then(|| v.to_string())
     }
+    // Quote-aware value end: when the matched value opens with `"`, take through
+    // its matching close quote so a `;` or `//` INSIDE the string is not read as
+    // a terminator. The lazy value regexes below otherwise stop at the first
+    // `;`/`//` and tear `"a;b"` down to `"a`, `"http://x"` down to `"http:`. The
+    // regex still locates where the value STARTS (`m.start()`); only its end is
+    // recomputed here. Every non-string value falls through to `clean`, byte for
+    // byte as before. NOTE: a backslash-escaped quote inside the string
+    // (`"a\"b"`) is a known limitation — the scan stops at the first `"`; such
+    // values are rare enough in a constant that handling escapes is not worth
+    // the extra code.
+    fn value_of(decl: &str, m: Option<regex::Match<'_>>) -> Option<String> {
+        let m = m?;
+        let rest = &decl[m.start()..];
+        if let Some(body) = rest.strip_prefix('"') {
+            if let Some(rel) = body.find('"') {
+                // opening quote + body + closing quote (quote is 1 ASCII byte)
+                return Some(rest[..rel + 2].to_string());
+            }
+        }
+        clean(m.as_str())
+    }
     use std::sync::OnceLock;
     static C_DEFINE: OnceLock<regex::Regex> = OnceLock::new();
     static C_CONST: OnceLock<regex::Regex> = OnceLock::new();
@@ -1114,7 +1135,7 @@ pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
                 regex::Regex::new(r"(?m)^\s*#\s*define\s+(\w+)\s+(.+?)\s*(?:/[/*].*)?$").unwrap()
             });
             if let Some(c) = def.captures(decl) {
-                if let Some(v) = clean(&c[2]) {
+                if let Some(v) = value_of(decl, c.get(2)) {
                     return Some(v);
                 }
             }
@@ -1122,27 +1143,27 @@ pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
                 regex::Regex::new(r"\b(?:static\s+)?const\s+\w[\w\s\*]*\b(\w+)\s*=\s*(.+?)\s*;")
                     .unwrap()
             });
-            cst.captures(decl).and_then(|c| clean(&c[2]))
+            cst.captures(decl).and_then(|c| value_of(decl, c.get(2)))
         }
         "rust" => {
             let re = RUST.get_or_init(|| {
                 regex::Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(\w+)\s*:\s*[^=]+=\s*(.+?)\s*;")
                     .unwrap()
             });
-            re.captures(decl).and_then(|c| clean(&c[2]))
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
         }
         "go" => {
             let re = GO.get_or_init(|| {
                 regex::Regex::new(r"(?m)^\s*(?:const\s+)?(\w+)\s*(?:[\w.\[\]*]+\s+)?=\s*(.+?)\s*$")
                     .unwrap()
             });
-            re.captures(decl).and_then(|c| clean(&c[2]))
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
         }
         "python" | "ruby" | "bash" | "sh" | "shell" => {
             let re = UPPER.get_or_init(|| {
                 regex::Regex::new(r"(?m)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$").unwrap()
             });
-            re.captures(decl).and_then(|c| clean(&c[2]))
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
         }
         _ => None,
     }
@@ -1167,7 +1188,21 @@ pub fn definitions(file_rel: &str, lang: &str, text: &str) -> Vec<xerj_common::h
             } else {
                 s.code
             };
-            let value = extract_value(lang, &decl);
+            // Only a named constant (`const`) carries a literal value. The
+            // per-language `extract_value` is a regex with no notion of symbol
+            // kind, so run on EVERY symbol it reads a function prototype's
+            // default argument (`void f(const int x = 5)` -> "5)"), a Go type
+            // alias's RHS (`type Handler = http.HandlerFunc`) or a mutable
+            // binding's initialiser as if it were a constant value. Of the
+            // capture-name kinds the queries emit, only `const` is value-bearing:
+            // `#define` is emitted as `const`, whereas `static` is the MUTABLE
+            // module binding (Go `var`, Rust `static`, a C++ mutable global) and
+            // every other kind is structural. Gate the call on kind.
+            let value = if s.kind == "const" {
+                extract_value(lang, &decl)
+            } else {
+                None
+            };
             xerj_common::hub::DefRecord {
                 symbol: s.name,
                 kind: s.kind,
@@ -4344,5 +4379,67 @@ mod tests {
         if let Some(helper) = defs.iter().find(|d| d.symbol == "helper") {
             assert_eq!(helper.value, None, "got {helper:?}");
         }
+    }
+
+    /// Fix A: `definitions` attaches a `value` only to a constant-kind symbol.
+    /// `extract_value` is a per-language regex with no notion of symbol kind, so
+    /// run on EVERY symbol it reads a prototype's default argument, a type
+    /// alias's RHS or a mutable `var`/`static` initialiser as a constant value.
+    /// The kind gate stops that; a real `const` still carries its value.
+    #[test]
+    fn definitions_only_values_constant_kinds() {
+        // C++ function prototype: `= 5` is a parameter default, never a value.
+        for d in definitions("x.cpp", "cpp", "void f(const int x = 5);") {
+            assert_eq!(d.value, None, "cpp prototype leaked a value: {d:?}");
+        }
+        // Go `type` alias: the RHS is a type, not a value.
+        for d in definitions("x.go", "go", "package p\ntype Handler = http.HandlerFunc\n") {
+            assert_ne!(d.kind, "const", "a Go type alias is not a constant: {d:?}");
+            assert_eq!(d.value, None, "go type alias leaked a value: {d:?}");
+        }
+        // Go package-level `var`: a mutable binding (kind `static`), not a value.
+        // It is still indexed as a symbol; it simply carries no `value`.
+        let gv = definitions("x.go", "go", "package p\nvar DefaultPort = 8080\n");
+        assert!(
+            gv.iter().any(|d| d.symbol == "DefaultPort"),
+            "the Go var should still be a symbol: {gv:?}"
+        );
+        for d in &gv {
+            assert_eq!(d.value, None, "go var leaked a value: {d:?}");
+        }
+        // The gate must NOT suppress a genuine constant's value.
+        let rc = definitions("x.rs", "rust", "pub const LIMIT: u32 = 128;\n");
+        let limit = rc
+            .iter()
+            .find(|d| d.symbol == "LIMIT")
+            .expect("const LIMIT captured");
+        assert_eq!(limit.kind, "const");
+        assert_eq!(limit.value.as_deref(), Some("128"));
+    }
+
+    /// Fix B: a quoted value is kept whole — a `;` or `//` inside the string is
+    /// not a terminator — while non-string values extract exactly as before.
+    #[test]
+    fn extract_value_keeps_quoted_strings_intact() {
+        // `//` inside a C string is not the start of a comment.
+        assert_eq!(
+            extract_value("c", r#"#define PATH "/usr//local/bin""#),
+            Some(r#""/usr//local/bin""#.to_string())
+        );
+        // A URL's `//` must not truncate the value down to `"http:`.
+        assert_eq!(
+            extract_value("c", r#"#define API_URL "http://x.com""#),
+            Some(r#""http://x.com""#.to_string())
+        );
+        // `;` inside a Rust string literal is not the statement terminator.
+        assert_eq!(
+            extract_value("rust", r#"const S: &str = "a;b";"#),
+            Some(r#""a;b""#.to_string())
+        );
+        // Non-string values are untouched: the trailing comment and `;` still go.
+        assert_eq!(
+            extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
+            Some("0".to_string())
+        );
     }
 }
