@@ -445,6 +445,11 @@ fn parse_requirements(text: &str) -> Vec<String> {
     out
 }
 
+// KNOWN SCOPE GAP: only PEP 621 `[project].dependencies` is parsed. Poetry's
+// `[tool.poetry.dependencies]` table (a map keyed by name, not a PEP 508 list)
+// is NOT read, so a pure-Poetry project contributes no dependency hints to
+// routing. Left unimplemented deliberately — PEP 621 is the cross-tool standard;
+// Poetry support is a separate change, not part of this fix.
 fn parse_pyproject(text: &str) -> Vec<String> {
     #[derive(Deserialize)]
     struct PyProject {

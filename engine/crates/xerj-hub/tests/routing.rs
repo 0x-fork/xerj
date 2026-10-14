@@ -13,8 +13,9 @@
 //! corpus's description — and routes every question twice: once with the line's
 //! dependencies present in the working directory (a synthetic `Cargo.lock`), and
 //! once with none. It asserts top-1 accuracy (a `Confident` verdict for the
-//! expected slug, or the expected slug first in an `Ambiguous` list) of at least
-//! 85% with dependencies and 70% without.
+//! expected slug, or the expected slug first in an `Ambiguous` list) against the
+//! plan's targets (`docs/CORPUS_HUB_V2_IMPLEMENTATION.md` §5): at least 90% with
+//! dependencies and 80% without.
 //!
 //! Only the crate's public API is used, so this exercises the router exactly as
 //! the CLI will.
@@ -297,13 +298,13 @@ fn routing_fixture_meets_accuracy_targets() {
     );
 
     assert!(
-        acc_with >= 0.85,
-        "with-deps top-1 accuracy {:.1}% is below the 85% target",
+        acc_with >= 0.90,
+        "with-deps top-1 accuracy {:.1}% is below the 90% target",
         acc_with * 100.0
     );
     assert!(
-        acc_without >= 0.70,
-        "without-deps top-1 accuracy {:.1}% is below the 70% target",
+        acc_without >= 0.80,
+        "without-deps top-1 accuracy {:.1}% is below the 80% target",
         acc_without * 100.0
     );
 }
