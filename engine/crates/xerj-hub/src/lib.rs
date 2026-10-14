@@ -17,6 +17,7 @@ pub mod ask;
 pub mod catalogue;
 pub mod cli;
 pub mod def;
+mod flock;
 pub mod lockfile;
 pub mod node;
 pub mod pack;
