@@ -34,17 +34,21 @@ pub struct RenderOpts<'a> {
 /// Render the full result block: the optional arms-ran note line, one block
 /// per hit, the footer. `note` is printed EVERY time it exists — a silently
 /// BM25-only "hybrid" result must never read as hybrid.
-/// The longest non-empty string field of a source object, "" when there is
-/// none — the content-bearing field of a raw-JSON record (#1158). Fields are
-/// visited in sorted key order and only a STRICTLY longer field replaces the
-/// winner, so a tie goes to the alphabetically first name and the passage
-/// never depends on the wire's key order.
+/// The longest non-empty string field of a source object (excluding `ax_*`
+/// provenance metadata), "" when there is none — the content-bearing field of
+/// a raw-JSON record (#1158). Fields are visited in sorted key order and only
+/// a STRICTLY longer field replaces the winner, so a tie goes to the
+/// alphabetically first name and the passage never depends on the wire's key
+/// order.
 fn longest_string_field(src: &Value) -> String {
     let mut best: Option<(usize, &str)> = None;
     if let Some(obj) = src.as_object() {
         let mut keys: Vec<&String> = obj.keys().collect();
         keys.sort();
         for key in keys {
+            if key.starts_with("ax_") {
+                continue;
+            }
             if let Some(s) = obj[key].as_str() {
                 if !s.trim().is_empty() && best.is_none_or(|(len, _)| s.chars().count() > len) {
                     best = Some((s.chars().count(), s));
@@ -138,17 +142,17 @@ fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) 
     };
     let mut out = format!("\n─── {loc}  ({shown}{lic_part})\n");
 
-    // `body` is the content field of every family EXCEPT plain text
-    // (`.txt` mirrors put their passage in `text`) — fall back so those
-    // records render a real passage, not an empty one (#1139). A raw-JSON
-    // record (#1158) carries no either: its text lives in schema-named
-    // fields (`summary`, `details`, …), so the last resort is the longest
-    // string field — for a data record that IS the content, and provenance
-    // (`ax_*` paths, dates) never wins a longest-string contest.
+    // `body` is the content field of every family EXCEPT plain text (`.txt`
+    // mirrors put their passage in `text`, #1139) and `*-symbols` records
+    // (which store the declaration in `code`). A raw-JSON record (#1158)
+    // carries none of those: its text lives in schema-named fields
+    // (`summary`, `details`, …), so the last resort is the longest non-`ax_*`
+    // string field.
     let body = src
         .get("body")
         .and_then(Value::as_str)
         .or_else(|| src.get("text").and_then(Value::as_str))
+        .or_else(|| src.get("code").and_then(Value::as_str))
         .map(str::to_string)
         .unwrap_or_else(|| longest_string_field(&src));
 
@@ -375,6 +379,88 @@ mod tests {
         assert!(text.contains("aaa_field") || text.contains("same length exactly"));
         // Both same content here — the deterministic pick is still ONE field.
         assert!(text.contains("same length exactly"), "{text}");
+    }
+
+    #[test]
+    fn symbol_index_hit_and_short_raw_json_hit_never_render_ax_provenance_as_passage() {
+        // Autoindex `*-symbols` records store the declaration in `code` (with
+        // no `body`, `text`, or `symbols` array) alongside a 42-char `ax_file`
+        // provenance digest (`axf2-<32-hex>-<size-hex>`).
+        let sym_hit = json!({
+            "_score": 11.2,
+            "_source": {
+                "ax_file": "axf2-1fbdaa51d7231323867e3200dc599463-1075",
+                "ax_path": "tantivy/src/error.rs",
+                "title": "enum TantivyError — error.rs",
+                "path": "tantivy/src/error.rs",
+                "language": "rust",
+                "name": "TantivyError",
+                "kind": "enum",
+                "line": 15,
+                "code": "pub enum TantivyError {"
+            }
+        });
+        let text = render(
+            &[sym_hit],
+            &licences(),
+            &RenderOpts {
+                corpus: "tantivy",
+                query: "TantivyError",
+                full: 800,
+                no_symbol: false,
+                meatl: false,
+                rrf_scores: false,
+                age_days: None,
+                strict_licence: false,
+            },
+            None,
+        );
+        assert!(
+            text.contains("─── tantivy/src/error.rs:15  (score 11.20, Apache-2.0/MIT)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pub enum TantivyError {"),
+            "symbol hit must render `code`, not `ax_file`: {text}"
+        );
+        assert!(
+            !text.contains("axf2-"),
+            "internal `ax_file` digest must never be rendered as passage: {text}"
+        );
+
+        // A raw-JSON record whose content field is shorter than the 42-char
+        // `ax_file` digest must still render the content field, never `ax_*`.
+        let short_raw = json!({
+            "_score": 4.0,
+            "_source": {
+                "ax_file": "axf2-1fbdaa51d7231323867e3200dc599463-1075",
+                "ax_path": "notes/short.json",
+                "summary": "short advisory note"
+            }
+        });
+        let raw_text = render(
+            &[short_raw],
+            &HashMap::new(),
+            &RenderOpts {
+                corpus: "notes",
+                query: "advisory",
+                full: 800,
+                no_symbol: true,
+                meatl: false,
+                rrf_scores: false,
+                age_days: None,
+                strict_licence: false,
+            },
+            None,
+        );
+        assert!(
+            raw_text.contains("short advisory note"),
+            "short raw-JSON record must render `summary`, not `ax_file`: {raw_text}"
+        );
+        assert!(
+            !raw_text.contains("axf2-"),
+            "internal `ax_file` digest must never win longest_string_field: {raw_text}"
+        );
     }
 
     #[test]
