@@ -22,3 +22,13 @@ tar = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true
+# The pack roundtrip test boots a real in-process node (ephemeral TCP port) so
+# the builder/pull snapshot+restore HTTP calls run end to end.
+xerj-api = { path = "../xerj-api" }
+xerj-engine = { path = "../xerj-engine" }
+xerj-common = { path = "../xerj-common" }
+xerj-autoindex = { path = "../xerj-autoindex" }
+tokio = { workspace = true }
+axum.workspace = true
+sha2 = "0.10"
+serde_json = { workspace = true }
