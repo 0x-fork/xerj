@@ -1,11 +1,15 @@
-//! Corpus Hub v2 — the `xerj hub …` subcommands and the `--def` code path
-//! (plan §2 builder + client, §3 `def`).
+//! Corpus Hub v2 — the `xerj hub …` subcommands, `xerj ask`, and the `--def` code
+//! path (plan §2 builder + client, §3 `def`, §5 `ask` / node, §8 `status`).
 //!
-//! Three entry points, all returning a process exit code:
+//! Entry points, all returning a process exit code:
 //!
 //! - [`run_hub_cli`] dispatches `xerj hub build-pack` (CI builds a signed,
-//!   pre-indexed pack) and `xerj hub pull` (a client downloads, verifies and
-//!   restores one). Future hub subcommands (status, sync, …) are plan §5/§8.
+//!   pre-indexed pack), `pull` (a client downloads, verifies and restores one),
+//!   `status`, `stop` (stop the automatic node) and `config hosted on|off`.
+//!   `sync`, `update` and `rm` are plan §8 and are not here.
+//! - [`run_ask`] is `xerj ask "<question>"` (and the bare `xerj "<question>"`
+//!   form, see [`is_bare_question`]): the flags are parsed here, the answer flow
+//!   itself is [`crate::ask`].
 //! - [`run_code`] is the `xerj code` front door: `--def <SYMBOL>` answers from
 //!   the corpus's `-defs` index via [`crate::def::lookup`] and the shared
 //!   renderer; everything else delegates unchanged to the existing
@@ -28,14 +32,16 @@ use serde_json::{json, Value};
 
 use xerj_common::hub::{
     render, Answer, LicenceClass, PackIndex, PackManifest, PackSource, AUTO_PULL_MAX_BYTES,
-    DEFAULT_HUB_URL, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
+    DEFAULT_HUB_URL, DISK_BUDGET_BYTES, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
 };
 use xerj_common::xccode::manifest::read_hub_manifest;
 use xerj_common::xccode::state;
 use xerj_common::xccode::XcHttp;
 
+use crate::ask::{self, AskArgs, HostedSwitch, ModeRequest};
 use crate::catalogue::{build_catalogue, load_catalogue, CorpusBuildInput};
-use crate::node::{resolve_url, HubNode};
+use crate::lockfile;
+use crate::node::{self, resolve_url, HubNode, NodeLauncher, StopOutcome};
 use crate::pack;
 
 const HUB_USAGE: &str = "usage: xerj hub <command>
@@ -44,6 +50,15 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
         Build a signed, pre-indexed pack from a registry manifest (CI).
   pull <slug> [--quiet] [--url <node>]
         Download, verify and restore a pack, then `xerj code <slug>` works.
+  status
+        Cached packs, the automatic node, the hosted setting, catalogue age.
+  stop
+        Stop the automatic node `xerj ask` started (only that process).
+  config hosted on|off|auto
+        Whether questions may be sent to the hosted hub (default auto: off
+        inside a git repository, on elsewhere).
+
+Ask a question with `xerj ask \"<question>\"` (see `xerj ask --help`).
 
 Packs are pulled on demand and never cloned or indexed on the user's machine
 (docs/CORPUS_HUB_V2_IMPLEMENTATION.md).";
@@ -58,6 +73,9 @@ pub fn run_hub_cli(args: &[String]) -> i32 {
     match sub.as_str() {
         "build-pack" => run_build_pack(rest),
         "pull" => run_pull(rest),
+        "status" => run_status(rest),
+        "stop" => run_stop(rest),
+        "config" => run_config(rest),
         "-h" | "--help" | "help" => {
             println!("{HUB_USAGE}");
             0
@@ -460,11 +478,24 @@ fn run_pull(args: &[String]) -> i32 {
         eprintln!("xerj hub pull: <slug> is required\n\n{HUB_USAGE}");
         return 2;
     };
-    // DEFER: the client's localhost:9200 default is mandated by plan §2 ("Node
-    // for the client ... localhost:9200"); step 5's auto-spawned ~/.xerj/hub/node
-    // will own client node resolution. Unlike build-pack, pull's --url is optional.
-    let url = resolve_url(url.as_deref());
-    match pull(&slug, &url, quiet) {
+    // Unlike build-pack, pull's --url is optional: `--url` > `XERJ_URL` >
+    // `localhost:9200`, and when none of those answers, the automatic node
+    // (plan §5) is started or reused.
+    let launcher = match NodeLauncher::current() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("xerj hub pull: {e:#}");
+            return 1;
+        }
+    };
+    let resolved = match node::ensure_node(&hub_home(), url.as_deref(), &launcher) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("xerj hub pull: {e:#}");
+            return 1;
+        }
+    };
+    match pull(&slug, &resolved.url, resolved.managed, quiet) {
         Ok(Pulled::Already) => {
             if !quiet {
                 println!("{slug}: already present");
@@ -484,7 +515,7 @@ fn run_pull(args: &[String]) -> i32 {
     }
 }
 
-enum Pulled {
+pub(crate) enum Pulled {
     Already,
     Done(String),
 }
@@ -496,9 +527,9 @@ enum Pulled {
 /// a pull already in progress, the download, the restore, or writing the
 /// ledger). Keeping 2 and 3 exact lets a caller tell "wrong name" and "untrusted
 /// bytes" apart from "the machine or network got in the way".
-struct PullError {
-    code: i32,
-    message: String,
+pub(crate) struct PullError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
 }
 impl PullError {
     fn new(code: i32, message: impl Into<String>) -> Self {
@@ -562,7 +593,10 @@ impl Drop for PullLock {
     }
 }
 
-fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
+/// Pull `slug` into the node at `url`. `managed` is true for the automatic node
+/// (started `--insecure`, so no credential is sent); `quiet` suppresses the
+/// eviction notices.
+pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<Pulled, PullError> {
     // 0. Validate the slug BEFORE it is ever joined into a filesystem path. The
     //    catalogue is accepted UNVERIFIED when no hub pubkey is configured, so a
     //    hostile `slug` ("../../etc") must be rejected here, ahead of every fs op.
@@ -622,10 +656,30 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
     //    key is a verification failure that must not leave a `.tmp` to re-fetch.
     let pubkey = hub_pubkey().map_err(|e| PullError::new(E_VERIFY, format!("{e:#}")))?;
 
+    // 3b. Disk budget (plan §5 step 6): make room BEFORE any download, evicting
+    //     least-recently-used packs — never this slug's. Pack directories only;
+    //     the node's restored indices are not touched.
+    for c in ask::evict_to_budget(&hub_home, slug, entry.pack_bytes, DISK_BUDGET_BYTES) {
+        if !quiet {
+            eprintln!(
+                "xerj hub: evicted '{}' {} ({} MB, least recently used) to stay under the {} MB \
+                 disk budget",
+                c.pack.slug,
+                c.pack.pin8,
+                ask::megabytes(c.bytes),
+                ask::megabytes(DISK_BUDGET_BYTES)
+            );
+        }
+    }
+
     // 4. The node (infra if unreachable).
     let root = xerj_autoindex::xc::code_root();
-    let node = HubNode::connect_with_key(url, None)
-        .map_err(|e| PullError::new(E_INFRA, format!("connect {url}: {e:#}")))?;
+    let node = if managed {
+        HubNode::connect_insecure(url)
+    } else {
+        HubNode::connect_with_key(url, None)
+    }
+    .map_err(|e| PullError::new(E_INFRA, format!("connect {url}: {e:#}")))?;
 
     // 5. Take the per-pin lock so a concurrent pull does not race the tmp/extract
     //    dirs; released on every return below (Drop).
@@ -732,7 +786,7 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
 /// `..`, no `/`, non-empty, no leading/trailing separator. This is what stops a
 /// catalogue (which may be unverified) from steering a pull's writes out of
 /// `~/.xerj/hub/packs/<slug>/`.
-fn valid_slug(s: &str) -> bool {
+pub(crate) fn valid_slug(s: &str) -> bool {
     let b = s.as_bytes();
     if b.is_empty() {
         return false;
@@ -777,6 +831,262 @@ fn fetch_to(url: &str, dest: &Path, max_bytes: u64) -> Result<u64> {
     }
     fs::write(dest, &buf).with_context(|| format!("write {}", dest.display()))?;
     Ok(buf.len() as u64)
+}
+
+// ── xerj hub status / stop / config ──────────────────────────────────────────
+
+/// `xerj hub status`: cached packs, the node, the hosted setting, last sync and
+/// catalogue age — plan §8's report, one line per item. A node record whose
+/// process is gone is cleared first so it is not reported as running.
+fn run_status(args: &[String]) -> i32 {
+    if let Some(code) = no_extra_args("status", args) {
+        return code;
+    }
+    status_in(&hub_home())
+}
+
+fn status_in(home: &Path) -> i32 {
+    node::reap_stale(home);
+    println!(
+        "{}",
+        lockfile::render_status(&lockfile::gather_status(home))
+    );
+    0
+}
+
+/// `xerj hub stop`: stop the node `xerj ask` started — exactly the PID recorded
+/// in `~/.xerj/hub/node.pid`, after confirming it is still that node.
+fn run_stop(args: &[String]) -> i32 {
+    if let Some(code) = no_extra_args("stop", args) {
+        return code;
+    }
+    stop_in(&hub_home())
+}
+
+fn stop_in(home: &Path) -> i32 {
+    match node::stop_node(home) {
+        Ok(StopOutcome::NothingRecorded) => {
+            println!("no hub node was started by xerj; nothing to stop");
+            0
+        }
+        Ok(StopOutcome::StaleRemoved { pid }) => {
+            println!("the recorded hub node (pid {pid}) is no longer running; removed its record");
+            0
+        }
+        Ok(StopOutcome::Stopped { pid }) => {
+            println!("stopped the hub node (pid {pid})");
+            0
+        }
+        Err(e) => {
+            eprintln!("xerj hub stop: {e:#}");
+            1
+        }
+    }
+}
+
+/// `-h` prints the usage; any other argument to a no-argument command is a
+/// usage error. `None` means "carry on".
+fn no_extra_args(cmd: &str, args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str) {
+        None => None,
+        Some("-h" | "--help") => {
+            println!("{HUB_USAGE}");
+            Some(0)
+        }
+        Some(other) => {
+            eprintln!("xerj hub {cmd}: unexpected argument '{other}'\n\n{HUB_USAGE}");
+            Some(2)
+        }
+    }
+}
+
+/// `xerj hub config hosted on|off|auto`.
+fn run_config(args: &[String]) -> i32 {
+    config_in(&hub_home(), args)
+}
+
+fn config_in(home: &Path, args: &[String]) -> i32 {
+    let usage = |msg: &str| {
+        eprintln!("xerj hub config: {msg}\n\n{HUB_USAGE}");
+        2
+    };
+    let value = match args {
+        [key, value] if key == "hosted" => value.as_str(),
+        [first, ..] if first == "-h" || first == "--help" => {
+            println!("{HUB_USAGE}");
+            return 0;
+        }
+        _ => return usage("expected `hosted on|off|auto`"),
+    };
+    let stored = match value {
+        "on" | "off" => Some(value),
+        "auto" => None,
+        other => return usage(&format!("hosted must be on, off or auto, not '{other}'")),
+    };
+    match ask::set_config_hosted(home, stored) {
+        Ok(()) => {
+            println!("hosted = {value}");
+            0
+        }
+        Err(e) => {
+            eprintln!("xerj hub config: {e:#}");
+            1
+        }
+    }
+}
+
+// ── xerj ask ─────────────────────────────────────────────────────────────────
+
+const ASK_USAGE: &str = "usage: xerj ask \"<question>\" [options]
+       xerj \"<question>\"            (the same, when the question contains a space)
+
+Answers from a hub corpus - pulling its pre-indexed pack the first time - and
+always names the corpus, the pinned revision and the licence.
+
+options:
+  --corpus <slug>        skip routing and ask this corpus
+  --def <SYMBOL>         exact definition lookup (file:line, declaration, value)
+  --how                  a how-does-it-work question (ranked passages)
+  --files                list the relevant files with their licences
+  --offline              never touch the network (cached catalogue and packs only)
+  --no-fetch             do not download a pack for next time
+  --hosted on|off|auto   may the question be sent to the hosted hub? (default
+                         auto: off inside a git repository, on elsewhere)
+  --max-tokens N         cap the answer at about N tokens
+  --json                 print the answer as JSON
+  --url <node>           the node that holds the packs (default: XERJ_URL, then
+                         localhost:9200, else a local node is started)
+
+exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
+unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
+(candidates are printed; re-run with --corpus <slug>)";
+
+/// The first argument of every real `xerj` subcommand.
+pub const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "index",
+    "search",
+    "def",
+    "init",
+    "gain",
+    "autoindex",
+    "brain",
+    "share",
+    "feedback",
+    "code",
+    "corpus",
+    "hub",
+    "ask",
+    "mcp",
+];
+
+/// True for `xerj "<question>"`: `argv[1]` is not a known subcommand, does not
+/// start with `-`, and contains a space (plan §5).
+pub fn is_bare_question(argv1: Option<&str>) -> bool {
+    match argv1 {
+        Some(a) => !KNOWN_SUBCOMMANDS.contains(&a) && !a.starts_with('-') && a.contains(' '),
+        None => false,
+    }
+}
+
+/// `xerj ask "<question>" [options]` — also the target of the bare
+/// `xerj "<question>"` form, whose arguments are the same minus the word `ask`.
+pub fn run_ask(args: &[String]) -> i32 {
+    let parsed = match parse_ask_args(args) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            println!("{ASK_USAGE}");
+            return 0;
+        }
+        Err(msg) => {
+            eprintln!("xerj ask: {msg}\n\n{ASK_USAGE}");
+            return ask::EXIT_USAGE;
+        }
+    };
+    let outcome = ask::run_ask(&parsed, None);
+    for line in &outcome.stderr {
+        eprintln!("{line}");
+    }
+    if !outcome.stdout.is_empty() {
+        println!("{}", outcome.stdout);
+    }
+    outcome.exit
+}
+
+/// Parse `xerj ask`'s arguments. `Ok(None)` is `--help`. Words that are not
+/// flags (or flag values) are the question, joined with spaces — so an
+/// unquoted `xerj ask how does lz4 work` still asks the whole sentence.
+pub fn parse_ask_args(args: &[String]) -> Result<Option<AskArgs>, String> {
+    let mut a = AskArgs::new(String::new());
+    let mut words: Vec<&str> = Vec::new();
+    let mut mode_flags = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let mut value = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        match flag {
+            "-h" | "--help" => return Ok(None),
+            "--corpus" => a.corpus = Some(value("--corpus")?),
+            "--def" => {
+                a.mode = ModeRequest::Def(value("--def")?);
+                mode_flags += 1;
+            }
+            "--how" => {
+                a.mode = ModeRequest::How;
+                mode_flags += 1;
+            }
+            "--files" => {
+                a.mode = ModeRequest::Files;
+                mode_flags += 1;
+            }
+            "--offline" => a.offline = true,
+            "--no-fetch" => a.no_fetch = true,
+            "--json" => a.json = true,
+            "--hosted" => {
+                a.hosted = match value("--hosted")?.as_str() {
+                    "on" => HostedSwitch::On,
+                    "off" => HostedSwitch::Off,
+                    "auto" => HostedSwitch::Auto,
+                    other => {
+                        return Err(format!("--hosted must be on, off or auto, not '{other}'"))
+                    }
+                }
+            }
+            "--max-tokens" => {
+                let v = value("--max-tokens")?;
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => a.max_tokens = Some(n),
+                    _ => return Err(format!("--max-tokens must be a positive number, got '{v}'")),
+                }
+            }
+            "--url" => a.url = Some(value("--url")?),
+            f if f.starts_with("--") => return Err(format!("unknown flag '{f}'")),
+            word => words.push(word),
+        }
+        i += 1;
+    }
+    if mode_flags > 1 {
+        return Err("--def, --how and --files are mutually exclusive".to_string());
+    }
+    if let ModeRequest::Def(sym) = &a.mode {
+        if sym.trim().is_empty() {
+            return Err("--def needs a symbol".to_string());
+        }
+    }
+    a.question = words.join(" ");
+    if a.question.trim().is_empty() {
+        // `--def SYM` alone is a complete request: the symbol is the question.
+        if let ModeRequest::Def(sym) = &a.mode {
+            a.question = sym.clone();
+        } else {
+            return Err("a question is required".to_string());
+        }
+    }
+    Ok(Some(a))
 }
 
 // ── xerj code (with --def) ───────────────────────────────────────────────────
@@ -902,7 +1212,7 @@ fn emit_answer(answer: &Answer, as_json: bool) {
 
 /// `~/.xerj/hub`, overridable by `XERJ_HUB_HOME` (tests). Never `/tmp`: the
 /// pack cache and catalogue must survive a reboot (same rule as `code_root`).
-fn hub_home() -> PathBuf {
+pub(crate) fn hub_home() -> PathBuf {
     if let Ok(h) = std::env::var("XERJ_HUB_HOME") {
         if !h.is_empty() {
             return PathBuf::from(h);
@@ -1057,6 +1367,167 @@ mod tests {
             "/nonexistent/key".into(),
         ]);
         assert_eq!(rc, 2, "missing --url is a usage error");
+    }
+
+    // ── xerj ask: argument parsing ───────────────────────────────────────────
+
+    fn strs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parsed(a: &[&str]) -> AskArgs {
+        parse_ask_args(&strs(a)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn ask_args_default_to_auto_everything() {
+        let a = parsed(&["how does lz4 framing work"]);
+        assert_eq!(a.question, "how does lz4 framing work");
+        assert_eq!(a.mode, ModeRequest::Auto);
+        assert_eq!(a.hosted, HostedSwitch::Auto);
+        assert!(a.corpus.is_none() && a.url.is_none() && a.max_tokens.is_none());
+        assert!(!a.offline && !a.no_fetch && !a.json);
+    }
+
+    #[test]
+    fn ask_args_take_every_documented_flag() {
+        let a = parsed(&[
+            "a question",
+            "--corpus",
+            "lz4",
+            "--offline",
+            "--no-fetch",
+            "--hosted",
+            "off",
+            "--max-tokens",
+            "80",
+            "--json",
+            "--url",
+            "http://127.0.0.1:9300",
+            "--files",
+        ]);
+        assert_eq!(a.corpus.as_deref(), Some("lz4"));
+        assert!(a.offline && a.no_fetch && a.json);
+        assert_eq!(a.hosted, HostedSwitch::Off);
+        assert_eq!(a.max_tokens, Some(80));
+        assert_eq!(a.url.as_deref(), Some("http://127.0.0.1:9300"));
+        assert_eq!(a.mode, ModeRequest::Files);
+        assert_eq!(parsed(&["q", "--how"]).mode, ModeRequest::How);
+        assert_eq!(
+            parsed(&["q", "--def", "LZ4_VERSION"]).mode,
+            ModeRequest::Def("LZ4_VERSION".into())
+        );
+    }
+
+    #[test]
+    fn unquoted_words_are_one_question_and_flags_may_come_first() {
+        let a = parsed(&["--json", "how", "does", "lz4", "work", "--corpus", "lz4"]);
+        assert_eq!(a.question, "how does lz4 work");
+        assert!(a.json);
+        // `--def SYM` alone is a complete request.
+        let a = parsed(&["--def", "LZ4_VERSION_RELEASE"]);
+        assert_eq!(a.question, "LZ4_VERSION_RELEASE");
+    }
+
+    #[test]
+    fn ask_args_reject_misuse() {
+        for (bad, why) in [
+            (vec![], "no question"),
+            (vec!["--json"], "flags only"),
+            (vec!["q", "--bogus"], "unknown flag"),
+            (vec!["q", "--corpus"], "missing value"),
+            (vec!["q", "--hosted", "maybe"], "bad hosted value"),
+            (vec!["q", "--max-tokens", "0"], "zero tokens"),
+            (vec!["q", "--max-tokens", "lots"], "non-numeric tokens"),
+            (vec!["q", "--def", "A", "--how"], "two modes"),
+            (vec!["q", "--how", "--files"], "two modes"),
+            (vec!["q", "--def", " "], "blank symbol"),
+        ] {
+            assert!(parse_ask_args(&strs(&bad)).is_err(), "{why}: {bad:?}");
+        }
+        assert!(parse_ask_args(&strs(&["--help"])).unwrap().is_none());
+        assert!(parse_ask_args(&strs(&["q", "-h"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_bare_form_needs_a_space_a_non_flag_and_a_non_subcommand() {
+        assert!(is_bare_question(Some("how does lz4 frame work")));
+        assert!(is_bare_question(Some("lz4 block")));
+        // No space: a typo'd or unknown word is not a question.
+        assert!(!is_bare_question(Some("lz4")));
+        assert!(!is_bare_question(Some("LZ4_VERSION_RELEASE")));
+        // A flag, with or without spaces, is not a question.
+        assert!(!is_bare_question(Some("--port")));
+        assert!(!is_bare_question(Some("--data-dir /x y")));
+        // Subcommands are never questions, even if one ever grew a space.
+        for sub in KNOWN_SUBCOMMANDS {
+            assert!(!is_bare_question(Some(sub)), "{sub}");
+        }
+        assert!(!is_bare_question(None));
+        assert!(!is_bare_question(Some("")));
+    }
+
+    #[test]
+    fn known_subcommands_cover_what_main_dispatches() {
+        for sub in [
+            "index",
+            "search",
+            "def",
+            "init",
+            "gain",
+            "autoindex",
+            "brain",
+            "share",
+            "feedback",
+            "code",
+            "corpus",
+            "hub",
+            "ask",
+            "mcp",
+        ] {
+            assert!(KNOWN_SUBCOMMANDS.contains(&sub), "{sub}");
+        }
+    }
+
+    // ── xerj hub status / stop / config ──────────────────────────────────────
+
+    #[test]
+    fn hub_config_writes_and_clears_the_hosted_setting() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "on"])), 0);
+        let text = fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(text.contains("hosted = \"on\""), "{text}");
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "off"])), 0);
+        assert!(fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("hosted = \"off\""));
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "auto"])), 0);
+        assert!(!fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .contains("hosted"));
+        // Misuse is a usage error and writes nothing new.
+        assert_eq!(config_in(home.path(), &strs(&["hosted", "sometimes"])), 2);
+        assert_eq!(config_in(home.path(), &strs(&["hosted"])), 2);
+        assert_eq!(config_in(home.path(), &strs(&["colour", "on"])), 2);
+        assert_eq!(config_in(home.path(), &strs(&[])), 2);
+    }
+
+    #[test]
+    fn hub_stop_and_status_with_nothing_running_succeed() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(stop_in(home.path()), 0);
+        assert_eq!(status_in(home.path()), 0);
+        assert!(!home.path().join("node.pid").exists());
+    }
+
+    #[test]
+    fn hub_usage_lists_the_new_commands() {
+        for word in ["status", "stop", "config hosted"] {
+            assert!(HUB_USAGE.contains(word), "{word}");
+        }
+        assert_eq!(run_hub_cli(&strs(&["status", "extra"])), 2);
+        assert_eq!(run_hub_cli(&strs(&["stop", "--bogus"])), 2);
+        assert_eq!(run_hub_cli(&strs(&["config"])), 2);
     }
 
     // NOTE: `hub_pubkey()` reads the process-global `XERJ_HUB_PUBKEY`, which the
