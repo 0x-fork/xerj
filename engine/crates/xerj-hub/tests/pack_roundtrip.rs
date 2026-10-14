@@ -32,7 +32,7 @@ use xerj_hub::node::HubNode;
 use xerj_hub::pack::{self, PackFileEntry};
 use xerj_hub::{
     Catalogue, CatalogueEntry, DefRecord, LicenceClass, PackIndex, PackManifest, PackSource,
-    Sketch, CATALOGUE_FORMAT_VERSION, PACK_FORMAT_VERSION,
+    Sketch, AUTO_PULL_MAX_BYTES, CATALOGUE_FORMAT_VERSION, PACK_FORMAT_VERSION,
 };
 
 const PIN_SHA: &str = "0774d05537f9762f838f7ab541b7765f1a729cb5";
@@ -211,8 +211,16 @@ fn seed_and_snapshot(url: &str, location: &Path) {
     .unwrap();
 }
 
-/// Write a catalogue with one mini-c entry pointing at a `file://` pack.
+/// Write a catalogue with one mini-c entry pointing at a `file://` pack, taking
+/// the pack's real on-disk size as the advertised `pack_bytes`.
 fn write_catalogue(hub_home: &Path, archive: &Path, pack_sha256: &str) {
+    let real = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+    write_catalogue_bytes(hub_home, archive, pack_sha256, real);
+}
+
+/// `write_catalogue` with an explicit advertised `pack_bytes` — lets a test lie
+/// about the size to exercise the size cap.
+fn write_catalogue_bytes(hub_home: &Path, archive: &Path, pack_sha256: &str, pack_bytes: u64) {
     let sig = {
         let mut s = archive.as_os_str().to_os_string();
         s.push(".sig");
@@ -228,7 +236,7 @@ fn write_catalogue(hub_home: &Path, archive: &Path, pack_sha256: &str) {
         refresh_cadence_days: 7,
         licence_spdx: "MIT".into(),
         licence_class: LicenceClass::AdaptWithAttribution,
-        pack_bytes: std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0),
+        pack_bytes,
         pack_url: format!("file://{}", archive.display()),
         pack_sha256: pack_sha256.to_string(),
         sig_url: format!("file://{}", sig.display()),
@@ -480,8 +488,161 @@ async fn pack_build_pull_def_roundtrip() {
     };
     assert_eq!(rc2, 0, "a second pull of the same pin is a no-op success");
 
+    // ── A PARTIAL index set must NOT be mistaken for a complete pack ───────
+    // Drop the -defs index on node B: def now misses. A re-pull must detect the
+    // partial set, RESTORE (not skip), and only then is the ledger honest.
+    {
+        let before = {
+            let (u, ch) = (url_b.clone(), code_home.clone());
+            tokio::task::spawn_blocking(move || {
+                std::env::set_var("XERJ_CODE_HOME", &ch);
+                let node = HubNode::connect(&u).unwrap();
+                node.request_ok("DELETE", &format!("/{PREFIX}-defs"), None)
+                    .unwrap();
+                xerj_hub::def::lookup(&node, "mini-c", "MINI_LIMIT", 5)
+            })
+            .await
+            .unwrap()
+        };
+        assert!(
+            before.hits.is_empty(),
+            "with -defs deleted, def must miss (partial set)"
+        );
+
+        let rc = run_pull(&code_home, &hub_home, Some(&public), &url_b).await;
+        assert_eq!(rc, 0, "a partial set re-pulls cleanly (restore, not skip)");
+
+        let after = {
+            let (u, ch) = (url_b.clone(), code_home.clone());
+            tokio::task::spawn_blocking(move || {
+                std::env::set_var("XERJ_CODE_HOME", &ch);
+                let node = HubNode::connect(&u).unwrap();
+                xerj_hub::def::lookup(&node, "mini-c", "MINI_LIMIT", 5)
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            after.hits.len(),
+            1,
+            "the partial set was restored, not skipped: {after:?}"
+        );
+        assert_eq!(after.hits[0].value.as_deref(), Some("128"));
+    }
+
+    // ── A too-large advertised pack is refused BEFORE any download (DoS cap) ──
+    {
+        let hh = work.join("hub-cap");
+        write_catalogue_bytes(&hh, &archive, &good_sha, AUTO_PULL_MAX_BYTES + 1);
+        let rc = run_pull(&work.join("code-cap"), &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 1, "over-cap pack → policy/infra exit 1");
+        assert!(
+            !hh.join("packs/mini-c").join(format!("{PIN8}.tmp")).exists(),
+            "nothing downloaded over the cap"
+        );
+        assert!(
+            !hh.join("packs/mini-c").join(PIN8).exists(),
+            "nothing extracted over the cap"
+        );
+    }
+
+    // ── No verifying key → verify-fail exit 3, and NO temp dir is leaked ──
+    {
+        let hh = work.join("hub-nokey");
+        write_catalogue(&hh, &archive, &good_sha);
+        // HUB_PUBKEY_HEX is "" in this build, so an unset env var leaves no key.
+        let rc = run_pull(&work.join("code-nokey"), &hh, None, &url_b).await;
+        assert_eq!(rc, 3, "no key → verification failure exit 3");
+        assert!(
+            !hh.join("packs/mini-c").join(format!("{PIN8}.tmp")).exists(),
+            "the empty-key path must not leak a .tmp to re-download"
+        );
+        assert!(
+            !hh.join("packs/mini-c").join(PIN8).exists(),
+            "nothing extracted"
+        );
+    }
+
+    // ── An unreachable node is an INFRA failure (exit 1), not 2 or 3 ──
+    {
+        let hh = work.join("hub-infra");
+        write_catalogue(&hh, &archive, &good_sha);
+        let rc = run_pull(
+            &work.join("code-infra"),
+            &hh,
+            Some(&public),
+            "http://127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(rc, 1, "unreachable node → infra exit 1 (distinct from 2/3)");
+    }
+
+    // ── A concurrent pull of the same pin is refused by the lock (exit 1) ──
+    {
+        let hh = work.join("hub-lock");
+        write_catalogue(&hh, &archive, &good_sha);
+        let lockdir = hh.join("packs").join("mini-c");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        std::fs::create_dir(lockdir.join(format!("{PIN8}.lock"))).unwrap(); // simulate in-flight pull
+        let rc = run_pull(&work.join("code-lock"), &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 1, "a held pull lock → exit 1");
+    }
+
+    // ── A traversal slug is rejected before ANY filesystem write (exit 2) ──
+    {
+        let hh = work.join("hub-traversal");
+        std::fs::create_dir_all(&hh).unwrap();
+        let rc = run_pull_slug(
+            &work.join("code-traversal"),
+            &hh,
+            Some(&public),
+            &url_b,
+            "../../../tmp/evil",
+        )
+        .await;
+        assert_eq!(rc, 2, "a traversal slug is an invalid-slug error (exit 2)");
+        assert!(
+            !hh.join("packs").exists(),
+            "no packs dir created for a rejected slug"
+        );
+    }
+
     // Clean up the env so it does not leak to other tests in the binary.
     std::env::remove_var("XERJ_CODE_HOME");
     std::env::remove_var("XERJ_HUB_HOME");
     std::env::remove_var("XERJ_HUB_PUBKEY");
+}
+
+/// Run `xerj hub pull mini-c --url <url> --quiet` with the given homes and key
+/// (None unsets the pubkey), returning the exit code. Env is process-global;
+/// callers `.await` these sequentially so they do not race.
+async fn run_pull(code: &Path, hub: &Path, pubkey: Option<&str>, url: &str) -> i32 {
+    run_pull_slug(code, hub, pubkey, url, "mini-c").await
+}
+
+async fn run_pull_slug(
+    code: &Path,
+    hub: &Path,
+    pubkey: Option<&str>,
+    url: &str,
+    slug: &str,
+) -> i32 {
+    let (code, hub, pubkey, url, slug) = (
+        code.to_path_buf(),
+        hub.to_path_buf(),
+        pubkey.map(str::to_string),
+        url.to_string(),
+        slug.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        std::env::set_var("XERJ_CODE_HOME", &code);
+        std::env::set_var("XERJ_HUB_HOME", &hub);
+        match pubkey {
+            Some(pk) => std::env::set_var("XERJ_HUB_PUBKEY", &pk),
+            None => std::env::remove_var("XERJ_HUB_PUBKEY"),
+        }
+        xerj_hub::cli::run_hub_cli(&["pull".into(), slug, "--url".into(), url, "--quiet".into()])
+    })
+    .await
+    .unwrap()
 }

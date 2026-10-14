@@ -933,4 +933,41 @@ mod tests {
         assert_eq!(lang_for_ext("m", "function y = f(x)\n"), Some("matlab"));
         assert_eq!(lang_for_ext("mm", ""), Some("objc"));
     }
+
+    /// The language NAME `lang_for_ext` returns must actually exist in the
+    /// extractor's `registry()` — otherwise a row rename (e.g. `csharp` ->
+    /// `c_sharp`) would make every `.cs` file yield ZERO defs while `files.jsonl`
+    /// still labels them `csharp`. There is no public registry enumerator, so we
+    /// prove membership the only observable way: a known one-definition snippet
+    /// routed through the resolved name must extract at least one def. (Names
+    /// that do not resolve in the registry return an empty Vec from
+    /// `definitions`.)
+    #[test]
+    fn lang_names_resolve_in_the_extractor_registry() {
+        // (extension, file, a one-definition snippet in that language).
+        let cases: &[(&str, &str, &str)] = &[
+            ("c", "a.c", "int cfn(void){return 0;}\n"),
+            ("cpp", "a.cpp", "class CppThing { public: void run(); };\n"),
+            ("rs", "a.rs", "pub fn rfn() {}\n"),
+            ("go", "a.go", "package p\nfunc GoFn() {}\n"),
+            ("py", "a.py", "def pyfn():\n    return 1\n"),
+            ("js", "a.js", "function jsfn(){}\n"),
+            ("ts", "a.ts", "function tsfn(){}\n"),
+            ("java", "A.java", "class JavaThing {}\n"),
+            ("cs", "A.cs", "class CsThing {}\n"),
+            ("rb", "a.rb", "def rbfn\nend\n"),
+            ("php", "a.php", "<?php function phpfn(){}\n"),
+            ("sh", "a.sh", "shfn() { :; }\n"),
+        ];
+        for (ext, file, snippet) in cases {
+            let lang = lang_for_ext(ext, snippet)
+                .unwrap_or_else(|| panic!(".{ext} resolves to no language"));
+            let defs = definitions(file, lang, snippet);
+            assert!(
+                !defs.is_empty(),
+                "lang_for_ext(.{ext}) = {lang:?} extracted no defs — the name is no longer a \
+                 registry() row (a rename would silently zero out every .{ext} file's defs)"
+            );
+        }
+    }
 }

@@ -19,6 +19,7 @@
 //! through the §1 renderer.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,8 +27,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use xerj_common::hub::{
-    render, Answer, LicenceClass, PackIndex, PackManifest, PackSource, DEFAULT_HUB_URL,
-    HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
+    render, Answer, LicenceClass, PackIndex, PackManifest, PackSource, AUTO_PULL_MAX_BYTES,
+    DEFAULT_HUB_URL, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
 };
 use xerj_common::xccode::manifest::read_hub_manifest;
 use xerj_common::xccode::state;
@@ -116,14 +117,19 @@ fn run_build_pack(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    let (Some(slug), Some(registry), Some(out), Some(sign_key)) = (slug, registry, out, sign_key)
+    // `--url` is REQUIRED for the builder (plan §2 shows it without brackets).
+    // It must never fall through to resolve_url's localhost:9200 default — the
+    // builder clones + indexes + snapshots into the node it is handed, and a
+    // silent default would mutate whatever shared node happens to answer there.
+    let (Some(slug), Some(registry), Some(out), Some(sign_key), Some(url)) =
+        (slug, registry, out, sign_key, url)
     else {
         eprintln!(
-            "xerj hub build-pack: <slug>, --registry, --out and --sign-key are required\n\n{HUB_USAGE}"
+            "xerj hub build-pack: <slug>, --registry, --out, --url and --sign-key are all \
+             required\n\n{HUB_USAGE}"
         );
         return 2;
     };
-    let url = resolve_url(url.as_deref());
     match build_pack(&slug, &registry, &out, &url, &sign_key) {
         Ok(summary) => {
             println!("{summary}");
@@ -454,6 +460,9 @@ fn run_pull(args: &[String]) -> i32 {
         eprintln!("xerj hub pull: <slug> is required\n\n{HUB_USAGE}");
         return 2;
     };
+    // DEFER: the client's localhost:9200 default is mandated by plan §2 ("Node
+    // for the client ... localhost:9200"); step 5's auto-spawned ~/.xerj/hub/node
+    // will own client node resolution. Unlike build-pack, pull's --url is optional.
     let url = resolve_url(url.as_deref());
     match pull(&slug, &url, quiet) {
         Ok(Pulled::Already) => {
@@ -480,7 +489,13 @@ enum Pulled {
     Done(String),
 }
 
-/// A pull failure carrying the plan's exit code (2 unknown slug, 3 verify fail).
+/// A pull failure carrying an exit code the caller can act on: **2** = the slug
+/// is unknown or malformed; **3** = the pack failed verification (sha /
+/// signature / format, or there was no key to verify with); **1** = an
+/// infrastructure or policy failure (catalogue load, the size cap, node connect,
+/// a pull already in progress, the download, the restore, or writing the
+/// ledger). Keeping 2 and 3 exact lets a caller tell "wrong name" and "untrusted
+/// bytes" apart from "the machine or network got in the way".
 struct PullError {
     code: i32,
     message: String,
@@ -494,19 +509,84 @@ impl PullError {
     }
 }
 
+/// Infrastructure/policy failure — not a slug or a verification problem.
+const E_INFRA: i32 = 1;
+/// The slug is unknown or malformed.
+const E_SLUG: i32 = 2;
+/// The pack failed verification (sha / signature / format / missing key).
+const E_VERIFY: i32 = 3;
+
+/// Largest signature file pull will download — an ed25519 sig is 128 hex chars,
+/// so this caps a hostile hub's "signature" far below the pack cap.
+const SIG_MAX_BYTES: u64 = 4096;
+/// A pull lock older than this is an abandoned lock from a crashed pull and is
+/// stolen, so a hard kill cannot wedge a corpus forever.
+const LOCK_STALE: Duration = Duration::from_secs(30 * 60);
+
+/// A best-effort cross-process mutex for one `(slug, pin)`: an atomically
+/// created `<pin8>.lock` directory. A second concurrent pull of the same pin
+/// sees it and refuses rather than racing the shared tmp/extract dirs; the guard
+/// removes it on drop (every non-crash return below). A lock left by a crash is
+/// stolen once older than [`LOCK_STALE`]. The durable lockfile is plan §8; this
+/// only closes the same-pin race.
+struct PullLock {
+    path: PathBuf,
+}
+impl PullLock {
+    fn acquire(pack_dir: &Path, slug: &str, pin8: &str) -> Result<PullLock, PullError> {
+        fs::create_dir_all(pack_dir)
+            .map_err(|e| PullError::new(E_INFRA, format!("create {}: {e}", pack_dir.display())))?;
+        let path = pack_dir.join(format!("{pin8}.lock"));
+        // Steal an abandoned lock from a crashed pull.
+        let stale = fs::metadata(&path)
+            .ok()
+            .and_then(|md| md.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .map(|age| age > LOCK_STALE)
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_dir(&path);
+        }
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(PullLock { path }),
+            Err(_) => Err(PullError::new(
+                E_INFRA,
+                format!("a pull of '{slug}' ({pin8}) is already in progress"),
+            )),
+        }
+    }
+}
+impl Drop for PullLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
 fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
+    // 0. Validate the slug BEFORE it is ever joined into a filesystem path. The
+    //    catalogue is accepted UNVERIFIED when no hub pubkey is configured, so a
+    //    hostile `slug` ("../../etc") must be rejected here, ahead of every fs op.
+    if !valid_slug(slug) {
+        return Err(PullError::new(
+            E_SLUG,
+            format!(
+                "invalid corpus slug '{slug}' (allowed: lower-case a-z 0-9 . _ -, no '..' or '/')"
+            ),
+        ));
+    }
+
     let hub_home = hub_home();
     let hub_url = std::env::var("XERJ_HUB_URL")
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
 
-    // 1. Catalogue → the entry for this slug. Unknown slug is exit 2.
+    // 1. Catalogue → the entry for this slug.
     let cat = load_catalogue(&hub_url, &hub_home, false)
-        .map_err(|e| PullError::new(2, format!("cannot load catalogue: {e:#}")))?;
+        .map_err(|e| PullError::new(E_INFRA, format!("cannot load catalogue: {e:#}")))?;
     let entry = cat.corpora.iter().find(|c| c.slug == slug).ok_or_else(|| {
         PullError::new(
-            2,
+            E_SLUG,
             format!(
                 "unknown corpus '{slug}' (catalogue generated {}); `xerj hub status` lists what is \
                  available",
@@ -514,41 +594,56 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
             ),
         )
     })?;
+    // The matched entry's own slug drives the paths too; it equals `slug` (the
+    // find matched on it, already validated), but re-check defensively.
+    if !valid_slug(&entry.slug) {
+        return Err(PullError::new(
+            E_SLUG,
+            format!("catalogue entry has an invalid slug '{}'", entry.slug),
+        ));
+    }
     let pin8 = pin8_of(&entry.pin_sha)
-        .map_err(|e| PullError::new(2, format!("catalogue entry for '{slug}': {e:#}")))?;
+        .map_err(|e| PullError::new(E_INFRA, format!("catalogue entry for '{slug}': {e:#}")))?;
 
-    // 2. Already present? Same pin in the local ledger AND its indices live on
-    //    this node → nothing to do (plan §2 step 4 "skip restore and say so").
-    let root = xerj_autoindex::xc::code_root();
-    let node = HubNode::connect_with_key(url, None)
-        .map_err(|e| PullError::new(2, format!("connect {url}: {e:#}")))?;
-    if let Ok(st) = state::load_state(&root, slug) {
-        if st.pin_sha.as_deref() == Some(entry.pin_sha.as_str()) {
-            let prefix = state::query_prefix(&st);
-            if node
-                .cat_indices_json(&format!("{prefix}*"))
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-            {
-                return Ok(Pulled::Already);
-            }
-        }
+    // 2. Size cap BEFORE any download — a malicious hub must not OOM the client
+    //    by advertising a huge pack (decision 2 / AUTO_PULL_MAX_BYTES). The
+    //    transfer is bounded again in `fetch_to` in case the field lies.
+    if entry.pack_bytes > AUTO_PULL_MAX_BYTES {
+        return Err(PullError::new(
+            E_INFRA,
+            format!(
+                "pack '{slug}' is {} bytes, over the {}-byte auto-pull cap; not downloaded",
+                entry.pack_bytes, AUTO_PULL_MAX_BYTES
+            ),
+        ));
     }
 
-    // 3. Download pack + sig into a temp dir. NOTHING is extracted yet.
+    // 3. The verifying key, resolved BEFORE any temp dir exists — a pull with no
+    //    key is a verification failure that must not leave a `.tmp` to re-fetch.
+    let pubkey = hub_pubkey().map_err(|e| PullError::new(E_VERIFY, format!("{e:#}")))?;
+
+    // 4. The node (infra if unreachable).
+    let root = xerj_autoindex::xc::code_root();
+    let node = HubNode::connect_with_key(url, None)
+        .map_err(|e| PullError::new(E_INFRA, format!("connect {url}: {e:#}")))?;
+
+    // 5. Take the per-pin lock so a concurrent pull does not race the tmp/extract
+    //    dirs; released on every return below (Drop).
     let pack_dir = hub_home.join("packs").join(slug);
+    let _lock = PullLock::acquire(&pack_dir, slug, &pin8)?;
+
+    // 6. Download pack + sig into a temp dir (size-capped). NOTHING is extracted.
     let tmp = pack_dir.join(format!("{pin8}.tmp"));
     let extract = pack_dir.join(pin8.clone());
-    // A stale temp from a crashed pull must not poison this one.
-    let _ = fs::remove_dir_all(&tmp);
+    let _ = fs::remove_dir_all(&tmp); // a stale temp from a crash must not poison this
     fs::create_dir_all(&tmp)
-        .map_err(|e| PullError::new(3, format!("create {}: {e}", tmp.display())))?;
+        .map_err(|e| PullError::new(E_INFRA, format!("create {}: {e}", tmp.display())))?;
     let archive = tmp.join(format!("{slug}-{pin8}.hubpack.tar.zst"));
     let sig = tmp.join(format!("{slug}-{pin8}.hubpack.tar.zst.sig"));
     let dl = (|| -> Result<u64> {
-        let n = fetch_to(&entry.pack_url, &archive)
+        let n = fetch_to(&entry.pack_url, &archive, AUTO_PULL_MAX_BYTES)
             .with_context(|| format!("download pack {}", entry.pack_url))?;
-        fetch_to(&entry.sig_url, &sig)
+        fetch_to(&entry.sig_url, &sig, SIG_MAX_BYTES)
             .with_context(|| format!("download sig {}", entry.sig_url))?;
         Ok(n)
     })();
@@ -556,40 +651,49 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
         Ok(n) => n,
         Err(e) => {
             let _ = fs::remove_dir_all(&tmp);
-            return Err(PullError::new(3, format!("{e:#}")));
+            return Err(PullError::new(E_INFRA, format!("{e:#}")));
         }
     };
 
-    // 4. Verify sha256 THEN signature THEN format_version, extracting nothing
+    // 7. Verify sha256 THEN signature THEN format_version, extracting nothing
     //    until all pass (plan §11). Any failure: delete the temp, exit 3.
-    let pubkey = hub_pubkey().map_err(|e| PullError::new(3, format!("{e:#}")))?;
     let manifest =
         match pack::read_and_verify_pack(&archive, &sig, &entry.pack_sha256, &pubkey, &extract) {
             Ok(m) => m,
             Err(e) => {
                 let _ = fs::remove_dir_all(&tmp);
-                // On failure read_and_verify_pack never populates `extract`; make
-                // sure a half-written dir from an interrupted prior run is gone too.
+                // read_and_verify_pack never populates `extract` on failure; clear
+                // any half-written dir from an interrupted prior run too.
                 let _ = fs::remove_dir_all(&extract);
                 return Err(PullError::new(
-                    3,
+                    E_VERIFY,
                     format!("pack verification failed: {e:#}"),
                 ));
             }
         };
     let _ = fs::remove_dir_all(&tmp);
 
-    // 5. Register + restore the snapshot (unless the same prefix is already
-    //    restored on this node).
+    // 8. Restore — unless the WHOLE index set is already live on this node. A
+    //    partial match (a prior partial restore, or a local `corpus index` that
+    //    produced a different build) must NOT read as a complete pack: skipping
+    //    then would leave `--def` querying a missing index and stamp the ledger
+    //    "answered from: local pack" over data that is not the pack. So the skip
+    //    requires EVERY manifest index present; a list error counts as "not
+    //    present" and restores (it never silently skips). Idempotent on a real
+    //    full match.
     let prefix = manifest.index_prefix.clone();
-    let already_live = node
+    let live = node
         .cat_indices_json(&format!("{prefix}*"))
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    if !already_live {
+        .unwrap_or_default();
+    let fully_present = !manifest.indices.is_empty()
+        && manifest
+            .indices
+            .iter()
+            .all(|idx| live.iter().any(|n| n == &idx.name));
+    if !fully_present {
         let location = extract.join("snapshot");
         register_repo(&node, &format!("hub-{slug}"), &location)
-            .map_err(|e| PullError::new(3, format!("register restore repo: {e:#}")))?;
+            .map_err(|e| PullError::new(E_INFRA, format!("register restore repo: {e:#}")))?;
         node.request_ok(
             "POST",
             &format!(
@@ -598,10 +702,10 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
             ),
             Some(&json!({ "indices": format!("{prefix}-*") })),
         )
-        .map_err(|e| PullError::new(3, format!("restore snapshot: {e:#}")))?;
+        .map_err(|e| PullError::new(E_INFRA, format!("restore snapshot: {e:#}")))?;
     }
 
-    // 6. Write the ledger with source: hubpack — `xerj code <slug>` now works.
+    // 9. Only now — with the full set provably present — stamp the ledger.
     state::write_hubpack_state(
         &root,
         slug,
@@ -612,8 +716,11 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
         &manifest.licence_spdx,
         licence_class_str(manifest.licence_class),
     )
-    .map_err(|e| PullError::new(3, format!("write state: {e}")))?;
+    .map_err(|e| PullError::new(E_INFRA, format!("write state: {e}")))?;
 
+    if fully_present {
+        return Ok(Pulled::Already);
+    }
     let n_indices = manifest.indices.len();
     Ok(Pulled::Done(format!(
         "pulled {slug} {pin8} {bytes} → {n_indices} indices, {} definitions",
@@ -621,10 +728,33 @@ fn pull(slug: &str, url: &str, _quiet: bool) -> Result<Pulled, PullError> {
     )))
 }
 
-/// Download `url` to `dest`. Supports `file://` (the tests' local packs) and
-/// `http(s)://`. Returns the number of bytes written.
-fn fetch_to(url: &str, dest: &Path) -> Result<u64> {
+/// `^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$` — a slug safe to join into a path: no
+/// `..`, no `/`, non-empty, no leading/trailing separator. This is what stops a
+/// catalogue (which may be unverified) from steering a pull's writes out of
+/// `~/.xerj/hub/packs/<slug>/`.
+fn valid_slug(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let edge = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let body = |c: u8| edge(c) || matches!(c, b'.' | b'_' | b'-');
+    edge(b[0]) && edge(b[b.len() - 1]) && b.iter().all(|&c| body(c))
+}
+
+/// Download `url` to `dest`, refusing anything over `max_bytes`. Supports
+/// `file://` (the tests' local packs) and `http(s)://`. For HTTP a too-large
+/// `Content-Length` is rejected AND the body is read through a `max_bytes + 1`
+/// bound, so a missing or lying length cannot OOM the client. Returns the number
+/// of bytes written.
+fn fetch_to(url: &str, dest: &Path, max_bytes: u64) -> Result<u64> {
     if let Some(path) = url.strip_prefix("file://") {
+        let sz = fs::metadata(path)
+            .with_context(|| format!("stat {path}"))?
+            .len();
+        if sz > max_bytes {
+            bail!("{path} is {sz} bytes, over the {max_bytes}-byte cap");
+        }
         let n = fs::copy(path, dest).with_context(|| format!("copy {path}"))?;
         return Ok(n);
     }
@@ -633,9 +763,20 @@ fn fetch_to(url: &str, dest: &Path) -> Result<u64> {
     if !status.is_success() {
         bail!("GET {url} -> HTTP {status}");
     }
-    let bytes = resp.bytes().with_context(|| format!("read body {url}"))?;
-    fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
-    Ok(bytes.len() as u64)
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            bail!("{url} advertises {len} bytes, over the {max_bytes}-byte cap");
+        }
+    }
+    let mut buf = Vec::new();
+    resp.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("read body {url}"))?;
+    if buf.len() as u64 > max_bytes {
+        bail!("{url} body exceeds the {max_bytes}-byte cap");
+    }
+    fs::write(dest, &buf).with_context(|| format!("write {}", dest.display()))?;
+    Ok(buf.len() as u64)
 }
 
 // ── xerj code (with --def) ───────────────────────────────────────────────────
@@ -853,27 +994,75 @@ mod tests {
     }
 
     #[test]
-    fn fetch_to_copies_a_file_url() {
+    fn fetch_to_copies_a_file_url_within_the_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src.bin");
         fs::write(&src, b"hub pack bytes").unwrap();
         let dst = tmp.path().join("dst.bin");
         let url = format!("file://{}", src.display());
-        let n = fetch_to(&url, &dst).unwrap();
+        let n = fetch_to(&url, &dst, 1024).unwrap();
         assert_eq!(n, 14);
         assert_eq!(fs::read(&dst).unwrap(), b"hub pack bytes");
     }
 
     #[test]
-    fn hub_pubkey_prefers_env_and_errors_when_empty() {
-        // Serialise env mutation with other env-touching tests in this crate is
-        // unnecessary here: XERJ_HUB_PUBKEY is unique to this path.
-        std::env::set_var("XERJ_HUB_PUBKEY", "abcd");
-        assert_eq!(hub_pubkey().unwrap(), "abcd");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
-        // HUB_PUBKEY_HEX is empty in this build, so no key is an error.
-        if HUB_PUBKEY_HEX.is_empty() {
-            assert!(hub_pubkey().is_err());
+    fn fetch_to_refuses_a_file_over_the_cap_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("big.bin");
+        fs::write(&src, vec![0u8; 2048]).unwrap();
+        let dst = tmp.path().join("dst.bin");
+        let url = format!("file://{}", src.display());
+        let err = fetch_to(&url, &dst, 1024).unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+        assert!(!dst.exists(), "nothing is written when over the cap");
+    }
+
+    #[test]
+    fn valid_slug_accepts_real_slugs_and_rejects_traversal() {
+        for ok in ["mini-c", "lz4", "a", "xerj-blogposts", "a.b_c-1", "x9"] {
+            assert!(valid_slug(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "..",
+            "../../etc",
+            "a/b",
+            "/abs",
+            ".hidden",
+            "trailing-",
+            "-leading",
+            "UPPER",
+            "a b",
+            "x\0y",
+        ] {
+            assert!(!valid_slug(bad), "{bad:?} must be rejected");
         }
     }
+
+    #[test]
+    fn build_pack_requires_url_and_makes_no_network_call() {
+        // A build-pack missing --url must error with the usage (exit 2) BEFORE it
+        // could reach a node — never fall through to a localhost:9200 default.
+        // The registry/out/sign-key point at non-existent paths; if --url were
+        // defaulted the code would try to clone/connect, but the required-args
+        // gate returns first, so no filesystem/network work happens.
+        let rc = run_hub_cli(&[
+            "build-pack".into(),
+            "mini-c".into(),
+            "--registry".into(),
+            "/nonexistent/registry".into(),
+            "--out".into(),
+            "/nonexistent/out".into(),
+            "--sign-key".into(),
+            "/nonexistent/key".into(),
+        ]);
+        assert_eq!(rc, 2, "missing --url is a usage error");
+    }
+
+    // NOTE: `hub_pubkey()` reads the process-global `XERJ_HUB_PUBKEY`, which the
+    // `catalogue` test module already mutates under its own `ENV_LOCK`. A unit
+    // test here that set/removed that var would race those tests (lib tests share
+    // one process and run in parallel, and the lock is private to that module).
+    // The empty-key path — no key => exit 3, with no `.tmp` leaked — is covered
+    // end to end by the `nokey` scenario in `tests/pack_roundtrip.rs` instead.
 }
