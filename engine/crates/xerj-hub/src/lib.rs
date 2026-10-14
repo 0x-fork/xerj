@@ -14,6 +14,7 @@
 //! router + ask (Step 5). Alongside them this file re-exports the shared types.
 
 pub mod catalogue;
+pub mod lockfile;
 pub mod node;
 pub mod pack;
 pub mod router;
