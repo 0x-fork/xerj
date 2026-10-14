@@ -1377,6 +1377,176 @@ fn apply_judge(
     Ok(())
 }
 
+fn is_two_letter_tech_term(w: &str) -> bool {
+    matches!(
+        w,
+        "db" | "ui"
+            | "ux"
+            | "ip"
+            | "gc"
+            | "vm"
+            | "id"
+            | "kv"
+            | "ir"
+            | "ci"
+            | "pr"
+            | "ai"
+            | "ml"
+            | "tx"
+            | "rx"
+            | "fs"
+            | "fd"
+            | "pk"
+            | "fk"
+    )
+}
+
+fn is_three_letter_glue_word(w: &str) -> bool {
+    matches!(
+        w,
+        "del"
+            | "por"
+            | "los"
+            | "las"
+            | "una"
+            | "uno"
+            | "con"
+            | "sin"
+            | "sus"
+            | "mis"
+            | "tus"
+            | "nos"
+            | "les"
+            | "mas"
+            | "muy"
+            | "tan"
+            | "que"
+            | "son"
+            | "fue"
+            | "era"
+            | "ser"
+            | "hay"
+            | "the"
+            | "and"
+            | "for"
+            | "not"
+            | "are"
+            | "but"
+            | "can"
+            | "all"
+            | "has"
+            | "had"
+            | "was"
+            | "one"
+            | "out"
+            | "who"
+            | "how"
+            | "why"
+            | "his"
+            | "her"
+            | "its"
+            | "our"
+            | "you"
+            | "any"
+            | "may"
+            | "via"
+            | "per"
+            | "des"
+            | "aux"
+            | "par"
+            | "sur"
+            | "une"
+            | "est"
+            | "ses"
+            | "vos"
+            | "ils"
+            | "pas"
+            | "qui"
+            | "der"
+            | "die"
+            | "das"
+            | "den"
+            | "dem"
+            | "ein"
+            | "und"
+            | "mit"
+            | "von"
+            | "aus"
+            | "bei"
+            | "vor"
+            | "zur"
+            | "zum"
+            | "wie"
+            | "wir"
+            | "sie"
+            | "ich"
+            | "uma"
+            | "dos"
+            | "nas"
+            | "com"
+            | "sem"
+            | "seu"
+            | "sua"
+            | "nao"
+            | "gli"
+            | "nel"
+            | "sul"
+            | "col"
+            | "tra"
+            | "fra"
+            | "che"
+            | "non"
+            | "piu"
+    )
+}
+
+fn is_natural_language_glue_token(clean: &str) -> bool {
+    if clean.is_empty() || clean.contains('_') {
+        return false;
+    }
+    if !clean.chars().all(|c| c.is_alphabetic() && c.is_lowercase()) {
+        return false;
+    }
+    let char_len = clean.chars().count();
+    (char_len <= 2 && !is_two_letter_tech_term(clean)) || is_three_letter_glue_word(clean)
+}
+
+/// Normalize a plain-words `xerj_search` query before expanding it into
+/// `multi_match` / `match_phrase` / `term` clauses (#1364), matching
+/// `xerj_autoindex::search::normalize_code_search_query`.
+fn normalize_code_search_query(query: &str) -> String {
+    let mut seen = Vec::<String>::new();
+    let mut dedup = Vec::<&str>::new();
+    for raw in query.split_whitespace() {
+        let clean = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if clean.is_empty() {
+            continue;
+        }
+        let lower = clean.to_lowercase();
+        if !seen.contains(&lower) {
+            seen.push(lower);
+            dedup.push(clean);
+        }
+    }
+    if dedup.len() < 3 {
+        return if dedup.is_empty() {
+            query.trim().to_string()
+        } else {
+            dedup.join(" ")
+        };
+    }
+    let content: Vec<&str> = dedup
+        .iter()
+        .copied()
+        .filter(|tok| !is_natural_language_glue_token(tok))
+        .collect();
+    if content.is_empty() {
+        dedup.join(" ")
+    } else {
+        content.join(" ")
+    }
+}
+
 fn build_search(args: &Value) -> Result<BuiltRequest, String> {
     // #962: `index` used to be required, but nothing an agent reads said what
     // to pass — the first real tool call after `xerj autoindex` was an error
@@ -1399,16 +1569,17 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
         // untouched for structured queries.
         Some(Value::String(q)) if !q.trim().is_empty() => {
             plain_string = true;
+            let shaped = normalize_code_search_query(q);
             body.insert(
                 "query".into(),
                 json!({ "bool": { "should": [
                     { "multi_match": {
-                        "query": q,
-                        "fields": ["name^4", "defs^3", "code^2", "body", "title"],
+                        "query": shaped,
+                        "fields": ["name^4", "code^2", "body", "defs^3", "title"],
                         "type": "most_fields"
                     }},
-                    { "match_phrase": { "defs": { "query": q, "boost": 8 } } },
-                    { "term": { "name": { "value": q, "boost": 10 } } }
+                    { "match_phrase": { "defs": { "query": shaped, "boost": 8 } } },
+                    { "term": { "name": { "value": shaped, "boost": 10 } } }
                 ]}}),
             );
         }
@@ -1982,6 +2153,27 @@ mod tests {
         assert_eq!(path, "/ax-*/_search");
         let (_, path, _) = built(build_search(&json!({ "index": "docs" })));
         assert_eq!(path, "/docs/_search");
+    }
+
+    #[test]
+    fn search_plain_string_strips_multiword_glue_tokens_and_preserves_single_word() {
+        let (_, _, body) = built(build_search(&json!({
+            "query": "factor de calibracion de margen de seguridad"
+        })));
+        assert_eq!(
+            body["query"]["bool"]["should"][0]["multi_match"]["query"],
+            "factor calibracion margen seguridad"
+        );
+        assert_eq!(
+            body["query"]["bool"]["should"][0]["multi_match"]["fields"],
+            json!(["name^4", "code^2", "body", "defs^3", "title"])
+        );
+
+        let (_, _, single) = built(build_search(&json!({ "query": "de" })));
+        assert_eq!(
+            single["query"]["bool"]["should"][0]["multi_match"]["query"],
+            "de"
+        );
     }
 
     #[test]

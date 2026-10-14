@@ -40121,6 +40121,26 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                 Vec::new();
             for spec in &field_specs {
                 for (field_name, text) in collect_passage_field_texts(&hit.source, spec) {
+                    // `defs` and `name` are autoindex's synthetic symbol-list
+                    // and identifier fields whose actual source lives in `body`
+                    // (whole-file docs) or `code` (per-symbol docs). Ensure
+                    // `body` and `code` are candidates ahead of `defs` and
+                    // `name` even when a query lists `name^4` / `defs^3` first
+                    // (`xerj search` / `xerj def`, #1364).
+                    if matches!(field_name.as_str(), "defs" | "name") {
+                        for primary in ["body", "code"] {
+                            if !seen_fields.contains(primary) {
+                                for (primary_name, primary_text) in
+                                    collect_passage_field_texts(&hit.source, primary)
+                                {
+                                    if seen_fields.insert(primary_name.clone()) {
+                                        let (lower, map) = build_lower_offset_map(&primary_text);
+                                        candidates.push((primary_name, primary_text, lower, map));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if seen_fields.insert(field_name.clone()) {
                         let (lower, map) = build_lower_offset_map(&text);
                         candidates.push((field_name, text, lower, map));
@@ -40156,26 +40176,29 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                         // `refine_code_passage` would usually force it back
                         // to the tree root (the padding routinely spills
                         // outside the enclosing function) and silently no-op
-                        // the refinement. Anchor on one actual query-term
-                        // occurrence inside the window instead — any point
-                        // inside the matched region resolves to the same
-                        // enclosing block. ASCII-lowercase only (not the
-                        // Unicode-aware `lower`/`map` used above): it never
-                        // changes byte length, so `pos` lines up with `text`
-                        // without a second offset table; source identifiers
+                        // the refinement. Anchor on the highest-weight (rarest)
+                        // query-term occurrence inside the window (#1364) so a
+                        // common term in the leading context padding cannot pull
+                        // the AST refinement onto an adjacent block. ASCII-lowercase
+                        // only (not the Unicode-aware `lower`/`map` used above):
+                        // it never changes byte length, so `pos` lines up with
+                        // `text` without a second offset table; source identifiers
                         // are ASCII in the overwhelming case, and a missed
                         // non-ASCII anchor just skips the refinement, not a
                         // correctness bug.
-                        let (start, end) = weighted_terms
-                            .iter()
-                            .find_map(|&(term, _)| {
-                                if term.is_empty() {
-                                    return None;
-                                }
-                                text.get(start..end)?
-                                    .to_ascii_lowercase()
-                                    .find(term)
-                                    .map(|pos| start + pos)
+                        let window_lower = text.get(start..end).map(str::to_ascii_lowercase);
+                        let (start, end) = window_lower
+                            .as_deref()
+                            .and_then(|win| {
+                                weighted_terms
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, &(term, _))| !term.is_empty())
+                                    .filter_map(|(idx, &(term, weight))| {
+                                        win.find(term).map(|pos| (weight, idx, start + pos))
+                                    })
+                                    .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                                    .map(|(_, _, anchor)| anchor)
                             })
                             .and_then(|anchor| {
                                 let anchor_end = (anchor + 1).min(text.len());
@@ -56460,6 +56483,121 @@ mod lexical_passage_tests {
         assert_eq!(
             passage.text,
             &body[passage.start_offset as usize..passage.end_offset as usize]
+        );
+    }
+
+    /// #1364: on a per-symbol code hit (`name: "de"`, `title: "de"`, `code:
+    /// "de <- function(col)"`), `_passage` must come from `code` rather than
+    /// the single-word `name` field; and when a multi-word query hits a
+    /// whole-file document where a common glue token (`"de"`) appears in an
+    /// adjacent function just above the rarer target token
+    /// (`"factor_calibracion"`), `refine_code_passage` must anchor on the
+    /// highest-weight matched query term in the window rather than the first
+    /// alphabetically sorted term.
+    #[test]
+    fn code_lexical_passage_prefers_code_over_name_and_anchors_on_rarest_term() {
+        // 1. Per-symbol hit: `code` wins over `name` and `title`.
+        let symbol_source = serde_json::json!({
+            "ax_path": "R/utils.R",
+            "language": "r",
+            "symbol_count": 1,
+            "name": "de",
+            "title": "de",
+            "code": "de <- function(col) {\n  trimws(col)\n}",
+        });
+        let symbol_query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "defs^3".into(),
+                "code^2".into(),
+                "body".into(),
+                "title".into(),
+            ],
+            query: "de".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let symbol_hit = Hit {
+            id: "sym-de".into(),
+            score: 1.0,
+            source: symbol_source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![symbol_hit], &symbol_query);
+        let passage = out[0].passage.as_ref().expect("symbol passage filled");
+        assert_eq!(passage.field, "code");
+        assert!(
+            passage.text.starts_with("de <- function(col)"),
+            "expected function body from `code`, got {:?}",
+            passage.text
+        );
+
+        // 2. Whole-file hit: common token `de` appears frequently across the
+        // file and in an adjacent helper right above `pub fn compute_calibration`,
+        // while `factor_calibracion` appears only inside `compute_calibration`.
+        let mut body = String::new();
+        for i in 0..25 {
+            body.push_str(&format!("// comentario de relleno linea {i}\n"));
+        }
+        body.push_str(
+            "pub fn helper_anterior() {\n    // nota de control\n    let x = 1;\n}\n\n\
+             pub fn compute_calibration() -> f64 {\n    let factor_calibracion = 0.85;\n    factor_calibracion\n}\n",
+        );
+        let file_source = serde_json::json!({
+            "ax_path": "src/calib.rs",
+            "language": "rust",
+            "symbol_count": 2,
+            "defs": "helper_anterior compute_calibration",
+            "title": "calib",
+            "body": body,
+        });
+        let file_query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "code^2".into(),
+                "body".into(),
+                "defs^3".into(),
+                "title".into(),
+            ],
+            query: "de factor_calibracion".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let file_hit = Hit {
+            id: "file-calib".into(),
+            score: 1.0,
+            source: file_source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![file_hit], &file_query);
+        let passage = out[0].passage.as_ref().expect("file passage filled");
+        assert_eq!(passage.field, "body");
+        assert!(
+            passage.text.starts_with("pub fn compute_calibration"),
+            "expected enclosing function of rarest matched term, got {:?}",
+            passage.text
         );
     }
 
