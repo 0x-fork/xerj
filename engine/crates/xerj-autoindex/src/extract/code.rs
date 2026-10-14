@@ -1395,6 +1395,8 @@ fn emit_code_doc(
     // So dedup by locator here, BEFORE counting/emitting — do not rely on the
     // downstream `_id` overwrite (which fixes the doc but not the count).
     let mut emitted_locators = std::collections::HashSet::new();
+    let lines: Vec<&str> = text.lines().collect();
+    const IMPL_CAP: usize = 16_384;
     for s in symbols {
         if s.code.is_empty() {
             continue;
@@ -1414,14 +1416,52 @@ fn emit_code_doc(
         sf.insert("name".into(), Value::String(name.clone()));
         sf.insert("kind".into(), Value::String(s.kind.clone()));
         sf.insert("line".into(), Value::Number((line as u64).into()));
+        sf.insert(
+            "end_line".into(),
+            Value::Number((s.end_line.max(line) as u64).into()),
+        );
         sf.insert("code".into(), Value::String(s.code.clone()));
-        // No field beyond the five #579 froze: a NEW scalar field on this
-        // document would make `reconcile_plan::ensure_compatible` (see
-        // reconcile_plan.rs, "field {name} is absent from frozen dataset")
-        // abort the next incremental run over an index an older binary froze.
-        // `end_line` therefore rides in the file document's `symbols` array,
-        // which that check exempts because an array carries no scalar
-        // observations (the #580/#581 rule).
+        // #1237: symbol records carry a bounded `impl` slice (`body[line..=end_line]`,
+        // capped at 16 KB on a UTF-8 char boundary) so `xerj code --fuse-symbols`
+        // can score a second BM25 leg over definition bodies without length-norm
+        // dilution from a 4,000-line file. For container kinds (`class`), bound
+        // `impl` to the lines preceding the first nested definition so method
+        // bodies are not duplicated inside the enclosing class record.
+        // `reconcile_plan::ensure_compatible` exempts `impl` and `end_line` on
+        // pre-#1237 frozen datasets so incremental runs over older state dirs
+        // never abort.
+        let impl_end_line = if s.kind == "class" {
+            symbols
+                .iter()
+                .filter(|child| child.line > line && child.line <= s.end_line)
+                .map(|child| child.line.saturating_sub(1).max(line))
+                .min()
+                .unwrap_or(s.end_line.max(line))
+        } else {
+            s.end_line.max(line)
+        };
+        if s.end_line > line
+            || matches!(
+                s.kind.as_str(),
+                "function" | "method" | "class" | "macro" | "struct" | "enum" | "trait" | "impl"
+            )
+        {
+            let lo = line.saturating_sub(1).min(lines.len());
+            let hi = impl_end_line.min(lines.len()).max(lo);
+            if hi > lo {
+                let mut impl_slice = lines[lo..hi].join("\n");
+                if impl_slice.len() > IMPL_CAP {
+                    let mut cut = IMPL_CAP;
+                    while cut > 0 && !impl_slice.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    impl_slice.truncate(cut);
+                }
+                if !impl_slice.is_empty() {
+                    sf.insert("impl".into(), Value::String(impl_slice));
+                }
+            }
+        }
         stats.records += 1;
         if !sink(RawRecord {
             fields: sf,
@@ -4440,6 +4480,48 @@ mod tests {
         assert_eq!(
             extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
             Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn emit_code_doc_records_symbol_impl_and_bounds_class_before_methods() {
+        let mut records = Vec::new();
+        let mut stats = ExtractStats::default();
+        let src =
+            "class Widget:\n    kind = 'box'\n    def render(self):\n        return self.kind\n";
+        let s = syms("python", src);
+        let ok = emit_code_doc(
+            Path::new("widget.py"),
+            "python",
+            src,
+            &s,
+            &mut stats,
+            &mut |rec| {
+                records.push(rec);
+                true
+            },
+        );
+        assert!(ok);
+        let class_rec = records
+            .iter()
+            .find(|r| r.locator == "code:1:Widget")
+            .expect("Widget symbol record");
+        assert_eq!(
+            class_rec.fields.get("impl").and_then(Value::as_str),
+            Some("class Widget:\n    kind = 'box'"),
+            "class impl stops before nested method definition so method bodies are not duplicated"
+        );
+        let method_rec = records
+            .iter()
+            .find(|r| r.locator == "code:3:render")
+            .expect("render symbol record");
+        assert_eq!(
+            method_rec.fields.get("impl").and_then(Value::as_str),
+            Some("    def render(self):\n        return self.kind")
+        );
+        assert_eq!(
+            method_rec.fields.get("end_line").and_then(Value::as_u64),
+            Some(4)
         );
     }
 }

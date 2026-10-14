@@ -38,13 +38,13 @@ pub fn query_terms(query: &str) -> Vec<String> {
 }
 
 /// `[(name, kind, start_line, end_line)]` from the record's own `symbols`.
-/// A definition runs until the next definition starts — a coarse but honest
-/// bound: it never claims a range the index did not report.
+/// Uses recorded `end_line` when present (#1237); otherwise falls back to
+/// running until the next definition starts.
 fn symbol_spans(src: &Value) -> Vec<(String, String, i64, Option<i64>)> {
     let Some(syms) = src.get("symbols").and_then(Value::as_array) else {
         return Vec::new();
     };
-    let mut got: Vec<(String, String, i64)> = syms
+    let mut got: Vec<(String, String, i64, Option<i64>)> = syms
         .iter()
         .filter(|s| s.is_object())
         .filter_map(|s| {
@@ -53,6 +53,10 @@ fn symbol_spans(src: &Value) -> Vec<(String, String, i64, Option<i64>)> {
             if name.is_empty() {
                 return None;
             }
+            let end_line = s
+                .get("end_line")
+                .and_then(Value::as_i64)
+                .filter(|&e| e >= line);
             Some((
                 name.to_string(),
                 s.get("kind")
@@ -60,19 +64,23 @@ fn symbol_spans(src: &Value) -> Vec<(String, String, i64, Option<i64>)> {
                     .unwrap_or("")
                     .to_string(),
                 line,
+                end_line,
             ))
         })
         .collect();
-    got.sort_by_key(|(_, _, line)| *line);
+    got.sort_by_key(|(_, _, line, _)| *line);
     got.windows(2)
         .map(|w| {
-            let (name, kind, line) = w[0].clone();
-            let end = w.get(1).map(|(_, _, l)| *l - 1);
+            let (name, kind, line, end_line) = w[0].clone();
+            let end = end_line.or_else(|| w.get(1).map(|(_, _, l, _)| *l - 1));
             (name, kind, line, end)
         })
         .collect::<Vec<_>>()
         .into_iter()
-        .chain(got.last().map(|(n, k, l)| (n.clone(), k.clone(), *l, None)))
+        .chain(
+            got.last()
+                .map(|(n, k, l, end_line)| (n.clone(), k.clone(), *l, *end_line)),
+        )
         .collect()
 }
 
@@ -372,5 +380,19 @@ mod tests {
         assert_eq!(commaus(1_000), "1,000");
         assert_eq!(commaus(21_461), "21,461");
         assert_eq!(commaus(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn symbol_passage_bounds_span_by_recorded_end_line() {
+        let body = "fn alpha() {\n    let needle = 1;\n}\n// trailing comment mentioning needle needle needle\nfn beta() {}\n";
+        let src = json!({
+            "symbols": [
+                { "name": "alpha", "kind": "function", "line": 1, "end_line": 3 },
+                { "name": "beta", "kind": "function", "line": 5, "end_line": 5 }
+            ]
+        });
+        let (text, label) = symbol_passage(body, &src, "needle", 800).unwrap();
+        assert_eq!(label, "function alpha @ line 1");
+        assert_eq!(text, "fn alpha() {\n    let needle = 1;\n}");
     }
 }
