@@ -7649,6 +7649,7 @@ name = "xerj-hub"
 version = "1.0.0-rc.95"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.23.1",
  "chrono",
  "reqwest",
@@ -7657,9 +7658,12 @@ dependencies = [
  "sha2 0.10.9",
  "tar",
  "tempfile",
+ "tokio",
  "toml",
+ "xerj-api",
  "xerj-autoindex",
  "xerj-common",
+ "xerj-engine",
  "zstd",
 ]
 
@@ -7766,6 +7770,7 @@ dependencies = [
  "xerj-console-api",
  "xerj-engine",
  "xerj-fts",
+ "xerj-hub",
  "xerj-logs",
  "xerj-mcp",
  "xerj-query",

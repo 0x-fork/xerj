@@ -2293,9 +2293,11 @@ async fn async_main() -> Result<()> {
     if matches!(argv1.as_deref(), Some("code")) {
         // Reference-coding retrieval (issue #977, previously xc.py): blocking
         // ES-compat client + local state ledger, synchronous — off the
-        // runtime like `def`.
+        // runtime like `def`. Routed through the hub CLI so `--def <SYMBOL>`
+        // answers from the `-defs` index; every other invocation delegates
+        // unchanged to `xc::run_code_cli` (Corpus Hub v2, §3).
         let args: Vec<String> = std::env::args().skip(2).collect();
-        let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_code_cli(&args))
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_code(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);
@@ -2306,6 +2308,16 @@ async fn async_main() -> Result<()> {
         // synchronous — off the runtime like `autoindex`.
         let args: Vec<String> = std::env::args().skip(2).collect();
         let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_corpus_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("hub")) {
+        // Corpus Hub v2 (discussion #1374): pull pre-indexed, signed packs and
+        // build them (CI). Synchronous (git + blocking HTTP) — off the runtime
+        // like `corpus`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_hub_cli(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);

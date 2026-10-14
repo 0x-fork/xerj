@@ -32,6 +32,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use xerj_autoindex::extract::code::{definitions, is_code_ext};
 use xerj_autoindex::harvest::sign::{sign_bytes, verify_bytes};
 use xerj_common::hub::{DefRecord, PackManifest, PACK_FORMAT_VERSION};
 
@@ -374,6 +375,170 @@ fn extract_into(members: &BTreeMap<String, Vec<u8>>, dest: &Path) -> Result<()> 
     Ok(())
 }
 
+// ── builder: defs + file inventory from a cloned corpus tree (plan §2/§3) ────
+
+/// Largest file read for AST extraction — past a couple MB a "file" is a
+/// generated bundle, not human code (mirrors the ingest extractor's `CODE_CAP`).
+const DEFS_READ_CAP: u64 = 2 << 20;
+
+/// Walk a cloned corpus tree and return (a) every definition
+/// ([`xerj_autoindex::extract::code::definitions`]) as [`DefRecord`]s, sorted by
+/// `(file, line)`, and (b) a file inventory as [`PackFileEntry`]s, sorted by
+/// path — the `defs.jsonl` and `files.jsonl` members of the pack (plan §2).
+///
+/// `corpus_root` is `<code_root>/corpora/<slug>`; paths are recorded relative to
+/// it with forward slashes (so they read the same on every OS and line up with
+/// the docs index's `ax_path`). `licence_of(rel)` supplies the per-file licence
+/// (the licence of the repo sub-tree the file sits in). `.git` and the corpus's
+/// own `corpus.json` are skipped. This is NODE-FREE: it only reads files.
+pub fn build_defs_and_files(
+    corpus_root: &Path,
+    licence_of: &dyn Fn(&str) -> String,
+) -> Result<(Vec<DefRecord>, Vec<PackFileEntry>)> {
+    let mut defs: Vec<DefRecord> = Vec::new();
+    let mut files: Vec<PackFileEntry> = Vec::new();
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    walk_corpus(corpus_root, corpus_root, &mut found)?;
+
+    for (rel, abs) in &found {
+        // The corpus's own metadata file is not a source file.
+        if rel == "corpus.json" {
+            continue;
+        }
+        let bytes = fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
+        let ext = ext_of(rel);
+        let licence = licence_of(rel);
+
+        let lang = if is_code_ext(&ext) && bytes <= DEFS_READ_CAP {
+            // Read once; the decoded text is used for both language resolution
+            // (the `.m` objc/matlab probe needs content) and extraction.
+            let raw = fs::read(abs).unwrap_or_default();
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(lang) = lang_for_ext(&ext, &text) {
+                defs.extend(definitions(rel, lang, &text));
+                Some(lang)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        files.push(PackFileEntry {
+            path: rel.clone(),
+            lang: lang.unwrap_or("").to_string(),
+            bytes,
+            licence,
+        });
+    }
+
+    defs.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((defs, files))
+}
+
+/// Recursively collect regular files as `(relative-forward-slash path, abs)`,
+/// skipping `.git`. Mirrors the snapshot walker but keyed on a corpus root.
+fn walk_corpus(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            walk_corpus(base, &path, out)?;
+        } else if ft.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                if let Ok(s) = rel_to_forward_slash(rel) {
+                    out.push((s, path));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lower-case extension of a `/`-joined relative path (empty when none).
+fn ext_of(rel: &str) -> String {
+    rel.rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.').map(|(_, e)| e))
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Map a lower-case extension to the registry language name
+/// `extract/code.rs`'s `definitions` expects. Kept in lock-step with that
+/// registry (there is no public enumerator to borrow it from); the
+/// `lang_table_matches_is_code_ext` test fails if the two drift on any
+/// extension this table knows. The `.m`/`.mm` collision is resolved the way the
+/// extractor does — Objective-C markers win, MATLAB is the fallback for `.m`.
+fn lang_for_ext(ext: &str, text: &str) -> Option<&'static str> {
+    let name = match ext {
+        "py" | "pyi" => "python",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "rs" => "rust",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "rb" => "ruby",
+        "php" => "php",
+        "cs" => "csharp",
+        "sh" | "bash" => "bash",
+        "kt" | "kts" => "kotlin",
+        "swift" => "swift",
+        "scala" | "sc" => "scala",
+        "dart" => "dart",
+        "lua" => "lua",
+        "pl" | "pm" => "perl",
+        "r" => "r",
+        "jl" => "julia",
+        "hs" => "haskell",
+        "ex" | "exs" => "elixir",
+        "erl" | "hrl" => "erlang",
+        "ml" => "ocaml",
+        "mli" => "ocaml_interface",
+        "zig" => "zig",
+        "mm" => "objc",
+        "m" => {
+            if looks_like_objc(text) {
+                "objc"
+            } else {
+                "matlab"
+            }
+        }
+        "groovy" | "gradle" => "groovy",
+        "ps1" | "psm1" | "psd1" => "powershell",
+        "fs" | "fsx" => "fsharp",
+        "nix" => "nix",
+        "f90" | "f95" | "f03" => "fortran",
+        "sol" => "solidity",
+        "clj" | "cljs" | "cljc" => "clojure",
+        "scm" | "ss" | "sld" | "sps" => "scheme",
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// `.m` disambiguator — Objective-C near-universally carries one of these
+/// markers; a `.m` with none is MATLAB (the extractor's `looks_like_objc`).
+fn looks_like_objc(text: &str) -> bool {
+    [
+        "#import",
+        "@interface",
+        "@implementation",
+        "@protocol",
+        "@end",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,5 +842,132 @@ mod tests {
             !sums.contains(SHA256SUMS),
             "SHA256SUMS must not list itself"
         );
+    }
+
+    #[test]
+    fn build_defs_and_files_extracts_c_defines_and_inventories_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("corpora").join("mini-c");
+        fs::create_dir_all(root.join("lz4")).unwrap();
+        fs::write(
+            root.join("lz4/limits.h"),
+            "#define MINI_LIMIT 128\nint helper(int x);\n",
+        )
+        .unwrap();
+        fs::write(root.join("LICENSE"), "MIT License\n").unwrap();
+        // corpus.json is metadata, never a source file.
+        fs::write(root.join("corpus.json"), "{}").unwrap();
+        // .git content is skipped.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let licence_of = |_rel: &str| "MIT".to_string();
+        let (defs, files) = build_defs_and_files(&root, &licence_of).unwrap();
+
+        // The #define carries its value; the prototype has none.
+        let limit = defs
+            .iter()
+            .find(|d| d.symbol == "MINI_LIMIT")
+            .expect("MINI_LIMIT extracted");
+        assert_eq!(limit.value.as_deref(), Some("128"));
+        assert_eq!(limit.file, "lz4/limits.h");
+        assert_eq!(limit.lang, "c");
+        assert_eq!(limit.line, 1);
+
+        // Inventory: the .h and the LICENSE, never corpus.json or .git/*.
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["LICENSE", "lz4/limits.h"]);
+        assert!(!paths
+            .iter()
+            .any(|p| p.contains(".git") || *p == "corpus.json"));
+        let h = files.iter().find(|f| f.path == "lz4/limits.h").unwrap();
+        assert_eq!(h.lang, "c");
+        assert_eq!(h.licence, "MIT");
+        // A non-code file is inventoried with an empty lang.
+        assert_eq!(files.iter().find(|f| f.path == "LICENSE").unwrap().lang, "");
+    }
+
+    #[test]
+    fn defs_are_sorted_by_file_then_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("c");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("b.c"), "#define B1 1\n#define B2 2\n").unwrap();
+        fs::write(root.join("a.c"), "#define A1 9\n").unwrap();
+        let (defs, _) = build_defs_and_files(&root, &|_| "MIT".into()).unwrap();
+        let order: Vec<(&str, u32)> = defs.iter().map(|d| (d.file.as_str(), d.line)).collect();
+        assert_eq!(order, vec![("a.c", 1), ("b.c", 1), ("b.c", 2)]);
+    }
+
+    /// The hub's extension→language table must agree with the extractor's own
+    /// `is_code_ext` for every extension it claims — the guard against the two
+    /// drifting apart (there is no public registry enumerator to share).
+    #[test]
+    fn lang_table_matches_is_code_ext() {
+        let claimed = [
+            "py", "pyi", "js", "jsx", "mjs", "cjs", "ts", "mts", "cts", "tsx", "rs", "go", "java",
+            "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "rb", "php", "cs", "sh", "bash",
+            "kt", "kts", "swift", "scala", "sc", "dart", "lua", "pl", "pm", "r", "jl", "hs", "ex",
+            "exs", "erl", "hrl", "ml", "mli", "zig", "m", "mm", "groovy", "gradle", "ps1", "psm1",
+            "psd1", "fs", "fsx", "nix", "f90", "f95", "f03", "sol", "clj", "cljs", "cljc", "scm",
+            "ss", "sld", "sps",
+        ];
+        for ext in claimed {
+            assert!(
+                is_code_ext(ext),
+                "{ext} is in the hub lang table but the extractor no longer treats it as code"
+            );
+            assert!(
+                lang_for_ext(ext, "").is_some(),
+                "{ext} resolves to no language"
+            );
+        }
+        // A non-code extension resolves to no language.
+        assert!(lang_for_ext("md", "").is_none());
+        assert!(lang_for_ext("", "").is_none());
+    }
+
+    #[test]
+    fn dot_m_probes_objc_vs_matlab() {
+        assert_eq!(lang_for_ext("m", "@interface Foo\n@end\n"), Some("objc"));
+        assert_eq!(lang_for_ext("m", "function y = f(x)\n"), Some("matlab"));
+        assert_eq!(lang_for_ext("mm", ""), Some("objc"));
+    }
+
+    /// The language NAME `lang_for_ext` returns must actually exist in the
+    /// extractor's `registry()` — otherwise a row rename (e.g. `csharp` ->
+    /// `c_sharp`) would make every `.cs` file yield ZERO defs while `files.jsonl`
+    /// still labels them `csharp`. There is no public registry enumerator, so we
+    /// prove membership the only observable way: a known one-definition snippet
+    /// routed through the resolved name must extract at least one def. (Names
+    /// that do not resolve in the registry return an empty Vec from
+    /// `definitions`.)
+    #[test]
+    fn lang_names_resolve_in_the_extractor_registry() {
+        // (extension, file, a one-definition snippet in that language).
+        let cases: &[(&str, &str, &str)] = &[
+            ("c", "a.c", "int cfn(void){return 0;}\n"),
+            ("cpp", "a.cpp", "class CppThing { public: void run(); };\n"),
+            ("rs", "a.rs", "pub fn rfn() {}\n"),
+            ("go", "a.go", "package p\nfunc GoFn() {}\n"),
+            ("py", "a.py", "def pyfn():\n    return 1\n"),
+            ("js", "a.js", "function jsfn(){}\n"),
+            ("ts", "a.ts", "function tsfn(){}\n"),
+            ("java", "A.java", "class JavaThing {}\n"),
+            ("cs", "A.cs", "class CsThing {}\n"),
+            ("rb", "a.rb", "def rbfn\nend\n"),
+            ("php", "a.php", "<?php function phpfn(){}\n"),
+            ("sh", "a.sh", "shfn() { :; }\n"),
+        ];
+        for (ext, file, snippet) in cases {
+            let lang = lang_for_ext(ext, snippet)
+                .unwrap_or_else(|| panic!(".{ext} resolves to no language"));
+            let defs = definitions(file, lang, snippet);
+            assert!(
+                !defs.is_empty(),
+                "lang_for_ext(.{ext}) = {lang:?} extracted no defs — the name is no longer a \
+                 registry() row (a rename would silently zero out every .{ext} file's defs)"
+            );
+        }
     }
 }
