@@ -150,7 +150,12 @@ async fn count_lane_full_window_is_served_columnar() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("cves28", kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"])).unwrap();
+    engine
+        .create_index(
+            "cves28",
+            kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"]),
+        )
+        .unwrap();
     let idx = engine.get_index("cves28").unwrap();
     let digests = seed(&idx).await;
 
@@ -199,7 +204,12 @@ async fn count_lane_with_resident_ghosts_is_served_and_exact() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("cves28g", kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"])).unwrap();
+    engine
+        .create_index(
+            "cves28g",
+            kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"]),
+        )
+        .unwrap();
     let idx = engine.get_index("cves28g").unwrap();
     let digests = seed(&idx).await;
 
@@ -291,7 +301,9 @@ async fn doc_lane_window_fetch_is_bounded() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("catalog", kw_schema(&["file_key", "run_id", "ax_path"])).unwrap();
+    engine
+        .create_index("catalog", kw_schema(&["file_key", "run_id", "ax_path"]))
+        .unwrap();
     let idx = engine.get_index("catalog").unwrap();
     // The catalog holds ONE doc per (digest, alias) — seed the same digests
     // plus a run_id that matches everything (the resume-rewrote-everything

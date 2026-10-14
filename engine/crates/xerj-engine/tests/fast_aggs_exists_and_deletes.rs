@@ -117,7 +117,9 @@ async fn exists_in_top_filter_matches_brute() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("existsq", kw_schema(&["extension", "text"])).unwrap();
+    engine
+        .create_index("existsq", kw_schema(&["extension", "text"]))
+        .unwrap();
     let idx = engine.get_index("existsq").unwrap();
     seed_exists_shapes(&idx).await;
 
@@ -160,7 +162,9 @@ async fn exists_on_numeric_field_matches_brute() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("existsn", kw_schema(&["group"])).unwrap();
+    engine
+        .create_index("existsn", kw_schema(&["group"]))
+        .unwrap();
     let idx = engine.get_index("existsn").unwrap();
     for i in 0..12_000u32 {
         let mut doc = json!({ "group": if i % 2 == 0 { "a" } else { "b" } });
@@ -236,7 +240,9 @@ async fn unmerged_ghosts_still_bail() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("ghosts", kw_schema(&["group"])).unwrap();
+    engine
+        .create_index("ghosts", kw_schema(&["group"]))
+        .unwrap();
     let idx = engine.get_index("ghosts").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
@@ -288,7 +294,9 @@ async fn merged_delete_history_re_qualifies_for_fast_path() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("readmit", kw_schema(&["extension"])).unwrap();
+    engine
+        .create_index("readmit", kw_schema(&["extension"]))
+        .unwrap();
     let idx = engine.get_index("readmit").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
@@ -385,7 +393,9 @@ async fn object_valued_memtable_doc_counts_as_exists() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("objmem", kw_schema(&["extension", "text"])).unwrap();
+    engine
+        .create_index("objmem", kw_schema(&["extension", "text"]))
+        .unwrap();
     let idx = engine.get_index("objmem").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
