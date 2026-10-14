@@ -31,8 +31,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use xerj_common::hub::{
-    render, Answer, LicenceClass, PackIndex, PackManifest, PackSource, AUTO_PULL_MAX_BYTES,
-    DEFAULT_HUB_URL, DISK_BUDGET_BYTES, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
+    render, Answer, CatalogueEntry, LicenceClass, PackIndex, PackManifest, PackSource,
+    AUTO_PULL_MAX_BYTES, DEFAULT_HUB_URL, DISK_BUDGET_BYTES, HUB_PUBKEY_HEX, PACK_FORMAT_VERSION,
 };
 use xerj_common::xccode::manifest::read_hub_manifest;
 use xerj_common::xccode::state;
@@ -40,6 +40,7 @@ use xerj_common::xccode::XcHttp;
 
 use crate::ask::{self, AskArgs, HostedSwitch, ModeRequest};
 use crate::catalogue::{build_catalogue, load_catalogue, CorpusBuildInput};
+use crate::flock::{held_by, FileLock, LockError};
 use crate::lockfile;
 use crate::node::{self, resolve_url, HubNode, NodeLauncher, StopOutcome};
 use crate::pack;
@@ -50,6 +51,10 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
         Build a signed, pre-indexed pack from a registry manifest (CI).
   pull <slug> [--quiet] [--url <node>]
         Download, verify and restore a pack, then `xerj code <slug>` works.
+        Exits 2 for an unknown corpus, 3 when the pack fails verification, 5 when
+        this build has no hub public key to verify with (nothing is downloaded),
+        1 for anything else (an excluded licence and a pack over the size limit
+        are refused here too).
   status
         Cached packs, the automatic node, the hosted setting, catalogue age.
   stop
@@ -478,6 +483,17 @@ fn run_pull(args: &[String]) -> i32 {
         eprintln!("xerj hub pull: <slug> is required\n\n{HUB_USAGE}");
         return 2;
     };
+    // Everything that can refuse this pull — a malformed or unknown slug, an
+    // excluded licence, a pack over the size cap, no key to verify it with — is
+    // decided BEFORE a node is looked for or started. A doomed pull used to boot a
+    // whole node first, and only then say "no".
+    let plan = match plan_pull(&slug) {
+        Ok(p) => p,
+        Err(PullError { code, message }) => {
+            eprintln!("xerj hub pull: {message}");
+            return code;
+        }
+    };
     // Unlike build-pack, pull's --url is optional: `--url` > `XERJ_URL` >
     // `localhost:9200`, and when none of those answers, the automatic node
     // (plan §5) is started or reused.
@@ -495,7 +511,7 @@ fn run_pull(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match pull(&slug, &resolved.url, resolved.managed, quiet) {
+    match pull_with(&plan, &resolved.url, resolved.managed, quiet) {
         Ok(Pulled::Already) => {
             if !quiet {
                 println!("{slug}: already present");
@@ -522,11 +538,14 @@ pub(crate) enum Pulled {
 
 /// A pull failure carrying an exit code the caller can act on: **2** = the slug
 /// is unknown or malformed; **3** = the pack failed verification (sha /
-/// signature / format, or there was no key to verify with); **1** = an
-/// infrastructure or policy failure (catalogue load, the size cap, node connect,
-/// a pull already in progress, the download, the restore, or writing the
-/// ledger). Keeping 2 and 3 exact lets a caller tell "wrong name" and "untrusted
-/// bytes" apart from "the machine or network got in the way".
+/// signature / format); **5** = this build has no hub public key, so nothing can
+/// be verified (and nothing was downloaded); **1** = an infrastructure or policy
+/// failure (catalogue load, the licence or size policy, node connect, a pull
+/// already in progress, the download, the restore, or writing the ledger).
+/// Keeping 2, 3 and 5 exact lets a caller tell "wrong name", "untrusted bytes"
+/// and "this binary cannot verify anything" apart from "the machine or network
+/// got in the way".
+#[derive(Debug)]
 pub(crate) struct PullError {
     pub(crate) code: i32,
     pub(crate) message: String,
@@ -544,59 +563,100 @@ impl PullError {
 const E_INFRA: i32 = 1;
 /// The slug is unknown or malformed.
 const E_SLUG: i32 = 2;
-/// The pack failed verification (sha / signature / format / missing key).
+/// The pack failed verification (sha / signature / format).
 const E_VERIFY: i32 = 3;
+/// No hub public key is configured: the pack was never even fetched. Its own code,
+/// because it is not a verification FAILURE (the bytes were not judged and found
+/// wanting) and not a transient one (retrying cannot help): the build is missing
+/// the key.
+const E_NOKEY: i32 = ask::EXIT_NO_KEY;
 
 /// Largest signature file pull will download — an ed25519 sig is 128 hex chars,
 /// so this caps a hostile hub's "signature" far below the pack cap.
 const SIG_MAX_BYTES: u64 = 4096;
-/// A pull lock older than this is an abandoned lock from a crashed pull and is
-/// stolen, so a hard kill cannot wedge a corpus forever.
-const LOCK_STALE: Duration = Duration::from_secs(30 * 60);
+/// How long a pull waits for another pull of the same pin to finish before it
+/// gives up. A pull is a download of at most [`AUTO_PULL_MAX_BYTES`] plus a
+/// restore, so this is generous; it exists so a wedged holder cannot hang a
+/// caller (an agent's tool call) for ever.
+const PULL_LOCK_WAIT: Duration = Duration::from_secs(60);
 
-/// A best-effort cross-process mutex for one `(slug, pin)`: an atomically
-/// created `<pin8>.lock` directory. A second concurrent pull of the same pin
-/// sees it and refuses rather than racing the shared tmp/extract dirs; the guard
-/// removes it on drop (every non-crash return below). A lock left by a crash is
-/// stolen once older than [`LOCK_STALE`]. The durable lockfile is plan §8; this
-/// only closes the same-pin race.
+/// Cross-process exclusion for one `(slug, pin)`: an OS lock on `<pin8>.lock`
+/// (see [`crate::flock`]). A second concurrent pull of the same pin waits for the
+/// first (bounded by [`PULL_LOCK_WAIT`]) instead of racing it over the shared
+/// tmp/extract directories — and then finds the pack present.
+///
+/// The lock belongs to the process holding it: it is released the moment that
+/// process exits, however it exits. This used to be an atomically created
+/// directory that was only ever removed by the pull's own destructor, so a pull
+/// killed with SIGKILL, an OOM or an agent's tool timeout left the corpus
+/// un-pullable for thirty minutes, with no owner recorded and a message that
+/// named no path.
 struct PullLock {
-    path: PathBuf,
+    _lock: FileLock,
 }
 impl PullLock {
-    fn acquire(pack_dir: &Path, slug: &str, pin8: &str) -> Result<PullLock, PullError> {
+    fn acquire(
+        pack_dir: &Path,
+        slug: &str,
+        pin8: &str,
+        wait: Duration,
+        quiet: bool,
+    ) -> Result<PullLock, PullError> {
         fs::create_dir_all(pack_dir)
             .map_err(|e| PullError::new(E_INFRA, format!("create {}: {e}", pack_dir.display())))?;
         let path = pack_dir.join(format!("{pin8}.lock"));
-        // Steal an abandoned lock from a crashed pull.
-        let stale = fs::metadata(&path)
-            .ok()
-            .and_then(|md| md.modified().ok())
-            .and_then(|m| m.elapsed().ok())
-            .map(|age| age > LOCK_STALE)
-            .unwrap_or(false);
-        if stale {
-            let _ = fs::remove_dir(&path);
-        }
-        match fs::create_dir(&path) {
-            Ok(()) => Ok(PullLock { path }),
-            Err(_) => Err(PullError::new(
+        let contended = |holder| {
+            PullError::new(
                 E_INFRA,
-                format!("a pull of '{slug}' ({pin8}) is already in progress"),
-            )),
+                format!(
+                    "a pull of '{slug}' ({pin8}) is already in progress (lock {}{}) and was still \
+                     running after {}s; wait for it to finish — the lock is released the moment \
+                     that process exits, however it exits",
+                    path.display(),
+                    held_by(holder),
+                    wait.as_secs()
+                ),
+            )
+        };
+        let infra = |e: std::io::Error| {
+            PullError::new(
+                E_INFRA,
+                format!("cannot take the pull lock {}: {e}", path.display()),
+            )
+        };
+        // One immediate try, so the caller is only told it is waiting when it is.
+        match FileLock::acquire(&path, Duration::ZERO) {
+            Ok(lock) => return Ok(PullLock { _lock: lock }),
+            Err(LockError::Io(e)) => return Err(infra(e)),
+            Err(LockError::Timeout { .. }) => {}
         }
-    }
-}
-impl Drop for PullLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        if !quiet {
+            eprintln!(
+                "xerj hub: another pull of '{slug}' ({pin8}) is running; waiting up to {}s for it \
+                 (lock {})",
+                wait.as_secs(),
+                path.display()
+            );
+        }
+        match FileLock::acquire(&path, wait) {
+            Ok(lock) => Ok(PullLock { _lock: lock }),
+            Err(LockError::Timeout { holder }) => Err(contended(holder)),
+            Err(LockError::Io(e)) => Err(infra(e)),
+        }
     }
 }
 
-/// Pull `slug` into the node at `url`. `managed` is true for the automatic node
-/// (started `--insecure`, so no credential is sent); `quiet` suppresses the
-/// eviction notices.
-pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<Pulled, PullError> {
+/// What a pull has decided before it touches a node or the disk: the catalogue
+/// entry, the pin its files are named by, and the key it will verify with.
+pub(crate) struct PullPlan {
+    entry: CatalogueEntry,
+    pin8: String,
+    pubkey: String,
+}
+
+/// Look `slug` up in the catalogue and decide whether it may be pulled at all
+/// ([`plan_pull_entry`]).
+pub(crate) fn plan_pull(slug: &str) -> Result<PullPlan, PullError> {
     // 0. Validate the slug BEFORE it is ever joined into a filesystem path. The
     //    catalogue is accepted UNVERIFIED when no hub pubkey is configured, so a
     //    hostile `slug` ("../../etc") must be rejected here, ahead of every fs op.
@@ -628,20 +688,52 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
             ),
         )
     })?;
-    // The matched entry's own slug drives the paths too; it equals `slug` (the
-    // find matched on it, already validated), but re-check defensively.
-    if !valid_slug(&entry.slug) {
+    plan_pull_entry(entry)
+}
+
+/// Everything that can refuse to pull `entry`, checked in the order that costs
+/// least and before any node, download or temp dir exists:
+///
+/// 1. its slug is safe to join into a path (the matched entry's own slug drives
+///    the paths, so it is re-checked even though the lookup matched on a valid one);
+/// 2. its pin is a commit;
+/// 3. its licence class is not `excluded` — **plan §11: an excluded corpus is never
+///    pulled.** This is enforced here, in the pull itself, and not only in the
+///    `ask` flow that decides whether to *start* one: `xerj hub pull <slug>` is a
+///    command anybody (or any agent that was handed a hint) can type, and a policy
+///    that only the caller applies is a policy the next caller forgets. There is
+///    deliberately no override flag: nothing in the plan lets a command line waive
+///    a licence class, and a flag an agent can read in `--help` is not a human
+///    decision. If an override is ever wanted it needs its own decision and its own
+///    confirmation, not a switch here;
+/// 4. its advertised size is within [`AUTO_PULL_MAX_BYTES`] — a malicious hub must
+///    not OOM the client by advertising a huge pack (decision 2). The transfer is
+///    bounded again in [`fetch_to`] in case the field lies;
+/// 5. there is a key to verify it with (exit [`E_NOKEY`]). Resolved before any temp
+///    dir exists, so a pull with no key leaves nothing to re-fetch.
+pub(crate) fn plan_pull_entry(entry: &CatalogueEntry) -> Result<PullPlan, PullError> {
+    let slug = entry.slug.as_str();
+    if !valid_slug(slug) {
         return Err(PullError::new(
             E_SLUG,
-            format!("catalogue entry has an invalid slug '{}'", entry.slug),
+            format!("catalogue entry has an invalid slug '{slug}'"),
         ));
     }
     let pin8 = pin8_of(&entry.pin_sha)
         .map_err(|e| PullError::new(E_INFRA, format!("catalogue entry for '{slug}': {e:#}")))?;
-
-    // 2. Size cap BEFORE any download — a malicious hub must not OOM the client
-    //    by advertising a huge pack (decision 2 / AUTO_PULL_MAX_BYTES). The
-    //    transfer is bounded again in `fetch_to` in case the field lies.
+    if entry.licence_class == LicenceClass::Excluded {
+        return Err(PullError::new(
+            E_INFRA,
+            format!(
+                "pack '{slug}' has an excluded licence class ({}) and is never pulled",
+                if entry.licence_spdx.is_empty() {
+                    "unknown"
+                } else {
+                    &entry.licence_spdx
+                }
+            ),
+        ));
+    }
     if entry.pack_bytes > AUTO_PULL_MAX_BYTES {
         return Err(PullError::new(
             E_INFRA,
@@ -651,14 +743,31 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
             ),
         ));
     }
+    let pubkey = hub_pubkey().map_err(|e| PullError::new(E_NOKEY, format!("{e:#}")))?;
+    Ok(PullPlan {
+        entry: entry.clone(),
+        pin8,
+        pubkey,
+    })
+}
 
-    // 3. The verifying key, resolved BEFORE any temp dir exists — a pull with no
-    //    key is a verification failure that must not leave a `.tmp` to re-fetch.
-    let pubkey = hub_pubkey().map_err(|e| PullError::new(E_VERIFY, format!("{e:#}")))?;
+/// Pull the planned corpus into the node at `url`. `managed` is true for the
+/// automatic node (started `--insecure`, so no credential is sent); `quiet`
+/// suppresses the eviction and wait notices.
+pub(crate) fn pull_with(
+    plan: &PullPlan,
+    url: &str,
+    managed: bool,
+    quiet: bool,
+) -> Result<Pulled, PullError> {
+    let entry = &plan.entry;
+    let slug = entry.slug.as_str();
+    let pin8 = plan.pin8.as_str();
+    let hub_home = hub_home();
 
-    // 3b. Disk budget (plan §5 step 6): make room BEFORE any download, evicting
-    //     least-recently-used packs — never this slug's. Pack directories only;
-    //     the node's restored indices are not touched.
+    // Disk budget (plan §5 step 6): make room BEFORE any download, evicting
+    // least-recently-used packs — never this slug's. Pack directories only; the
+    // node's restored indices are not touched.
     for c in ask::evict_to_budget(&hub_home, slug, entry.pack_bytes, DISK_BUDGET_BYTES) {
         if !quiet {
             eprintln!(
@@ -672,7 +781,7 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
         }
     }
 
-    // 4. The node (infra if unreachable).
+    // The node (infra if unreachable).
     let root = xerj_autoindex::xc::code_root();
     let node = if managed {
         HubNode::connect_insecure(url)
@@ -681,14 +790,15 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
     }
     .map_err(|e| PullError::new(E_INFRA, format!("connect {url}: {e:#}")))?;
 
-    // 5. Take the per-pin lock so a concurrent pull does not race the tmp/extract
-    //    dirs; released on every return below (Drop).
+    // Take the per-pin lock so a concurrent pull does not race the tmp/extract
+    // dirs; released on every return below (Drop), and by the OS if this process
+    // dies before it gets there.
     let pack_dir = hub_home.join("packs").join(slug);
-    let _lock = PullLock::acquire(&pack_dir, slug, &pin8)?;
+    let _lock = PullLock::acquire(&pack_dir, slug, pin8, PULL_LOCK_WAIT, quiet)?;
 
-    // 6. Download pack + sig into a temp dir (size-capped). NOTHING is extracted.
+    // Download pack + sig into a temp dir (size-capped). NOTHING is extracted.
     let tmp = pack_dir.join(format!("{pin8}.tmp"));
-    let extract = pack_dir.join(pin8.clone());
+    let extract = pack_dir.join(pin8);
     let _ = fs::remove_dir_all(&tmp); // a stale temp from a crash must not poison this
     fs::create_dir_all(&tmp)
         .map_err(|e| PullError::new(E_INFRA, format!("create {}: {e}", tmp.display())))?;
@@ -709,32 +819,42 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
         }
     };
 
-    // 7. Verify sha256 THEN signature THEN format_version, extracting nothing
-    //    until all pass (plan §11). Any failure: delete the temp, exit 3.
-    let manifest =
-        match pack::read_and_verify_pack(&archive, &sig, &entry.pack_sha256, &pubkey, &extract) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&tmp);
-                // read_and_verify_pack never populates `extract` on failure; clear
-                // any half-written dir from an interrupted prior run too.
-                let _ = fs::remove_dir_all(&extract);
-                return Err(PullError::new(
-                    E_VERIFY,
-                    format!("pack verification failed: {e:#}"),
-                ));
-            }
-        };
+    // Verify sha256 THEN signature THEN format_version, extracting nothing until
+    // all pass (plan §11). Any failure: delete the temp, exit 3.
+    //
+    // The extraction goes to a staging directory inside `tmp`, never to `extract`
+    // itself, for two reasons. A pack killed mid-extraction must not leave a
+    // directory at the final path that looks complete (`pack.json`, the marker
+    // `ask` and `status` go by, used to be written before `snapshot/`). And a pull
+    // that fails — or is killed — must not delete the pack an earlier, successful
+    // pull put at `extract`: only what THIS run created is removed on failure.
+    let staging = tmp.join("extract");
+    let manifest = match pack::read_and_verify_pack(
+        &archive,
+        &sig,
+        &entry.pack_sha256,
+        &plan.pubkey,
+        &staging,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(PullError::new(
+                E_VERIFY,
+                format!("pack verification failed: {e:#}"),
+            ));
+        }
+    };
+    install_extract(&staging, &extract, &tmp)?;
     let _ = fs::remove_dir_all(&tmp);
 
-    // 8. Restore — unless the WHOLE index set is already live on this node. A
-    //    partial match (a prior partial restore, or a local `corpus index` that
-    //    produced a different build) must NOT read as a complete pack: skipping
-    //    then would leave `--def` querying a missing index and stamp the ledger
-    //    "answered from: local pack" over data that is not the pack. So the skip
-    //    requires EVERY manifest index present; a list error counts as "not
-    //    present" and restores (it never silently skips). Idempotent on a real
-    //    full match.
+    // Restore — unless the WHOLE index set is already live on this node. A partial
+    // match (a prior partial restore, or a local `corpus index` that produced a
+    // different build) must NOT read as a complete pack: skipping then would leave
+    // `--def` querying a missing index and stamp the ledger "answered from: local
+    // pack" over data that is not the pack. So the skip requires EVERY manifest
+    // index present; a list error counts as "not present" and restores (it never
+    // silently skips). Idempotent on a real full match.
     let prefix = manifest.index_prefix.clone();
     let live = node
         .cat_indices_json(&format!("{prefix}*"))
@@ -759,7 +879,7 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
         .map_err(|e| PullError::new(E_INFRA, format!("restore snapshot: {e:#}")))?;
     }
 
-    // 9. Only now — with the full set provably present — stamp the ledger.
+    // Only now — with the full set provably present — stamp the ledger.
     state::write_hubpack_state(
         &root,
         slug,
@@ -780,6 +900,34 @@ pub(crate) fn pull(slug: &str, url: &str, managed: bool, quiet: bool) -> Result<
         "pulled {slug} {pin8} {bytes} → {n_indices} indices, {} definitions",
         manifest.defs_count
     )))
+}
+
+/// Put the verified, fully extracted `staging` directory at `dest` by renaming it —
+/// one step, so `dest` is either absent or complete. A pack already at `dest`
+/// (from an earlier pull of the same pin) is moved into `scratch` first and put
+/// back if the rename fails; it is deleted with `scratch` once the new one is in
+/// place.
+fn install_extract(staging: &Path, dest: &Path, scratch: &Path) -> Result<(), PullError> {
+    let previous = scratch.join("previous");
+    let had_previous = dest.exists();
+    if had_previous {
+        fs::rename(dest, &previous).map_err(|e| {
+            PullError::new(
+                E_INFRA,
+                format!("cannot replace the pack at {}: {e}", dest.display()),
+            )
+        })?;
+    }
+    if let Err(e) = fs::rename(staging, dest) {
+        if had_previous {
+            let _ = fs::rename(&previous, dest);
+        }
+        return Err(PullError::new(
+            E_INFRA,
+            format!("cannot move the verified pack into {}: {e}", dest.display()),
+        ));
+    }
+    Ok(())
 }
 
 /// `^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$` — a slug safe to join into a path: no
@@ -959,7 +1107,8 @@ options:
 
 exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
 unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
-(candidates are printed; re-run with --corpus <slug>)";
+(candidates are printed; re-run with --corpus <slug>); 5 this build has no hub
+public key, so no pack can be verified (nothing was downloaded)";
 
 /// The first argument of every real `xerj` subcommand.
 pub const KNOWN_SUBCOMMANDS: &[&str] = &[
@@ -1235,8 +1384,9 @@ fn hub_pubkey() -> Result<String> {
         return Ok(HUB_PUBKEY_HEX.to_string());
     }
     bail!(
-        "no hub public key configured (HUB_PUBKEY_HEX is empty and XERJ_HUB_PUBKEY is unset); \
-           cannot verify a pack signature"
+        "no hub public key is configured in this build (HUB_PUBKEY_HEX is empty and \
+         XERJ_HUB_PUBKEY is unset), so a pack's signature cannot be verified; nothing was \
+         downloaded"
     )
 }
 
@@ -1534,6 +1684,235 @@ mod tests {
     // `catalogue` test module already mutates under its own `ENV_LOCK`. A unit
     // test here that set/removed that var would race those tests (lib tests share
     // one process and run in parallel, and the lock is private to that module).
-    // The empty-key path — no key => exit 3, with no `.tmp` leaked — is covered
-    // end to end by the `nokey` scenario in `tests/pack_roundtrip.rs` instead.
+    // The empty-key path — no key => its own exit code (5), with no `.tmp` leaked
+    // and no node started — is covered end to end by the `nokey` scenario in
+    // `tests/pack_roundtrip.rs` instead. Everything below refuses BEFORE the key is
+    // looked at, so it needs no environment.
+
+    // ── the pull policy lives in the pull ────────────────────────────────────
+
+    fn entry(slug: &str, class: LicenceClass, pack_bytes: u64) -> CatalogueEntry {
+        CatalogueEntry {
+            slug: slug.to_string(),
+            domain: "TEST".to_string(),
+            topics: vec![],
+            ask_for: "x".to_string(),
+            pin_sha: "0774d05537f9762f838f7ab541b7765f1a729cb5".to_string(),
+            pin_date: "2026-10-02".to_string(),
+            refresh_cadence_days: 7,
+            licence_spdx: "GPL-3.0".to_string(),
+            licence_class: class,
+            pack_bytes,
+            pack_url: "file:///nonexistent".to_string(),
+            pack_sha256: "0".repeat(64),
+            sig_url: "file:///nonexistent.sig".to_string(),
+            dependency_names: vec![],
+            quality_grade: None,
+            term_sketch: xerj_common::hub::Sketch {
+                m_bits: 64,
+                k_hashes: 7,
+                bits_base64: "AAAAAAAAAAA=".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn an_excluded_corpus_is_refused_by_pull_itself_not_only_by_the_ask_flow() {
+        // `xerj hub pull <slug>` is a command anyone can type — including from a
+        // hint an earlier run printed. Plan §11: an excluded licence class is never
+        // pulled. The refusal is the pull's, before any node, download or temp dir.
+        let err = plan_pull_entry(&entry("gpl-thing", LicenceClass::Excluded, 1024))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, 1, "a policy refusal, exit 1");
+        assert!(
+            err.message.contains("excluded licence class"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("never pulled"), "{}", err.message);
+        assert!(
+            err.message.contains("GPL-3.0"),
+            "names the licence: {}",
+            err.message
+        );
+        // Excluded wins over the size cap: the licence is the first thing said.
+        let err = plan_pull_entry(&entry("gpl-thing", LicenceClass::Excluded, u64::MAX / 2))
+            .err()
+            .expect("refused");
+        assert!(
+            err.message.contains("excluded licence class"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn pull_refuses_a_pack_over_the_cap_and_a_bad_slug_before_anything_else() {
+        let err = plan_pull_entry(&entry(
+            "big",
+            LicenceClass::AdaptWithAttribution,
+            AUTO_PULL_MAX_BYTES + 1,
+        ))
+        .err()
+        .expect("refused");
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("over the"), "{}", err.message);
+
+        let err = plan_pull_entry(&entry("../../etc", LicenceClass::AdaptWithAttribution, 1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, 2, "a malformed slug is exit 2");
+
+        let mut bad_pin = entry("ok", LicenceClass::AdaptWithAttribution, 1);
+        bad_pin.pin_sha = "not-a-commit".to_string();
+        assert_eq!(plan_pull_entry(&bad_pin).err().expect("refused").code, 1);
+    }
+
+    #[test]
+    fn approach_only_is_still_pullable_the_policy_only_stops_excluded() {
+        // The key lookup is the first thing that can still fail for these; either
+        // way the answer is not a licence refusal.
+        for class in [
+            LicenceClass::AdaptWithAttribution,
+            LicenceClass::ApproachOnly,
+        ] {
+            match plan_pull_entry(&entry("fine", class, 1024)) {
+                Ok(plan) => assert_eq!(plan.pin8, "0774d055"),
+                Err(e) => assert_eq!(
+                    e.code, E_NOKEY,
+                    "only a missing key may stop it: {}",
+                    e.message
+                ),
+            }
+        }
+    }
+
+    // ── the pull lock belongs to the process that holds it ───────────────────
+
+    #[test]
+    fn a_pull_waits_a_bounded_time_for_the_lock_and_names_it_when_it_gives_up() {
+        let packs = tempfile::tempdir().unwrap();
+        let dir = packs.path().join("lz4");
+        let held = PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let err = PullLock::acquire(&dir, "lz4", "0774d055", Duration::from_millis(300), true)
+            .err()
+            .expect("still held");
+        let waited = t0.elapsed();
+        assert_eq!(err.code, 1);
+        let lock = dir.join("0774d055.lock");
+        assert!(
+            err.message.contains(&lock.display().to_string()),
+            "the message names the lock file: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains(&format!("held by pid {}", std::process::id())),
+            "and its owner: {}",
+            err.message
+        );
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+            "bounded: {waited:?}"
+        );
+
+        // A different pin of the same corpus is a different lock.
+        let other = PullLock::acquire(&dir, "lz4", "deadbeef", Duration::ZERO, true).unwrap();
+        drop(other);
+
+        drop(held);
+        PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true)
+            .expect("free the moment the holder lets go");
+    }
+
+    #[test]
+    fn a_waiting_pull_proceeds_as_soon_as_the_other_one_finishes() {
+        let packs = tempfile::tempdir().unwrap();
+        let dir = packs.path().join("lz4");
+        let held = PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true).unwrap();
+        let waiter_dir = dir.clone();
+        let waiter = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let got = PullLock::acquire(
+                &waiter_dir,
+                "lz4",
+                "0774d055",
+                Duration::from_secs(20),
+                true,
+            );
+            (got.is_ok(), t0.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        drop(held);
+        let (got, waited) = waiter.join().unwrap();
+        assert!(got, "the second pull got the lock once the first finished");
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_lock_directory_left_by_an_older_build_does_not_block_a_pull() {
+        // The old scheme: `<pin8>.lock` was a directory, removed only by the pull's
+        // own destructor.
+        let packs = tempfile::tempdir().unwrap();
+        let dir = packs.path().join("lz4");
+        fs::create_dir_all(dir.join("0774d055.lock")).unwrap();
+        PullLock::acquire(&dir, "lz4", "0774d055", Duration::ZERO, true)
+            .expect("the leftover directory is replaced by a lock file");
+    }
+
+    // ── installing a verified extract ────────────────────────────────────────
+
+    fn fake_extract(dir: &Path, marker: &str) {
+        fs::create_dir_all(dir.join("snapshot")).unwrap();
+        fs::write(dir.join("pack.json"), marker).unwrap();
+        fs::write(dir.join("snapshot").join("data"), marker).unwrap();
+    }
+
+    #[test]
+    fn a_verified_extract_is_renamed_into_place_and_replaces_an_older_one() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("0774d055.tmp");
+        let dest = root.path().join("0774d055");
+        let staging = scratch.join("extract");
+
+        // Nothing there yet.
+        fake_extract(&staging, "first");
+        install_extract(&staging, &dest, &scratch).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("pack.json")).unwrap(), "first");
+        assert!(!staging.exists(), "moved, not copied");
+
+        // An older extract is replaced whole: nothing of it is mixed into the new one.
+        fs::write(dest.join("stale-file"), "x").unwrap();
+        fake_extract(&staging, "second");
+        install_extract(&staging, &dest, &scratch).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("pack.json")).unwrap(),
+            "second"
+        );
+        assert!(!dest.join("stale-file").exists());
+    }
+
+    #[test]
+    fn a_failed_install_puts_the_previous_extract_back() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("0774d055.tmp");
+        fs::create_dir_all(&scratch).unwrap();
+        let dest = root.path().join("0774d055");
+        fake_extract(&dest, "verified-earlier");
+        // The staging directory is missing, so the second rename fails.
+        let err =
+            install_extract(&scratch.join("no-such-staging"), &dest, &scratch).expect_err("fails");
+        assert_eq!(err.code, 1);
+        assert_eq!(
+            fs::read_to_string(dest.join("pack.json")).unwrap(),
+            "verified-earlier",
+            "the pack an earlier pull verified is still there"
+        );
+    }
 }

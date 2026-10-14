@@ -22,6 +22,13 @@
 //! - **D. the disk budget:** a pull evicts a least-recently-used pack that is
 //!   over the 4 GiB budget (sparse files, so nothing is written).
 //! - **E. offline with no pack:** exit 1, and no node is started to say so.
+//! - **G. an excluded corpus:** never pulled, and never hinted at — `--offline` and
+//!   `--no-fetch` used to print `run: xerj hub pull <slug>` for it, and `hub pull`
+//!   itself had no licence check.
+//! - **F. a pull killed mid-run:** a second process running `xerj hub pull` is
+//!   blocked mid-download holding the pull lock, killed with SIGKILL, and the retry
+//!   is not blocked (the lock was a directory that only the pull's destructor
+//!   removed, so a killed pull wedged its corpus for half an hour).
 //!
 //! The test binary doubles as the `xerj` executable the flow spawns: a
 //! `NodeLauncher` points at it with `--ignored --exact child_main --nocapture --`
@@ -921,5 +928,192 @@ async fn ask_end_to_end() {
         assert!(msg.contains("run: xerj hub pull mini-c"), "{msg}");
         assert!(!hub.join("node.pid").exists(), "no node was started");
         assert!(!hub.join("packs").exists(), "nothing was downloaded");
+    }
+
+    // ── G. an EXCLUDED corpus: no pull, and no hint to pull it, offline or not ─
+    {
+        let hub = work.join("hub-g");
+        let code = work.join("code-g");
+        publish(&archive, &sig, &work.join("net-g"), &hub);
+        set_catalogue_field(&hub, "licence_class", json!("excluded"));
+        set_env(&hub, &code, &scratch_home, &public);
+        for flag in ["--offline", "--no-fetch", "(neither)"] {
+            let mut args = def_args();
+            match flag {
+                "--offline" => args.offline = true,
+                "--no-fetch" => args.no_fetch = true,
+                _ => {}
+            }
+            let out = run(Case {
+                hub: hub.clone(),
+                cwd: cwd.clone(),
+                url: Some("http://127.0.0.1:1".to_string()),
+                launcher: forbidden_launcher(),
+                hosted: HostedKind::None,
+                args,
+            })
+            .await;
+            assert_eq!(out.exit, EXIT_NO_ANSWER, "{flag}");
+            let msg = out.stderr.join("\n");
+            assert!(msg.contains("excluded licence class"), "{flag}: {msg}");
+            assert!(
+                !msg.contains("xerj hub pull") && !msg.contains("run:"),
+                "{flag}: a hint to pull an excluded corpus is a way round the policy: {msg}"
+            );
+            assert!(!hub.join("packs").exists(), "{flag}: nothing downloaded");
+            assert!(!hub.join("node.pid").exists(), "{flag}: no node started");
+        }
+        // The command the old hint named refuses it too.
+        let rc = tokio::task::spawn_blocking({
+            let url = "http://127.0.0.1:1".to_string();
+            move || {
+                xerj_hub::cli::run_hub_cli(&[
+                    "pull".into(),
+                    "mini-c".into(),
+                    "--url".into(),
+                    url,
+                    "--quiet".into(),
+                ])
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rc, 1, "`xerj hub pull` itself refuses an excluded corpus");
+        assert!(!hub.join("packs").exists());
+    }
+
+    // ── F. a pull killed mid-run does not wedge its corpus ───────────────────
+    // The old pull lock was a directory removed only by the pull's own destructor:
+    // SIGKILL, an OOM kill or an agent's tool timeout left the corpus un-pullable
+    // for half an hour, with no owner recorded. It is an OS lock now.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let hub = work.join("hub-f");
+        let code = work.join("code-f");
+        publish(&archive, &sig, &work.join("net-f"), &hub);
+        let real_catalogue = std::fs::read(hub.join("catalogue.json")).unwrap();
+        set_env(&hub, &code, &scratch_home, &public);
+        let url = spawn_node(&work.join("data-f"), allowlist.clone()).await;
+
+        // A pack URL that never delivers a byte: a FIFO with no writer. The pull takes
+        // its lock, starts "downloading" and blocks in open(2).
+        let fifo = work.join("net-f").join("never.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
+        set_catalogue_field(
+            &hub,
+            "pack_url",
+            json!(format!("file://{}", fifo.display())),
+        );
+
+        // The victim is a separate process running `xerj hub pull` (this binary).
+        let mut victim = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "child_main",
+                "--nocapture",
+                "--",
+                "hub",
+                "pull",
+                "mini-c",
+                "--url",
+                &url,
+                "--quiet",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let lock_path = hub
+            .join("packs")
+            .join("mini-c")
+            .join(format!("{PIN8}.lock"));
+        wait_for(
+            "the victim to take the pull lock",
+            Duration::from_secs(90),
+            || lock_is_held(&lock_path),
+        )
+        .await;
+        assert!(
+            hub.join("packs")
+                .join("mini-c")
+                .join(format!("{PIN8}.tmp"))
+                .is_dir(),
+            "it is mid-pull: past the lock, into its temp dir"
+        );
+        assert!(
+            victim.try_wait().unwrap().is_none(),
+            "still blocked in the download"
+        );
+
+        // SIGKILL: no destructor runs. (The kernel closes its descriptors.)
+        victim.kill().unwrap();
+        victim.wait().unwrap();
+        assert!(!lock_is_held(&lock_path), "the dead process holds nothing");
+
+        // The retry is NOT blocked — and, pointed at the real pack, it completes.
+        std::fs::write(hub.join("catalogue.json"), &real_catalogue).unwrap();
+        let t0 = Instant::now();
+        let rc = tokio::task::spawn_blocking({
+            let url = url.clone();
+            move || {
+                xerj_hub::cli::run_hub_cli(&[
+                    "pull".into(),
+                    "mini-c".into(),
+                    "--url".into(),
+                    url,
+                    "--quiet".into(),
+                ])
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rc, 0, "the retry after a killed pull succeeds");
+        assert!(
+            t0.elapsed() < Duration::from_secs(45),
+            "and does not sit out a 30-minute lock: {:?}",
+            t0.elapsed()
+        );
+        assert!(hub
+            .join("packs")
+            .join("mini-c")
+            .join(PIN8)
+            .join("pack.json")
+            .is_file());
+        let _ = std::fs::remove_file(&fifo);
+    }
+}
+
+/// Set one field of the first catalogue entry in `<hub>/catalogue.json`.
+fn set_catalogue_field(hub: &Path, field: &str, value: serde_json::Value) {
+    let path = hub.join("catalogue.json");
+    let mut cat: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cat["corpora"][0][field] = value;
+    std::fs::write(&path, serde_json::to_vec(&cat).unwrap()).unwrap();
+}
+
+/// Is somebody holding the lock file `path`? (Tries it, and lets go again.)
+#[cfg(unix)]
+fn lock_is_held(path: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(path)
+    else {
+        return false;
+    };
+    match f.try_lock() {
+        Ok(()) => {
+            let _ = f.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(e)) => panic!("cannot probe {}: {e}", path.display()),
     }
 }

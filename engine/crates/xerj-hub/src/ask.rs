@@ -16,9 +16,11 @@
 //! 4. **No pack, hosted allowed** → answer through the hosted hub now, then (unless
 //!    `--no-fetch`) start a detached `xerj hub pull` for next time — subject to the
 //!    pull policy ([`pull_policy`]).
-//! 5. **No pack, no hosted** → `--offline` (or `--no-fetch`) exits 1 naming the
-//!    pack to pull; otherwise pull synchronously (same policy) and answer
-//!    locally.
+//! 5. **No pack, no hosted** → the pull policy decides first ([`pull_policy`]): an
+//!    excluded corpus is never pulled and a pack over the size limit is not
+//!    downloaded, whatever else was asked, and neither is ever answered with a
+//!    command to run. Then `--offline` (or `--no-fetch`) exits 1 naming the pack to
+//!    pull; otherwise pull synchronously and answer locally.
 //! 6. **Disk budget** — before any pull, least-recently-used packs are evicted
 //!    until the pack cache fits ([`evict_to_budget`], called from `hub pull`).
 //! 7. The §1 renderer prints the [`Answer`]; `--json` prints the struct.
@@ -49,6 +51,7 @@
 //! | 2 | usage error; unknown `--corpus`; a pull rejected the slug |
 //! | 3 | a pulled pack failed verification (sha256 / signature / format) |
 //! | 4 | ambiguous — re-run with `--corpus` (the code `xerj autoindex` uses for "needs a decision") |
+//! | 5 | this build has no hub public key, so no pack can be verified (nothing was downloaded) |
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -67,8 +70,8 @@ use xerj_common::xccode::{self, licence, passage, state, CodeParams, XcHttp};
 
 use crate::catalogue::load_catalogue;
 use crate::node::{self, HubNode, NodeLauncher, ResolvedNode};
-use crate::router::{route, HostedSearch, Routing};
-use crate::{cli, def, lockfile};
+use crate::router::{route_ranked, HostedSearch, Routing};
+use crate::{cli, def, lockfile, sketch};
 
 /// Answered with at least one hit.
 pub const EXIT_OK: i32 = 0;
@@ -80,6 +83,9 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_UNVERIFIED: i32 = 3;
 /// More than one corpus matches: the caller must choose (`--corpus`).
 pub const EXIT_NEEDS_DECISION: i32 = 4;
+/// A pull was refused because this build has no hub public key: not a pack that
+/// failed verification ([`EXIT_UNVERIFIED`]) but one that cannot be judged at all.
+pub const EXIT_NO_KEY: i32 = 5;
 
 /// Printed (stderr) when the router finds nothing credible.
 pub const NO_CORPUS_MESSAGE: &str = "no hub corpus matches; see xerj.org/llms.txt";
@@ -333,14 +339,48 @@ pub fn megabytes(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
 }
 
-/// `run: xerj hub pull <slug> (<MB> MB)` — what to type for a pack too large to
-/// pull automatically.
+/// `run: xerj hub pull <slug> (<MB> MB)` — the command that fetches this pack.
+///
+/// Only ever offered for a pack the pull policy allows ([`PullPolicy::Allow`]):
+/// `xerj hub pull` refuses an excluded corpus and a pack over the size limit, so a
+/// hint naming it would send the reader to a command that fails — or, worse, one
+/// they would be tempted to get around. Callers check [`pull_policy`] first.
 pub fn pull_hint(entry: &CatalogueEntry) -> String {
     format!(
         "run: xerj hub pull {} ({} MB)",
-        entry.slug,
+        printable(&entry.slug),
         megabytes(entry.pack_bytes)
     )
+}
+
+/// A catalogue- or network-supplied string made safe to print on one terminal
+/// line. The catalogue is accepted unverified until the hub key ships, and a slug
+/// or an `ask_for` is printed for an agent (and a person) to read: a control
+/// character in it is an escape sequence, a forged line, or a rewritten screen.
+/// Every control character — ESC, CR, LF, BEL, NUL, DEL, the C1 range — the
+/// Unicode line/paragraph separators and the bidirectional overrides (which
+/// reorder how a slug is *displayed*) become a space; runs of spaces collapse.
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = false;
+    for c in s.chars() {
+        let hostile = c.is_control()
+            || matches!(
+                c,
+                '\u{2028}' | '\u{2029}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            );
+        let c = if hostile { ' ' } else { c };
+        if c == ' ' {
+            if last_space {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        out.push(c);
+    }
+    out.trim().to_string()
 }
 
 /// `approach-only licence (<spdx>): read, do not copy`.
@@ -467,7 +507,7 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
     };
 
     // Step 2: route.
-    let Some(slug) = select_corpus(args, deps, hosted, &mut out) else {
+    let Some(slug) = select_corpus(args, deps, hosted, symbol.as_deref(), &mut out) else {
         return out;
     };
     let entry = deps.catalogue.corpora.iter().find(|e| e.slug == slug);
@@ -489,20 +529,51 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
     // Step 4: hosted answers now; the pull happens behind it.
     if let Some(h) = hosted {
         match h.answer(&req) {
-            Ok(answer) => return finish_hosted(args, deps, entry, answer, out),
+            Ok(answer) => return finish_hosted(args, deps, &slug, entry, answer, out),
             Err(e) => out.stderr.push(format!("hosted answer failed: {e:#}")),
         }
     }
 
     // Step 5: neither a pack nor a hosted answer.
+    let shown = printable(&slug);
     let Some(entry) = entry else {
         out.stderr.push(format!(
-            "corpus '{slug}' is not in the catalogue, so it cannot be pulled, and no hosted \
+            "corpus '{shown}' is not in the catalogue, so it cannot be pulled, and no hosted \
              answer is available"
         ));
         out.exit = EXIT_NO_ANSWER;
         return out;
     };
+    // The pull policy is decided FIRST, before anything about how this run was asked
+    // to behave. Whether a pack may be pulled at all does not depend on `--offline`
+    // or `--no-fetch`; and what is printed below must never be a command that
+    // `xerj hub pull` refuses — or, for an excluded licence class, a way round
+    // "never pulled". (The offline branch used to run before the policy and print
+    // `run: xerj hub pull <slug>` for an excluded corpus; `hub pull` itself had no
+    // licence check, so an agent that followed the hint pulled it.) An excluded
+    // corpus and an oversize pack get a plain no.
+    match pull_policy(entry) {
+        PullPolicy::Excluded => {
+            out.stderr.push(format!(
+                "'{shown}' has an excluded licence class ({}) and is never pulled; no hosted \
+                 answer is available",
+                printable(&entry.licence_spdx)
+            ));
+            out.exit = EXIT_NO_ANSWER;
+            return out;
+        }
+        PullPolicy::TooLarge => {
+            out.stderr.push(format!(
+                "'{shown}' is {} MB, over the {} MB limit for pulling a pack, so it is not \
+                 downloaded; no hosted answer is available",
+                megabytes(entry.pack_bytes),
+                megabytes(AUTO_PULL_MAX_BYTES)
+            ));
+            out.exit = EXIT_NO_ANSWER;
+            return out;
+        }
+        PullPolicy::Allow => {}
+    }
     if args.offline || args.no_fetch {
         let flag = if args.offline {
             "--offline"
@@ -510,41 +581,72 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
             "--no-fetch"
         };
         out.stderr.push(format!(
-            "no local pack for '{slug}' and {flag} forbids downloading it; {}",
+            "no local pack for '{shown}' and {flag} forbids downloading it; {}",
             pull_hint(entry)
         ));
         out.exit = EXIT_NO_ANSWER;
         return out;
     }
-    match pull_policy(entry) {
-        PullPolicy::Excluded => {
-            out.stderr.push(format!(
-                "'{slug}' has an excluded licence class ({}) and is never pulled; no hosted \
-                 answer is available",
-                entry.licence_spdx
-            ));
-            out.exit = EXIT_NO_ANSWER;
+    match deps.backend.pull_now(entry) {
+        Ok(()) => answer_locally(args, deps, &req, Some(entry), out),
+        Err(f) => {
+            out.stderr.push(f.message);
+            out.exit = f.code;
             out
         }
-        PullPolicy::TooLarge => {
-            out.stderr.push(format!(
-                "'{slug}' is {} MB, over the {} MB automatic pull limit, and no hosted answer \
-                 is available; {}",
-                megabytes(entry.pack_bytes),
-                megabytes(AUTO_PULL_MAX_BYTES),
-                pull_hint(entry)
-            ));
-            out.exit = EXIT_NO_ANSWER;
-            out
+    }
+}
+
+/// A definition name found in the term sketches of more corpora than this names no
+/// one corpus (`main`, `init`, `NULL`): it is not evidence, and listing every
+/// corpus that defines it would only be noise.
+const MAX_SYMBOL_CANDIDATES: usize = 5;
+/// How many closest corpora a "nothing matches" answer names.
+const CLOSEST_SHOWN: usize = 3;
+
+/// The corpora whose term sketch holds `symbol` verbatim, by slug. The sketch is
+/// built from every definition's symbol in its own case, so a hit means the corpus
+/// defines exactly that name (a Bloom filter's false-positive rate at the planned
+/// sizing is around 1e-8). Empty when the name is too common to point anywhere
+/// ([`MAX_SYMBOL_CANDIDATES`]).
+fn symbol_hits(cat: &Catalogue, symbol: &str) -> Vec<String> {
+    let mut hits: Vec<String> = cat
+        .corpora
+        .iter()
+        .filter(|e| sketch::contains(&e.term_sketch, symbol))
+        .map(|e| e.slug.clone())
+        .collect();
+    if hits.len() > MAX_SYMBOL_CANDIDATES {
+        return Vec::new();
+    }
+    hits.sort();
+    hits
+}
+
+/// Fold the exact-symbol evidence into the verdict the question's words reached.
+///
+/// A confident verdict stands: the question (or the project's own dependencies)
+/// already decided, and a symbol that merely also exists elsewhere does not
+/// override that. Otherwise the symbol decides what the words could not: of an
+/// ambiguous list it keeps the candidates that define the name, and when the words
+/// found nothing credible it proposes the corpora that define it. One such corpus
+/// is a confident answer (an exact name in one corpus's definitions is strong
+/// evidence — the question's own words, diluted by every stop word around the
+/// name, never could reach that score for a `what is the value of NAME` question);
+/// several are ambiguous.
+fn with_symbol_evidence(routing: Routing, hits: &[String]) -> Routing {
+    let pick = |candidates: Vec<String>| match candidates.len() {
+        0 => None,
+        1 => Some(Routing::Confident(candidates[0].clone())),
+        _ => Some(Routing::Ambiguous(candidates)),
+    };
+    match routing {
+        Routing::Confident(slug) => Routing::Confident(slug),
+        Routing::Ambiguous(slugs) => {
+            let both: Vec<String> = slugs.iter().filter(|s| hits.contains(s)).cloned().collect();
+            pick(both).unwrap_or(Routing::Ambiguous(slugs))
         }
-        PullPolicy::Allow => match deps.backend.pull_now(entry) {
-            Ok(()) => answer_locally(args, deps, &req, Some(entry), out),
-            Err(f) => {
-                out.stderr.push(f.message);
-                out.exit = f.code;
-                out
-            }
-        },
+        Routing::NoCorpus => pick(hits.to_vec()).unwrap_or(Routing::NoCorpus),
     }
 }
 
@@ -554,6 +656,7 @@ fn select_corpus(
     args: &AskArgs,
     deps: &AskDeps<'_>,
     hosted: Option<&dyn HostedHub>,
+    symbol: Option<&str>,
     out: &mut AskOutcome,
 ) -> Option<String> {
     if let Some(c) = &args.corpus {
@@ -561,27 +664,37 @@ fn select_corpus(
             return Some(c.clone());
         }
         out.stderr.push(format!(
-            "unknown corpus '{c}' (catalogue generated {})",
-            deps.catalogue.generated_at
+            "unknown corpus '{}' (catalogue generated {})",
+            printable(c),
+            printable(&deps.catalogue.generated_at)
         ));
         out.exit = EXIT_USAGE;
         return None;
     }
 
     let cached = cached_slugs(deps.hub_home);
+    // A definition lookup names its symbol: route on the symbol itself as well as
+    // on the sentence around it.
+    let by_symbol = symbol
+        .map(|s| symbol_hits(deps.catalogue, s.trim()))
+        .unwrap_or_default();
     // Route on the catalogue alone first. The hosted node is asked only when
     // that is not decisive, so a question a local pack can answer never leaves
     // the machine.
-    let mut routing = route(&args.question, deps.cwd, deps.catalogue, None, &cached);
+    let (routing, mut ranked) =
+        route_ranked(&args.question, deps.cwd, deps.catalogue, None, &cached);
+    let mut routing = with_symbol_evidence(routing, &by_symbol);
     if !matches!(routing, Routing::Confident(_)) {
         if let Some(h) = hosted {
-            routing = route(
+            let (hosted_routing, hosted_ranked) = route_ranked(
                 &args.question,
                 deps.cwd,
                 deps.catalogue,
                 Some(&SearchOnly(h)),
                 &cached,
             );
+            routing = with_symbol_evidence(hosted_routing, &by_symbol);
+            ranked = hosted_ranked;
         }
     }
     match routing {
@@ -595,9 +708,9 @@ fn select_corpus(
                         .corpora
                         .iter()
                         .find(|e| &e.slug == s)
-                        .map(|e| e.ask_for.replace(['\n', '\r'], " "))
+                        .map(|e| printable(&e.ask_for))
                         .unwrap_or_default();
-                    format!("{s} — {ask_for}")
+                    format!("{} — {ask_for}", printable(s))
                 })
                 .collect();
             out.stdout = lines.join("\n");
@@ -608,6 +721,21 @@ fn select_corpus(
         }
         Routing::NoCorpus => {
             out.stderr.push(NO_CORPUS_MESSAGE.to_string());
+            // Nothing was credible, but something may have been close: name the
+            // nearest few so the asker can pick one with `--corpus` instead of
+            // starting over from "no".
+            let closest: Vec<String> = ranked
+                .iter()
+                .filter(|(slug, _)| deps.catalogue.corpora.iter().any(|e| &e.slug == slug))
+                .take(CLOSEST_SHOWN)
+                .map(|(slug, _)| printable(slug))
+                .collect();
+            if !closest.is_empty() {
+                out.stderr.push(format!(
+                    "closest corpora: {}; re-run with --corpus <slug> to ask one of them",
+                    closest.join(", ")
+                ));
+            }
             out.exit = EXIT_NO_ANSWER;
             None
         }
@@ -640,10 +768,15 @@ fn answer_locally(
 fn finish_hosted(
     args: &AskArgs,
     deps: &AskDeps<'_>,
+    slug: &str,
     entry: Option<&CatalogueEntry>,
     mut answer: Answer,
     mut out: AskOutcome,
 ) -> AskOutcome {
+    // The answer is attributed to the corpus this run asked about, whatever the
+    // response says it is: "always names the corpus" must be true of what was
+    // asked, not of what a response claims. (The flow below also pulls `slug`.)
+    answer.corpus = slug.to_string();
     answer.answered_from = AnsweredFrom::Hosted;
     let mut notes: Vec<String> = Vec::new();
     match entry {
@@ -653,24 +786,31 @@ fn finish_hosted(
                     match deps.backend.pull_in_background(&e.slug) {
                         Ok(BackgroundPull::Started { pid }) => out.stderr.push(format!(
                             "pulling '{}' in the background (pid {pid}); the next answer is local",
-                            e.slug
+                            printable(&e.slug)
                         )),
                         Ok(BackgroundPull::AlreadyRunning { .. }) => {}
-                        Err(msg) => out
-                            .stderr
-                            .push(format!("could not start the background pull: {msg}")),
+                        Err(msg) => out.stderr.push(format!(
+                            "could not start the background pull: {}",
+                            printable(&msg)
+                        )),
                     }
                 }
             }
-            PullPolicy::TooLarge => notes.push(pull_hint(e)),
+            // No command to run for these: `xerj hub pull` refuses both.
+            PullPolicy::TooLarge => notes.push(format!(
+                "the pack is {} MB, over the {} MB limit for pulling a pack: this answer is \
+                 from the hosted hub only",
+                megabytes(e.pack_bytes),
+                megabytes(AUTO_PULL_MAX_BYTES)
+            )),
             PullPolicy::Excluded => notes.push(format!(
                 "excluded licence ({}): this corpus is never pulled",
-                e.licence_spdx
+                printable(&e.licence_spdx)
             )),
         },
         None => notes.push(format!(
             "corpus '{}' is not in the local catalogue; it was not pulled",
-            answer.corpus
+            printable(slug)
         )),
     }
     finalize(args, entry, answer, notes, &mut out);
@@ -1239,6 +1379,14 @@ impl Backend for RealBackend {
     }
 
     fn pull_now(&self, entry: &CatalogueEntry) -> Result<(), PullFailure> {
+        // Everything that can refuse this pull — the licence policy, the size cap, a
+        // malformed slug or pin, no key to verify with — is decided BEFORE a node is
+        // started for it. A pull that is going to be refused must not first boot a
+        // whole node.
+        let plan = cli::plan_pull_entry(entry).map_err(|e| PullFailure {
+            code: e.code,
+            message: format!("pull of '{}' failed: {}", printable(&entry.slug), e.message),
+        })?;
         let node = self.node().map_err(|message| PullFailure {
             code: EXIT_NO_ANSWER,
             message,
@@ -1248,7 +1396,7 @@ impl Backend for RealBackend {
             entry.slug,
             megabytes(entry.pack_bytes)
         );
-        match cli::pull(&entry.slug, &node.0.url, node.0.managed, false) {
+        match cli::pull_with(&plan, &node.0.url, node.0.managed, false) {
             Ok(cli::Pulled::Already) => Ok(()),
             Ok(cli::Pulled::Done(line)) => {
                 eprintln!("xerj hub: {line}");
@@ -1508,6 +1656,9 @@ mod tests {
     struct StubHosted {
         found: Vec<(String, f32)>,
         fail: bool,
+        /// Attribute the answer to this corpus instead of the one asked about —
+        /// what a buggy or hostile hosted node could do.
+        claim: Option<String>,
         searches: Cell<usize>,
         answers: Cell<usize>,
     }
@@ -1516,6 +1667,7 @@ mod tests {
             StubHosted {
                 found: vec![],
                 fail: false,
+                claim: None,
                 searches: Cell::new(0),
                 answers: Cell::new(0),
             }
@@ -1534,7 +1686,11 @@ mod tests {
                 anyhow::bail!("hosted node unreachable");
             }
             // Deliberately mislabelled: `ask` must stamp it `Hosted` itself.
-            Ok(canned(req.slug, AnsweredFrom::LocalPack, req.mode))
+            let mut a = canned(req.slug, AnsweredFrom::LocalPack, req.mode);
+            if let Some(other) = &self.claim {
+                a.corpus = other.clone();
+            }
+            Ok(a)
         }
     }
 
@@ -1835,16 +1991,20 @@ mod tests {
         );
         assert_eq!(out.exit, EXIT_OK);
         assert!(!backend.called("pull_"), "{:?}", backend.calls());
-        assert!(
-            out.stdout.contains("run: xerj hub pull lz4 (60.0 MB)"),
-            "{}",
-            out.stdout
-        );
-        // The same hint is in the structured answer.
+        // The note names the size, and is in the structured answer too ...
+        assert!(out.stdout.contains("60.0 MB"), "{}", out.stdout);
         let ans = out.answer.unwrap();
-        assert!(ans
-            .warnings
-            .contains(&"run: xerj hub pull lz4 (60.0 MB)".to_string()));
+        assert!(
+            ans.warnings
+                .iter()
+                .any(|w| w.contains("60.0 MB") && w.contains("hosted hub only")),
+            "{:?}",
+            ans.warnings
+        );
+        // ... but it is not a command: `xerj hub pull` refuses an oversize pack, so
+        // a `run:` line would send the reader to a command that fails.
+        assert!(!out.stdout.contains("xerj hub pull"), "{}", out.stdout);
+        assert!(!out.stdout.contains("run:"), "{}", out.stdout);
     }
 
     #[test]
@@ -2011,8 +2171,8 @@ mod tests {
         assert!(!backend.called("pull_now"), "{:?}", backend.calls());
         assert!(out.stderr[0].contains("80.0 MB"), "{:?}", out.stderr);
         assert!(
-            out.stderr[0].contains("run: xerj hub pull lz4"),
-            "{:?}",
+            !out.stderr[0].contains("xerj hub pull") && !out.stderr[0].contains("run:"),
+            "no command for a pack `hub pull` refuses: {:?}",
             out.stderr
         );
 
@@ -2042,6 +2202,435 @@ mod tests {
         assert_eq!(out.exit, EXIT_OK);
         assert!(out.stderr[0].contains("local pack unavailable: no node answers"));
         assert!(out.stdout.contains("answered from: hosted hub"));
+    }
+
+    // ── the pull policy comes before --offline / --no-fetch ─────────────────
+
+    /// The two refusals that must never be answered with a command.
+    fn no_pull_command(out: &AskOutcome) {
+        let all = format!("{}\n{}", out.stdout, out.stderr.join("\n"));
+        assert!(!all.contains("xerj hub pull"), "no pull hint at all: {all}");
+        assert!(!all.contains("run:"), "no command to run: {all}");
+    }
+
+    #[test]
+    fn offline_never_hints_a_pull_for_an_excluded_corpus() {
+        // The bypass: `--offline` returned before the pull policy and printed
+        // `run: xerj hub pull <slug>` for an excluded corpus; `hub pull` then had no
+        // licence check of its own.
+        let rig = Rig::new();
+        let cat = catalogue(vec![lz4(12 * 1024 * 1024, LicenceClass::Excluded)]);
+        for (flag, name) in [(true, "--offline"), (false, "--no-fetch")] {
+            let backend = FakeBackend::new(false);
+            let mut a = args("q", Some("lz4"));
+            if flag {
+                a.offline = true;
+            } else {
+                a.no_fetch = true;
+            }
+            let out = rig.run(&a, &cat, None, &backend);
+            assert_eq!(out.exit, EXIT_NO_ANSWER, "{name}");
+            assert!(
+                out.stderr[0].contains("excluded licence class")
+                    && out.stderr[0].contains("never pulled"),
+                "{name}: {:?}",
+                out.stderr
+            );
+            no_pull_command(&out);
+            assert_eq!(backend.calls(), ["ready:lz4"], "{name}: nothing pulled");
+        }
+    }
+
+    #[test]
+    fn offline_never_hints_a_pull_for_a_pack_over_the_limit() {
+        let rig = Rig::new();
+        let cat = catalogue(vec![lz4(
+            80 * 1024 * 1024,
+            LicenceClass::AdaptWithAttribution,
+        )]);
+        for offline in [true, false] {
+            let backend = FakeBackend::new(false);
+            let mut a = args("q", Some("lz4"));
+            if offline {
+                a.offline = true;
+            } else {
+                a.no_fetch = true;
+            }
+            let out = rig.run(&a, &cat, None, &backend);
+            assert_eq!(out.exit, EXIT_NO_ANSWER);
+            assert!(out.stderr[0].contains("80.0 MB"), "{:?}", out.stderr);
+            no_pull_command(&out);
+            assert_eq!(backend.calls(), ["ready:lz4"]);
+        }
+    }
+
+    #[test]
+    fn offline_still_hints_the_pull_for_a_pack_that_may_be_pulled() {
+        // The hint is for the case where it works.
+        let rig = Rig::new();
+        for class in [
+            LicenceClass::AdaptWithAttribution,
+            LicenceClass::ApproachOnly,
+        ] {
+            let cat = catalogue(vec![lz4(12 * 1024 * 1024, class)]);
+            let mut a = args("q", Some("lz4"));
+            a.offline = true;
+            let out = rig.run(&a, &cat, None, &FakeBackend::new(false));
+            assert!(
+                out.stderr
+                    .join("\n")
+                    .contains("run: xerj hub pull lz4 (12.0 MB)"),
+                "{:?}",
+                out.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn a_hosted_excluded_answer_carries_no_pull_command_either() {
+        let rig = Rig::new();
+        let cat = catalogue(vec![lz4(80 * 1024 * 1024, LicenceClass::Excluded)]);
+        let backend = FakeBackend::new(false);
+        let out = rig.run(
+            &args("q", Some("lz4")),
+            &cat,
+            Some(&StubHosted::new()),
+            &backend,
+        );
+        assert_eq!(out.exit, EXIT_OK);
+        assert!(out.stdout.contains("never pulled"), "{}", out.stdout);
+        no_pull_command(&out);
+        assert!(!backend.called("pull_"));
+    }
+
+    // ── hosted answers are attributed to the corpus that was asked ──────────
+
+    #[test]
+    fn a_hosted_answer_is_attributed_to_the_corpus_asked_about_not_the_one_it_claims() {
+        let rig = Rig::new();
+        let cat = catalogue(vec![lz4(1024, LicenceClass::AdaptWithAttribution)]);
+        let mut hosted = StubHosted::new();
+        hosted.claim = Some("some-other-corpus".to_string());
+        let out = rig.run(
+            &args("q", Some("lz4")),
+            &cat,
+            Some(&hosted),
+            &FakeBackend::new(false),
+        );
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert_eq!(out.answer.as_ref().unwrap().corpus, "lz4");
+        assert!(out.stdout.starts_with("lz4  pin "), "{}", out.stdout);
+        assert!(!out.stdout.contains("some-other-corpus"), "{}", out.stdout);
+    }
+
+    // ── nothing a catalogue says reaches the terminal as control codes ──────
+
+    #[test]
+    fn printable_removes_control_characters_and_collapses_what_is_left() {
+        assert_eq!(
+            printable("an agent working on lz4"),
+            "an agent working on lz4"
+        );
+        assert_eq!(printable("a\nb\r\nc\td"), "a b c d");
+        // An escape sequence cannot clear the screen or recolour the line.
+        assert_eq!(printable("x\u{1b}[2J\u{1b}[31my"), "x [2J [31my");
+        assert!(!printable("\u{1b}]0;title\u{7}z").contains('\u{1b}'));
+        assert!(!printable("nul\0byte\u{7f}del\u{85}c1")
+            .chars()
+            .any(char::is_control));
+        // Bidirectional overrides and line separators that reorder or split a line.
+        let sneaky = printable("safe\u{202E}evil\u{2028}next\u{2066}x");
+        assert!(
+            !sneaky
+                .chars()
+                .any(|c| matches!(c, '\u{202E}' | '\u{2028}' | '\u{2066}')),
+            "{sneaky:?}"
+        );
+        assert_eq!(printable("  padded  "), "padded");
+        assert_eq!(printable(""), "");
+        // Ordinary non-ASCII text is untouched.
+        assert_eq!(printable("sürf — 日本語"), "sürf — 日本語");
+    }
+
+    #[test]
+    fn candidate_lines_never_carry_terminal_control_codes() {
+        let rig = Rig::new();
+        let mut a = entry(
+            "alpha",
+            1,
+            LicenceClass::AdaptWithAttribution,
+            &["tokio", "runtime"],
+        );
+        a.ask_for = "fine\n\u{1b}[2Jfake line\r\nanother".to_string();
+        let mut b = entry(
+            "beta",
+            1,
+            LicenceClass::AdaptWithAttribution,
+            &["tokio", "runtime"],
+        );
+        b.slug = "be\u{1b}[31mta".to_string();
+        let cat = catalogue(vec![a, b]);
+        let out = rig.run(
+            &args("tokio runtime", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_eq!(out.exit, EXIT_NEEDS_DECISION, "{out:?}");
+        assert_eq!(
+            out.stdout.lines().count(),
+            2,
+            "one line per candidate: {:?}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.chars().any(|c| c.is_control() && c != '\n'),
+            "{:?}",
+            out.stdout
+        );
+    }
+
+    // ── routing on the symbol, and naming the closest on a miss ─────────────
+
+    /// A catalogue where `lz4` defines `LZ4_VERSION_RELEASE` and the fillers do not.
+    fn symbol_catalogue() -> Catalogue {
+        catalogue(with_fillers(vec![
+            entry(
+                "lz4",
+                1024,
+                LicenceClass::AdaptWithAttribution,
+                &[
+                    "lz4",
+                    "block",
+                    "decoder",
+                    "LZ4_VERSION_RELEASE",
+                    "LZ4_compress_default",
+                ],
+            ),
+            entry(
+                "zstd",
+                1024,
+                LicenceClass::AdaptWithAttribution,
+                &["zstd", "frame", "ZSTD_VERSION_RELEASE"],
+            ),
+        ]))
+    }
+
+    #[test]
+    fn a_definition_question_routes_on_the_symbol_the_words_around_it_cannot() {
+        let rig = Rig::new();
+        let cat = symbol_catalogue();
+        let q = "what is the exact value of LZ4_VERSION_RELEASE";
+        // The sentence alone: the symbol is one of six words and its lower-case
+        // twin never matches, so the score cannot reach "confident".
+        let cached: Vec<String> = vec![];
+        assert!(
+            matches!(
+                crate::router::route(q, rig.cwd.path(), &cat, None, &cached),
+                Routing::NoCorpus
+            ),
+            "the words alone do not route"
+        );
+        // The flow knows the question is about that symbol, and the symbol is
+        // defined by exactly one corpus.
+        let backend = FakeBackend::new(true);
+        let out = rig.run(&args(q, None), &cat, None, &backend);
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert_eq!(backend.calls(), ["ready:lz4", "answer_local:lz4"]);
+
+        // `--def SYM` with an unrelated sentence routes the same way.
+        let mut a = args("tell me about it", None);
+        a.mode = ModeRequest::Def("LZ4_compress_default".to_string());
+        let backend = FakeBackend::new(true);
+        let out = rig.run(&a, &cat, None, &backend);
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert_eq!(backend.calls(), ["ready:lz4", "answer_local:lz4"]);
+
+        // And a bare identifier, the shortest definition question.
+        let backend = FakeBackend::new(true);
+        let out = rig.run(&args("ZSTD_VERSION_RELEASE", None), &cat, None, &backend);
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert_eq!(backend.calls(), ["ready:zstd", "answer_local:zstd"]);
+    }
+
+    #[test]
+    fn a_symbol_defined_by_several_corpora_is_ambiguous_not_a_guess() {
+        let rig = Rig::new();
+        let cat = catalogue(with_fillers(vec![
+            entry(
+                "boringssl",
+                1,
+                LicenceClass::AdaptWithAttribution,
+                &["ssl", "SSL_CTX_new"],
+            ),
+            entry(
+                "openssl",
+                1,
+                LicenceClass::AdaptWithAttribution,
+                &["ssl", "SSL_CTX_new"],
+            ),
+        ]));
+        let backend = FakeBackend::new(true);
+        let out = rig.run(
+            &args("what is the value of SSL_CTX_new", None),
+            &cat,
+            None,
+            &backend,
+        );
+        assert_eq!(out.exit, EXIT_NEEDS_DECISION, "{out:?}");
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "{:?}", out.stdout);
+        assert!(lines[0].starts_with("boringssl — "), "{}", lines[0]);
+        assert!(lines[1].starts_with("openssl — "), "{}", lines[1]);
+        assert!(backend.calls().is_empty());
+    }
+
+    #[test]
+    fn a_symbol_every_corpus_defines_is_no_evidence() {
+        // `main`-like names say nothing about which corpus is meant.
+        let rig = Rig::new();
+        let entries: Vec<CatalogueEntry> = (0..MAX_SYMBOL_CANDIDATES + 1)
+            .map(|i| {
+                entry(
+                    &format!("c{i}"),
+                    1,
+                    LicenceClass::AdaptWithAttribution,
+                    &["main_loop"],
+                )
+            })
+            .collect();
+        let cat = catalogue(entries);
+        assert!(symbol_hits(&cat, "main_loop").is_empty());
+        let out = rig.run(
+            &args("main_loop", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_ne!(out.exit, EXIT_OK, "not guessed: {out:?}");
+    }
+
+    #[test]
+    fn a_confident_question_is_not_overridden_by_a_symbol_defined_elsewhere() {
+        let rig = Rig::new();
+        let cat = symbol_catalogue();
+        // The words name lz4 outright; the symbol happens to live in zstd only.
+        let backend = FakeBackend::new(true);
+        let mut a = args("lz4 block decoder", None);
+        a.mode = ModeRequest::Def("ZSTD_VERSION_RELEASE".to_string());
+        let out = rig.run(&a, &cat, None, &backend);
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert_eq!(backend.calls(), ["ready:lz4", "answer_local:lz4"]);
+    }
+
+    #[test]
+    fn symbol_evidence_narrows_an_ambiguous_list() {
+        let both = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            with_symbol_evidence(Routing::Ambiguous(both.clone()), &["b".to_string()]),
+            Routing::Confident("b".to_string())
+        );
+        assert_eq!(
+            with_symbol_evidence(
+                Routing::Ambiguous(both.clone()),
+                &["b".to_string(), "c".to_string()]
+            ),
+            Routing::Ambiguous(vec!["b".to_string(), "c".to_string()])
+        );
+        assert_eq!(
+            with_symbol_evidence(Routing::Ambiguous(both.clone()), &["z".to_string()]),
+            Routing::Ambiguous(both),
+            "a symbol defined elsewhere changes nothing"
+        );
+        assert_eq!(
+            with_symbol_evidence(Routing::NoCorpus, &[]),
+            Routing::NoCorpus
+        );
+    }
+
+    #[test]
+    fn no_corpus_names_the_three_closest_so_the_asker_can_pick_one() {
+        let rig = Rig::new();
+        // Four corpora each hold one word of the question: nobody is credible
+        // (each scores 0.2, below the 0.3 candidate bar), but there is a ranking.
+        let cat = catalogue(vec![
+            entry("c-one", 1, LicenceClass::AdaptWithAttribution, &["decoder"]),
+            entry(
+                "c-two",
+                1,
+                LicenceClass::AdaptWithAttribution,
+                &["internals"],
+            ),
+            entry(
+                "c-three",
+                1,
+                LicenceClass::AdaptWithAttribution,
+                &["overview"],
+            ),
+            entry("c-four", 1, LicenceClass::AdaptWithAttribution, &["please"]),
+            entry(
+                "c-five",
+                1,
+                LicenceClass::AdaptWithAttribution,
+                &["unrelated"],
+            ),
+        ]);
+        let out = rig.run(
+            &args("decoder internals overview please", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_eq!(out.exit, EXIT_NO_ANSWER, "{out:?}");
+        assert_eq!(out.stderr[0], NO_CORPUS_MESSAGE);
+        let closest = out.stderr.get(1).expect("a closest-corpora line");
+        assert!(closest.starts_with("closest corpora: "), "{closest}");
+        assert!(closest.contains("--corpus"), "{closest}");
+        let named = ["c-one", "c-two", "c-three", "c-four", "c-five"]
+            .iter()
+            .filter(|s| closest.contains(*s))
+            .count();
+        assert_eq!(named, 3, "exactly the top three: {closest}");
+        assert!(
+            !closest.contains("c-five"),
+            "the unrelated one is not close: {closest}"
+        );
+    }
+
+    // ── a pull that will be refused does not start a node ───────────────────
+
+    #[test]
+    fn a_refused_pull_is_refused_before_a_node_is_started() {
+        // `RealBackend::pull_now` used to start (and wait for) a node, and only
+        // then ask the pull whether it would go ahead.
+        let hub = tempfile::tempdir().unwrap();
+        let forbidden = NodeLauncher {
+            exe: PathBuf::from("/nonexistent/xerj-must-not-be-spawned"),
+            pre_args: vec![],
+        };
+        let backend = RealBackend::new(
+            hub.path().to_path_buf(),
+            Some("http://127.0.0.1:1".to_string()),
+            forbidden,
+        );
+        for (class, bytes, want) in [
+            (LicenceClass::Excluded, 1024, "excluded licence class"),
+            (
+                LicenceClass::AdaptWithAttribution,
+                80 * 1024 * 1024,
+                "auto-pull cap",
+            ),
+        ] {
+            let failure = backend
+                .pull_now(&lz4(bytes, class))
+                .expect_err("refused by the policy");
+            assert_eq!(failure.code, 1);
+            assert!(failure.message.contains(want), "{}", failure.message);
+        }
+        assert!(
+            std::fs::read_dir(hub.path()).unwrap().next().is_none(),
+            "no node dir, no log, no record: nothing was started or written"
+        );
     }
 
     // ── the hosted switch ───────────────────────────────────────────────────

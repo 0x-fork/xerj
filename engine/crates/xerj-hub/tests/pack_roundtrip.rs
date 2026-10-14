@@ -221,6 +221,34 @@ fn write_catalogue(hub_home: &Path, archive: &Path, pack_sha256: &str) {
 /// `write_catalogue` with an explicit advertised `pack_bytes` — lets a test lie
 /// about the size to exercise the size cap.
 fn write_catalogue_bytes(hub_home: &Path, archive: &Path, pack_sha256: &str, pack_bytes: u64) {
+    write_catalogue_full(
+        hub_home,
+        archive,
+        pack_sha256,
+        pack_bytes,
+        LicenceClass::AdaptWithAttribution,
+    );
+}
+
+/// `write_catalogue` with an explicit licence class — lets a test publish an
+/// `excluded` (or `approach-only`) corpus.
+fn write_catalogue_class(
+    hub_home: &Path,
+    archive: &Path,
+    pack_sha256: &str,
+    licence_class: LicenceClass,
+) {
+    let real = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+    write_catalogue_full(hub_home, archive, pack_sha256, real, licence_class);
+}
+
+fn write_catalogue_full(
+    hub_home: &Path,
+    archive: &Path,
+    pack_sha256: &str,
+    pack_bytes: u64,
+    licence_class: LicenceClass,
+) {
     let sig = {
         let mut s = archive.as_os_str().to_os_string();
         s.push(".sig");
@@ -235,7 +263,7 @@ fn write_catalogue_bytes(hub_home: &Path, archive: &Path, pack_sha256: &str, pac
         pin_date: PIN_DATE.into(),
         refresh_cadence_days: 7,
         licence_spdx: "MIT".into(),
-        licence_class: LicenceClass::AdaptWithAttribution,
+        licence_class,
         pack_bytes,
         pack_url: format!("file://{}", archive.display()),
         pack_sha256: pack_sha256.to_string(),
@@ -546,13 +574,17 @@ async fn pack_build_pull_def_roundtrip() {
         );
     }
 
-    // ── No verifying key → verify-fail exit 3, and NO temp dir is leaked ──
+    // ── No verifying key → its OWN exit code (5), NOT "failed verification" (3) ──
     {
         let hh = work.join("hub-nokey");
         write_catalogue(&hh, &archive, &good_sha);
         // HUB_PUBKEY_HEX is "" in this build, so an unset env var leaves no key.
         let rc = run_pull(&work.join("code-nokey"), &hh, None, &url_b).await;
-        assert_eq!(rc, 3, "no key → verification failure exit 3");
+        assert_eq!(
+            rc, 5,
+            "no key → \"this build cannot verify anything\" (5), which is not exit 3: the \
+             bytes were never judged, let alone found wanting"
+        );
         assert!(
             !hh.join("packs/mini-c").join(format!("{PIN8}.tmp")).exists(),
             "the empty-key path must not leak a .tmp to re-download"
@@ -561,6 +593,112 @@ async fn pack_build_pull_def_roundtrip() {
             !hh.join("packs/mini-c").join(PIN8).exists(),
             "nothing extracted"
         );
+    }
+
+    // ── An EXCLUDED corpus is refused by `hub pull` itself (plan §11) ──
+    {
+        let hh = work.join("hub-excluded");
+        write_catalogue_class(&hh, &archive, &good_sha, LicenceClass::Excluded);
+        let rc = run_pull(&work.join("code-excluded"), &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 1, "an excluded corpus is a policy refusal (exit 1)");
+        assert!(
+            !hh.join("packs").exists(),
+            "nothing was downloaded, extracted or even given a directory"
+        );
+        assert!(
+            !work.join("code-excluded").join("state").exists(),
+            "and no ledger was written"
+        );
+        // An approach-only corpus is a different matter: it is pulled (with a warning
+        // wherever it is answered).
+        let hh = work.join("hub-approach");
+        write_catalogue_class(&hh, &archive, &good_sha, LicenceClass::ApproachOnly);
+        let rc = run_pull(&work.join("code-approach"), &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 0, "approach-only is allowed through");
+    }
+
+    // ── Everything that can refuse a pull is decided BEFORE a node is started ──
+    {
+        // No --url, XERJ_URL on a silent port: the old order started (and waited for)
+        // a whole node first and only then looked at the slug, the licence, the size
+        // and the key.
+        let hh = work.join("hub-preflight");
+        write_catalogue_class(&hh, &archive, &good_sha, LicenceClass::Excluded);
+        let silent = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let silent_url = format!("http://127.0.0.1:{silent}");
+        for (slug, want_rc, why) in [
+            ("mini-c", 1, "excluded"),
+            ("no-such-corpus", 2, "unknown slug"),
+            ("../../etc", 2, "malformed slug"),
+        ] {
+            let rc = run_pull_without_url(
+                &work.join("code-preflight"),
+                &hh,
+                Some(&public),
+                &silent_url,
+                slug,
+            )
+            .await;
+            assert_eq!(rc, want_rc, "{why}");
+            for started in [
+                "node",
+                "node.pid",
+                "node.port",
+                "node.log",
+                "node.toml",
+                "node.lock",
+            ] {
+                assert!(
+                    !hh.join(started).exists(),
+                    "{why}: `{started}` exists, so a node was prepared or started before the \
+                     pull was refused"
+                );
+            }
+        }
+        std::env::remove_var("XERJ_URL");
+    }
+
+    // ── A pull that fails verification must not delete the pack an earlier pull
+    //    verified (it used to `remove_dir_all` the extract on ANY failure) ──
+    {
+        let code_home = work.join("code-keep");
+        let hh = work.join("hub-keep");
+        write_catalogue(&hh, &archive, &good_sha);
+        let rc = run_pull(&code_home, &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 0, "the first pull succeeds");
+        let extract = hh.join("packs").join("mini-c").join(PIN8);
+        assert!(extract.join("pack.json").is_file());
+        assert!(extract.join("snapshot").is_dir());
+
+        // A re-pull whose archive no longer matches the catalogue's hash.
+        let flipped = out.join("flipped.hubpack.tar.zst");
+        write_catalogue(&hh, &flipped, &good_sha);
+        let rc = run_pull(&code_home, &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 3, "the bad archive is refused");
+        assert!(
+            extract.join("pack.json").is_file() && extract.join("snapshot").is_dir(),
+            "the pack verified earlier is still there: a failed re-pull deletes only what \
+             that run created"
+        );
+        assert!(
+            !hh.join("packs/mini-c").join(format!("{PIN8}.tmp")).exists(),
+            "and the failed run's own temp is gone"
+        );
+
+        // A good re-pull replaces it whole and leaves no staging behind.
+        write_catalogue(&hh, &archive, &good_sha);
+        let rc = run_pull(&code_home, &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 0);
+        let leftovers: Vec<String> = std::fs::read_dir(hh.join("packs").join("mini-c"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != PIN8 && n != &format!("{PIN8}.lock"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp/staging left: {leftovers:?}");
     }
 
     // ── An unreachable node is an INFRA failure (exit 1), not 2 or 3 ──
@@ -577,15 +715,49 @@ async fn pack_build_pull_def_roundtrip() {
         assert_eq!(rc, 1, "unreachable node → infra exit 1 (distinct from 2/3)");
     }
 
-    // ── A concurrent pull of the same pin is refused by the lock (exit 1) ──
+    // ── A concurrent pull of the same pin: the second WAITS for the first ──
+    // (it used to be refused outright, and a lock left by a killed pull blocked the
+    //  corpus for half an hour; the lock is now the OS's, held by a live process.)
     {
         let hh = work.join("hub-lock");
         write_catalogue(&hh, &archive, &good_sha);
         let lockdir = hh.join("packs").join("mini-c");
         std::fs::create_dir_all(&lockdir).unwrap();
-        std::fs::create_dir(lockdir.join(format!("{PIN8}.lock"))).unwrap(); // simulate in-flight pull
+        // Another process (here: another open file description) holds the pin's lock.
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lockdir.join(format!("{PIN8}.lock")))
+            .unwrap();
+        holder.try_lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(holder); // the first pull finishes
+        });
+        let t0 = std::time::Instant::now();
         let rc = run_pull(&work.join("code-lock"), &hh, Some(&public), &url_b).await;
-        assert_eq!(rc, 1, "a held pull lock → exit 1");
+        release.join().unwrap();
+        assert_eq!(
+            rc, 0,
+            "the second pull waited for the first, then went ahead"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(1200),
+            "and it really did wait: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // ── A lock DIRECTORY left by an older build blocks nothing ──
+    {
+        let hh = work.join("hub-oldlock");
+        write_catalogue(&hh, &archive, &good_sha);
+        let lockdir = hh.join("packs").join("mini-c");
+        std::fs::create_dir_all(lockdir.join(format!("{PIN8}.lock"))).unwrap();
+        let rc = run_pull(&work.join("code-oldlock"), &hh, Some(&public), &url_b).await;
+        assert_eq!(rc, 0, "a stale lock directory is replaced, not obeyed");
     }
 
     // ── A traversal slug is rejected before ANY filesystem write (exit 2) ──
@@ -618,6 +790,37 @@ async fn pack_build_pull_def_roundtrip() {
 /// callers `.await` these sequentially so they do not race.
 async fn run_pull(code: &Path, hub: &Path, pubkey: Option<&str>, url: &str) -> i32 {
     run_pull_slug(code, hub, pubkey, url, "mini-c").await
+}
+
+/// `xerj hub pull <slug> --quiet` with NO `--url`: the node comes from `XERJ_URL`
+/// (here a silent loopback port), so the automatic-node path is what would run if
+/// the pull got that far.
+async fn run_pull_without_url(
+    code: &Path,
+    hub: &Path,
+    pubkey: Option<&str>,
+    xerj_url: &str,
+    slug: &str,
+) -> i32 {
+    let (code, hub, pubkey, xerj_url, slug) = (
+        code.to_path_buf(),
+        hub.to_path_buf(),
+        pubkey.map(str::to_string),
+        xerj_url.to_string(),
+        slug.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        std::env::set_var("XERJ_CODE_HOME", &code);
+        std::env::set_var("XERJ_HUB_HOME", &hub);
+        std::env::set_var("XERJ_URL", &xerj_url);
+        match pubkey {
+            Some(pk) => std::env::set_var("XERJ_HUB_PUBKEY", &pk),
+            None => std::env::remove_var("XERJ_HUB_PUBKEY"),
+        }
+        xerj_hub::cli::run_hub_cli(&["pull".into(), slug, "--quiet".into()])
+    })
+    .await
+    .unwrap()
 }
 
 async fn run_pull_slug(

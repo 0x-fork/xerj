@@ -360,9 +360,17 @@ fn verify_sha256sums(members: &BTreeMap<String, Vec<u8>>) -> Result<()> {
 
 /// Write every member under `dest`, creating parent directories. Keys are `/`-joined
 /// relative paths already sanitised by [`read_members`].
+///
+/// `pack.json` is written **last**. A pack directory counts as present (cached,
+/// answerable, evictable) exactly when `pack.json` exists, and `BTreeMap` order puts
+/// it *before* `snapshot/`, so a process killed partway through the extraction used
+/// to leave a directory that looked complete with most of its snapshot missing.
+/// Written last, `pack.json` is the marker that everything else is already there.
+/// (`hub pull` extracts into a staging directory and renames it into place, so this
+/// is the second line of defence for anyone extracting straight into a final path.)
 fn extract_into(members: &BTreeMap<String, Vec<u8>>, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    for (rel, data) in members {
+    let write_member = |rel: &str, data: &[u8]| -> Result<()> {
         let mut target = dest.to_path_buf();
         for part in rel.split('/') {
             target.push(part);
@@ -370,7 +378,15 @@ fn extract_into(members: &BTreeMap<String, Vec<u8>>, dest: &Path) -> Result<()> 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
-        fs::write(&target, data).with_context(|| format!("write {}", target.display()))?;
+        fs::write(&target, data).with_context(|| format!("write {}", target.display()))
+    };
+    for (rel, data) in members {
+        if rel != PACK_JSON {
+            write_member(rel, data)?;
+        }
+    }
+    if let Some(manifest) = members.get(PACK_JSON) {
+        write_member(PACK_JSON, manifest)?;
     }
     Ok(())
 }
@@ -842,6 +858,40 @@ mod tests {
             !sums.contains(SHA256SUMS),
             "SHA256SUMS must not list itself"
         );
+    }
+
+    #[test]
+    fn pack_json_is_written_last_so_an_interrupted_extraction_never_looks_complete() {
+        // A pack dir is "present" when pack.json exists, and BTreeMap order puts
+        // pack.json BEFORE snapshot/: extracted in map order, a process killed
+        // after pack.json looked like a complete pack with most of its snapshot
+        // missing. Fail the extraction partway (a file where the snapshot
+        // directory has to go) and check pack.json was not written.
+        let mut members: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        members.insert(PACK_JSON.into(), b"{}".to_vec());
+        members.insert(SHA256SUMS.into(), b"".to_vec());
+        members.insert("defs.jsonl".into(), b"".to_vec());
+        members.insert("snapshot/idx/segment_0.bin".into(), vec![1, 2, 3]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("snapshot"), b"in the way").unwrap();
+        assert!(extract_into(&members, &dest).is_err());
+        assert!(
+            !dest.join(PACK_JSON).exists(),
+            "an extraction that failed on the snapshot must not have left pack.json"
+        );
+        assert!(
+            dest.join("defs.jsonl").exists(),
+            "the members before the failure were written"
+        );
+
+        // Cleared, the same members extract completely, pack.json included.
+        let ok = tmp.path().join("ok");
+        extract_into(&members, &ok).unwrap();
+        assert_eq!(fs::read(ok.join(PACK_JSON)).unwrap(), b"{}");
+        assert!(ok.join("snapshot/idx/segment_0.bin").is_file());
     }
 
     #[test]
