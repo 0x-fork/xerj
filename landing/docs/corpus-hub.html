@@ -123,7 +123,10 @@
   <a href="/docs/" class="active">DOCS</a>
   <a href="/docs/recipes/">RECIPES</a>
   <a href="/playground">DASHBOARDS</a>
+  <a href="https://hub.xerj.org" rel="external">HUB</a>
   <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <a href="https://x.com/xerj_org" rel="external" title="XERJ on X" style="display:inline-flex;align-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg></a>
+  <a href="https://discord.com/invite/yetXFusXfs" rel="external" title="XERJ on Discord" style="display:inline-flex;align-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.74 19.74 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.1 13.1 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.3 12.3 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.84 19.84 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg></a>
   <span class="spacer"></span>
   <span class="theme">
     <button type="button" data-theme="day" class="active">DAY</button>
@@ -234,12 +237,26 @@
   <p class="source-note">Source · tools/xerj-code/hub/CONTRIBUTING.md (corpus-hub branch) · launch post: /blog/the-corpus-hub · browse: hub.xerj.org</p>
 
   <h2 id="consume">Consuming a corpus</h2>
-  <p>Three commands, no build step — the binary indexes from the pinned manifest directly:</p>
-<pre class="code">$ xerj corpus add --from https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/xerj-storage.json
-$ xerj corpus index xerj-storage
-$ xerj code xerj-storage "flush epoch crash recovery"</pre>
-  <p>Clones live under <code class="inline">~/.xerj-code/corpora/</code>, the index under
-  <code class="inline">~/.xerj-code/data</code> — both persist across reboots. An index older than
+  <p>A corpus is used through a local node, so start one first if none is running
+  and keep its PID so you can later stop exactly that one
+  (<code class="inline">nohup xerj --insecure --data-dir ~/xerj-data &gt; ~/xerj-node.log 2&gt;&amp;1 &amp; echo $! &gt; ~/xerj-node.pid</code>;
+  stop it with <code class="inline">kill $(cat ~/xerj-node.pid)</code>, never <code class="inline">pkill xerj</code>).
+  The health check <code class="inline">curl -s localhost:9200/_cluster/health</code> answers
+  <code class="inline">"status":"green"</code>. Then download the pinned manifest, add it, index it, ask:</p>
+<pre class="code">$ curl -fsSLO https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/lz4.json
+$ xerj corpus add --from ./lz4.json     # last line: next: xerj corpus index lz4
+$ xerj corpus index lz4                 # last lines: corpus 'lz4' searchable: 1980 records
+$ xerj code lz4 "maximum input size"    # passages headed by file path and line</pre>
+  <p><code class="inline">--from</code> reads a local file: v1.0.0-rc.95 does not fetch a URL, and
+  passing one answers <code class="inline">no such manifest</code>. Run on a clean install of
+  v1.0.0-rc.95, the four lines above took under a minute, install included. An agent without a
+  shell uses the MCP tool <code class="inline">xerj_code_search</code> with
+  <code class="inline">{"corpus": "lz4", "query": "…"}</code> once the corpus is indexed on the node.</p>
+  <p><strong>Hub corpus or local corpus?</strong> Use a hub corpus for public material you cannot
+  quote exactly from memory. Use <code class="inline">xerj autoindex &lt;folder&gt;</code> for files
+  only your machine has. Both can live on the same node.</p>
+  <p>Clones live under <code class="inline">~/.xerj-code/corpora/</code>; the index lives in the data
+  directory of the node you indexed into — both persist across reboots. An index older than
   30 days is refused by design: <strong>a stale index is worse than none</strong>, so re-run
   <code class="inline">xerj corpus index</code> rather than forcing a stale answer. Pack consumers
   additionally verify the detached ed25519 signature over SHA256SUMS before trusting a record.</p>
