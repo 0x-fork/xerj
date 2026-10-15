@@ -490,8 +490,9 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
     Ok(out)
 }
 
+/// `HOME`, else `USERPROFILE` (native Windows usually has no `HOME`).
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    xerj_common::home::home_dir()
 }
 
 #[cfg(test)]
