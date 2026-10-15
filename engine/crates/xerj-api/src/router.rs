@@ -243,6 +243,18 @@ pub fn build_native_router(state: AppState) -> Router {
 /// POST   /:index/_bulk                      bulk_ops
 /// ```
 pub fn build_es_compat_router(state: AppState) -> Router {
+    let hub = hub_api::HubShared::new(state.clone());
+    build_es_compat_router_with_hub(state, hub)
+}
+
+/// [`build_es_compat_router`] over a [`hub_api::HubShared`] the caller also
+/// hands to the gRPC `XerjHub` service, so the two surfaces count one client
+/// against ONE hub rate-limit budget (and share one query-slot pool and one
+/// catalogue cache) instead of each granting the full allowance.
+pub fn build_es_compat_router_with_hub(
+    state: AppState,
+    hub: std::sync::Arc<hub_api::HubShared>,
+) -> Router {
     let body_limit = state.config.limits.max_body_bytes;
     let access_log = state.config.logging.access_log;
     // Build the CORS layer before `state` is moved into the auth middleware.
@@ -928,8 +940,10 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // other route; with `hub.public = true` exactly these four skip
         // authentication, authorization and the audit log (the three
         // `*_unless_public_hub` wrappers below). The rate limit is a layer on
-        // the sub-router itself, so it holds in both modes.
-        .merge(hub_api::routes(hub_api::HubShared::new(state.clone())))
+        // the sub-router itself, so it holds in both modes. `hub` is the
+        // same `HubShared` the gRPC `XerjHub` service holds, so a client has
+        // one budget across both listeners, not one per listener.
+        .merge(hub_api::routes(hub))
         // ── Share links ───────────────────────────────────────────────────────
         // `xerj share`: hand one indexed corpus to a guest as a scoped,
         // read-only, expiring key. Create/list/revoke are superuser-only in

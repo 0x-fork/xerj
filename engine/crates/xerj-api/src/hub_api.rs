@@ -282,6 +282,9 @@ pub struct HubShared {
     tuning: Tuning,
     /// How many times the node-wide mappings were read for `search`.
     mapping_reads: AtomicU64,
+    /// The answer flow's empty `cwd`/`hub_home`, made on the first `Ask` that
+    /// needs it and reused after; see [`HubShared::routing_root`].
+    routing_root: OnceLock<PathBuf>,
 }
 
 /// The outcome of reading the node-wide mappings for `search`.
@@ -336,6 +339,7 @@ impl HubShared {
             search_fields: Mutex::new(None),
             tuning,
             mapping_reads: AtomicU64::new(0),
+            routing_root: OnceLock::new(),
         })
     }
 
@@ -1849,6 +1853,16 @@ async fn refusal(resp: Response) -> HubRefusal {
 }
 
 impl HubShared {
+    /// Count one request from a transport that is not an axum request (the
+    /// gRPC `XerjHub` service) against the same per-client budget the HTTP
+    /// routes' layer draws on. The client is read exactly as there
+    /// ([`crate::share::client_source`]): the TCP `peer`, or the
+    /// `x-forwarded-for` values only when `peer` is a declared
+    /// `server.trusted_proxies` entry.
+    pub fn admit_peer(&self, peer: Option<IpAddr>, forwarded: &[&str]) -> Result<(), HubRefusal> {
+        self.admit(&crate::share::client_source(&self.app, peer, forwarded))
+    }
+
     /// Count one request from `client` (an IP address, as text) against the same
     /// per-address budget the HTTP routes use ([`RATE_LIMIT`] per
     /// [`RATE_WINDOW`]); `Err` is the `429` refusal.
@@ -2047,7 +2061,7 @@ pub async fn ask_answer(
     args.json = true;
     args.max_tokens = ask.max_tokens.map(|m| m as usize);
 
-    let root = routing_root(&shared.app).map_err(|e| {
+    let root = shared.routing_root().map_err(|e| {
         tracing::warn!(error = %e, "hub routing directory");
         HubRefusal::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2113,14 +2127,31 @@ pub async fn ask_answer(
     })
 }
 
-/// `<data_dir>/hub-routing`, an empty directory holding only a `.git` marker:
-/// the `cwd` and `hub_home` [`ask_answer`] hands the answer flow. The router
-/// reads lockfiles from `cwd` up to the first `.git`, and the pack cache from
-/// `hub_home/packs`; here there must be neither.
-fn routing_root(app: &AppState) -> std::io::Result<PathBuf> {
-    let root = PathBuf::from(&app.config.server.data_dir).join("hub-routing");
-    std::fs::create_dir_all(root.join(".git"))?;
-    Ok(root)
+/// Where [`HubShared::routing_root`] lives under the data directory.
+///
+/// An index's store is `<data_dir>/<index name>`, so this name must be one no
+/// index can take: [`xerj_common::types::IndexName`] refuses a leading `_`
+/// (a name starts with a lowercase letter or `.`), the same reason the ML
+/// model store is `<data_dir>/_ml`. The old `hub-routing` was a legal index
+/// name, so an `Ask` wrote a `.git` into a user's `hub-routing` index.
+pub const ROUTING_DIR: &str = "_hub-routing";
+
+impl HubShared {
+    /// `<data_dir>/_hub-routing`, an empty directory holding only a `.git`
+    /// marker: the `cwd` and `hub_home` [`ask_answer`] hands the answer flow.
+    /// The router reads lockfiles from `cwd` up to the first `.git`, and the
+    /// pack cache from `hub_home/packs`; here there must be neither.
+    ///
+    /// Made once per node, on the first `Ask`, not on every request. A failed
+    /// attempt is not remembered, so the next `Ask` tries again.
+    fn routing_root(&self) -> std::io::Result<PathBuf> {
+        if let Some(root) = self.routing_root.get() {
+            return Ok(root.clone());
+        }
+        let root = PathBuf::from(&self.app.config.server.data_dir).join(ROUTING_DIR);
+        std::fs::create_dir_all(root.join(".git"))?;
+        Ok(self.routing_root.get_or_init(|| root).clone())
+    }
 }
 
 /// The answer flow's [`xerj_hub::ask::Backend`] on a serving node: "the local

@@ -436,7 +436,8 @@ where
     listener
         .set_nonblocking(true)
         .with_context(|| format!("gRPC: set the listener on {addr} non-blocking"))?;
-    serve_grpc_on(listener, state, shutdown).await
+    let hub = xerj_api::hub_api::HubShared::new(state.clone());
+    serve_grpc_on(listener, state, hub, shutdown).await
 }
 
 /// Serve gRPC on a listener the caller already bound.
@@ -445,9 +446,16 @@ where
 /// taken port fails startup instead of being logged under a banner that
 /// already claimed the port (issue #465). That requires handing the bound
 /// listener in rather than letting tonic bind it here.
+///
+/// `hub` is the [`xerj_api::hub_api::HubShared`] the ES-compat router's
+/// `/_hub/v1/*` routes were built over
+/// ([`xerj_api::router::build_es_compat_router_with_hub`]): the `XerjHub`
+/// service draws on the same per-client rate-limit budget, query slots and
+/// catalogue cache, so a second listener is not a second allowance.
 pub async fn serve_grpc_on<F>(
     listener: std::net::TcpListener,
     state: AppState,
+    hub: std::sync::Arc<xerj_api::hub_api::HubShared>,
     shutdown: F,
 ) -> anyhow::Result<()>
 where
@@ -478,7 +486,7 @@ where
         state: state.clone(),
     };
     let hub = pb::xerj_hub_server::XerjHubServer::with_interceptor(
-        crate::grpc_hub::HubService::new(state.clone()),
+        crate::grpc_hub::HubService::new(hub),
         interceptor.clone(),
     );
     let svc = XerjSearchServer::with_interceptor(GrpcService::new(state), interceptor);

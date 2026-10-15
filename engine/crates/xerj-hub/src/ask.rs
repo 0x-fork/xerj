@@ -139,6 +139,12 @@ pub struct AskArgs {
     pub k: Option<usize>,
     pub json: bool,
     pub url: Option<String>,
+    /// Use only the catalogue already cached on this machine; never fetch it,
+    /// however old it is. Not a CLI flag: the MCP tools set it, so an agent's
+    /// tool call never blocks on the hub (the fetch's 10 s connect / 30 s
+    /// timeouts). With no cached copy the outcome is [`NO_CACHED_CATALOGUE`].
+    /// Unlike `offline`, the rest of the flow is unchanged.
+    pub cached_catalogue_only: bool,
 }
 
 impl AskArgs {
@@ -155,6 +161,7 @@ impl AskArgs {
             k: None,
             json: false,
             url: None,
+            cached_catalogue_only: false,
         }
     }
 }
@@ -518,6 +525,20 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
         return out;
     };
     let entry = deps.catalogue.corpora.iter().find(|e| e.slug == slug);
+    // An excluded licence class is never served — not from a pack that happens to
+    // be on disk (pulled before a reclassification, or copied in by hand), and not
+    // by the hosted node, whose `ask_answer` routes over the non-excluded corpora
+    // only and whose answer endpoints refuse one. `xerj_hub_find` never lists one;
+    // naming it explicitly gets this plain no rather than an answer.
+    if let Some(e) = entry.filter(|e| e.licence_class == LicenceClass::Excluded) {
+        out.stderr.push(format!(
+            "'{}' has an excluded licence class ({}) and is never served or pulled",
+            printable(&slug),
+            printable(&e.licence_spdx)
+        ));
+        out.exit = EXIT_NO_ANSWER;
+        return out;
+    }
     let req = Request {
         slug: &slug,
         question: &args.question,
@@ -658,6 +679,39 @@ fn with_symbol_evidence(routing: Routing, hits: &[String]) -> Routing {
     }
 }
 
+/// The catalogue without its excluded-licence corpora: what routing, the
+/// "closest corpora" hint and `find` may ever name. Mirrors the gRPC
+/// `ask_answer`'s `routable` catalogue.
+fn routable(cat: &Catalogue) -> Catalogue {
+    Catalogue {
+        format_version: cat.format_version,
+        generated_at: cat.generated_at.clone(),
+        corpora: cat
+            .corpora
+            .iter()
+            .filter(|e| e.licence_class != LicenceClass::Excluded)
+            .cloned()
+            .collect(),
+    }
+}
+
+/// A named corpus is echoed back at most this many bytes long (the hub's own
+/// slugs are at most 64; anything longer is not one, and a caller-supplied
+/// string is not repeated back in full).
+const SLUG_ECHO_MAX: usize = 64;
+
+/// `printable`, cut to [`SLUG_ECHO_MAX`] bytes on a character boundary.
+fn printable_slug(s: &str) -> String {
+    if s.len() <= SLUG_ECHO_MAX {
+        return printable(s);
+    }
+    let mut end = SLUG_ECHO_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", printable(&s[..end]))
+}
+
 /// Step 2. `None` means `out` already holds the verdict (an exit code and its
 /// message / candidate lines).
 fn select_corpus(
@@ -673,31 +727,33 @@ fn select_corpus(
         }
         out.stderr.push(format!(
             "unknown corpus '{}' (catalogue generated {})",
-            printable(c),
+            printable_slug(c),
             printable(&deps.catalogue.generated_at)
         ));
         out.exit = EXIT_USAGE;
         return None;
     }
 
+    // Route over the corpora that can be served at all: an excluded corpus is
+    // never picked, never offered as ambiguous, never named as "closest".
+    let catalogue = &routable(deps.catalogue);
     let cached = cached_slugs(deps.hub_home);
     // A definition lookup names its symbol: route on the symbol itself as well as
     // on the sentence around it.
     let by_symbol = symbol
-        .map(|s| symbol_hits(deps.catalogue, s.trim()))
+        .map(|s| symbol_hits(catalogue, s.trim()))
         .unwrap_or_default();
     // Route on the catalogue alone first. The hosted node is asked only when
     // that is not decisive, so a question a local pack can answer never leaves
     // the machine.
-    let (routing, mut ranked) =
-        route_ranked(&args.question, deps.cwd, deps.catalogue, None, &cached);
+    let (routing, mut ranked) = route_ranked(&args.question, deps.cwd, catalogue, None, &cached);
     let mut routing = with_symbol_evidence(routing, &by_symbol);
     if !matches!(routing, Routing::Confident(_)) {
         if let Some(h) = hosted {
             let (hosted_routing, hosted_ranked) = route_ranked(
                 &args.question,
                 deps.cwd,
-                deps.catalogue,
+                catalogue,
                 Some(&SearchOnly(h)),
                 &cached,
             );
@@ -705,14 +761,37 @@ fn select_corpus(
             ranked = hosted_ranked;
         }
     }
+    // Hosted search evidence can still name an excluded corpus (the local
+    // catalogue knows its class even when the hosted node's ranking does not
+    // say): drop it from the verdict. A slug the local catalogue does not list at
+    // all is left alone — the hosted node may know a newer catalogue.
+    let excluded = |s: &String| {
+        deps.catalogue
+            .corpora
+            .iter()
+            .any(|e| &e.slug == s && e.licence_class == LicenceClass::Excluded)
+    };
+    let known = |s: &String| catalogue.corpora.iter().any(|e| &e.slug == s);
+    let routing = match routing {
+        Routing::Confident(slug) if excluded(&slug) => Routing::NoCorpus,
+        Routing::Ambiguous(slugs) => {
+            let kept: Vec<String> = slugs.into_iter().filter(|s| !excluded(s)).collect();
+            // One left is still not a confident pick: the asker decides.
+            if kept.is_empty() {
+                Routing::NoCorpus
+            } else {
+                Routing::Ambiguous(kept)
+            }
+        }
+        other => other,
+    };
     match routing {
         Routing::Confident(slug) => Some(slug),
         Routing::Ambiguous(slugs) => {
             let lines: Vec<String> = slugs
                 .iter()
                 .map(|s| {
-                    let ask_for = deps
-                        .catalogue
+                    let ask_for = catalogue
                         .corpora
                         .iter()
                         .find(|e| &e.slug == s)
@@ -734,7 +813,7 @@ fn select_corpus(
             // starting over from "no".
             let closest: Vec<String> = ranked
                 .iter()
-                .filter(|(slug, _)| deps.catalogue.corpora.iter().any(|e| &e.slug == slug))
+                .filter(|(slug, _)| known(slug))
                 .take(CLOSEST_SHOWN)
                 .map(|(slug, _)| printable(slug))
                 .collect();
@@ -1485,13 +1564,20 @@ pub fn run_ask_with(
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
-    let catalogue = match load_catalogue(&hub_url, &hub_home, args.offline) {
-        Ok(c) => c,
-        Err(e) => {
-            return AskOutcome::fail(
-                EXIT_NO_ANSWER,
-                format!("cannot load the hub catalogue: {e:#}"),
-            )
+    let catalogue = if args.cached_catalogue_only {
+        match load_cached_catalogue(&hub_home) {
+            Ok(c) => c,
+            Err(msg) => return AskOutcome::fail(EXIT_NO_ANSWER, msg),
+        }
+    } else {
+        match load_catalogue(&hub_url, &hub_home, args.offline) {
+            Ok(c) => c,
+            Err(e) => {
+                return AskOutcome::fail(
+                    EXIT_NO_ANSWER,
+                    format!("cannot load the hub catalogue: {e:#}"),
+                )
+            }
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1556,6 +1642,7 @@ pub fn find(
     catalogue: &Catalogue,
 ) -> FindOutcome {
     let k = k.clamp(1, FIND_MAX_K);
+    let catalogue = &routable(catalogue);
     let cached = cached_slugs(hub_home);
     let (_, symbol) = detect_mode(question, &ModeRequest::Auto);
     let by_symbol = symbol
@@ -1610,16 +1697,27 @@ pub fn find(
     }
 }
 
-/// Load the catalogue the way [`run_ask`] does and run [`find`] from the
-/// current directory.
+/// What a caller that never fetches the catalogue (the MCP tools) says when
+/// none is cached on this machine.
+pub const NO_CACHED_CATALOGUE: &str = "no hub catalogue is cached on this machine, and hub tools \
+     never fetch one (a tool call does not wait on the network); run `xerj hub sync` in a shell \
+     once, then call the tool again";
+
+/// The catalogue cached in `hub_home`, with no network access at all, however
+/// old it is (an old copy still warns on stderr). `Err` is
+/// [`NO_CACHED_CATALOGUE`] plus the underlying reason.
+pub fn load_cached_catalogue(hub_home: &Path) -> Result<Catalogue, String> {
+    // `offline = true` never builds an HTTP client; the URL is unused.
+    load_catalogue(DEFAULT_HUB_URL, hub_home, true)
+        .map_err(|e| format!("{NO_CACHED_CATALOGUE} ({e:#})"))
+}
+
+/// Load the catalogue already cached on this machine — never fetching it
+/// ([`load_cached_catalogue`]) — and run [`find`] from the current directory.
+/// Only the MCP `xerj_hub_find` tool calls this.
 pub fn run_find(question: &str, k: usize) -> Result<FindOutcome, String> {
     let hub_home = cli::hub_home();
-    let hub_url = std::env::var("XERJ_HUB_URL")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
-    let catalogue = load_catalogue(&hub_url, &hub_home, false)
-        .map_err(|e| format!("cannot load the hub catalogue: {e:#}"))?;
+    let catalogue = load_cached_catalogue(&hub_home)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     Ok(find(question, k, &cwd, &hub_home, &catalogue))
 }
@@ -2175,28 +2273,28 @@ mod tests {
     fn an_excluded_corpus_is_never_pulled() {
         let rig = Rig::new();
         let cat = catalogue(vec![lz4(1024, LicenceClass::Excluded)]);
-        // Hosted answers, but no pull is started.
-        let backend = FakeBackend::new(false);
-        let out = rig.run(
-            &args("q", Some("lz4")),
-            &cat,
-            Some(&StubHosted::new()),
-            &backend,
-        );
-        assert_eq!(out.exit, EXIT_OK);
-        assert!(!backend.called("pull_"), "{:?}", backend.calls());
-        assert!(
-            out.stdout.contains("excluded licence (MIT)"),
-            "{}",
-            out.stdout
-        );
-
-        // With no hosted answer to fall back on, there is nothing to say but no.
-        let backend = FakeBackend::new(false);
-        let out = rig.run(&args("q", Some("lz4")), &cat, None, &backend);
-        assert_eq!(out.exit, EXIT_NO_ANSWER);
-        assert!(!backend.called("pull_"), "{:?}", backend.calls());
-        assert!(out.stderr[0].contains("never pulled"), "{:?}", out.stderr);
+        // Neither the hosted node (it never serves an excluded corpus) nor a pull:
+        // with or without a hosted hub, there is nothing to say but no.
+        for hosted in [None, Some(StubHosted::new())] {
+            let backend = FakeBackend::new(false);
+            let out = rig.run(
+                &args("q", Some("lz4")),
+                &cat,
+                hosted.as_ref().map(|h| h as &dyn HostedHub),
+                &backend,
+            );
+            assert_eq!(out.exit, EXIT_NO_ANSWER);
+            assert!(!backend.called("pull_"), "{:?}", backend.calls());
+            assert!(
+                out.stderr[0].contains("excluded licence class (MIT)")
+                    && out.stderr[0].contains("never served or pulled"),
+                "{:?}",
+                out.stderr
+            );
+            if let Some(h) = &hosted {
+                assert_eq!(h.answers.get(), 0);
+            }
+        }
     }
 
     #[test]
@@ -2396,12 +2494,12 @@ mod tests {
             assert_eq!(out.exit, EXIT_NO_ANSWER, "{name}");
             assert!(
                 out.stderr[0].contains("excluded licence class")
-                    && out.stderr[0].contains("never pulled"),
+                    && out.stderr[0].contains("never served or pulled"),
                 "{name}: {:?}",
                 out.stderr
             );
             no_pull_command(&out);
-            assert_eq!(backend.calls(), ["ready:lz4"], "{name}: nothing pulled");
+            assert!(backend.calls().is_empty(), "{name}: nothing read or pulled");
         }
     }
 
@@ -2451,20 +2549,22 @@ mod tests {
     }
 
     #[test]
-    fn a_hosted_excluded_answer_carries_no_pull_command_either() {
+    fn a_named_excluded_corpus_is_refused_with_no_pull_command_either() {
+        // The hosted node is not asked: it never serves an excluded corpus.
         let rig = Rig::new();
         let cat = catalogue(vec![lz4(80 * 1024 * 1024, LicenceClass::Excluded)]);
         let backend = FakeBackend::new(false);
-        let out = rig.run(
-            &args("q", Some("lz4")),
-            &cat,
-            Some(&StubHosted::new()),
-            &backend,
+        let hosted = StubHosted::new();
+        let out = rig.run(&args("q", Some("lz4")), &cat, Some(&hosted), &backend);
+        assert_eq!(out.exit, EXIT_NO_ANSWER);
+        assert!(
+            out.stderr[0].contains("never served or pulled"),
+            "{:?}",
+            out.stderr
         );
-        assert_eq!(out.exit, EXIT_OK);
-        assert!(out.stdout.contains("never pulled"), "{}", out.stdout);
         no_pull_command(&out);
-        assert!(!backend.called("pull_"));
+        assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        assert_eq!(hosted.answers.get(), 0);
     }
 
     // ── hosted answers are attributed to the corpus that was asked ──────────
@@ -3273,6 +3373,94 @@ mod tests {
             approach_only_warning(""),
             "approach-only licence (unknown): read, do not copy"
         );
+    }
+
+    // ── an excluded corpus is never routed to or answered ───────────────────
+
+    /// Review finding (rev7): `xerj_hub_find` hid an excluded corpus, but the ask
+    /// flow behind `xerj_hub_ask` / `xerj hub ask` still routed to it, named it as
+    /// a "closest corpus" to re-run with, and — given a pack on disk — answered
+    /// from it at step 3 without any licence check. The gRPC `ask_answer` already
+    /// routes over the non-excluded corpora only; the local flow now does the same.
+    #[test]
+    fn rev7_mcp_flow_routes_to_and_serves_an_excluded_corpus_find_hides() {
+        let rig = Rig::new();
+        let cat = catalogue(with_fillers(vec![
+            lz4(1024, LicenceClass::Excluded),
+            entry(
+                "zstd",
+                1024,
+                LicenceClass::AdaptWithAttribution,
+                &["zstd", "frame"],
+            ),
+        ]));
+        // A pack of the excluded corpus is on disk (pulled before it was
+        // reclassified, or copied in by hand).
+        let pack = rig.hub.path().join("packs").join("lz4").join("00000000");
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(pack.join("pack.json"), "{}").unwrap();
+
+        // find hides it ...
+        let found = find("lz4 block decoder", 5, rig.cwd.path(), rig.hub.path(), &cat);
+        assert!(found.corpora.iter().all(|c| c.slug != "lz4"), "{found:?}");
+
+        // ... so ask, named or routed, must neither answer from it nor point at it.
+        for (question, corpus) in [
+            ("q", Some("lz4")),
+            ("lz4 block decoder", None),
+            ("how does the lz4 block decoder do compression", None),
+            ("lz4", None),
+        ] {
+            for hosted in [None, Some(StubHosted::new())] {
+                let backend = FakeBackend::new(true);
+                let out = rig.run(
+                    &args(question, corpus),
+                    &cat,
+                    hosted.as_ref().map(|h| h as &dyn HostedHub),
+                    &backend,
+                );
+                let ctx = format!("{question:?} corpus={corpus:?} hosted={}", hosted.is_some());
+                assert!(out.answer.is_none(), "{ctx}: answered {:?}", out.answer);
+                assert_ne!(out.exit, EXIT_OK, "{ctx}");
+                assert!(
+                    !backend.called("answer_local") && !backend.called("ready:lz4"),
+                    "{ctx}: {:?}",
+                    backend.calls()
+                );
+                assert!(!backend.called("pull_"), "{ctx}: {:?}", backend.calls());
+                if let Some(h) = &hosted {
+                    assert_eq!(h.answers.get(), 0, "{ctx}: hosted asked about lz4");
+                }
+                let all = format!("{}\n{}", out.stdout, out.stderr.join("\n"));
+                if corpus.is_some() {
+                    // Named explicitly: a plain refusal, not "unknown corpus".
+                    assert!(all.contains("excluded licence class"), "{ctx}: {all}");
+                    assert!(!all.contains("xerj hub pull"), "{ctx}: {all}");
+                } else {
+                    assert!(!all.contains("lz4"), "{ctx}: points at it: {all}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_named_corpus_is_echoed_back_cut_to_the_slug_cap() {
+        let rig = Rig::new();
+        let cat = catalogue(vec![lz4(1024, LicenceClass::AdaptWithAttribution)]);
+        let backend = FakeBackend::new(false);
+        let long = "z".repeat(200 * 1024);
+        let out = rig.run(&args("q", Some(&long)), &cat, None, &backend);
+        assert_eq!(out.exit, EXIT_USAGE);
+        let msg = out.stderr.join("\n");
+        assert!(msg.contains("unknown corpus"), "{msg}");
+        assert!(msg.len() < 200, "{} bytes", msg.len());
+        assert!(
+            msg.contains(&format!("{}…", "z".repeat(SLUG_ECHO_MAX))),
+            "{msg}"
+        );
+        // A short unknown slug is shown whole.
+        let out = rig.run(&args("q", Some("nope")), &cat, None, &backend);
+        assert!(out.stderr[0].contains("'nope'"), "{:?}", out.stderr);
     }
 
     // ── find (MCP `xerj_hub_find`) ──────────────────────────────────────────

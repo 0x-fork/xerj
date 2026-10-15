@@ -390,4 +390,76 @@ async fn hub_tools_answer_from_a_local_pack_and_never_download() {
         .await
         .unwrap();
     assert_eq!(cat.as_array().unwrap().len(), 4, "{cat}");
+
+    // ── a tool call never fetches the catalogue (#B, review of 9dffe9fcc) ──
+    // A hub that accepts and counts connections. Before the fix, a stale or
+    // missing cache sent `xerj_hub_find` and `xerj_hub_ask` to the network
+    // (up to the 10 s/30 s fetch timeouts) from inside an agent's tool call.
+    let hub_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hub_url = format!("http://{}", hub_listener.local_addr().unwrap());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let hits = hits.clone();
+        std::thread::spawn(move || {
+            for conn in hub_listener.incoming() {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(conn);
+            }
+        });
+    }
+    std::env::set_var("XERJ_HUB_URL", &hub_url);
+    let requests = || hits.load(std::sync::atomic::Ordering::SeqCst);
+
+    // A stale cache (older than the 24 h freshness window) is still served as is.
+    let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(hub.join("catalogue.json"))
+        .unwrap()
+        .set_modified(two_days_ago)
+        .unwrap();
+    let r = call(
+        &url,
+        "xerj_hub_find",
+        json!({"question": "what is the value of MINI_LIMIT"}),
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["corpora"][0]["slug"], "mini-c");
+    let r = call(
+        &url,
+        "xerj_hub_def",
+        json!({"slug": "mini-c", "symbol": "MINI_LIMIT"}),
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["hits"][0]["value"], "128");
+    assert_eq!(
+        requests(),
+        0,
+        "a stale cache made a tool call fetch the catalogue"
+    );
+
+    // No cache at all: every tool says to run `xerj hub sync`, and still fetches nothing.
+    std::fs::remove_file(hub.join("catalogue.json")).unwrap();
+    for (name, args) in [
+        ("xerj_hub_find", json!({"question": "MINI_LIMIT"})),
+        (
+            "xerj_hub_ask",
+            json!({"question": "what is the value of MINI_LIMIT"}),
+        ),
+        (
+            "xerj_hub_def",
+            json!({"slug": "mini-c", "symbol": "MINI_LIMIT"}),
+        ),
+    ] {
+        let r = call(&url, name, args).await;
+        assert_eq!(r["isError"], true, "{name}: {r}");
+        assert!(text(&r).contains("xerj hub sync"), "{name}: {}", text(&r));
+    }
+    assert_eq!(
+        requests(),
+        0,
+        "a missing cache made a tool call fetch the catalogue"
+    );
 }

@@ -167,6 +167,8 @@ sent to the hosted hub. `xerj hub config hosted off` forbids that.
 
 A hub tool answers only from packs already on this machine; it never downloads one. When a corpus
 is not here, the answer is the `xerj hub pull <slug>` line: run it in a shell, then ask again.
+Nor does a hub tool fetch the catalogue: it reads the cached copy. If it says no catalogue is
+cached, run `xerj hub sync` in a shell once, then call the tool again.
 
 Register `xerj mcp` once, then restart the session. Success: `xerj_search` is in the tool list.
 Use the absolute path to the binary: an editor started from a desktop icon does not inherit your
@@ -828,6 +830,7 @@ mod tests {
             rest = &tail[end..];
         }
         assert!(HUB_SKILL_MD.contains("never downloads one"));
+        assert!(HUB_SKILL_MD.contains("run `xerj hub sync` in a shell once"));
         assert!(!HUB_SKILL_MD.contains("has no hub tool"));
         let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
         assert!(printed.contains("xerj_search"));
