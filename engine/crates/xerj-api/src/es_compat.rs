@@ -262,7 +262,7 @@ fn configured_members(config: &xerj_common::config::Config) -> Vec<(String, std:
 /// Node count for `/_cluster/health`: `1` when cluster mode is off, else the
 /// distinct configured membership (own address + peers, so a peer list that
 /// also names this node is not double-counted).
-fn configured_node_count(config: &xerj_common::config::Config) -> u32 {
+pub(crate) fn configured_node_count(config: &xerj_common::config::Config) -> u32 {
     if !config.cluster.enabled {
         return 1;
     }
