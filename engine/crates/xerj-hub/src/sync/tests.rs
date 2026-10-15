@@ -1266,36 +1266,67 @@ fn timer_dirs_follow_xdg_config_home_and_ignore_a_relative_one() {
 /// systemd is the arbiter of what a unit means, so when the machine has
 /// `systemd-analyze` ask it: the calendar spec must fire every six hours, and
 /// `verify` must have no complaint about the files we wrote. (Skipped where it
-/// is absent: it is not a build dependency.)
+/// is absent, or too old (< 254) to take `--base-time`: it is not a build
+/// dependency.)
 #[cfg(target_os = "linux")]
 #[test]
 fn systemd_reads_the_units_as_a_six_hourly_oneshot() {
     let have = Command::new("systemd-analyze").arg("--version").output();
-    if !have.is_ok_and(|o| o.status.success()) {
+    let Some(version) = have.ok().filter(|o| o.status.success()).and_then(|o| {
+        // First line: "systemd 255 (255.4-1ubuntu8)".
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse::<u32>().ok())
+    }) else {
         eprintln!("systemd-analyze not available; skipping");
+        return;
+    };
+    if version < 254 {
+        eprintln!("systemd-analyze {version} predates --base-time; skipping");
         return;
     }
 
-    // The calendar spec in the timer we render, in UTC so the host's zone is moot.
+    // The calendar spec in the timer we render, evaluated from a FIXED clock
+    // in UTC so neither the host's zone nor the time of day the test runs at
+    // moves the answer. 21:30 UTC sits between the 18:00 and 00:00 firings,
+    // so the next five are 00, 06, 12, 18, 00 — on any day, at any hour.
     let spec = render_systemd_timer()
         .lines()
         .find_map(|l| l.strip_prefix("OnCalendar=").map(str::to_string))
         .expect("the timer has an OnCalendar line");
     let cal = Command::new("systemd-analyze")
         .env("TZ", "UTC")
-        .args(["calendar", "--iterations=5", &spec])
+        .args([
+            "calendar",
+            "--iterations=5",
+            "--base-time=2026-01-01 21:30:00 UTC",
+            &spec,
+        ])
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&cal.stdout).into_owned();
     assert!(cal.status.success(), "calendar spec rejected:\n{text}");
-    let hours: Vec<&str> = text
+    let firings: Vec<String> = text
         .lines()
         .filter(|l| l.contains("UTC") && !l.contains("From now"))
-        .filter_map(|l| l.split_whitespace().rev().nth(1))
+        .filter_map(|l| {
+            // "    Next elapse: Fri 2026-01-02 00:00:00 UTC" -> "2026-01-02 00:00:00"
+            let mut w = l.split_whitespace().rev().skip(1);
+            let time = w.next()?;
+            let date = w.next()?;
+            Some(format!("{date} {time}"))
+        })
         .collect();
     assert_eq!(
-        hours,
-        vec!["00:00:00", "06:00:00", "12:00:00", "18:00:00", "00:00:00"],
+        firings,
+        vec![
+            "2026-01-02 00:00:00",
+            "2026-01-02 06:00:00",
+            "2026-01-02 12:00:00",
+            "2026-01-02 18:00:00",
+            "2026-01-03 00:00:00",
+        ],
         "five successive firings are six hours apart:\n{text}"
     );
 
