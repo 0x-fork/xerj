@@ -69,19 +69,27 @@ fn agents_md_section() -> String {
 }
 
 /// Back up `path` to `path.bak` before the first edit. Returns true if a
-/// backup was made (false when the file did not exist).
-fn backup(path: &Path, dry: bool) -> bool {
+/// backup was made (false when the file did not exist). A backup that cannot
+/// be written is an error, so the caller never edits a file it could not save
+/// a copy of first.
+fn backup(path: &Path, dry: bool) -> Result<bool, String> {
     if !path.exists() {
-        return false;
+        return Ok(false);
     }
     if !dry {
         let bak = path.with_extension(match path.extension() {
             Some(e) => format!("{}.bak", e.to_string_lossy()),
             None => "bak".to_string(),
         });
-        let _ = fs::copy(path, bak);
+        fs::copy(path, &bak).map_err(|e| {
+            format!(
+                "could not back up {} to {} ({e}); not touching it",
+                path.display(),
+                bak.display()
+            )
+        })?;
     }
-    true
+    Ok(true)
 }
 
 fn write_file(path: &Path, content: &str, dry: bool) -> std::io::Result<()> {
@@ -196,7 +204,7 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
         out.push(report("kept", &mcp_path));
     } else {
         let merged = merged_mcp_json(existing.as_deref(), url)?;
-        let had = backup(&mcp_path, dry);
+        let had = backup(&mcp_path, dry)?;
         write_file(&mcp_path, &merged, dry).map_err(|e| e.to_string())?;
         out.push(report(if had { "merged" } else { "wrote" }, &mcp_path));
     }
@@ -236,10 +244,17 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
             out.push(report("kept", &agents));
         }
         Ok(text) => {
-            backup(&agents, dry);
+            backup(&agents, dry)?;
             write_file(&agents, &format!("{text}{}", agents_md_section()), dry)
                 .map_err(|e| e.to_string())?;
             out.push(report("appended", &agents));
+        }
+        // Unreadable but present (not UTF-8, no permission): never replace it.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "could not read {} ({e}); not touching it",
+                agents.display()
+            ));
         }
         Err(_) => {
             write_file(
@@ -295,6 +310,35 @@ mod tests {
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    /// When the `.bak` cannot be written, the original is not edited: the
+    /// promise is "never touch a byte we did not write without a backup".
+    #[test]
+    fn failed_backup_leaves_mcp_json_untouched() {
+        let d = tmp();
+        let original = r#"{"mcpServers":{"other":{"command":"other-bin"}}}"#;
+        fs::write(d.path().join(".mcp.json"), original).unwrap();
+        // A directory where the backup file must go makes the copy fail.
+        fs::create_dir(d.path().join(".mcp.json.bak")).unwrap();
+        let err = run_init_in(d.path(), "http://x:1", false).unwrap_err();
+        assert!(err.contains("could not back up"), "{err}");
+        assert_eq!(
+            fs::read_to_string(d.path().join(".mcp.json")).unwrap(),
+            original
+        );
+    }
+
+    /// An AGENTS.md that exists but is not valid UTF-8 is never replaced by a
+    /// fresh file (it used to be: any read error took the "absent" branch).
+    #[test]
+    fn unreadable_agents_md_is_not_replaced() {
+        let d = tmp();
+        let bytes = b"# notes\n\xff\xfe not utf-8\n";
+        fs::write(d.path().join("AGENTS.md"), bytes).unwrap();
+        let err = run_init_in(d.path(), "http://x:1", false).unwrap_err();
+        assert!(err.contains("AGENTS.md"), "{err}");
+        assert_eq!(fs::read(d.path().join("AGENTS.md")).unwrap(), bytes);
     }
 
     #[test]
