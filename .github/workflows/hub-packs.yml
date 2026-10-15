@@ -30,7 +30,9 @@
 #   `corpus-hub` explicitly and opens its PRs against it.
 #
 # CHAIN OF CUSTODY (the shape of pack-publish.yml)
-#   build -> sign (PACK_SIGNING_SEED, the secret pack-publish.yml already uses)
+#   build -> sign (HUB_SIGNING_SEED: a key used ONLY for hub packs and the catalogue,
+#   deliberately separate from pack-publish.yml's PACK_SIGNING_SEED so a leak of one
+#   lane-B pack key cannot sign hub packs)
 #   -> verify against the key CLIENTS embed (HUB_PUBKEY_HEX in
 #   engine/crates/xerj-common/src/hub.rs) in the same run -> publish. A seed that
 #   does not match that key fails here instead of shipping packs no client can
@@ -165,7 +167,7 @@ jobs:
 
       - id: check
         env:
-          PACK_SIGNING_SEED: ${{ secrets.PACK_SIGNING_SEED }}
+          HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -177,18 +179,18 @@ jobs:
           else
             pub=$(sed -n 's/^pub const HUB_PUBKEY_HEX: &str = "\([0-9a-fA-F]*\)";.*/\1/p' "$HUB_RS" | head -n 1 | tr 'A-F' 'a-f')
             if [ -z "$pub" ]; then
-              why="HUB_PUBKEY_HEX in $HUB_RS is empty: the hub signing key has not been provisioned (xerj corpus keygen; set PACK_SIGNING_SEED; commit the public half there)"
-            elif [ -z "$PACK_SIGNING_SEED" ]; then
-              echo "::error title=hub packs::HUB_PUBKEY_HEX is set but the PACK_SIGNING_SEED secret is not"
+              why="HUB_PUBKEY_HEX in $HUB_RS is empty: the hub signing key has not been provisioned (xerj corpus keygen; set HUB_SIGNING_SEED; commit the public half there)"
+            elif [ -z "$HUB_SIGNING_SEED" ]; then
+              echo "::error title=hub packs::HUB_PUBKEY_HEX is set but the HUB_SIGNING_SEED secret is not"
               exit 1
             else
               # Prove the secret is the private half of the key clients embed.
               umask 077
-              printf '%s' "$PACK_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
+              printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
               derived=$(bash tools/hub-packs/ed25519.sh derive "$RUNNER_TEMP/pack.key")
               rm -f "$RUNNER_TEMP/pack.key"
               if [ "$derived" != "$pub" ]; then
-                echo "::error title=hub packs::the PACK_SIGNING_SEED secret does not match HUB_PUBKEY_HEX; refusing to publish packs no client can verify"
+                echo "::error title=hub packs::the HUB_SIGNING_SEED secret does not match HUB_PUBKEY_HEX; refusing to publish packs no client can verify"
                 exit 1
               fi
               ready=true
@@ -335,14 +337,14 @@ jobs:
 
       - name: Build and sign the pack
         env:
-          PACK_SIGNING_SEED: ${{ secrets.PACK_SIGNING_SEED }}
+          HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
           XERJ_CODE_HOME: ${{ runner.temp }}/code-home
         run: |
           set -euo pipefail
           umask 077
-          printf '%s' "$PACK_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
+          printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
           # The builder parses untrusted source trees: keep the seed out of its environment.
-          unset PACK_SIGNING_SEED
+          unset HUB_SIGNING_SEED
           trap 'rm -f "$RUNNER_TEMP/pack.key"' EXIT
           bin/xerj hub build-pack "$SLUG" --registry "$REGISTRY" --out "$PACK_OUT" \
             --url "http://127.0.0.1:$BUILDER_PORT" --sign-key "$RUNNER_TEMP/pack.key" \
@@ -539,12 +541,12 @@ jobs:
 
       - name: Build and sign the catalogue
         env:
-          PACK_SIGNING_SEED: ${{ secrets.PACK_SIGNING_SEED }}
+          HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
         run: |
           set -euo pipefail
           umask 077
-          printf '%s' "$PACK_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
-          unset PACK_SIGNING_SEED
+          printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
+          unset HUB_SIGNING_SEED
           trap 'rm -f "$RUNNER_TEMP/pack.key"' EXIT
           bin/xerj hub build-catalogue --registry "$REGISTRY" --packs "$RUNNER_TEMP/packs" \
             --out catalogue.json --sign-key "$RUNNER_TEMP/pack.key"
