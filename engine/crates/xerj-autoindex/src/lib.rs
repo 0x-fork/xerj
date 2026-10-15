@@ -9627,8 +9627,10 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
     let dirs: Vec<std::path::PathBuf> = match &cfg.state_dir {
         Some(d) => vec![d.clone()],
         None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            let base = Path::new(&home).join(".xerj").join("autoindex");
+            let base = xerj_common::home::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".xerj")
+                .join("autoindex");
             std::fs::read_dir(&base)
                 .map(|rd| rd.flatten().map(|e| e.path()).collect())
                 .unwrap_or_default()
