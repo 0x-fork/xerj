@@ -10,7 +10,7 @@ compatibility_date = "2024-09-01"
 crons = ["0 6 * * *"]
 
 # Reuses the existing bucket the installer writes to; history lives under
-# metrics/history.json, installs under installs/<date>/.
+# metrics/dashboard.json, installs under installs/<date>/.
 [[r2_buckets]]
 binding = "INSTALLS"
 bucket_name = "xerj-installs"
