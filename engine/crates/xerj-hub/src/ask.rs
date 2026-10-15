@@ -139,6 +139,12 @@ pub struct AskArgs {
     pub k: Option<usize>,
     pub json: bool,
     pub url: Option<String>,
+    /// Use only the catalogue already cached on this machine; never fetch it,
+    /// however old it is. Not a CLI flag: the MCP tools set it, so an agent's
+    /// tool call never blocks on the hub (the fetch's 10 s connect / 30 s
+    /// timeouts). With no cached copy the outcome is [`NO_CACHED_CATALOGUE`].
+    /// Unlike `offline`, the rest of the flow is unchanged.
+    pub cached_catalogue_only: bool,
 }
 
 impl AskArgs {
@@ -155,6 +161,7 @@ impl AskArgs {
             k: None,
             json: false,
             url: None,
+            cached_catalogue_only: false,
         }
     }
 }
@@ -1485,13 +1492,20 @@ pub fn run_ask_with(
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
-    let catalogue = match load_catalogue(&hub_url, &hub_home, args.offline) {
-        Ok(c) => c,
-        Err(e) => {
-            return AskOutcome::fail(
-                EXIT_NO_ANSWER,
-                format!("cannot load the hub catalogue: {e:#}"),
-            )
+    let catalogue = if args.cached_catalogue_only {
+        match load_cached_catalogue(&hub_home) {
+            Ok(c) => c,
+            Err(msg) => return AskOutcome::fail(EXIT_NO_ANSWER, msg),
+        }
+    } else {
+        match load_catalogue(&hub_url, &hub_home, args.offline) {
+            Ok(c) => c,
+            Err(e) => {
+                return AskOutcome::fail(
+                    EXIT_NO_ANSWER,
+                    format!("cannot load the hub catalogue: {e:#}"),
+                )
+            }
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1610,16 +1624,27 @@ pub fn find(
     }
 }
 
-/// Load the catalogue the way [`run_ask`] does and run [`find`] from the
-/// current directory.
+/// What a caller that never fetches the catalogue (the MCP tools) says when
+/// none is cached on this machine.
+pub const NO_CACHED_CATALOGUE: &str = "no hub catalogue is cached on this machine, and hub tools \
+     never fetch one (a tool call does not wait on the network); run `xerj hub sync` in a shell \
+     once, then call the tool again";
+
+/// The catalogue cached in `hub_home`, with no network access at all, however
+/// old it is (an old copy still warns on stderr). `Err` is
+/// [`NO_CACHED_CATALOGUE`] plus the underlying reason.
+pub fn load_cached_catalogue(hub_home: &Path) -> Result<Catalogue, String> {
+    // `offline = true` never builds an HTTP client; the URL is unused.
+    load_catalogue(DEFAULT_HUB_URL, hub_home, true)
+        .map_err(|e| format!("{NO_CACHED_CATALOGUE} ({e:#})"))
+}
+
+/// Load the catalogue already cached on this machine — never fetching it
+/// ([`load_cached_catalogue`]) — and run [`find`] from the current directory.
+/// Only the MCP `xerj_hub_find` tool calls this.
 pub fn run_find(question: &str, k: usize) -> Result<FindOutcome, String> {
     let hub_home = cli::hub_home();
-    let hub_url = std::env::var("XERJ_HUB_URL")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
-    let catalogue = load_catalogue(&hub_url, &hub_home, false)
-        .map_err(|e| format!("cannot load the hub catalogue: {e:#}"))?;
+    let catalogue = load_cached_catalogue(&hub_home)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     Ok(find(question, k, &cwd, &hub_home, &catalogue))
 }
