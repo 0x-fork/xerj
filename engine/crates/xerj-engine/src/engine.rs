@@ -3979,6 +3979,10 @@ impl Engine {
         let data_dir = self.data_dir.to_string_lossy().to_string();
         let cluster_settings = self.cluster_settings.clone();
         const FLOOD_STAGE_SETTING: &str = "cluster.routing.allocation.disk.watermark.flood_stage";
+        const BREAKER_LIMIT_SETTING: &str = "indices.breaker.total.limit";
+        // Snapshot the uncapped machine memory once: a percentage override is
+        // resolved against it, and it is the hard clamp for an absolute one.
+        let machine_memory_bytes = crate::governor::effective_memory_limit_bytes();
         let _ = std::thread::Builder::new()
             .name("xerj-mem-sampler".to_string())
             .spawn(move || {
@@ -4042,6 +4046,24 @@ impl Engine {
                             })
                             .and_then(crate::governor::parse_flood_stage_pct);
                         governor.set_disk_flood_pct_override(flood_override);
+
+                        // Runtime parent-memory-breaker watermark override
+                        // (#1250): raise the watermark on a big box live via
+                        // `PUT _cluster/settings {indices.breaker.total.limit}`,
+                        // no restart — the live equivalent of the boot-only
+                        // XERJ_MAX_PROCESS_MEMORY_MB cap.
+                        let breaker_override = settings
+                            .get("persistent")
+                            .and_then(|p| p.get(BREAKER_LIMIT_SETTING))
+                            .or_else(|| {
+                                settings
+                                    .get("transient")
+                                    .and_then(|t| t.get(BREAKER_LIMIT_SETTING))
+                            })
+                            .and_then(|v| {
+                                crate::governor::parse_breaker_total_limit(v, machine_memory_bytes)
+                            });
+                        governor.set_memory_watermark_override(breaker_override);
                     }
                 }
             });

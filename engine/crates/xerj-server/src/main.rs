@@ -86,7 +86,7 @@ use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use xerj_api::{build_es_compat_router, build_native_router, AppState};
+use xerj_api::{build_es_compat_router_with_hub, build_native_router, AppState};
 use xerj_cluster::{transport::TcpTransport, ClusterNode, ClusterRunner};
 use xerj_common::{config::Config, metrics::Metrics};
 use xerj_console_api::{state::ClusterMode, ConsoleState, RpConfig};
@@ -96,6 +96,7 @@ mod brain;
 #[cfg(all(target_os = "linux", feature = "debug-profiling"))]
 mod debug_profiling;
 mod grpc;
+mod grpc_hub;
 mod ingest_memory_trace;
 mod share;
 
@@ -228,6 +229,10 @@ fn help_text(feedback: bool) -> String {
                                                   of peer projects (see xerj code --help)\n\
              xerj corpus add|index|list          the corpus lifecycle behind `xerj code`\n\
                                                   (see xerj corpus --help)\n\
+             xerj ask \"<question>\"              answer a question from a hub corpus: the\n\
+                                                  pre-indexed pack is pulled the first time\n\
+                                                  (see xerj ask --help); `xerj \"<question>\"`\n\
+                                                  is the same\n\
              xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
                                                   index --help)\n\
              xerj brain <folder>                 index + browse in one command (see xerj\n\
@@ -2293,9 +2298,11 @@ async fn async_main() -> Result<()> {
     if matches!(argv1.as_deref(), Some("code")) {
         // Reference-coding retrieval (issue #977, previously xc.py): blocking
         // ES-compat client + local state ledger, synchronous — off the
-        // runtime like `def`.
+        // runtime like `def`. Routed through the hub CLI so `--def <SYMBOL>`
+        // answers from the `-defs` index; every other invocation delegates
+        // unchanged to `xc::run_code_cli` (Corpus Hub v2, §3).
         let args: Vec<String> = std::env::args().skip(2).collect();
-        let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_code_cli(&args))
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_code(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);
@@ -2306,6 +2313,35 @@ async fn async_main() -> Result<()> {
         // synchronous — off the runtime like `autoindex`.
         let args: Vec<String> = std::env::args().skip(2).collect();
         let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_corpus_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("hub")) {
+        // Corpus Hub v2 (discussion #1374): pull pre-indexed, signed packs and
+        // build them (CI). Synchronous (git + blocking HTTP) — off the runtime
+        // like `corpus`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_hub_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("ask")) {
+        // Corpus Hub v2 answer flow (plan §5): route the question to a hub
+        // corpus, answer from its pack (pulling it the first time). Blocking
+        // HTTP + process spawn — off the runtime like `hub`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_ask(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if xerj_hub::cli::is_bare_question(argv1.as_deref()) {
+        // `xerj "how does lz4 frame work"`: argv[1] is not a subcommand, does
+        // not start with `-`, and contains a space — the same as `xerj ask`.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_ask(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);
@@ -2844,7 +2880,10 @@ async fn async_main() -> Result<()> {
     //     merge would leave xerj-api compiling and serving on its own
     //     — a property worth preserving.
     let mut native_router = build_native_router(state.clone());
-    let mut es_router = build_es_compat_router(state.clone());
+    // One hub state for the ES-compat `/_hub/v1/*` routes AND the gRPC
+    // `XerjHub` service: one rate-limit budget per client across both.
+    let hub_shared = xerj_api::hub_api::HubShared::new(state.clone());
+    let mut es_router = build_es_compat_router_with_hub(state.clone(), hub_shared.clone());
     if let Some(console_state) = xerj_console_state {
         let xerj_console_router = xerj_console_api::xerj_console_router(console_state);
         native_router = native_router.merge(xerj_console_router.clone());
@@ -2934,7 +2973,9 @@ async fn async_main() -> Result<()> {
     // made no false claim: it did hold the port.
     let grpc_state = state.clone();
     let grpc = tokio::spawn(async move {
-        if let Err(e) = grpc::serve_grpc_on(grpc_listener, grpc_state, shutdown_signal()).await {
+        if let Err(e) =
+            grpc::serve_grpc_on(grpc_listener, grpc_state, hub_shared, shutdown_signal()).await
+        {
             error!("gRPC server: {e:#}");
         }
     });

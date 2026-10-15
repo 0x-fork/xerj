@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **130 settings** versus
+//! Configuration is intentionally minimal: **132 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -102,9 +102,13 @@ pub struct Config {
     /// nearest-neighbour vote — 8 settings. Inert until `decisions.index`
     /// names an index that exists.
     pub decisions: DecisionsConfig,
+    /// Corpus Hub hosted read-only endpoints (`/_hub/v1/…`) — 2 settings.
+    /// Inert until `hub.catalogue_path` names a catalogue file; the routes
+    /// need an API key unless `hub.public` is switched on.
+    pub hub: HubConfig,
 }
 
-// 23 sub-configs, 130 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 132 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -233,6 +237,17 @@ impl Config {
         // echoed by `GET /_xerj/rerank`. Same two rules as the WAL tap target.
         if let Err(reason) = RerankProviderConfig::check_endpoint(&self.rerank.endpoint) {
             return Err(XerjError::config(reason));
+        }
+
+        // Hub: a public node validates every corpus name against the
+        // catalogue, so a public node with no catalogue answers 404 to
+        // everything while appearing to be up. Refuse that at boot.
+        if self.hub.public && self.hub.catalogue_path.trim().is_empty() {
+            return Err(XerjError::config(
+                "hub.public = true requires hub.catalogue_path: the public routes validate \
+                 every corpus name against the catalogue, and with none every request \
+                 would be a 404",
+            ));
         }
 
         // Compression: block_size_docs is documented as 16–4096 and was
@@ -535,7 +550,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (130 user-facing settings total; counted by
+// Sub-configs  (132 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -2684,6 +2699,37 @@ impl Default for DecisionsConfig {
         }
     }
 }
+
+/// Corpus Hub hosted endpoints: four read-only `GET` routes under
+/// `/_hub/v1/` that answer from the pre-indexed packs restored on this node
+/// (`catalogue`, `def/{slug}/{symbol}`, `code/{slug}`, `search`). They are
+/// served on the Elasticsearch-compatible listener (`server.es_compat_port`),
+/// next to `/_memory`, not on the native one.
+///
+/// **2 settings.**
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubConfig {
+    /// Let those four routes — and nothing else — answer without an API key
+    /// (default: `false`, every route needs a key).
+    ///
+    /// With `true`, `GET /_hub/v1/catalogue`, `/_hub/v1/def/{slug}/{symbol}`,
+    /// `/_hub/v1/code/{slug}` and `/_hub/v1/search` skip authentication,
+    /// authorization and the audit log. Every other route on the node keeps
+    /// all three. The four routes are read-only, only ever query `xc-*`
+    /// indices, and are rate-limited to 60 requests a minute per client
+    /// address (`429` with `Retry-After`). Behind a reverse proxy, list the
+    /// proxy in `server.trusted_proxies`; without it every client shares the
+    /// proxy's address and therefore one 60-a-minute budget.
+    pub public: bool,
+    /// Path to the signed `catalogue.json` this node serves at
+    /// `GET /_hub/v1/catalogue` and validates every corpus name against
+    /// (default: `""` — none). A corpus name that is not in the file is a
+    /// `404`. Required when `public = true`. Prefer an absolute path: a
+    /// relative one resolves against the server's working directory.
+    pub catalogue_path: String,
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2710,6 +2756,35 @@ mod tests {
         // and not judged.
         assert!(RerankProviderConfig::check_resolved_endpoint(good, Some(bad)).is_ok());
         assert!(RerankProviderConfig::check_resolved_endpoint(bad, Some(good)).is_err());
+    }
+
+    /// `[hub]` is closed and fail-closed: a typo is a boot error, the
+    /// defaults leave every route behind the API key, and a public node with
+    /// no catalogue is refused rather than left answering 404 to everything.
+    #[test]
+    fn hub_section_defaults_closed_and_public_requires_a_catalogue() {
+        let d = Config::default();
+        assert!(!d.hub.public, "the hosted routes are keyed by default");
+        assert!(d.hub.catalogue_path.is_empty());
+
+        let ok = Config::from_toml_str(
+            "[hub]\npublic = true\ncatalogue_path = \"/srv/hub/catalogue.json\"\n",
+        )
+        .expect("a public node with a catalogue is valid");
+        assert!(ok.hub.public);
+        assert_eq!(ok.hub.catalogue_path, "/srv/hub/catalogue.json");
+
+        let err = Config::from_toml_str("[hub]\npublic = true\n")
+            .expect_err("public without a catalogue must be refused at boot");
+        assert!(
+            err.to_string().contains("hub.catalogue_path"),
+            "the error names the setting to set: {err}"
+        );
+        // A private node needs no catalogue to boot.
+        Config::from_toml_str("[hub]\npublic = false\n").expect("private, no catalogue");
+
+        // Closed: a misspelt key is an error, not a silently ignored line.
+        assert!(Config::from_toml_str("[hub]\npubic = true\n").is_err());
     }
 
     #[test]
@@ -3600,6 +3675,7 @@ mod tests {
         ("wal_tap", 10),
         ("rerank", 3),
         ("decisions", 8),
+        ("hub", 2),
     ];
 
     /// Count the settings by *counting them*.
@@ -3642,7 +3718,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 130,
+            total, 132,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
