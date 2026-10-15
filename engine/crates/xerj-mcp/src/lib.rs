@@ -9,8 +9,9 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as thirteen
-//! tools that map 1:1 onto XERJ's real, verified REST surface. Every tool is
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as sixteen
+//! tools: thirteen that map 1:1 onto XERJ's real, verified REST surface, and
+//! three Corpus Hub tools (`xerj_hub_*`) that run the `xerj ask` flow itself. Every tool is
 //! a *thin proxy*: it constructs exactly the request the running engine
 //! already accepts and forwards it to a configurable base URL.
 //!
@@ -30,6 +31,7 @@
 //! | `xerj_brain_overview`  | `GET /_graph/{brain}/overview`        | whole-brain orientation: counts, hubs, detectors, timeline |
 //! | `xerj_plan`            | `POST /_ask`                          | natural-language prompt in, VALIDATED query DSL out (deterministic planner, not an LLM) |
 //! | `xerj_map`             | `POST /autoindex-catalog/_search`     | per-index field map from the autoindex catalog (#1055) |
+//! | `xerj_hub_find` / `xerj_hub_def` / `xerj_hub_ask` | the `xerj ask` flow (`src/hub.rs`) | which hub corpus answers; one definition; one question — from local packs, never downloading |
 //!
 //! ## Honesty notes (must match the engine, never oversell)
 //!
@@ -87,6 +89,7 @@
 //! words), with overlapping file:line passages deduped before budgeting and
 //! over-budget hits reduced to locators.
 
+mod hub;
 mod map;
 mod token_budget;
 
@@ -122,6 +125,12 @@ xerj_map, xerj_plan — to a
 XERJ node that
 is ALREADY RUNNING. This command does not start a node; start one first with
 `xerj --data-dir ./data`.
+
+It also serves three Corpus Hub tools — xerj_hub_find, xerj_hub_def,
+xerj_hub_ask — which run the `xerj ask` flow: answered from packs already on
+this machine (a tool call never downloads one; it names the `xerj hub pull`
+line instead). Like `xerj ask`, they use the node above when it answers and
+otherwise the automatic hub node.
 
 OPTIONS:
     --url <URL>     Base URL of the XERJ ES-compatible listener.
@@ -389,6 +398,23 @@ async fn handle_message(ctx: &Ctx, msg: Value) -> Option<Value> {
     }
 }
 
+/// Handle one JSON-RPC message exactly as the stdio loop does, against the node
+/// at `base_url` — for the end-to-end tests in `tests/`, which cannot reach the
+/// private dispatch. Not part of the supported API.
+#[doc(hidden)]
+pub async fn handle_message_for_test(
+    base_url: &str,
+    auth: Option<String>,
+    msg: Value,
+) -> Option<Value> {
+    let ctx = Ctx {
+        client: reqwest::Client::new(),
+        base_url: base_url.trim_end_matches('/').to_string(),
+        auth,
+    };
+    handle_message(&ctx, msg).await
+}
+
 /// Build the `initialize` result, echoing the client's requested protocol
 /// version when present (our JSON-RPC handling is version-agnostic).
 fn initialize_result(msg: &Value) -> Value {
@@ -603,7 +629,8 @@ fn max_tokens_arg_schema() -> Value {
     })
 }
 
-/// The thirteen tool specifications advertised via `tools/list`. Input schemas
+/// The sixteen tool specifications advertised via `tools/list` (the three
+/// `xerj_hub_*` specs come from `hub::specs`, appended last). Input schemas
 /// are plain JSON Schema; every property maps onto a field the engine accepts.
 ///
 /// Public because this is the single source of truth for the published
@@ -612,7 +639,7 @@ fn max_tokens_arg_schema() -> Value {
 /// once advertised six tools while the binary served ten — nobody noticed,
 /// because nothing compared them.
 pub fn tool_specs() -> Value {
-    json!([
+    let mut specs = json!([
         {
             "name": "xerj_search",
             "description":
@@ -1055,7 +1082,11 @@ pub fn tool_specs() -> Value {
                 "required": ["prompt"]
             }
         }
-    ])
+    ]);
+    if let Value::Array(tools) = &mut specs {
+        tools.extend(hub::specs());
+    }
+    specs
 }
 
 /// Dispatch a `tools/call` to the matching proxy. Any bad-argument or transport
@@ -1110,6 +1141,13 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         // returns a tool result directly instead of a BuiltRequest.
         "xerj_map" => return map::run(ctx, &args).await,
         "xerj_code_search" => return run_code_search(ctx, &args).await,
+        // Corpus Hub v2 (plan §7): the `xerj ask` flow itself, not a proxy.
+        hub_tool if hub_tool.starts_with("xerj_hub_") => {
+            return match hub::call(ctx, hub_tool, &args).await {
+                Some(result) => result,
+                None => tool_text(format!("unknown tool: {hub_tool}"), true),
+            }
+        }
         other => return tool_text(format!("unknown tool: {other}"), true),
     };
 
@@ -2391,6 +2429,14 @@ mod tests {
                         .unwrap_or(false),
                     "{name}: `max_tokens` is optional"
                 );
+            } else if name == "xerj_hub_ask" {
+                // The hub's own budget (docs/hub-v2-grpc-mcp-notes.md): the
+                // `xerj ask --max-tokens` cap, a SOFT ~4-chars-a-token trim of
+                // the rendered answer — not #1058's never-exceeded budget, and
+                // its description must not claim to be.
+                let d = prop["description"].as_str().expect("described");
+                assert!(d.starts_with("Soft"), "{name}: {d}");
+                assert!(!d.contains("NEVER exceeds"), "{name}: {d}");
             } else {
                 assert!(
                     prop.is_null(),
@@ -2710,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_all_thirteen() {
+    fn tools_list_has_all_sixteen() {
         let specs = tool_specs();
         let names: Vec<&str> = specs
             .as_array()
@@ -2718,7 +2764,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 16);
         for n in [
             "xerj_search",
             "xerj_semantic_search",
@@ -2735,8 +2781,12 @@ mod tests {
             // #977: reference-coding retrieval, served by the same pipeline
             // as `xerj code`.
             "xerj_code_search",
-            // #1056: prompt in, validated DSL out (LAST in the list).
+            // #1056: prompt in, validated DSL out.
             "xerj_plan",
+            // Corpus Hub v2 (plan §7), appended after the thirteen.
+            "xerj_hub_find",
+            "xerj_hub_def",
+            "xerj_hub_ask",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }

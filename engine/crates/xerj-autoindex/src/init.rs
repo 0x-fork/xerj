@@ -160,9 +160,13 @@ sent to the hosted hub. `xerj hub config hosted off` forbids that.
 
 ## MCP
 
-`xerj mcp` in this build has no hub tool: ask the hub with the shell line above. Through MCP you
-get the local-corpus tools (`xerj_search`, `xerj_code_search` and the rest). If your tool list names
-a tool that starts with `xerj_hub_`, your build is newer than this file: prefer that tool.
+`xerj mcp` serves three hub tools. They run the same flow as `xerj ask`:
+- `xerj_hub_ask` `{question, corpus?, mode?, max_tokens?}`: the shell line above, as one call.
+- `xerj_hub_def` `{slug, symbol, k?}`: `xerj ask --corpus <slug> --def <SYMBOL>`.
+- `xerj_hub_find` `{question, k?}`: which corpora could answer, best first. No passages.
+
+A hub tool answers only from packs already on this machine; it never downloads one. When a corpus
+is not here, the answer is the `xerj hub pull <slug>` line: run it in a shell, then ask again.
 
 Register `xerj mcp` once, then restart the session. Success: `xerj_search` is in the tool list.
 Use the absolute path to the binary: an editor started from a desktop icon does not inherit your
@@ -179,9 +183,9 @@ shell PATH. `command -v xerj` prints it (PowerShell: `(Get-Command xerj).Source`
 "##;
 
 /// The MCP tool whose presence proves `xerj mcp` is registered. It must be a
-/// tool `xerj mcp` serves today: the hub tools (`xerj_hub_*`, plan step 7) are
-/// not implemented yet, so naming one here would make a correct registration
-/// look like a failure.
+/// tool every `xerj mcp` serves. The hub tools (`xerj_hub_*`) are served too,
+/// but `xerj_search` is the proof the skill and the printed text have always
+/// used, and it stays the one check.
 const MCP_SUCCESS_TOOL: &str = "xerj_search";
 
 /// The default node URL; the printed Claude Code line carries `-e XERJ_URL=`
@@ -796,18 +800,37 @@ mod tests {
         assert_eq!(shell_quote("/it's/xerj"), r"'/it'\''s/xerj'");
     }
 
-    /// `xerj mcp` serves no `xerj_hub_*` tool yet (plan step 7 is deferred;
-    /// docs/hub-v2-grpc-mcp-notes.md). Text init installs or prints must not
-    /// send an agent to one, nor make one the proof that registration worked.
-    /// When step 7 lands, update this test together with the skill.
+    /// The hub tools `xerj mcp` serves (plan step 7; `xerj-mcp/src/hub.rs`,
+    /// whose own test pins the same three names to `tool_specs()`). The skill
+    /// names each, says a tool call never downloads a pack, and promises no
+    /// other `xerj_hub_*` tool; the printed registration still proves itself
+    /// with `xerj_search`.
     #[test]
-    fn no_unserved_hub_mcp_tool_is_promised() {
-        let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
-        for name in ["xerj_hub_ask", "xerj_hub_def", "xerj_hub_find"] {
-            assert!(!HUB_SKILL_MD.contains(name), "skill names {name}");
-            assert!(!printed.contains(name), "printed text names {name}");
+    fn the_hub_skill_names_exactly_the_hub_tools_mcp_serves() {
+        const SERVED: [&str; 3] = ["xerj_hub_ask", "xerj_hub_def", "xerj_hub_find"];
+        for name in SERVED {
+            assert!(
+                HUB_SKILL_MD.contains(name),
+                "the skill does not name {name}"
+            );
         }
-        assert!(HUB_SKILL_MD.contains("has no hub tool"));
+        let mut rest = HUB_SKILL_MD;
+        while let Some(at) = rest.find("xerj_hub_") {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            let named = &tail[..end];
+            assert!(
+                SERVED.contains(&named),
+                "the skill names an unserved tool {named}"
+            );
+            rest = &tail[end..];
+        }
+        assert!(HUB_SKILL_MD.contains("never downloads one"));
+        assert!(!HUB_SKILL_MD.contains("has no hub tool"));
+        let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
+        assert!(printed.contains("xerj_search"));
     }
 
     /// `--help` lists every file init can write, the hub pair included.
