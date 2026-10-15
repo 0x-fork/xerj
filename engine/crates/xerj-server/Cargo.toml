@@ -111,6 +111,9 @@ protox = { workspace = true }
 # HTTPS round-trip test against the in-process rustls listener.
 reqwest = { workspace = true }
 tempfile = { workspace = true }
+# `oneshot` against the ES router: the XerjHub test compares a gRPC `Def` with
+# the HTTP `/_hub/v1/def` route field by field.
+tower = { workspace = true }
 # HTTP/2 *as a client*, so `tests/http2_small_data_frames.rs` can choose the
 # DATA-frame size — the one thing no ordinary HTTP client exposes, and the
 # whole subject of #485. It also pins the workspace floor at the h2 release
