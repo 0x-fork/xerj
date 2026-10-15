@@ -287,7 +287,11 @@ jobs:
     needs: [preflight, plan, build-xerj]
     if: needs.plan.result == 'success' && needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The repo-wide ceiling (.github/scripts/workflow-timeout-guard.py, 1..90).
+    # This pipeline has not run for real yet (HUB_PUBKEY_HEX is unset), so there
+    # is no measured job time to justify more; if a real pack needs longer, that
+    # is a measured case for raising MAX_TIMEOUT there, not an exception here.
+    timeout-minutes: 90
     permissions:
       contents: write # release assets
     strategy:
@@ -488,7 +492,7 @@ jobs:
     # and check-catalogue refuses to delist a corpus that is still live.
     if: ${{ !cancelled() && needs.preflight.outputs.ready == 'true' && needs.plan.result == 'success' && needs.build-xerj.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90 # the repo-wide ceiling; see the `pack` job
     env:
       HUB_PUBKEY_HEX: ${{ needs.preflight.outputs.pubkey }}
       HUB_URL: https://hub.xerj.org
