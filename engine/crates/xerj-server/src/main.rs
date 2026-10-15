@@ -96,6 +96,10 @@ mod brain;
 #[cfg(all(target_os = "linux", feature = "debug-profiling"))]
 mod debug_profiling;
 mod grpc;
+// Corpus Hub v2: the XerjHub wire mapping. The service that calls it lands in
+// the next step-7 slice; until then only its tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+mod grpc_hub;
 mod ingest_memory_trace;
 mod share;
 
