@@ -1974,6 +1974,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5515,6 +5525,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7301,6 +7322,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "xerj-ai"
 version = "1.0.0-rc.95"
 dependencies = [
@@ -7350,8 +7381,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "xerj-ai",
+ "xerj-autoindex",
  "xerj-common",
  "xerj-engine",
+ "xerj-hub",
  "xerj-query",
  "xerj-rerank",
  "xerj-wasm",
@@ -7614,6 +7647,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "xerj-hub"
+version = "1.0.0-rc.95"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml",
+ "xerj-api",
+ "xerj-autoindex",
+ "xerj-common",
+ "xerj-engine",
+ "zstd",
+]
+
+[[package]]
 name = "xerj-logs"
 version = "1.0.0-rc.95"
 dependencies = [
@@ -7636,12 +7693,16 @@ name = "xerj-mcp"
 version = "1.0.0-rc.95"
 dependencies = [
  "anyhow",
+ "axum",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "unicode-segmentation",
+ "xerj-api",
  "xerj-common",
+ "xerj-engine",
+ "xerj-hub",
  "xerj-rerank",
 ]
 
@@ -7705,6 +7766,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "xerj-ai",
@@ -7716,6 +7778,7 @@ dependencies = [
  "xerj-console-api",
  "xerj-engine",
  "xerj-fts",
+ "xerj-hub",
  "xerj-logs",
  "xerj-mcp",
  "xerj-query",
