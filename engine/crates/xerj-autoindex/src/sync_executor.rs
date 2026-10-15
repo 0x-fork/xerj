@@ -355,12 +355,16 @@ pub(crate) fn replay_windowed<T: Sync>(
         }
         return Ok(());
     }
+    /// One dispatched operation: on its own thread, or — when that thread
+    /// could not be started (#1122) — already applied inline.
+    enum Dispatched<'scope> {
+        Thread(std::thread::ScopedJoinHandle<'scope, Result<()>>),
+        Inline(Result<()>),
+    }
     let failure = std::thread::scope(|scope| -> Result<Option<anyhow::Error>> {
         let mut next = items.iter();
-        let mut in_flight: std::collections::VecDeque<(
-            &T,
-            std::thread::ScopedJoinHandle<'_, Result<()>>,
-        )> = std::collections::VecDeque::new();
+        let mut in_flight: std::collections::VecDeque<(&T, Dispatched<'_>)> =
+            std::collections::VecDeque::new();
         let mut failure: Option<anyhow::Error> = None;
         loop {
             while failure.is_none() && in_flight.len() < width {
@@ -370,17 +374,32 @@ pub(crate) fn replay_windowed<T: Sync>(
                 let Some(item) = next.next() else { break };
                 hooks.begin(item)?;
                 let dispatched = item;
-                in_flight.push_back((item, scope.spawn(move || apply(dispatched))));
+                // #1122: `Scope::spawn` panics when a thread cannot be
+                // created, and release builds are panic=abort. A failed spawn
+                // never ran the closure, so the operation is applied inline
+                // instead: the window narrows, the order and the callbacks do
+                // not change.
+                let slot = match std::thread::Builder::new()
+                    .name("xerj-sync-apply".into())
+                    .spawn_scoped(scope, move || apply(dispatched))
+                {
+                    Ok(handle) => Dispatched::Thread(handle),
+                    Err(_) => Dispatched::Inline(apply(item)),
+                };
+                in_flight.push_back((item, slot));
             }
-            let Some((item, handle)) = in_flight.pop_front() else {
+            let Some((item, slot)) = in_flight.pop_front() else {
                 break;
             };
-            let outcome = handle.join().unwrap_or_else(|panic| {
-                Err(anyhow::anyhow!(
-                    "replay apply panicked: {}",
-                    panic_message(panic)
-                ))
-            });
+            let outcome = match slot {
+                Dispatched::Thread(handle) => handle.join().unwrap_or_else(|panic| {
+                    Err(anyhow::anyhow!(
+                        "replay apply panicked: {}",
+                        panic_message(panic)
+                    ))
+                }),
+                Dispatched::Inline(outcome) => outcome,
+            };
             let reported = hooks.applied(item, outcome);
             if let (None, Err(error)) = (&failure, reported) {
                 // First failure stops dispatch; the drain still reports.

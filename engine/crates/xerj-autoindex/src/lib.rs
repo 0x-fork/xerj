@@ -2225,6 +2225,21 @@ where
         }
     }
 
+    /// `n` workers the pipe was sized for will never run (#1122: their
+    /// threads could not be started). Stop counting them as live so the
+    /// "all / half parked" ship conditions in [`Self::settle`] are judged
+    /// against the workers that exist; without this a phantom worker would
+    /// hold a residual buffer back until a park timeout.
+    fn abandon_workers(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut st = self.lock();
+        st.live_workers = st.live_workers.saturating_sub(n);
+        drop(st);
+        self.ready.notify_all();
+    }
+
     /// A worker leaving its loop will submit nothing more. The last one out
     /// drains the residual buffer so the run never ends with unflushed bytes.
     fn retire(&self) {
@@ -7658,672 +7673,675 @@ fn run_index_report_inner(
         )
     };
 
-    std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            scope.spawn(|| {
-                loop {
-                    let (i, pdf_spool) = match queue.lock().unwrap().pop() {
-                        Some(job) => job,
-                        None => {
-                            // This worker will submit nothing more; the last
-                            // one out drains the shared buffer (#1147).
-                            pipe.retire();
-                            break;
-                        }
-                    };
-                    // The file's slot in the shared bulk buffer. Allocated
-                    // before staging so every exit path below can settle it.
-                    let file_token = pipe.token();
-                    let f = &files[i];
-                    // Counts this file done on EVERY exit path below, junk
-                    // included: progress measures work drained from the queue,
-                    // and a `continue` that skipped the count would park the
-                    // bar short of 100% forever.
-                    let in_flight = pr.file(&f.rel, f.size);
-                    let key = &keys[i];
-                    let expected_digest = &digests[i];
-                    let fa = plan.files.get(key).unwrap();
-                    let asg: HashMap<Option<String>, String> =
-                        fa.assignments.iter().cloned().collect();
-                    let sn = if stub_matcher.matches(&f.rel) {
-                        Ok(stub_sniffed(Path::new(&f.rel)))
-                    } else {
-                        sniff::sniff(&f.path)
-                    };
-                    let sn = match sn {
-                        Ok(s) => s,
-                        Err(e) => {
-                            extra_junk.lock().unwrap().push(JunkFile {
-                                file_key: key.clone(),
-                                rel: f.rel.clone(),
-                                format: "unknown".into(),
-                                status: "junk".into(),
-                                reason: format!("unreadable at index time: {e}"),
-                                bytes: f.size,
-                            });
-                            continue;
-                        }
-                    };
-                    let mut file_records = 0u64;
-                    let mut file_junk = 0u64;
-                    // Groups phase B saw that phase A never sampled, so they
-                    // have no dataset to route to. Silently counting these as
-                    // junk is how a whole Unity class (or SQL table) can
-                    // vanish from a run with nothing in the report to say so.
-                    let mut unrouted_groups: std::collections::BTreeMap<String, u64> =
-                        std::collections::BTreeMap::new();
-                    // `script_guid`s this file referenced that no `.meta` in
-                    // the tree defines. These are exactly the records that
-                    // ship without script_path/script_class, which is what
-                    // makes the headline query come back empty.
-                    let mut unresolved_script_guids: std::collections::BTreeMap<String, u64> =
-                        std::collections::BTreeMap::new();
-                    let mut file_dropped_by_dataset: HashMap<String, u64> = HashMap::new();
-                    let mut send_err: Option<String> = None;
-                    // Edges this file teaches — buffered apart from the node
-                    // staging file (different target index) and sent only
-                    // after the node bulks are accepted (§6.7).
-                    let mut edge_drafts: Vec<detect::EdgeDraft> = Vec::new();
-                    // (doc id, label) of the last staged text section — the
-                    // sequence detector's predecessor. Stream order is the
-                    // only source that can name a PDF page boundary's
-                    // predecessor (p2-s0 follows the LAST section of page 1).
-                    let mut prev_section: Option<(String, String)> = None;
-                    let mut staged = match tempfile::Builder::new()
-                        .prefix(".autoindex-stage-")
-                        .tempfile_in(&state_dir)
-                    {
-                        Ok(file) => file,
-                        Err(error) => {
-                            let mut errors = bulk_errors.lock().unwrap();
-                            if errors.len() < 5 {
-                                errors.push(format!(
-                                    "create per-file staging area for {}: {error}",
-                                    f.rel
-                                ));
-                            }
-                            continue;
-                        }
-                    };
-                    if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
-                        let mut errors = bulk_errors.lock().unwrap();
-                        if errors.len() < 5 {
-                            errors.push(format!("{error:#}"));
-                        }
-                        continue;
+    // One staging worker. Named (rather than written inline in `spawn`) so
+    // the current thread can run it too when no worker thread starts.
+    let worker = || {
+        loop {
+            let (i, pdf_spool) = match queue.lock().unwrap().pop() {
+                Some(job) => job,
+                None => {
+                    // This worker will submit nothing more; the last
+                    // one out drains the shared buffer (#1147).
+                    pipe.retire();
+                    break;
+                }
+            };
+            // The file's slot in the shared bulk buffer. Allocated
+            // before staging so every exit path below can settle it.
+            let file_token = pipe.token();
+            let f = &files[i];
+            // Counts this file done on EVERY exit path below, junk
+            // included: progress measures work drained from the queue,
+            // and a `continue` that skipped the count would park the
+            // bar short of 100% forever.
+            let in_flight = pr.file(&f.rel, f.size);
+            let key = &keys[i];
+            let expected_digest = &digests[i];
+            let fa = plan.files.get(key).unwrap();
+            let asg: HashMap<Option<String>, String> = fa.assignments.iter().cloned().collect();
+            let sn = if stub_matcher.matches(&f.rel) {
+                Ok(stub_sniffed(Path::new(&f.rel)))
+            } else {
+                sniff::sniff(&f.path)
+            };
+            let sn = match sn {
+                Ok(s) => s,
+                Err(e) => {
+                    extra_junk.lock().unwrap().push(JunkFile {
+                        file_key: key.clone(),
+                        rel: f.rel.clone(),
+                        format: "unknown".into(),
+                        status: "junk".into(),
+                        reason: format!("unreadable at index time: {e}"),
+                        bytes: f.size,
+                    });
+                    continue;
+                }
+            };
+            let mut file_records = 0u64;
+            let mut file_junk = 0u64;
+            // Groups phase B saw that phase A never sampled, so they
+            // have no dataset to route to. Silently counting these as
+            // junk is how a whole Unity class (or SQL table) can
+            // vanish from a run with nothing in the report to say so.
+            let mut unrouted_groups: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            // `script_guid`s this file referenced that no `.meta` in
+            // the tree defines. These are exactly the records that
+            // ship without script_path/script_class, which is what
+            // makes the headline query come back empty.
+            let mut unresolved_script_guids: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut file_dropped_by_dataset: HashMap<String, u64> = HashMap::new();
+            let mut send_err: Option<String> = None;
+            // Edges this file teaches — buffered apart from the node
+            // staging file (different target index) and sent only
+            // after the node bulks are accepted (§6.7).
+            let mut edge_drafts: Vec<detect::EdgeDraft> = Vec::new();
+            // (doc id, label) of the last staged text section — the
+            // sequence detector's predecessor. Stream order is the
+            // only source that can name a PDF page boundary's
+            // predecessor (p2-s0 follows the LAST section of page 1).
+            let mut prev_section: Option<(String, String)> = None;
+            let mut staged = match tempfile::Builder::new()
+                .prefix(".autoindex-stage-")
+                .tempfile_in(&state_dir)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    let mut errors = bulk_errors.lock().unwrap();
+                    if errors.len() < 5 {
+                        errors.push(format!(
+                            "create per-file staging area for {}: {error}",
+                            f.rel
+                        ));
                     }
-                    // File-card anchor node (§6.6.2a): one card doc per corpus
-                    // file, staged BEFORE the file's records. Its
-                    // deterministic id is `CorpusFile.anchor_doc_id` — the
-                    // node every file-level edge (wikilink/mdlink/href/
-                    // pathcite/cratecite/samedir dst, sequence opener src)
-                    // terminates at. Row/line/page families have no `s0`
-                    // section doc, so without the card those edges pointed at
-                    // ghosts. Not counted as an extracted record: it is
-                    // derived anchor infrastructure, not file content.
-                    if let Some(gr) = graph.as_ref() {
-                        if let Some(cf) = gr.corpus.files.get(&f.rel) {
-                            if let Some(rt) = ds_rt.get(&cf.dataset_slug) {
-                                let name = f.rel.rsplit('/').next().unwrap_or(&f.rel);
-                                let mut fields = Map::new();
-                                fields.insert("title".into(), Value::String(name.to_string()));
-                                fields.insert("ax_path".into(), Value::String(f.rel.clone()));
-                                fields.insert(
-                                    "ax_paths".into(),
-                                    Value::Array(
-                                        paths_by_key
-                                            .get(key)
-                                            .into_iter()
-                                            .flatten()
-                                            .cloned()
-                                            .map(Value::String)
-                                            .collect(),
-                                    ),
-                                );
-                                fields.insert("ax_file".into(), Value::String(key.clone()));
-                                fields.insert(
-                                    "ax_locator".into(),
-                                    Value::String(detect::FILE_CARD_LOCATOR.into()),
-                                );
-                                fields.insert(
-                                    "ax_dataset".into(),
-                                    Value::String(cf.dataset_slug.clone()),
-                                );
-                                fields.insert("ax_run".into(), Value::String(run_id.clone()));
-                                fields.insert(
-                                    "ax_format".into(),
-                                    Value::String(format_str(Some(&sn))),
-                                );
-                                let action = json!({"index": {
+                    continue;
+                }
+            };
+            if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
+                let mut errors = bulk_errors.lock().unwrap();
+                if errors.len() < 5 {
+                    errors.push(format!("{error:#}"));
+                }
+                continue;
+            }
+            // File-card anchor node (§6.6.2a): one card doc per corpus
+            // file, staged BEFORE the file's records. Its
+            // deterministic id is `CorpusFile.anchor_doc_id` — the
+            // node every file-level edge (wikilink/mdlink/href/
+            // pathcite/cratecite/samedir dst, sequence opener src)
+            // terminates at. Row/line/page families have no `s0`
+            // section doc, so without the card those edges pointed at
+            // ghosts. Not counted as an extracted record: it is
+            // derived anchor infrastructure, not file content.
+            if let Some(gr) = graph.as_ref() {
+                if let Some(cf) = gr.corpus.files.get(&f.rel) {
+                    if let Some(rt) = ds_rt.get(&cf.dataset_slug) {
+                        let name = f.rel.rsplit('/').next().unwrap_or(&f.rel);
+                        let mut fields = Map::new();
+                        fields.insert("title".into(), Value::String(name.to_string()));
+                        fields.insert("ax_path".into(), Value::String(f.rel.clone()));
+                        fields.insert(
+                            "ax_paths".into(),
+                            Value::Array(
+                                paths_by_key
+                                    .get(key)
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned()
+                                    .map(Value::String)
+                                    .collect(),
+                            ),
+                        );
+                        fields.insert("ax_file".into(), Value::String(key.clone()));
+                        fields.insert(
+                            "ax_locator".into(),
+                            Value::String(detect::FILE_CARD_LOCATOR.into()),
+                        );
+                        fields.insert("ax_dataset".into(), Value::String(cf.dataset_slug.clone()));
+                        fields.insert("ax_run".into(), Value::String(run_id.clone()));
+                        fields.insert("ax_format".into(), Value::String(format_str(Some(&sn))));
+                        let action = json!({"index": {
                                     "_index": rt.index, "_id": cf.anchor_doc_id}});
-                                if let Err(error) = writeln!(
-                                    staged.as_file_mut(),
-                                    "{}\n{}",
-                                    action,
-                                    Value::Object(fields)
-                                ) {
-                                    send_err =
-                                        Some(format!("stage file card for {}: {error}", f.rel));
-                                }
-                            }
+                        if let Err(error) = writeln!(
+                            staged.as_file_mut(),
+                            "{}\n{}",
+                            action,
+                            Value::Object(fields)
+                        ) {
+                            send_err = Some(format!("stage file card for {}: {error}", f.rel));
                         }
                     }
+                }
+            }
+            {
+                let mut sink = |rec: extract::RawRecord| -> bool {
+                    let Some(slug) = asg.get(&rec.group).or_else(|| asg.get(&None)) else {
+                        file_junk += 1;
+                        *unrouted_groups
+                            .entry(rec.group.clone().unwrap_or_else(|| "(ungrouped)".into()))
+                            .or_insert(0) += 1;
+                        return true;
+                    };
+                    let Some(rt) = ds_rt.get(slug) else {
+                        file_junk += 1;
+                        return true;
+                    };
+                    // Progress INSIDE a mailbox. One Takeout mbox is
+                    // the whole corpus, so crediting its bytes only
+                    // when the file finishes left the bar at 0.0% and
+                    // `since_progress_s` climbing for the entire run.
+                    // Every mbox record says how far into the file its
+                    // message began; that is the position.
+                    if sn.family == Family::Mbox {
+                        if let Some(offset) = extract::mbox::locator_offset(&rec.locator) {
+                            in_flight.advance_to(container_extract_credit(f.size, offset));
+                        }
+                    }
+                    let mut fields = rec.fields;
+                    // BEFORE coercion, not after: these are ordinary
+                    // record fields once stamped, and a field that
+                    // skips `coerce_record` is a field the dataset
+                    // plan never validated.
+                    if let Some(unresolved) =
+                        enrich_unity_fields(sn.family, &mut fields, &unity_guid_map.map, &f.rel)
                     {
-                        let mut sink = |rec: extract::RawRecord| -> bool {
-                            let Some(slug) = asg.get(&rec.group).or_else(|| asg.get(&None)) else {
-                                file_junk += 1;
-                                *unrouted_groups
-                                    .entry(
-                                        rec.group.clone().unwrap_or_else(|| "(ungrouped)".into()),
-                                    )
-                                    .or_insert(0) += 1;
-                                return true;
-                            };
-                            let Some(rt) = ds_rt.get(slug) else {
-                                file_junk += 1;
-                                return true;
-                            };
-                            // Progress INSIDE a mailbox. One Takeout mbox is
-                            // the whole corpus, so crediting its bytes only
-                            // when the file finishes left the bar at 0.0% and
-                            // `since_progress_s` climbing for the entire run.
-                            // Every mbox record says how far into the file its
-                            // message began; that is the position.
-                            if sn.family == Family::Mbox {
-                                if let Some(offset) = extract::mbox::locator_offset(&rec.locator) {
-                                    in_flight.advance_to(container_extract_credit(f.size, offset));
+                        *unresolved_script_guids.entry(unresolved).or_insert(0u64) += 1;
+                    }
+                    let dropped = coerce::coerce_record(&mut fields, &rt.plan);
+                    if dropped > 0 {
+                        let durable = file_dropped_by_dataset.entry(slug.clone()).or_default();
+                        *durable = durable.saturating_add(dropped as u64);
+                    }
+                    fields.insert("ax_path".into(), Value::String(f.rel.clone()));
+                    fields.insert(
+                        "ax_paths".into(),
+                        Value::Array(
+                            paths_by_key
+                                .get(key)
+                                .into_iter()
+                                .flatten()
+                                .cloned()
+                                .map(Value::String)
+                                .collect(),
+                        ),
+                    );
+                    fields.insert("ax_file".into(), Value::String(key.clone()));
+                    fields.insert("ax_locator".into(), Value::String(rec.locator.clone()));
+                    fields.insert("ax_dataset".into(), Value::String(slug.clone()));
+                    fields.insert("ax_run".into(), Value::String(run_id.clone()));
+                    fields.insert("ax_format".into(), Value::String(format_str(Some(&sn))));
+                    // `--label` (#1062): decide the record BEFORE it is
+                    // staged — after coerce, which would drop fields
+                    // the plan does not describe, and before the bulk
+                    // action is built, so what /_decide said is what
+                    // gets indexed. A failed decide fails the run: an
+                    // unlabelled corpus the operator believes is
+                    // labelled is the #204 defect class, not a warning.
+                    if let Some(labeler) = labeler.as_ref() {
+                        match labeler.label_fields(&fields) {
+                            Ok(pairs) => {
+                                for (name, value) in pairs {
+                                    fields.insert(name, value);
                                 }
                             }
-                            let mut fields = rec.fields;
-                            // BEFORE coercion, not after: these are ordinary
-                            // record fields once stamped, and a field that
-                            // skips `coerce_record` is a field the dataset
-                            // plan never validated.
-                            if let Some(unresolved) = enrich_unity_fields(
-                                sn.family,
-                                &mut fields,
-                                &unity_guid_map.map,
-                                &f.rel,
-                            ) {
-                                *unresolved_script_guids.entry(unresolved).or_insert(0u64) += 1;
-                            }
-                            let dropped = coerce::coerce_record(&mut fields, &rt.plan);
-                            if dropped > 0 {
-                                let durable =
-                                    file_dropped_by_dataset.entry(slug.clone()).or_default();
-                                *durable = durable.saturating_add(dropped as u64);
-                            }
-                            fields.insert("ax_path".into(), Value::String(f.rel.clone()));
-                            fields.insert(
-                                "ax_paths".into(),
-                                Value::Array(
-                                    paths_by_key
-                                        .get(key)
-                                        .into_iter()
-                                        .flatten()
-                                        .cloned()
-                                        .map(Value::String)
-                                        .collect(),
-                                ),
-                            );
-                            fields.insert("ax_file".into(), Value::String(key.clone()));
-                            fields.insert("ax_locator".into(), Value::String(rec.locator.clone()));
-                            fields.insert("ax_dataset".into(), Value::String(slug.clone()));
-                            fields.insert("ax_run".into(), Value::String(run_id.clone()));
-                            fields.insert("ax_format".into(), Value::String(format_str(Some(&sn))));
-                            // `--label` (#1062): decide the record BEFORE it is
-                            // staged — after coerce, which would drop fields
-                            // the plan does not describe, and before the bulk
-                            // action is built, so what /_decide said is what
-                            // gets indexed. A failed decide fails the run: an
-                            // unlabelled corpus the operator believes is
-                            // labelled is the #204 defect class, not a warning.
-                            if let Some(labeler) = labeler.as_ref() {
-                                match labeler.label_fields(&fields) {
-                                    Ok(pairs) => {
-                                        for (name, value) in pairs {
-                                            fields.insert(name, value);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        send_err = Some(format!(
-                                            "label {} (record {}): {error:#}",
-                                            f.rel, rec.locator
-                                        ));
-                                        return false;
-                                    }
-                                }
-                            }
-                            let id = ids::doc_id(slug, key, &rec.locator);
-                            let action = json!({"index": {"_index": rt.index, "_id": id}});
-                            let doc = Value::Object(fields);
-                            if let Err(error) = writeln!(
-                                staged.as_file_mut(),
-                                "{}\n{}",
-                                action,
-                                serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into())
-                            ) {
-                                send_err =
-                                    Some(format!("stage extracted records for {}: {error}", f.rel));
+                            Err(error) => {
+                                send_err = Some(format!(
+                                    "label {} (record {}): {error:#}",
+                                    f.rel, rec.locator
+                                ));
                                 return false;
                             }
-                            rt.records.fetch_add(1, Ordering::Relaxed);
-                            file_records += 1;
-                            // Textual edge detection (§6.6.2), after the node
-                            // action is staged: `body` is the exact section
-                            // string the node doc carries, and `id` is the
-                            // section node the evidence lives in.
-                            if let Some(gr) = graph.as_ref() {
-                                // Structured (field-level) detection first: it
-                                // is offered every record, text section or not
-                                // — an email's locators (`m{off}-msg-s0`) are
-                                // deliberately not text sections, and its
-                                // thread edges come from parsed headers.
-                                if let (Some(cf), Some(staged_fields)) =
-                                    (gr.corpus.files.get(&f.rel), doc.as_object())
-                                {
-                                    let ctx = detect::RecordCtx {
-                                        corpus: &gr.corpus,
-                                        file: cf,
-                                        locator: &rec.locator,
-                                        doc_id: &id,
-                                        fields: staged_fields,
-                                    };
-                                    for det in &gr.detectors {
-                                        det.detect_record(&ctx, &mut edge_drafts);
-                                    }
-                                }
-                                if let Some(label) = section_label(&rec.locator) {
-                                    if let (Some(cf), Some(body)) = (
-                                        gr.corpus.files.get(&f.rel),
-                                        doc.get("body").and_then(Value::as_str),
-                                    ) {
-                                        let ctx = detect::SectionCtx {
-                                            corpus: &gr.corpus,
-                                            file: cf,
-                                            section_label: &label,
-                                            prev_section: prev_section
-                                                .as_ref()
-                                                .map(|(pid, pl)| (pid.as_str(), pl.as_str())),
-                                            section_doc_id: &id,
-                                            text: body,
-                                        };
-                                        for det in &gr.detectors {
-                                            det.detect_text(&ctx, &mut edge_drafts);
-                                        }
-                                        prev_section = Some((id.clone(), label));
-                                    }
-                                }
-                            }
-                            true
-                        };
-                        // Demoted one-off config files (#173) index as
-                        // documents — their key sets are configuration, not a
-                        // schema (see `dataset` module docs).
-                        //
-                        // `as_document` deliberately outranks artifact replay.
-                        // It decides the record *shape*: phase A built this
-                        // dataset's mapping by re-sampling the file through
-                        // `extract_as_document`, whereas an artifact replays
-                        // PDF-parser page records. Replaying here would publish
-                        // records the frozen plan does not describe. Today no
-                        // PDF can reach this branch (`demotable_family` is
-                        // JSON/YAML/XML only), so this is a guard that keeps
-                        // the precedence right if that set ever widens — the
-                        // artifact is refunded rather than replayed.
-                        let res = if fa.as_document {
-                            if pdf_spool.is_some() {
-                                pdf_spool_budget.record_discarded_before_replay();
-                            }
-                            drop(pdf_spool);
-                            extract::extract_as_document(&f.path, sn.gzip, &mut sink)
-                        } else if sn.family == Family::Pdf {
-                            match pdf_spool {
-                                Some(spool) => {
-                                    match spool.replay(f.size, expected_digest, &mut sink) {
-                                        Ok(stats) => Ok(stats),
-                                        Err(replay_error) => {
-                                            // Replay verifies the complete
-                                            // artifact before `deliver`
-                                            // invokes the sink, so falling
-                                            // back here cannot duplicate a
-                                            // partially staged record stream.
-                                            pdf_spool_budget
-                                                .record_replay_fallback(&f.rel, &replay_error);
-                                            pdf_spool_budget.record_reparse();
-                                            extract::extract(&f.path, &sn, None, &mut sink)
-                                                .with_context(|| {
-                                                    format!(
-                                                        "reparse {} after run-local PDF artifact \
-                                                         verification failed: {replay_error:#}",
-                                                        f.rel
-                                                    )
-                                                })
-                                        }
-                                    }
-                                }
-                                None => {
-                                    pdf_spool_budget.record_reparse();
-                                    extract::extract(&f.path, &sn, None, &mut sink)
-                                }
-                            }
-                        } else {
-                            extract::extract(&f.path, &sn, None, &mut sink)
-                        };
-                        match res {
-                            Ok(stats) => {
-                                file_junk += stats.junk;
-                                if stats.truncated {
-                                    truncated_files.lock().unwrap().push(f.rel.clone());
-                                }
-                            }
-                            Err(e) => {
-                                send_err = Some(format!("extract {}: {e}", f.rel));
-                                extra_junk.lock().unwrap().push(JunkFile {
-                                    file_key: key.clone(),
-                                    rel: f.rel.clone(),
-                                    format: format_str(Some(&sn)),
-                                    status: "junk".into(),
-                                    reason: format!("extract failed at index time: {e}"),
-                                    bytes: f.size,
-                                });
+                        }
+                    }
+                    let id = ids::doc_id(slug, key, &rec.locator);
+                    let action = json!({"index": {"_index": rt.index, "_id": id}});
+                    let doc = Value::Object(fields);
+                    if let Err(error) = writeln!(
+                        staged.as_file_mut(),
+                        "{}\n{}",
+                        action,
+                        serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into())
+                    ) {
+                        send_err = Some(format!("stage extracted records for {}: {error}", f.rel));
+                        return false;
+                    }
+                    rt.records.fetch_add(1, Ordering::Relaxed);
+                    file_records += 1;
+                    // Textual edge detection (§6.6.2), after the node
+                    // action is staged: `body` is the exact section
+                    // string the node doc carries, and `id` is the
+                    // section node the evidence lives in.
+                    if let Some(gr) = graph.as_ref() {
+                        // Structured (field-level) detection first: it
+                        // is offered every record, text section or not
+                        // — an email's locators (`m{off}-msg-s0`) are
+                        // deliberately not text sections, and its
+                        // thread edges come from parsed headers.
+                        if let (Some(cf), Some(staged_fields)) =
+                            (gr.corpus.files.get(&f.rel), doc.as_object())
+                        {
+                            let ctx = detect::RecordCtx {
+                                corpus: &gr.corpus,
+                                file: cf,
+                                locator: &rec.locator,
+                                doc_id: &id,
+                                fields: staged_fields,
+                            };
+                            for det in &gr.detectors {
+                                det.detect_record(&ctx, &mut edge_drafts);
                             }
                         }
-                        if !unresolved_script_guids.is_empty() {
-                            let total: u64 = unresolved_script_guids.values().sum();
-                            pr.note(&format!(
-                                "unity: {}: {total} MonoBehaviour record(s) reference {} \
+                        if let Some(label) = section_label(&rec.locator) {
+                            if let (Some(cf), Some(body)) = (
+                                gr.corpus.files.get(&f.rel),
+                                doc.get("body").and_then(Value::as_str),
+                            ) {
+                                let ctx = detect::SectionCtx {
+                                    corpus: &gr.corpus,
+                                    file: cf,
+                                    section_label: &label,
+                                    prev_section: prev_section
+                                        .as_ref()
+                                        .map(|(pid, pl)| (pid.as_str(), pl.as_str())),
+                                    section_doc_id: &id,
+                                    text: body,
+                                };
+                                for det in &gr.detectors {
+                                    det.detect_text(&ctx, &mut edge_drafts);
+                                }
+                                prev_section = Some((id.clone(), label));
+                            }
+                        }
+                    }
+                    true
+                };
+                // Demoted one-off config files (#173) index as
+                // documents — their key sets are configuration, not a
+                // schema (see `dataset` module docs).
+                //
+                // `as_document` deliberately outranks artifact replay.
+                // It decides the record *shape*: phase A built this
+                // dataset's mapping by re-sampling the file through
+                // `extract_as_document`, whereas an artifact replays
+                // PDF-parser page records. Replaying here would publish
+                // records the frozen plan does not describe. Today no
+                // PDF can reach this branch (`demotable_family` is
+                // JSON/YAML/XML only), so this is a guard that keeps
+                // the precedence right if that set ever widens — the
+                // artifact is refunded rather than replayed.
+                let res = if fa.as_document {
+                    if pdf_spool.is_some() {
+                        pdf_spool_budget.record_discarded_before_replay();
+                    }
+                    drop(pdf_spool);
+                    extract::extract_as_document(&f.path, sn.gzip, &mut sink)
+                } else if sn.family == Family::Pdf {
+                    match pdf_spool {
+                        Some(spool) => {
+                            match spool.replay(f.size, expected_digest, &mut sink) {
+                                Ok(stats) => Ok(stats),
+                                Err(replay_error) => {
+                                    // Replay verifies the complete
+                                    // artifact before `deliver`
+                                    // invokes the sink, so falling
+                                    // back here cannot duplicate a
+                                    // partially staged record stream.
+                                    pdf_spool_budget.record_replay_fallback(&f.rel, &replay_error);
+                                    pdf_spool_budget.record_reparse();
+                                    extract::extract(&f.path, &sn, None, &mut sink).with_context(
+                                        || {
+                                            format!(
+                                                "reparse {} after run-local PDF artifact \
+                                                         verification failed: {replay_error:#}",
+                                                f.rel
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        None => {
+                            pdf_spool_budget.record_reparse();
+                            extract::extract(&f.path, &sn, None, &mut sink)
+                        }
+                    }
+                } else {
+                    extract::extract(&f.path, &sn, None, &mut sink)
+                };
+                match res {
+                    Ok(stats) => {
+                        file_junk += stats.junk;
+                        if stats.truncated {
+                            truncated_files.lock().unwrap().push(f.rel.clone());
+                        }
+                    }
+                    Err(e) => {
+                        send_err = Some(format!("extract {}: {e}", f.rel));
+                        extra_junk.lock().unwrap().push(JunkFile {
+                            file_key: key.clone(),
+                            rel: f.rel.clone(),
+                            format: format_str(Some(&sn)),
+                            status: "junk".into(),
+                            reason: format!("extract failed at index time: {e}"),
+                            bytes: f.size,
+                        });
+                    }
+                }
+                if !unresolved_script_guids.is_empty() {
+                    let total: u64 = unresolved_script_guids.values().sum();
+                    pr.note(&format!(
+                        "unity: {}: {total} MonoBehaviour record(s) reference {} \
                                  script guid(s) no .meta defines — they ship without \
                                  script_path/script_class: {}",
-                                f.rel,
-                                unresolved_script_guids.len(),
-                                unresolved_script_guids
-                                    .keys()
-                                    .take(REFUSAL_LIST_CAP)
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ));
-                        }
-                        if !unrouted_groups.is_empty() {
-                            let total: u64 = unrouted_groups.values().sum();
-                            let named = unrouted_groups
-                                .iter()
-                                .take(REFUSAL_LIST_CAP)
-                                .map(|(g, n)| format!("{g} ({n})"))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let more = unrouted_groups.len().saturating_sub(REFUSAL_LIST_CAP);
-                            let suffix = if more > 0 {
-                                format!(" and {more} more")
-                            } else {
-                                String::new()
-                            };
-                            // A NOTE, never an `extra_junk` entry. This file
-                            // still reaches `journal.file_done` — `send_err`
-                            // is untouched — and every junk entry is turned
-                            // into a catalog document under the same
-                            // `file:{file_key}` id as that completion
-                            // (`catalog::file_doc`, `catalog.rs`). Pushing one
-                            // here put two documents with one id in the same
-                            // bulk, and the later one wins: a file that
-                            // indexed N records was reported as status "junk"
-                            // with records 0, `junk_file_count` counted it
-                            // twice, and `code_coverage.observe` ran for it
-                            // twice. The dropped records are already carried
-                            // on that file's own completion as `junk`
-                            // (`file_junk` below), which is where a per-file
-                            // drop count belongs.
-                            pr.note(&format!(
-                                "{}: {total} record(s) dropped: group(s) never sampled in \
+                        f.rel,
+                        unresolved_script_guids.len(),
+                        unresolved_script_guids
+                            .keys()
+                            .take(REFUSAL_LIST_CAP)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !unrouted_groups.is_empty() {
+                    let total: u64 = unrouted_groups.values().sum();
+                    let named = unrouted_groups
+                        .iter()
+                        .take(REFUSAL_LIST_CAP)
+                        .map(|(g, n)| format!("{g} ({n})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more = unrouted_groups.len().saturating_sub(REFUSAL_LIST_CAP);
+                    let suffix = if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    };
+                    // A NOTE, never an `extra_junk` entry. This file
+                    // still reaches `journal.file_done` — `send_err`
+                    // is untouched — and every junk entry is turned
+                    // into a catalog document under the same
+                    // `file:{file_key}` id as that completion
+                    // (`catalog::file_doc`, `catalog.rs`). Pushing one
+                    // here put two documents with one id in the same
+                    // bulk, and the later one wins: a file that
+                    // indexed N records was reported as status "junk"
+                    // with records 0, `junk_file_count` counted it
+                    // twice, and `code_coverage.observe` ran for it
+                    // twice. The dropped records are already carried
+                    // on that file's own completion as `junk`
+                    // (`file_junk` below), which is where a per-file
+                    // drop count belongs.
+                    pr.note(&format!(
+                        "{}: {total} record(s) dropped: group(s) never sampled in \
                                  phase A, so they have no dataset — {named}{suffix}",
+                        f.rel
+                    ));
+                }
+            }
+            // Raw-source href pass: the HTML extractor strips markup
+            // before sectioning, so `<a href>` evidence exists only in
+            // the raw bytes (detect::href module docs). The second
+            // content::verify below still covers this re-read.
+            if send_err.is_none() {
+                if let Some(gr) = graph.as_ref() {
+                    if let Some(cf) = gr.corpus.files.get(&f.rel).filter(|cf| cf.family == "html") {
+                        if let Ok(Some(bytes)) =
+                            extract::read_whole(&f.path, sn.gzip, extract::MAX_WHOLE_FILE)
+                        {
+                            let (raw, _) = sniff::decode_text(&bytes);
+                            gr.href_raw
+                                .detect_raw_html(&gr.corpus, cf, &raw, &mut edge_drafts);
+                        }
+                    }
+                }
+            }
+            if send_err.is_none() {
+                if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
+                    send_err = Some(format!(
+                        "{error:#}; no records from this changing file were made visible"
+                    ));
+                }
+            }
+            // Visibility begins only after extraction and the second
+            // full-content verification. Delete-before-replace makes
+            // a retry clean up any partial prior attempt.
+            if send_err.is_none() && cleanup_required.contains(key) {
+                let mut indices: Vec<&str> = fa
+                    .assignments
+                    .iter()
+                    .filter_map(|(_, slug)| ds_rt.get(slug).map(|rt| rt.index.as_str()))
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                for index in indices {
+                    if let Err(error) =
+                        es.delete_by_query(index, &json!({"term": {"ax_file": key}}))
+                    {
+                        send_err = Some(format!(
+                            "remove prior records for {} before replacement: {error:#}",
+                            f.rel
+                        ));
+                        break;
+                    }
+                }
+                if send_err.is_none() {
+                    if let Err(error) = replacement_failpoint(2, &state_dir) {
+                        send_err = Some(format!("{error:#}"));
+                    }
+                }
+            }
+            if send_err.is_none() {
+                if let Err(error) = staged.as_file_mut().rewind() {
+                    send_err = Some(format!("rewind staged records for {}: {error}", f.rel));
+                }
+            }
+            if send_err.is_none() {
+                // The second half of a mailbox's bar: staged bytes
+                // handed to the engine, out of staged bytes in total.
+                // Credit is taken at submission: the shared buffer
+                // (#1147) may hold these bytes for a moment before a
+                // flush carries them, and the bar measures reading
+                // work, not wire time.
+                let credit_send = sn.family == Family::Mbox;
+                let staged_len = staged.as_file().metadata().map(|m| m.len()).unwrap_or(0);
+                let mut staged_sent = 0u64;
+                let mut reader = BufReader::new(staged.as_file_mut());
+                // A LOCAL chunk, not the bulk: chunks join whatever
+                // the other workers are staging in the shared buffer,
+                // so a small file stops paying for its own round-trip.
+                let mut chunk: Vec<u8> = Vec::with_capacity(bulk_cut + (1 << 20));
+                let mut docs = 0usize;
+                loop {
+                    // A bulk already carrying this file's records was
+                    // refused: stop reading. The sticky error comes
+                    // back from `settle` below (the pre-resolution
+                    // from a successful tail bulk must not clear it).
+                    if pipe.failed(file_token) {
+                        break;
+                    }
+                    let mut action = Vec::new();
+                    match reader.read_until(b'\n', &mut action) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) => {
+                            send_err = Some(format!("read staged action for {}: {error}", f.rel));
+                            break;
+                        }
+                    }
+                    let mut document = Vec::new();
+                    match reader.read_until(b'\n', &mut document) {
+                        Ok(0) => {
+                            send_err = Some(format!(
+                                "staged record for {} ended without a document",
                                 f.rel
                             ));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            send_err = Some(format!("read staged document for {}: {error}", f.rel));
+                            break;
                         }
                     }
-                    // Raw-source href pass: the HTML extractor strips markup
-                    // before sectioning, so `<a href>` evidence exists only in
-                    // the raw bytes (detect::href module docs). The second
-                    // content::verify below still covers this re-read.
-                    if send_err.is_none() {
-                        if let Some(gr) = graph.as_ref() {
-                            if let Some(cf) =
-                                gr.corpus.files.get(&f.rel).filter(|cf| cf.family == "html")
-                            {
-                                if let Ok(Some(bytes)) =
-                                    extract::read_whole(&f.path, sn.gzip, extract::MAX_WHOLE_FILE)
-                                {
-                                    let (raw, _) = sniff::decode_text(&bytes);
-                                    gr.href_raw.detect_raw_html(
-                                        &gr.corpus,
-                                        cf,
-                                        &raw,
-                                        &mut edge_drafts,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if send_err.is_none() {
-                        if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
-                            send_err = Some(format!(
-                                "{error:#}; no records from this changing file were made visible"
+                    chunk.extend_from_slice(&action);
+                    chunk.extend_from_slice(&document);
+                    staged_sent += (action.len() + document.len()) as u64;
+                    docs += 1;
+                    if chunk.len() >= bulk_cut || docs >= 5000 {
+                        pipe.submit(file_token, std::mem::take(&mut chunk), docs);
+                        docs = 0;
+                        chunk.reserve(bulk_cut);
+                        if credit_send {
+                            in_flight.advance_to(container_send_credit(
+                                f.size,
+                                staged_sent,
+                                staged_len,
                             ));
                         }
                     }
-                    // Visibility begins only after extraction and the second
-                    // full-content verification. Delete-before-replace makes
-                    // a retry clean up any partial prior attempt.
-                    if send_err.is_none() && cleanup_required.contains(key) {
-                        let mut indices: Vec<&str> = fa
-                            .assignments
-                            .iter()
-                            .filter_map(|(_, slug)| ds_rt.get(slug).map(|rt| rt.index.as_str()))
-                            .collect();
-                        indices.sort_unstable();
-                        indices.dedup();
-                        for index in indices {
-                            if let Err(error) =
-                                es.delete_by_query(index, &json!({"term": {"ax_file": key}}))
-                            {
-                                send_err = Some(format!(
-                                    "remove prior records for {} before replacement: {error:#}",
-                                    f.rel
-                                ));
-                                break;
-                            }
+                }
+                if !chunk.is_empty() && !pipe.failed(file_token) {
+                    pipe.submit(file_token, chunk, docs);
+                }
+            }
+            // The file's records are in the shared buffer, possibly
+            // already flushed inline; settle blocks until the bulk
+            // carrying them was accepted. Until it returns Ok, the
+            // records are NOT durably in and neither the edges below
+            // nor the journal commit may run.
+            if send_err.is_none() {
+                if let Err(e) = pipe.settle(file_token) {
+                    send_err = Some(e);
+                }
+            }
+            // Second-brain edges for this file (§6.7): only after the
+            // node bulks were accepted, so an edge never precedes its
+            // own src doc. A failed edge send leaves the file
+            // un-journaled — the whole file (nodes AND edges) is
+            // republished on the next run, which converges because
+            // both sides overwrite by deterministic _id.
+            if send_err.is_none() && !edge_drafts.is_empty() {
+                if let Some(gr) = graph.as_ref() {
+                    let out = detect::assemble(&edge_drafts, &gr.edges_index, gr.created_at_ms);
+                    gr.self_dropped
+                        .fetch_add(out.self_dropped, Ordering::Relaxed);
+                    let mut ebuf: Vec<u8> = Vec::new();
+                    for edge in &out.edges {
+                        ebuf.extend_from_slice(&edge.ndjson);
+                        if ebuf.len() >= bulk_cut
+                            && record_bulk_outcome(
+                                &es,
+                                std::mem::take(&mut ebuf),
+                                &rejected_records,
+                                &bulk_errors,
+                                &mut send_err,
+                            )
+                        {
+                            break;
                         }
-                        if send_err.is_none() {
-                            if let Err(error) = replacement_failpoint(2, &state_dir) {
-                                send_err = Some(format!("{error:#}"));
-                            }
-                        }
+                    }
+                    if send_err.is_none() && !ebuf.is_empty() {
+                        record_bulk_outcome(
+                            &es,
+                            ebuf,
+                            &rejected_records,
+                            &bulk_errors,
+                            &mut send_err,
+                        );
                     }
                     if send_err.is_none() {
-                        if let Err(error) = staged.as_file_mut().rewind() {
-                            send_err =
-                                Some(format!("rewind staged records for {}: {error}", f.rel));
+                        let mut written = gr.written.lock().unwrap();
+                        for edge in &out.edges {
+                            *written.entry(edge.detector).or_default() += 1;
                         }
                     }
-                    if send_err.is_none() {
-                        // The second half of a mailbox's bar: staged bytes
-                        // handed to the engine, out of staged bytes in total.
-                        // Credit is taken at submission: the shared buffer
-                        // (#1147) may hold these bytes for a moment before a
-                        // flush carries them, and the bar measures reading
-                        // work, not wire time.
-                        let credit_send = sn.family == Family::Mbox;
-                        let staged_len = staged.as_file().metadata().map(|m| m.len()).unwrap_or(0);
-                        let mut staged_sent = 0u64;
-                        let mut reader = BufReader::new(staged.as_file_mut());
-                        // A LOCAL chunk, not the bulk: chunks join whatever
-                        // the other workers are staging in the shared buffer,
-                        // so a small file stops paying for its own round-trip.
-                        let mut chunk: Vec<u8> = Vec::with_capacity(bulk_cut + (1 << 20));
-                        let mut docs = 0usize;
-                        loop {
-                            // A bulk already carrying this file's records was
-                            // refused: stop reading. The sticky error comes
-                            // back from `settle` below (the pre-resolution
-                            // from a successful tail bulk must not clear it).
-                            if pipe.failed(file_token) {
-                                break;
-                            }
-                            let mut action = Vec::new();
-                            match reader.read_until(b'\n', &mut action) {
-                                Ok(0) => break,
-                                Ok(_) => {}
-                                Err(error) => {
-                                    send_err =
-                                        Some(format!("read staged action for {}: {error}", f.rel));
-                                    break;
-                                }
-                            }
-                            let mut document = Vec::new();
-                            match reader.read_until(b'\n', &mut document) {
-                                Ok(0) => {
-                                    send_err = Some(format!(
-                                        "staged record for {} ended without a document",
-                                        f.rel
-                                    ));
-                                    break;
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    send_err = Some(format!(
-                                        "read staged document for {}: {error}",
-                                        f.rel
-                                    ));
-                                    break;
-                                }
-                            }
-                            chunk.extend_from_slice(&action);
-                            chunk.extend_from_slice(&document);
-                            staged_sent += (action.len() + document.len()) as u64;
-                            docs += 1;
-                            if chunk.len() >= bulk_cut || docs >= 5000 {
-                                pipe.submit(file_token, std::mem::take(&mut chunk), docs);
-                                docs = 0;
-                                chunk.reserve(bulk_cut);
-                                if credit_send {
-                                    in_flight.advance_to(container_send_credit(
-                                        f.size,
-                                        staged_sent,
-                                        staged_len,
-                                    ));
-                                }
-                            }
-                        }
-                        if !chunk.is_empty() && !pipe.failed(file_token) {
-                            pipe.submit(file_token, chunk, docs);
-                        }
-                    }
-                    // The file's records are in the shared buffer, possibly
-                    // already flushed inline; settle blocks until the bulk
-                    // carrying them was accepted. Until it returns Ok, the
-                    // records are NOT durably in and neither the edges below
-                    // nor the journal commit may run.
-                    if send_err.is_none() {
-                        if let Err(e) = pipe.settle(file_token) {
-                            send_err = Some(e);
-                        }
-                    }
-                    // Second-brain edges for this file (§6.7): only after the
-                    // node bulks were accepted, so an edge never precedes its
-                    // own src doc. A failed edge send leaves the file
-                    // un-journaled — the whole file (nodes AND edges) is
-                    // republished on the next run, which converges because
-                    // both sides overwrite by deterministic _id.
-                    if send_err.is_none() && !edge_drafts.is_empty() {
-                        if let Some(gr) = graph.as_ref() {
-                            let out =
-                                detect::assemble(&edge_drafts, &gr.edges_index, gr.created_at_ms);
-                            gr.self_dropped
-                                .fetch_add(out.self_dropped, Ordering::Relaxed);
-                            let mut ebuf: Vec<u8> = Vec::new();
-                            for edge in &out.edges {
-                                ebuf.extend_from_slice(&edge.ndjson);
-                                if ebuf.len() >= bulk_cut
-                                    && record_bulk_outcome(
-                                        &es,
-                                        std::mem::take(&mut ebuf),
-                                        &rejected_records,
-                                        &bulk_errors,
-                                        &mut send_err,
-                                    )
-                                {
-                                    break;
-                                }
-                            }
-                            if send_err.is_none() && !ebuf.is_empty() {
-                                record_bulk_outcome(
-                                    &es,
-                                    ebuf,
-                                    &rejected_records,
-                                    &bulk_errors,
-                                    &mut send_err,
-                                );
-                            }
-                            if send_err.is_none() {
-                                let mut written = gr.written.lock().unwrap();
-                                for edge in &out.edges {
-                                    *written.entry(edge.detector).or_default() += 1;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(e) = send_err {
-                        // endpoint trouble: record, do NOT journal file_done
-                        let mut be = bulk_errors.lock().unwrap();
-                        if be.len() < 5 {
-                            be.push(e);
-                        }
-                        continue;
-                    }
-                    if let Err(error) = replacement_failpoint(4, &state_dir) {
-                        let mut errors = bulk_errors.lock().unwrap();
-                        if errors.len() < 5 {
-                            errors.push(format!("{error:#}"));
-                        }
-                        continue;
-                    }
-                    records_total.fetch_add(file_records, Ordering::Relaxed);
-                    junk_records.fetch_add(file_junk, Ordering::Relaxed);
-                    let (commit_result, journal_path) = {
-                        let mut journal = journal_mx.lock().unwrap();
-                        let path = journal.path().display().to_string();
-                        let result = journal.file_done(&FileDone {
-                            file_key: key.clone(),
-                            path: f.rel.clone(),
-                            records: file_records,
-                            junk: file_junk,
-                            bytes: f.size,
-                            dropped_by_dataset: file_dropped_by_dataset,
-                            generation: Some(expected_digest.clone()),
-                        });
-                        (result, path)
-                    };
-                    match commit_result {
-                        Ok(()) => {}
-                        Err(error) => {
-                            let mut errors = bulk_errors.lock().unwrap();
-                            if errors.len() < 5 {
-                                errors.push(format!(
-                                    "durably commit completed source {} to {}: {error:#}. \
+                }
+            }
+            if let Some(e) = send_err {
+                // endpoint trouble: record, do NOT journal file_done
+                let mut be = bulk_errors.lock().unwrap();
+                if be.len() < 5 {
+                    be.push(e);
+                }
+                continue;
+            }
+            if let Err(error) = replacement_failpoint(4, &state_dir) {
+                let mut errors = bulk_errors.lock().unwrap();
+                if errors.len() < 5 {
+                    errors.push(format!("{error:#}"));
+                }
+                continue;
+            }
+            records_total.fetch_add(file_records, Ordering::Relaxed);
+            junk_records.fetch_add(file_junk, Ordering::Relaxed);
+            let (commit_result, journal_path) = {
+                let mut journal = journal_mx.lock().unwrap();
+                let path = journal.path().display().to_string();
+                let result = journal.file_done(&FileDone {
+                    file_key: key.clone(),
+                    path: f.rel.clone(),
+                    records: file_records,
+                    junk: file_junk,
+                    bytes: f.size,
+                    dropped_by_dataset: file_dropped_by_dataset,
+                    generation: Some(expected_digest.clone()),
+                });
+                (result, path)
+            };
+            match commit_result {
+                Ok(()) => {}
+                Err(error) => {
+                    let mut errors = bulk_errors.lock().unwrap();
+                    if errors.len() < 5 {
+                        errors.push(format!(
+                            "durably commit completed source {} to {}: {error:#}. \
                                      Live records may be present, but the file remains pending; \
                                      repair journal storage and rerun autoindex",
-                                    f.rel, journal_path
-                                ));
-                            }
-                            continue;
-                        }
+                            f.rel, journal_path
+                        ));
                     }
-                    // Workers no longer print. A worker can block for minutes
-                    // inside one file, so a worker-driven heartbeat cannot
-                    // bound silence; the ticker thread can, and does.
-                    files_done.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-            });
+            }
+            // Workers no longer print. A worker can block for minutes
+            // inside one file, so a worker-driven heartbeat cannot
+            // bound silence; the ticker thread can, and does.
+            files_done.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    // #1122: `Scope::spawn` panics when a thread cannot be created (thread
+    // limit, memory exhaustion), and release builds are panic=abort, so one
+    // failed spawn used to abort the whole run. Spawn through the fallible
+    // builder instead: workers that did start share the queue between them,
+    // the pipe stops counting the ones that never did, and if none started
+    // this thread works the queue itself. Slower, never wrong.
+    std::thread::scope(|scope| {
+        let mut started = 0usize;
+        for _ in 0..worker_count {
+            match std::thread::Builder::new()
+                .name("autoindex-worker".into())
+                .spawn_scoped(scope, worker)
+            {
+                Ok(_) => started += 1,
+                Err(error) => {
+                    pr.note(&format!(
+                        "autoindex: could not start indexing worker {} of {worker_count} \
+                         ({error}); continuing with {}",
+                        started + 1,
+                        started.max(1)
+                    ));
+                    break;
+                }
+            }
+        }
+        if started == 0 && worker_count > 0 {
+            pipe.abandon_workers(worker_count - 1);
+            worker();
+        } else {
+            pipe.abandon_workers(worker_count - started);
         }
     });
 
@@ -11649,6 +11667,32 @@ mod bulk_pipe_tests {
             "crossing the cut flushes immediately"
         );
         pipe.settle(t).expect("accepted");
+        pipe.retire();
+    }
+
+    /// #1122: workers whose threads never started must stop counting as
+    /// live. A pipe sized for four with three abandoned is a one-worker pipe:
+    /// that worker's residual buffer ships as soon as it settles, instead of
+    /// parking for a 30 s timeout waiting on three workers that do not exist.
+    #[test]
+    fn abandoned_workers_do_not_hold_back_the_residual_buffer() {
+        let bodies = Mutex::new(Vec::new());
+        let rejected = AtomicU64::new(0);
+        let errors = Mutex::new(Vec::new());
+        let pipe = BulkPipe::new(recording_send(&bodies), 64, 5000, &rejected, &errors, 4);
+        pipe.abandon_workers(3);
+
+        let t = pipe.token();
+        pipe.submit(t, vec![b'x'; 10], 1);
+        assert!(bodies.lock().unwrap().is_empty(), "below the cut: buffered");
+        let started = std::time::Instant::now();
+        pipe.settle(t).expect("accepted");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the lone live worker shipped its own residual, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 1);
         pipe.retire();
     }
 
