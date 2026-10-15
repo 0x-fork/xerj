@@ -9351,13 +9351,21 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
             })
             .unwrap_or_default())
     };
-    let mut ds_query = json!({"term": {"doc_kind": "dataset"}});
+    // `--prefix` scoping runs server-side first, so a node holding more
+    // catalog docs than one fetch returns (500 datasets / 200 correlations /
+    // 500 runs across every corpus) still answers for the requested corpus.
+    // The server filter over-approximates (`{prefix}-` also matches a longer
+    // hyphenated prefix; a phrase on a legacy text-inferred `prefix` matches a
+    // superset); the exact `catalog::*_matches_prefix` retains below decide.
+    let scoped_prefix = cfg.prefix.as_deref().map(|p| format!("{p}-"));
+    let mut ds_must = vec![json!({"term": {"doc_kind": "dataset"}})];
     if let Some(slug) = &cfg.dataset {
-        ds_query = json!({"bool": {"must": [
-            {"term": {"doc_kind": "dataset"}},
-            {"term": {"slug": slug}}
-        ]}});
+        ds_must.push(json!({"term": {"slug": slug}}));
     }
+    if let Some(sp) = &scoped_prefix {
+        ds_must.push(json!({"prefix": {"index_name": sp}}));
+    }
+    let ds_query = json!({"bool": {"must": ds_must}});
     let mut datasets = fetch(ds_query, 500, Some(json!([{"record_count": "desc"}])))?;
     if let Some(prefix) = cfg.prefix.as_deref() {
         datasets.retain(|d| catalog::dataset_matches_prefix(d, prefix));
@@ -9378,7 +9386,20 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         }
         return Ok(1);
     }
-    let mut runs = fetch(json!({"term": {"doc_kind": "run"}}), 500, None)?;
+    let mut run_must = vec![json!({"term": {"doc_kind": "run"}})];
+    if let Some(prefix) = cfg.prefix.as_deref() {
+        // `term` on the declared keyword `prefix`; `match_phrase` covers a
+        // pre-#737 catalog where `prefix` was inferred as `text` and a term
+        // on a hyphenated value matches nothing.
+        run_must.push(json!({"bool": {
+            "should": [
+                {"term": {"prefix": prefix}},
+                {"match_phrase": {"prefix": prefix}}
+            ],
+            "minimum_should_match": 1
+        }}));
+    }
+    let mut runs = fetch(json!({"bool": {"must": run_must}}), 500, None)?;
     if let Some(prefix) = cfg.prefix.as_deref() {
         runs.retain(|r| {
             r.get("prefix")
@@ -9396,7 +9417,12 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         )
     });
     let correlations = {
-        let mut all = fetch(json!({"term": {"doc_kind": "correlation"}}), 200, None)?;
+        let mut corr_must = vec![json!({"term": {"doc_kind": "correlation"}})];
+        if let Some(sp) = &scoped_prefix {
+            corr_must.push(json!({"prefix": {"a_index": sp}}));
+            corr_must.push(json!({"prefix": {"b_index": sp}}));
+        }
+        let mut all = fetch(json!({"bool": {"must": corr_must}}), 200, None)?;
         if let Some(prefix) = cfg.prefix.as_deref() {
             all.retain(|c| catalog::correlation_matches_prefix(c, prefix));
         }
