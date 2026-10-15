@@ -374,7 +374,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, label: &Path) -> IndexCfg {
         follow_symlinks: false,
         follow_symlinks_outside_root: false,
         ignore: crate::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 1,
+        max_file_bytes: 1 << 30,
         sample: 100,
         no_semantic: true,
         code_analyzer: Default::default(),

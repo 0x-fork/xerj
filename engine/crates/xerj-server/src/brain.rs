@@ -624,7 +624,7 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         // rather than inventing its own: build output does not belong in a
         // second brain either (#276).
         ignore: xerj_autoindex::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 2,
+        max_file_bytes: 2 << 30,
         sample: 500,
         no_semantic: false,
         code_analyzer: Default::default(),

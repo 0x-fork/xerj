@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 55 of XERJ's 130 user-facing settings to their
+# This file sets 55 of XERJ's 132 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -681,3 +681,23 @@ access_log = false
 # min_confidence = 0.0            # /_decide abstains below this
 # human_weight   = 2.0            # vote-weight multiplier for history docs carrying human: true
 # calibration    = "none"         # none | isotonic | temperature — p_cal beside every p_raw (#1063)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Corpus Hub — hosted read-only endpoints.
+#
+# Four GET routes under /_hub/v1/ answer from the pre-indexed corpus packs
+# restored on this node: /catalogue, /def/{slug}/{symbol}, /code/{slug} and
+# /search. They are served on the ES-compatible port (es_compat_port), are
+# read-only, only ever query xc-* indices, and are rate limited to 60
+# requests a minute per client address (429 + Retry-After).
+# By default every route needs an API key like the rest of the node.
+# `public = true` lets exactly those four routes answer without one; every
+# other route keeps authentication, authorization and the audit log.
+# `catalogue_path` is the signed catalogue.json the node serves and checks
+# every corpus name against; it is required when `public = true`, or the
+# node refuses to start. Behind a reverse proxy, also list the proxy in
+# [server] trusted_proxies, or every client shares the proxy's one budget.
+#
+# [hub]
+# public         = false
+# catalogue_path = ""    # not a default ("/srv/hub/catalogue.json") — required when public = true

@@ -775,7 +775,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         follow_symlinks_outside_root: false,
         stub_globs: Vec::new(),
         ignore: crate::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 1,
+        max_file_bytes: 1 << 30,
         sample: 50,
         no_semantic: true,
         code_analyzer: Default::default(),
@@ -3447,7 +3447,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             tally: &crate::ScanTally::default(),
         },
         100,
-        1,
+        1 << 30,
         false,
     );
     assert!(scan.pdf_spool.is_none());
@@ -3536,7 +3536,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             tally: &crate::ScanTally::default(),
         },
         100,
-        1,
+        1 << 30,
         false,
     );
 
@@ -3616,7 +3616,7 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
             tally: &crate::ScanTally::default(),
         },
         100,
-        1,
+        1 << 30,
         false,
     );
     assert!(scan.junk.is_some());

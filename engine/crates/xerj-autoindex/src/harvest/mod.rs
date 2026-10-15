@@ -288,6 +288,24 @@ fn kind_name(kind: SourceKind) -> &'static str {
 /// (posix-relative-path, absolute-path), sorted — directory iteration order
 /// must never reach the output.
 fn walk(root: &Path, glob: &str) -> Result<Vec<(String, PathBuf)>> {
+    // A source root that cannot be read is a HARD error, never an empty
+    // walk. A `dir` source whose path is typo'd, points at the wrong cwd, or
+    // names a tree that was renamed upstream would otherwise walk to zero
+    // files; `prune` then deletes every envelope the slug ever stored and
+    // the build exits 0 with a smaller, all-checksums-valid pack — silent
+    // data loss (#1110 negative-path audit, gap 1). An existing but empty
+    // directory is still allowed: a legitimately empty upstream prunes to
+    // zero on purpose, a missing one does not.
+    let meta = std::fs::metadata(root).with_context(|| {
+        format!(
+            "source root {} cannot be read — a typo'd path or a moved upstream \
+             tree must fail the build, not silently empty the pack",
+            root.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        bail!("source root {} is not a directory", root.display());
+    }
     let re = glob_regex(glob);
     let mut out = Vec::new();
     fn recurse(dir: &Path, root: &Path, re: &regex::Regex, out: &mut Vec<(String, PathBuf)>) {
@@ -418,6 +436,28 @@ mod tests {
         let files = walk(&root, "**/*.json").unwrap();
         let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
         assert_eq!(rels, vec!["a/first.json", "b/second.json"]);
+    }
+
+    #[test]
+    fn walk_refuses_a_missing_root_instead_of_pruning_everything() {
+        // #1110 gap 1: a missing source root must fail the build, not walk to
+        // zero files and let `prune` wipe the slug with a green exit.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = walk(&missing, "**/*.json").unwrap_err().to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+
+        // an existing but empty directory is still fine — a legitimately
+        // empty upstream prunes to zero on purpose.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(walk(&empty, "**/*.json").unwrap().is_empty());
+
+        // a file where a directory is expected is also refused.
+        let afile = tmp.path().join("a.json");
+        std::fs::write(&afile, "{}").unwrap();
+        let err = walk(&afile, "**/*.json").unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
     }
 
     #[test]
