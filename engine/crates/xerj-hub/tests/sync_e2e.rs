@@ -430,10 +430,17 @@ fn age_file(path: &Path, secs: u64) {
         .unwrap();
 }
 
+/// Every DIRECTORY under the corpus's pack dir: installed pins, plus any
+/// half-extracted `<pin8>.tmp` scratch dir a broken pull or sync would leave
+/// (which must show up and fail the assertion). The `<pin8>.lock` files are
+/// left out on purpose: they are flock files that `crate::flock` never deletes
+/// by design (unlinking one lets a waiter lock a dead inode), so they are not
+/// state a pull or a sync is responsible for removing.
 fn pin_dirs(hub_home: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(hub_home.join("packs/mini-c"))
         .map(|rd| {
             rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect()
         })
