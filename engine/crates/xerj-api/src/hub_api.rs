@@ -1849,6 +1849,16 @@ async fn refusal(resp: Response) -> HubRefusal {
 }
 
 impl HubShared {
+    /// Count one request from a transport that is not an axum request (the
+    /// gRPC `XerjHub` service) against the same per-client budget the HTTP
+    /// routes' layer draws on. The client is read exactly as there
+    /// ([`crate::share::client_source`]): the TCP `peer`, or the
+    /// `x-forwarded-for` values only when `peer` is a declared
+    /// `server.trusted_proxies` entry.
+    pub fn admit_peer(&self, peer: Option<IpAddr>, forwarded: &[&str]) -> Result<(), HubRefusal> {
+        self.admit(&crate::share::client_source(&self.app, peer, forwarded))
+    }
+
     /// Count one request from `client` (an IP address, as text) against the same
     /// per-address budget the HTTP routes use ([`RATE_LIMIT`] per
     /// [`RATE_WINDOW`]); `Err` is the `429` refusal.
