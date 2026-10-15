@@ -86,7 +86,7 @@ use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use xerj_api::{build_es_compat_router, build_native_router, AppState};
+use xerj_api::{build_es_compat_router_with_hub, build_native_router, AppState};
 use xerj_cluster::{transport::TcpTransport, ClusterNode, ClusterRunner};
 use xerj_common::{config::Config, metrics::Metrics};
 use xerj_console_api::{state::ClusterMode, ConsoleState, RpConfig};
@@ -2880,7 +2880,10 @@ async fn async_main() -> Result<()> {
     //     merge would leave xerj-api compiling and serving on its own
     //     — a property worth preserving.
     let mut native_router = build_native_router(state.clone());
-    let mut es_router = build_es_compat_router(state.clone());
+    // One hub state for the ES-compat `/_hub/v1/*` routes AND the gRPC
+    // `XerjHub` service: one rate-limit budget per client across both.
+    let hub_shared = xerj_api::hub_api::HubShared::new(state.clone());
+    let mut es_router = build_es_compat_router_with_hub(state.clone(), hub_shared.clone());
     if let Some(console_state) = xerj_console_state {
         let xerj_console_router = xerj_console_api::xerj_console_router(console_state);
         native_router = native_router.merge(xerj_console_router.clone());
@@ -2970,7 +2973,9 @@ async fn async_main() -> Result<()> {
     // made no false claim: it did hold the port.
     let grpc_state = state.clone();
     let grpc = tokio::spawn(async move {
-        if let Err(e) = grpc::serve_grpc_on(grpc_listener, grpc_state, shutdown_signal()).await {
+        if let Err(e) =
+            grpc::serve_grpc_on(grpc_listener, grpc_state, hub_shared, shutdown_signal()).await
+        {
             error!("gRPC server: {e:#}");
         }
     });

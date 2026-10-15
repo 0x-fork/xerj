@@ -16,8 +16,15 @@
 //! decision (an `excluded` corpus is never served; an `approach-only` one tags
 //! every hit with its licence warning), the 512-byte input cap, the `k` clamp,
 //! the in-process node pinned to one corpus build, the `xc-*` visibility guard,
-//! the query-concurrency cap and timeout, the per-address rate limit — applies
+//! the query-concurrency cap and timeout, the per-client rate limit — applies
 //! here unchanged, because it is the same code.
+//!
+//! It is also the same STATE: the service holds the very [`HubShared`] the
+//! ES-compat router's `/_hub/v1/*` routes were built over, so a client has one
+//! rate-limit budget across both listeners (not one per listener), and the
+//! client is read as the HTTP layer reads it
+//! ([`xerj_api::share::client_source`]: the TCP peer, or `x-forwarded-for`
+//! metadata only when the peer is a declared `server.trusted_proxies` entry).
 //!
 //! Read-only: none of the three RPCs writes, pulls, evicts or deletes anything
 //! (`ask_answer` runs the flow offline with a backend that refuses to pull).
@@ -47,25 +54,23 @@ use tonic::{Request, Response, Status};
 
 use xerj_api::auth::Principal;
 use xerj_api::hub_api::{self, HubAsk, HubRefusal, HubShared};
-use xerj_api::AppState;
 use xerj_common::hub::{Answer, AnswerMode, Hit};
 use xerj_engine::index_guard;
 
 use crate::grpc::pb;
 use pb::xerj_hub_server::XerjHub;
 
-/// The `XerjHub` service. Holds its own [`HubShared`] (query slots, rate-limit
-/// budget, catalogue cache), as each HTTP router does.
+/// The `XerjHub` service. Holds the node's [`HubShared`] (query slots,
+/// rate-limit budget, catalogue cache) — the one the ES-compat router's hub
+/// routes hold, never a second one.
 #[derive(Clone)]
 pub struct HubService {
     shared: Arc<HubShared>,
 }
 
 impl HubService {
-    pub fn new(state: AppState) -> Self {
-        Self {
-            shared: HubShared::new(state),
-        }
+    pub fn new(shared: Arc<HubShared>) -> Self {
+        Self { shared }
     }
 
     /// Who is calling and from where, with the rate limit counted. The visibility
@@ -88,11 +93,15 @@ impl HubService {
                 "a share link reads the index it was issued for, not the hub",
             ));
         }
-        let client = request
-            .remote_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        self.shared.admit(&client).map_err(refusal_status)?;
+        let forwarded: Vec<&str> = request
+            .metadata()
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        self.shared
+            .admit_peer(request.remote_addr().map(|a| a.ip()), &forwarded)
+            .map_err(refusal_status)?;
         let visibility =
             (!principal.is_superuser()).then(|| xerj_api::authz::visibility_for(&principal));
         // The in-process node forwards the caller's credential the way the HTTP
@@ -479,6 +488,122 @@ mod tests {
         assert_eq!(limited.message(), "why");
     }
 
+    // ── the rate limit: one budget per client, across HTTP and gRPC ──
+
+    mod rate_limit {
+        use super::super::*;
+        use axum::body::Body;
+        use std::net::SocketAddr;
+        use tonic::transport::server::TcpConnectInfo;
+        use tower::ServiceExt;
+        use xerj_api::hub_api::RATE_LIMIT;
+
+        fn state(dir: &std::path::Path, trusted: &[&str]) -> xerj_api::AppState {
+            let mut config = xerj_common::config::Config::default();
+            config.server.data_dir = dir.to_string_lossy().into_owned();
+            config.server.trusted_proxies = trusted.iter().map(|s| s.to_string()).collect();
+            let metrics = xerj_common::metrics::Metrics::new().unwrap();
+            let engine = xerj_engine::Engine::new(config.clone()).unwrap();
+            xerj_api::AppState::new(config, engine, metrics)
+        }
+
+        /// A request as tonic's transport hands it to the service: the
+        /// interceptor's principal installed, the TCP peer recorded, and
+        /// whatever `x-forwarded-for` metadata the caller chose to send.
+        fn from(peer: Option<&str>, xff: Option<&str>) -> Request<()> {
+            let mut r = Request::new(());
+            r.extensions_mut().insert(Principal::Superuser);
+            if let Some(peer) = peer {
+                r.extensions_mut().insert(TcpConnectInfo {
+                    local_addr: None,
+                    remote_addr: Some(peer.parse::<SocketAddr>().unwrap()),
+                });
+            }
+            if let Some(xff) = xff {
+                r.metadata_mut()
+                    .insert("x-forwarded-for", xff.parse().unwrap());
+            }
+            r
+        }
+
+        fn admitted(svc: &HubService, r: &Request<()>) -> Result<(), tonic::Code> {
+            svc.admit(r).map(|_| ()).map_err(|s| s.code())
+        }
+
+        /// The two listeners wired as `main.rs` wires them: one `HubShared`
+        /// for the ES-compat router and the gRPC service.
+        #[tokio::test]
+        async fn http_and_grpc_draw_on_one_budget() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state(dir.path(), &[]);
+            let shared = HubShared::new(state.clone());
+            let app = xerj_api::router::build_es_compat_router_with_hub(state, shared.clone());
+            let svc = HubService::new(shared);
+            // `oneshot` carries no ConnectInfo, so HTTP keys these on
+            // `unknown`; a gRPC request with no peer keys on `unknown` too.
+            for i in 0..RATE_LIMIT {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::get("/_hub/v1/catalogue")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(resp.status().as_u16(), 429, "HTTP request {i}");
+            }
+            assert_eq!(
+                admitted(&svc, &from(None, None)),
+                Err(tonic::Code::ResourceExhausted),
+                "{RATE_LIMIT} HTTP requests spent the client's budget; gRPC must not grant \
+                 a second one"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_trusted_proxy_is_keyed_on_the_forwarded_client() {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = HubService::new(HubShared::new(state(dir.path(), &["10.0.0.0/8"])));
+            for _ in 0..RATE_LIMIT {
+                admitted(&svc, &from(Some("10.1.1.1:5000"), Some("203.0.113.5"))).unwrap();
+            }
+            assert_eq!(
+                admitted(&svc, &from(Some("10.1.1.1:5000"), Some("203.0.113.5"))),
+                Err(tonic::Code::ResourceExhausted),
+                "the forwarded client is throttled"
+            );
+            assert_eq!(
+                admitted(&svc, &from(Some("10.1.1.1:5001"), Some("203.0.113.6"))),
+                Ok(()),
+                "another client behind the same sidecar has its own budget"
+            );
+            // Right-to-left past declared proxies, as the HTTP path reads it.
+            assert_eq!(
+                admitted(
+                    &svc,
+                    &from(Some("10.1.1.1:5002"), Some("198.51.100.7, 10.2.2.2"))
+                ),
+                Ok(()),
+            );
+        }
+
+        #[tokio::test]
+        async fn an_untrusted_peer_cannot_pick_its_bucket() {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = HubService::new(HubShared::new(state(dir.path(), &["10.0.0.0/8"])));
+            for i in 0..RATE_LIMIT {
+                let xff = format!("203.0.113.{i}");
+                admitted(&svc, &from(Some("192.0.2.9:7000"), Some(&xff))).unwrap();
+            }
+            assert_eq!(
+                admitted(&svc, &from(Some("192.0.2.9:7000"), Some("198.51.100.99"))),
+                Err(tonic::Code::ResourceExhausted),
+                "a fresh x-forwarded-for from an untrusted peer is ignored"
+            );
+        }
+    }
+
     // ── end to end: a real node, a restored fixture corpus, a real listener ──
 
     mod e2e {
@@ -587,7 +712,7 @@ mod tests {
             })
         }
 
-        fn state(dir: &std::path::Path) -> AppState {
+        fn state(dir: &std::path::Path) -> xerj_api::AppState {
             let fx = fixture();
             let mut config = xerj_common::config::Config::default();
             config.server.data_dir = dir.to_string_lossy().into_owned();
@@ -597,7 +722,7 @@ mod tests {
             config.auth.admin_api_key = ADMIN_KEY.into();
             let metrics = xerj_common::metrics::Metrics::new().unwrap();
             let engine = xerj_engine::Engine::new(config.clone()).unwrap();
-            AppState::new(config, engine, metrics)
+            xerj_api::AppState::new(config, engine, metrics)
         }
 
         async fn http(
@@ -697,7 +822,9 @@ mod tests {
             let fx = fixture();
             let data = tempfile::tempdir().unwrap();
             let state = state(data.path());
-            let app = xerj_api::router::build_es_compat_router(state.clone());
+            let shared = HubShared::new(state.clone());
+            let app =
+                xerj_api::router::build_es_compat_router_with_hub(state.clone(), shared.clone());
             seed(
                 &app,
                 "mini-c",
@@ -736,6 +863,7 @@ mod tests {
             let server = tokio::spawn(crate::grpc::serve_grpc_on(
                 listener,
                 state.clone(),
+                shared,
                 async move {
                     let _ = rx.await;
                 },

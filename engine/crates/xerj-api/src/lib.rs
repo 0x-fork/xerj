@@ -90,5 +90,5 @@ pub mod wal_tap_api;
 // ── Convenience re-exports ────────────────────────────────────────────────────
 
 pub use error::ApiError;
-pub use router::{build_es_compat_router, build_native_router};
+pub use router::{build_es_compat_router, build_es_compat_router_with_hub, build_native_router};
 pub use state::{AppState, IndexHandle, IndexSettings};
