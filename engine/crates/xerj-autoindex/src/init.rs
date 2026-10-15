@@ -141,31 +141,35 @@ more than one corpus defines the name.
 - Exit 1, `no hub corpus matches`: the hub does not hold it. Say so. Do not answer from memory.
 - Exit 3: a downloaded pack failed its checksum or signature check and was discarded. Do not use it.
   Tell the user.
+- Exit 5: this build has no hub public key, so no pack can be verified and nothing was downloaded.
+  Tell the user; a retry will not help.
 - `run: xerj hub pull <slug> (<MB> MB)`: the pack is above the automatic download limit. Run that
   line, then ask again. Success: `pulled <slug> <pin8> <bytes> → <n> indices, <defs> definitions`.
 
 ## The node, and where the question goes
 
-If a node answers on `localhost:9200`, XERJ uses it as it is. If none does, XERJ starts its own and
-records its PID. Stop only the node you started: `xerj hub stop` for XERJ's own,
-`kill $(cat ~/xerj-node.pid)` for one you started yourself and saved the PID of.
-Never `pkill xerj` or `killall xerj`: other XERJ nodes may be running on this machine.
+If a node answers on `--url`, `$XERJ_URL` or `localhost:9200` (first one set), XERJ uses it as it
+is. If none does, XERJ starts its own on a free loopback port and records its PID.
+Stop only the node you started: `xerj hub stop` for XERJ's own (success: `stopped the hub node
+(pid <N>)` or `no hub node was started by xerj; nothing to stop`); for a node you started by hand,
+kill only the PID you recorded when you started it. Never `pkill xerj` or `killall xerj`: other XERJ nodes may be running
+on this machine.
 
 By default, inside a git repository the question is answered on this machine. Outside one it may be
 sent to the hosted hub. `xerj hub config hosted off` forbids that.
 
 ## MCP
 
-- `xerj_hub_ask` with `{"question": "<question>"}`: the one line. Add `"corpus": "<slug>"` to name
-  a corpus.
-- `xerj_hub_def` with `{"slug": "<slug>", "symbol": "<SYMBOL>"}`: the `--def` form.
-- `xerj_hub_find` with `{"question": "<question>"}`: which corpora hold this.
+`xerj mcp` in this build has no hub tool: ask the hub with the shell line above. Through MCP you
+get the local-corpus tools (`xerj_search`, `xerj_code_search` and the rest). If your tool list names
+a tool that starts with `xerj_hub_`, your build is newer than this file: prefer that tool.
 
-Register `xerj mcp` once, then restart the session. Success: `xerj_hub_ask` is in the tool list.
-Use the absolute path to the binary (`command -v xerj`): an editor started from a desktop icon does
-not inherit your shell PATH.
+Register `xerj mcp` once, then restart the session. Success: `xerj_search` is in the tool list.
+Use the absolute path to the binary: an editor started from a desktop icon does not inherit your
+shell PATH. `command -v xerj` prints it (PowerShell: `(Get-Command xerj).Source`).
 
 - Claude Code: `claude mcp add --scope user xerj -- "$(command -v xerj)" mcp`
+  (PowerShell or cmd: put the full path of `xerj.exe` in place of `"$(command -v xerj)"`)
 - `.mcp.json` (Claude Code, project scope; `xerj init` writes it), Cursor, Windsurf, Claude Desktop,
   Cline: root key `mcpServers`.
   `{"mcpServers": {"xerj": {"command": "/abs/path/to/xerj", "args": ["mcp"]}}}`
@@ -174,24 +178,66 @@ not inherit your shell PATH.
   `{"servers": {"xerj": {"type": "stdio", "command": "/abs/path/to/xerj", "args": ["mcp"]}}}`
 "##;
 
-/// What `xerj init` prints for the clients `.mcp.json` does not cover. The same
-/// three registrations the hub skill carries; a unit test pins the two together
-/// so they cannot drift apart.
-const MCP_REGISTRATION: &str = r##"MCP registration for other clients (restart the session after; success is `xerj_hub_ask` in the tool list):
-  Claude Code, every project:  claude mcp add --scope user xerj -- "$(command -v xerj)" mcp
-  Cursor, Windsurf, Claude Desktop, Cline:  copy the "xerj" entry from .mcp.json; the root key is "mcpServers"
-  VS Code (.vscode/mcp.json):  root key "servers", not "mcpServers"; the entry needs "type": "stdio""##;
+/// The MCP tool whose presence proves `xerj mcp` is registered. It must be a
+/// tool `xerj mcp` serves today: the hub tools (`xerj_hub_*`, plan step 7) are
+/// not implemented yet, so naming one here would make a correct registration
+/// look like a failure.
+const MCP_SUCCESS_TOOL: &str = "xerj_search";
+
+/// The default node URL; the printed Claude Code line carries `-e XERJ_URL=`
+/// only when init was pointed somewhere else.
+const DEFAULT_URL: &str = "http://localhost:9200";
+
+/// Quote `s` as one argument for the shell the user is most likely to paste
+/// into: POSIX single quotes on Unix, double quotes on Windows (PowerShell and
+/// cmd both accept them; a Windows path cannot contain `"`).
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{s}\"")
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// What `xerj init` prints for the clients `.mcp.json` does not cover: the
+/// Claude Code user-scope line with THIS binary's absolute path and the node
+/// URL `.mcp.json` got (no `$(command -v …)`, which only a POSIX shell
+/// expands), then the root key each other client reads. A unit test pins it to
+/// the hub skill so the two cannot drift apart.
+fn mcp_registration(bin: &str, url: &str) -> String {
+    let env = if url == DEFAULT_URL {
+        String::new()
+    } else {
+        format!(" -e XERJ_URL={}", shell_quote(url))
+    };
+    format!(
+        "MCP registration for other clients (restart the session after; success: `{MCP_SUCCESS_TOOL}` is in the tool list):\n\
+         \x20 Claude Code, every project:  claude mcp add --scope user xerj{env} -- {} mcp\n\
+         \x20 Cursor, Windsurf, Claude Desktop, Cline:  copy the \"xerj\" entry from .mcp.json; the root key is \"mcpServers\"\n\
+         \x20 VS Code (.vscode/mcp.json):  root key \"servers\", not \"mcpServers\"; the entry needs \"type\": \"stdio\"",
+        shell_quote(bin)
+    )
+}
 
 /// What init says last: where to go next, the hub's one line, and the
 /// per-client MCP registration.
-fn closing_message() -> String {
+fn closing_message(bin: &str, url: &str) -> String {
     format!(
         "\ndone. Restart the agent session to pick up the tools, then\n\
          `xerj autoindex <folder>` anything you want searchable.\n\n\
          Public libraries, standards and advisories need no indexing: ask the hub with\n\
          `xerj \"<question>\"` (the xerj-hub skill says when).\n\n\
-         {MCP_REGISTRATION}"
+         {}",
+        mcp_registration(bin, url)
     )
+}
+
+/// This binary's absolute path, the same string `.mcp.json` gets.
+fn self_bin() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "xerj".to_string())
 }
 
 /// Write `content` to `path` unless a file is already there, so a skill the
@@ -234,10 +280,7 @@ fn write_file(path: &Path, content: &str, dry: bool) -> std::io::Result<()> {
 /// Absolute binary path — an MCP host launched from a desktop icon does not
 /// inherit the shell PATH (same rule the `xerj mcp` help documents).
 fn merged_mcp_json(existing: Option<&str>, url: &str) -> Result<String, String> {
-    let bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "xerj".to_string());
+    let bin = self_bin();
     let entry = json!({
         "command": bin,
         "args": ["mcp"],
@@ -276,7 +319,7 @@ pub fn run_init_cli() -> i32 {
     let mut url = std::env::var("XERJ_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "http://localhost:9200".to_string());
+        .unwrap_or_else(|| DEFAULT_URL.to_string());
     let mut dry = false;
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
@@ -303,7 +346,7 @@ pub fn run_init_cli() -> i32 {
             for l in &lines {
                 println!("{l}");
             }
-            println!("{}", closing_message());
+            println!("{}", closing_message(&self_bin(), &url));
             0
         }
         Err(e) => {
@@ -638,7 +681,8 @@ mod tests {
             "Stop only the node you started",
             "Never `pkill xerj` or `killall xerj`",
             "xerj hub pull",
-            "xerj_hub_ask",
+            "Exit 5",
+            "Success: `xerj_search` is in the tool list",
             "claude mcp add",
             "root key `mcpServers`",
             "root key `servers`, not `mcpServers`",
@@ -682,9 +726,10 @@ mod tests {
     /// line over about 300 characters in text an agent reads.
     #[test]
     fn hub_texts_have_no_line_over_300_characters() {
+        let printed = mcp_registration("/usr/local/bin/xerj", "http://10.0.0.7:9200");
         for (name, text) in [
             ("hub skill", HUB_SKILL_MD),
-            ("mcp registration", MCP_REGISTRATION),
+            ("mcp registration", printed.as_str()),
         ] {
             for (i, line) in text.lines().enumerate() {
                 let n = line.chars().count();
@@ -697,17 +742,72 @@ mod tests {
     /// two that drift: the same Claude Code command and the same root keys.
     #[test]
     fn printed_registration_and_hub_skill_agree() {
-        let claude = r#"claude mcp add --scope user xerj -- "$(command -v xerj)" mcp"#;
-        assert!(HUB_SKILL_MD.contains(claude));
-        assert!(MCP_REGISTRATION.contains(claude));
+        assert!(HUB_SKILL_MD
+            .contains(r#"claude mcp add --scope user xerj -- "$(command -v xerj)" mcp"#));
+        let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
+        assert!(
+            printed.contains("claude mcp add --scope user xerj -- "),
+            "{printed}"
+        );
         for key in ["mcpServers", "servers", "stdio"] {
             assert!(HUB_SKILL_MD.contains(key), "skill: {key}");
-            assert!(MCP_REGISTRATION.contains(key), "printed: {key}");
+            assert!(printed.contains(key), "printed: {key}");
         }
-        let closing = closing_message();
-        assert!(closing.contains(MCP_REGISTRATION));
+        let success = format!("`{MCP_SUCCESS_TOOL}` is in the tool list");
+        assert!(HUB_SKILL_MD.contains(&success));
+        assert!(printed.contains(&success), "{printed}");
+        let closing = closing_message("/usr/local/bin/xerj", DEFAULT_URL);
+        assert!(closing.contains(&printed));
         assert!(closing.contains(r#"xerj "<question>""#));
         assert!(closing.contains("xerj autoindex <folder>"));
+    }
+
+    /// The printed Claude Code line is pasteable in any shell: it carries the
+    /// absolute path init resolved (the one `.mcp.json` got), not a
+    /// `$(command -v xerj)` that only a POSIX shell expands, and it registers
+    /// the same node `.mcp.json` points at.
+    #[test]
+    fn printed_claude_line_uses_this_binary_and_this_url() {
+        let printed = mcp_registration("/opt/x y/xerj", DEFAULT_URL);
+        assert!(!printed.contains("$("), "{printed}");
+        assert!(
+            !printed.contains("XERJ_URL"),
+            "default URL needs no env: {printed}"
+        );
+        let quoted = shell_quote("/opt/x y/xerj");
+        assert!(
+            printed.contains(&format!("claude mcp add --scope user xerj -- {quoted} mcp")),
+            "{printed}"
+        );
+        let custom = mcp_registration("/opt/xerj", "http://10.0.0.7:9200");
+        let url = shell_quote("http://10.0.0.7:9200");
+        assert!(
+            custom.contains(&format!(
+                "claude mcp add --scope user xerj -e XERJ_URL={url} -- "
+            )),
+            "{custom}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quote_survives_a_single_quote_on_unix() {
+        assert_eq!(shell_quote("/a b/xerj"), "'/a b/xerj'");
+        assert_eq!(shell_quote("/it's/xerj"), r"'/it'\''s/xerj'");
+    }
+
+    /// `xerj mcp` serves no `xerj_hub_*` tool yet (plan step 7 is deferred;
+    /// docs/hub-v2-grpc-mcp-notes.md). Text init installs or prints must not
+    /// send an agent to one, nor make one the proof that registration worked.
+    /// When step 7 lands, update this test together with the skill.
+    #[test]
+    fn no_unserved_hub_mcp_tool_is_promised() {
+        let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
+        for name in ["xerj_hub_ask", "xerj_hub_def", "xerj_hub_find"] {
+            assert!(!HUB_SKILL_MD.contains(name), "skill names {name}");
+            assert!(!printed.contains(name), "printed text names {name}");
+        }
+        assert!(HUB_SKILL_MD.contains("has no hub tool"));
     }
 
     /// `--help` lists every file init can write, the hub pair included.
