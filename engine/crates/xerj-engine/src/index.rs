@@ -2676,6 +2676,57 @@ mod flush_publication_recovery_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_flush_does_not_enqueue_shard_finalize_work() {
+        // #1226 — a `_refresh` / `delete_by_query?refresh=true` on an index
+        // whose memtable holds nothing to drain must NOT contend for flush
+        // admission. Pre-fix, `flush()` fanned a `do_flush_shard` task out for
+        // EVERY shard regardless of contents; each task first takes a
+        // per-index `flush_sema` permit and then the process-global
+        // `flush_finalize_gate`, discovering the shard is empty only after it
+        // has queued behind every other index's in-flight finalize. That is
+        // the "latency tracks concurrent write load, not index size" symptom
+        // in #1226: a no-op refresh still paid one admission wait per shard.
+        //
+        // We prove the fix without touching the shared global gate (which the
+        // rest of the parallel suite depends on): exhaust this index's OWN
+        // `flush_sema` so that any shard task that got spawned would block
+        // forever on `acquire_owned`, then flush an empty memtable. With the
+        // fix no shard task is spawned, so the flush completes (its durability
+        // tail needs no flush permit). Without the fix the coordinator would
+        // await 16 tasks wedged on the exhausted semaphore and time out.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("empty-flush", Schema::empty()).unwrap();
+        let idx = engine.get_index("empty-flush").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(
+            idx.memtable.doc_count(),
+            0,
+            "precondition: the memtable must be empty"
+        );
+
+        // Take every per-index flush permit and hold it for the whole flush.
+        let permits = idx.flush_sema.available_permits() as u32;
+        assert!(permits > 0, "flush_sema must start with permits to hold");
+        let _held = idx
+            .flush_sema
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), idx.flush())
+            .await
+            .expect(
+                "#1226: an empty flush must not wait on flush admission — no shard \
+                 finalize should have been enqueued",
+            )
+            .expect("flush of an empty memtable must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn schemaless_cidr_term_matches_the_subnet_after_flush() {
         // #786: a CIDR `term` on an undeclared (dynamically mapped) ip-shaped
         // field matches in the memtable (the value-driven source scan expands
@@ -11993,6 +12044,15 @@ impl Index {
         // still fires shard flushes in parallel.
         let n_shards = self.memtable.shard_count();
         for shard_idx in 0..n_shards {
+            // #1226 — skip empty shards (same reasoning as `flush()`): a
+            // no-op shard finalize still acquires the process-global
+            // `flush_finalize_gate`, so an empty shard would make this
+            // serial refresh wait behind unrelated indices' ingest flushes
+            // for nothing. Bound the work to the shards actually holding
+            // documents.
+            if self.memtable.shard_load(shard_idx).0 == 0 {
+                continue;
+            }
             do_flush_shard(
                 shard_idx,
                 Arc::clone(&self.store),
@@ -25267,6 +25327,25 @@ impl Index {
         let coordinator = tokio::spawn(async move {
             let mut shard_futures = Vec::with_capacity(n_shards);
             for shard_idx in 0..n_shards {
+                // #1226 — do not fan a finalize out for an EMPTY shard.
+                //
+                // `do_flush_shard` acquires the *process-global*
+                // `flush_finalize_gate` (a handful of permits shared by every
+                // index) before it discovers the shard has nothing to drain,
+                // and it first takes a per-index `flush_sema` permit. Under a
+                // multi-index bulk storm that global gate is saturated by
+                // other indices' ingest flushes, so each no-op shard task
+                // still queues behind the whole backlog. A user-visible
+                // `_refresh` / `delete_by_query?refresh=true` therefore paid
+                // one full admission wait PER SHARD even when the memtable was
+                // already drained — the "latency tracks write load, not index
+                // size" signature in #1226. Skipping empty shards bounds a
+                // flush's finalize-admission cost to the shards it actually
+                // has to drain; an all-empty memtable now does zero finalize
+                // work (just the durability tail below).
+                if memtable.shard_load(shard_idx).0 == 0 {
+                    continue;
+                }
                 let sema = Arc::clone(&flush_sema);
                 let store = Arc::clone(&store);
                 let memtable = Arc::clone(&memtable);
