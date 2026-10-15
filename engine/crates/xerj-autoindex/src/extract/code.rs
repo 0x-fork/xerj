@@ -1424,13 +1424,16 @@ fn emit_code_doc(
         // #1237: symbol records carry a bounded `impl` slice (`body[line..=end_line]`,
         // capped at 16 KB on a UTF-8 char boundary) so `xerj code --fuse-symbols`
         // can score a second BM25 leg over definition bodies without length-norm
-        // dilution from a 4,000-line file. For container kinds (`class`), bound
-        // `impl` to the lines preceding the first nested definition so method
-        // bodies are not duplicated inside the enclosing class record.
+        // dilution from a 4,000-line file. For every kind except
+        // `function`/`method` (i.e. containers: `class`, `module`, `trait`,
+        // `interface`, `impl`, `struct`, `extension`, ...), bound `impl` to the
+        // lines preceding the first nested definition so member bodies are not
+        // duplicated inside the enclosing record. Functions keep their whole
+        // body: a nested closure/inner def is part of what the function does.
         // `reconcile_plan::ensure_compatible` exempts `impl` and `end_line` on
         // pre-#1237 frozen datasets so incremental runs over older state dirs
         // never abort.
-        let impl_end_line = if s.kind == "class" {
+        let impl_end_line = if !matches!(s.kind.as_str(), "function" | "method") {
             symbols
                 .iter()
                 .filter(|child| child.line > line && child.line <= s.end_line)
@@ -4481,6 +4484,44 @@ mod tests {
             extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
             Some("0".to_string())
         );
+    }
+
+    /// The container bound is not specific to `class`: a Rust `mod` holding a
+    /// function must not copy that function's body into its own `impl`.
+    #[test]
+    fn emit_code_doc_bounds_every_container_kind_before_nested_defs() {
+        let mut records = Vec::new();
+        let mut stats = ExtractStats::default();
+        let src = "mod engine {\n    use std::fmt;\n    fn spin_up() {\n        let unique_marker = 1;\n    }\n}\n";
+        let s = syms("rust", src);
+        assert!(has(&s, "engine", "module"), "got {s:?}");
+        assert!(has(&s, "spin_up", "function"), "got {s:?}");
+        assert!(emit_code_doc(
+            Path::new("lib.rs"),
+            "rust",
+            src,
+            &s,
+            &mut stats,
+            &mut |rec| {
+                records.push(rec);
+                true
+            },
+        ));
+        let module_impl = records
+            .iter()
+            .find(|r| r.locator == "code:1:engine")
+            .and_then(|r| r.fields.get("impl"))
+            .and_then(Value::as_str)
+            .expect("module impl");
+        assert_eq!(module_impl, "mod engine {\n    use std::fmt;");
+        assert!(!module_impl.contains("unique_marker"));
+        let fn_impl = records
+            .iter()
+            .find(|r| r.locator == "code:3:spin_up")
+            .and_then(|r| r.fields.get("impl"))
+            .and_then(Value::as_str)
+            .expect("function impl");
+        assert!(fn_impl.contains("unique_marker"), "{fn_impl}");
     }
 
     #[test]
