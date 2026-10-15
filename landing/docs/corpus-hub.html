@@ -237,12 +237,26 @@
   <p class="source-note">Source · tools/xerj-code/hub/CONTRIBUTING.md (corpus-hub branch) · launch post: /blog/the-corpus-hub · browse: hub.xerj.org</p>
 
   <h2 id="consume">Consuming a corpus</h2>
-  <p>Three commands, no build step — the binary indexes from the pinned manifest directly:</p>
-<pre class="code">$ xerj corpus add --from https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/xerj-storage.json
-$ xerj corpus index xerj-storage
-$ xerj code xerj-storage "flush epoch crash recovery"</pre>
-  <p>Clones live under <code class="inline">~/.xerj-code/corpora/</code>, the index under
-  <code class="inline">~/.xerj-code/data</code> — both persist across reboots. An index older than
+  <p>A corpus is used through a local node, so start one first if none is running
+  and keep its PID so you can later stop exactly that one
+  (<code class="inline">nohup xerj --insecure --data-dir ~/xerj-data &gt; ~/xerj-node.log 2&gt;&amp;1 &amp; echo $! &gt; ~/xerj-node.pid</code>;
+  stop it with <code class="inline">kill $(cat ~/xerj-node.pid)</code>, never <code class="inline">pkill xerj</code>).
+  The health check <code class="inline">curl -s localhost:9200/_cluster/health</code> answers
+  <code class="inline">"status":"green"</code>. Then download the pinned manifest, add it, index it, ask:</p>
+<pre class="code">$ curl -fsSLO https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/lz4.json
+$ xerj corpus add --from ./lz4.json     # last line: next: xerj corpus index lz4
+$ xerj corpus index lz4                 # last lines: corpus 'lz4' searchable: 1980 records
+$ xerj code lz4 "maximum input size"    # passages headed by file path and line</pre>
+  <p><code class="inline">--from</code> reads a local file: v1.0.0-rc.95 does not fetch a URL, and
+  passing one answers <code class="inline">no such manifest</code>. Run on a clean install of
+  v1.0.0-rc.95, the four lines above took under a minute, install included. An agent without a
+  shell uses the MCP tool <code class="inline">xerj_code_search</code> with
+  <code class="inline">{"corpus": "lz4", "query": "…"}</code> once the corpus is indexed on the node.</p>
+  <p><strong>Hub corpus or local corpus?</strong> Use a hub corpus for public material you cannot
+  quote exactly from memory. Use <code class="inline">xerj autoindex &lt;folder&gt;</code> for files
+  only your machine has. Both can live on the same node.</p>
+  <p>Clones live under <code class="inline">~/.xerj-code/corpora/</code>; the index lives in the data
+  directory of the node you indexed into — both persist across reboots. An index older than
   30 days is refused by design: <strong>a stale index is worse than none</strong>, so re-run
   <code class="inline">xerj corpus index</code> rather than forcing a stale answer. Pack consumers
   additionally verify the detached ed25519 signature over SHA256SUMS before trusting a record.</p>
