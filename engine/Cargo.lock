@@ -7693,12 +7693,16 @@ name = "xerj-mcp"
 version = "1.0.0-rc.95"
 dependencies = [
  "anyhow",
+ "axum",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "unicode-segmentation",
+ "xerj-api",
  "xerj-common",
+ "xerj-engine",
+ "xerj-hub",
  "xerj-rerank",
 ]
 
