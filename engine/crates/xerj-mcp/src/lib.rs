@@ -129,7 +129,8 @@ is ALREADY RUNNING. This command does not start a node; start one first with
 It also serves three Corpus Hub tools — xerj_hub_find, xerj_hub_def,
 xerj_hub_ask — which run the `xerj ask` flow: answered from packs already on
 this machine (a tool call never downloads one; it names the `xerj hub pull`
-line instead). Like `xerj ask`, they use the node above when it answers and
+line instead), from the catalogue already cached (never fetched; with none
+cached they say to run `xerj hub sync`). Like `xerj ask`, they use the node above when it answers and
 otherwise the automatic hub node.
 
 OPTIONS:

@@ -12,7 +12,7 @@
 //!
 //! The answer flow is the CLI's: local packs first, hosted second (this build
 //! has no hosted client, so "hosted" is unavailable exactly as it is for the
-//! CLI), `XERJ_HUB_URL` overrides the catalogue's base URL, and the node is the
+//! CLI), the catalogue is the cached copy (below), and the node is the
 //! one this server proxies to (`--url` / `XERJ_URL`), or the automatic hub node.
 //! The tool result text is the §1 rendering with the flow's notices on top (MCP
 //! has no stderr); the structured content is the [`xerj_hub::Answer`] JSON.
@@ -24,6 +24,11 @@
 //! delete) behind an agent's back. Excluded corpora are never pulled or served
 //! by the flow itself; approach-only answers carry the licence warning on every
 //! hit.
+//!
+//! Nor does a tool call fetch the catalogue: the tools read the copy `xerj hub
+//! sync` (or any CLI `xerj ask` / `xerj hub pull`) cached, however old, and
+//! never block on the hub's 10 s/30 s fetch timeouts inside an agent's turn.
+//! With no cached copy the tool says to run `xerj hub sync`.
 
 use serde_json::{json, Value};
 use xerj_hub::ask::{
@@ -50,7 +55,8 @@ pub fn specs() -> Vec<Value> {
                 "with their pin, licence and whether the pack is already on this machine — not ",
                 "passages; ask one with xerj_hub_ask. Routed exactly as `xerj ask` routes: your ",
                 "project's dependencies, the signed catalogue's term sketches, and the exact ",
-                "symbol a definition question names (offline; this build has no hosted search). ",
+                "symbol a definition question names (offline: reads the catalogue `xerj hub sync` ",
+                "cached and never fetches it; this build has no hosted search). ",
                 "Excluded-licence corpora are never listed."),
             "inputSchema": {
                 "type": "object",
@@ -103,7 +109,8 @@ pub fn specs() -> Vec<Value> {
                 "the offline sketch when omitted) and is always named in the answer; when more than ",
                 "one corpus fits, the candidates come back and you re-ask with `corpus`. Never ",
                 "downloads a pack: a corpus not on this machine is answered with the `xerj hub ",
-                "pull` line to run. Result text is the hub rendering (corpus, pin date, licence, ",
+                "pull` line to run, and never fetches the catalogue: with none cached it says to run ",
+                "`xerj hub sync`. Result text is the hub rendering (corpus, pin date, licence, ",
                 "file:line); structured content is the Answer JSON."),
             "inputSchema": {
                 "type": "object",
@@ -245,10 +252,11 @@ async fn ask_tool(ctx: &Ctx, args: &Value) -> Result<Value, String> {
     Ok(run(ctx, a).await)
 }
 
-/// Run the CLI's flow for `a` (never fetching) against this server's node and
-/// turn the outcome into a tool result.
+/// Run the CLI's flow for `a` (never fetching a pack or the catalogue) against
+/// this server's node and turn the outcome into a tool result.
 async fn run(ctx: &Ctx, mut a: AskArgs) -> Value {
     a.no_fetch = true;
+    a.cached_catalogue_only = true;
     a.json = false;
     a.url = Some(ctx.base_url.clone());
     let launcher = match launcher() {
