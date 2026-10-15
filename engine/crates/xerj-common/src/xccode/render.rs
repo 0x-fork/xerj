@@ -31,9 +31,6 @@ pub struct RenderOpts<'a> {
     pub strict_licence: bool,
 }
 
-/// Render the full result block: the optional arms-ran note line, one block
-/// per hit, the footer. `note` is printed EVERY time it exists — a silently
-/// BM25-only "hybrid" result must never read as hybrid.
 /// The longest non-empty string field of a source object (excluding `ax_*`
 /// provenance metadata), "" when there is none — the content-bearing field of
 /// a raw-JSON record (#1158). Fields are visited in sorted key order and only
@@ -59,6 +56,19 @@ fn longest_string_field(src: &Value) -> String {
     best.map(|(_, s)| s.to_string()).unwrap_or_default()
 }
 
+/// True for an autoindex `*-symbols` record: `name` and `kind` strings plus
+/// a numeric `line`, alongside the declaration in `code`. A raw-JSON data
+/// record that merely happens to have a `code` key does not match.
+fn is_symbol_record(src: &Value) -> bool {
+    src.get("name").is_some_and(Value::is_string)
+        && src.get("kind").is_some_and(Value::is_string)
+        && src.get("line").is_some_and(Value::is_u64)
+        && src.get("code").is_some_and(Value::is_string)
+}
+
+/// Render the full result block: the optional arms-ran note line, one block
+/// per hit, the footer. `note` is printed EVERY time it exists — a silently
+/// BM25-only "hybrid" result must never read as hybrid.
 pub fn render(
     hits: &[Value],
     licences: &HashMap<String, String>,
@@ -144,15 +154,21 @@ fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) 
 
     // `body` is the content field of every family EXCEPT plain text (`.txt`
     // mirrors put their passage in `text`, #1139) and `*-symbols` records
-    // (which store the declaration in `code`). A raw-JSON record (#1158)
-    // carries none of those: its text lives in schema-named fields
-    // (`summary`, `details`, …), so the last resort is the longest non-`ax_*`
-    // string field.
+    // (which store the declaration in `code`). `code` is trusted ONLY on a
+    // record with the symbol shape (`name` + `kind` + numeric `line`): a
+    // raw-JSON record (#1158) may carry its own short `code` field (an error
+    // code, a CWE id) that must not displace its real content. A raw-JSON
+    // record's text lives in schema-named fields (`summary`, `details`, …),
+    // so the last resort is the longest non-`ax_*` string field.
     let body = src
         .get("body")
         .and_then(Value::as_str)
         .or_else(|| src.get("text").and_then(Value::as_str))
-        .or_else(|| src.get("code").and_then(Value::as_str))
+        .or_else(|| {
+            is_symbol_record(&src)
+                .then(|| src.get("code").and_then(Value::as_str))
+                .flatten()
+        })
         .map(str::to_string)
         .unwrap_or_else(|| longest_string_field(&src));
 
@@ -461,6 +477,43 @@ mod tests {
             !raw_text.contains("axf2-"),
             "internal `ax_file` digest must never win longest_string_field: {raw_text}"
         );
+    }
+
+    /// #1158 must survive the symbol-`code` passage source: a raw-JSON
+    /// record with its OWN short `code` field (here a CWE id) still renders
+    /// its longest content field, not the code.
+    #[test]
+    fn a_raw_json_hit_with_a_short_code_field_still_renders_its_content() {
+        let raw_hit = json!({
+            "_score": 3.0,
+            "_source": {
+                "ax_file": "axf2-1fbdaa51d7231323867e3200dc599463-1075",
+                "ax_path": "cwe/records/79.json",
+                "code": "CWE-79",
+                "name": "XSS",
+                "details": "Improper neutralization of input during web page generation allows cross-site scripting."
+            }
+        });
+        let text = render(
+            &[raw_hit],
+            &HashMap::new(),
+            &RenderOpts {
+                corpus: "cwe",
+                query: "cross-site scripting",
+                full: 800,
+                no_symbol: true,
+                meatl: false,
+                rrf_scores: false,
+                age_days: None,
+                strict_licence: false,
+            },
+            None,
+        );
+        assert!(
+            text.contains("allows cross-site scripting"),
+            "the passage is `details`, not the short `code`: {text}"
+        );
+        assert!(!text.contains("axf2-"), "{text}");
     }
 
     #[test]
