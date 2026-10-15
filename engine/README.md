@@ -316,6 +316,7 @@ HTTP Request
 | `xerj-cluster` | Embedded Raft consensus for cluster metadata, written from scratch |
 | `xerj-mcp` | MCP stdio server exposing XERJ's REST surface to agent hosts as tools |
 | `xerj-rerank` | Second-stage reranking client for `_search`: strict `rerank` block parser, provider call with batching and a deadline, degrade-on-deadline / surface-on-contract failure policy. A leaf the API layer calls; the engine does not link it |
+| `xerj-hub` | Corpus Hub v2 client behind `xerj ask` / `xerj "<question>"`, `xerj hub …` and `xerj code <corpus> --def`: pulls, verifies and restores signed pre-indexed packs, builds them for CI, and routes a question to a corpus. Depends on `xerj-autoindex`; the engine does not link it |
 | `xerj-wasm` | Pluggable ingest-time document transform pipeline |
 
 Every crate under `crates/` appears in this table — `crates/xerj-engine/tests/docs_capability_lists.rs`
