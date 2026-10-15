@@ -938,7 +938,7 @@ fn install_extract(staging: &Path, dest: &Path, scratch: &Path) -> Result<(), Pu
 /// `..`, no `/`, non-empty, no leading/trailing separator. This is what stops a
 /// catalogue (which may be unverified) from steering a pull's writes out of
 /// `~/.xerj/hub/packs/<slug>/`.
-pub(crate) fn valid_slug(s: &str) -> bool {
+pub fn valid_slug(s: &str) -> bool {
     let b = s.as_bytes();
     if b.is_empty() {
         return false;

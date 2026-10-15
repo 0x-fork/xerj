@@ -133,6 +133,10 @@ pub struct AskArgs {
     pub no_fetch: bool,
     pub hosted: HostedSwitch,
     pub max_tokens: Option<usize>,
+    /// Max hits (`None` = the mode's default). Not a CLI flag: the MCP
+    /// `xerj_hub_def` tool and the gRPC `Def` take a `k`, and the flow carries it
+    /// to the backend unchanged.
+    pub k: Option<usize>,
     pub json: bool,
     pub url: Option<String>,
 }
@@ -148,6 +152,7 @@ impl AskArgs {
             no_fetch: false,
             hosted: HostedSwitch::Auto,
             max_tokens: None,
+            k: None,
             json: false,
             url: None,
         }
@@ -187,6 +192,8 @@ pub struct Request<'a> {
     /// Set exactly when `mode` is [`AnswerMode::Def`].
     pub symbol: Option<&'a str>,
     pub max_tokens: Option<usize>,
+    /// Max hits; `None` = the mode's default.
+    pub k: Option<usize>,
 }
 
 // ── seams ────────────────────────────────────────────────────────────────────
@@ -517,6 +524,7 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
         mode,
         symbol: symbol.as_deref(),
         max_tokens: args.max_tokens,
+        k: args.k,
     };
 
     // Step 3: a pack on this machine answers locally, with no network.
@@ -1315,11 +1323,11 @@ impl RealBackend {
     ) -> Result<Answer, String> {
         let root = xerj_autoindex::xc::code_root();
         let mut params = CodeParams::new(req.slug, req.question);
-        params.k = if req.mode == AnswerMode::Files {
+        params.k = req.k.unwrap_or(if req.mode == AnswerMode::Files {
             FILES_K
         } else {
             DEFAULT_K
-        };
+        });
         params.full = PASSAGE_WIDTH;
         params.as_json = true;
         let outcome = xccode::run_code_query(&root, node, url, &params, "`--stale-ok`");
@@ -1371,7 +1379,9 @@ impl Backend for RealBackend {
     fn answer_local(&self, req: &Request<'_>) -> Result<Answer, String> {
         let node = self.node()?;
         let answer = match (req.mode, req.symbol) {
-            (AnswerMode::Def, Some(symbol)) => def::lookup(&node.1, req.slug, symbol, DEFAULT_K),
+            (AnswerMode::Def, Some(symbol)) => {
+                def::lookup(&node.1, req.slug, symbol, req.k.unwrap_or(DEFAULT_K))
+            }
             _ => self.answer_search(&node.1, &node.0.url, req)?,
         };
         touch_last_used(&self.hub_home, req.slug);
@@ -1456,6 +1466,20 @@ impl Backend for RealBackend {
 /// [`AskOutcome::answer`] directly. `hosted` is the hosted client to use, or
 /// `None` when none is configured.
 pub fn run_ask(args: &AskArgs, hosted: Option<&dyn HostedHub>) -> AskOutcome {
+    match NodeLauncher::current() {
+        Ok(launcher) => run_ask_with(args, hosted, launcher),
+        Err(e) => AskOutcome::fail(EXIT_NO_ANSWER, format!("{e:#}")),
+    }
+}
+
+/// [`run_ask`] with the executable that starts the automatic node named
+/// explicitly. The MCP server needs this: as the standalone `xerj-mcp` binary,
+/// `current_exe()` is not a `xerj` that accepts node flags.
+pub fn run_ask_with(
+    args: &AskArgs,
+    hosted: Option<&dyn HostedHub>,
+    launcher: NodeLauncher,
+) -> AskOutcome {
     let hub_home = cli::hub_home();
     let hub_url = std::env::var("XERJ_HUB_URL")
         .ok()
@@ -1470,10 +1494,6 @@ pub fn run_ask(args: &AskArgs, hosted: Option<&dyn HostedHub>) -> AskOutcome {
             )
         }
     };
-    let launcher = match NodeLauncher::current() {
-        Ok(l) => l,
-        Err(e) => return AskOutcome::fail(EXIT_NO_ANSWER, format!("{e:#}")),
-    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let backend = RealBackend::new(hub_home.clone(), args.url.clone(), launcher);
     ask(
@@ -1486,6 +1506,150 @@ pub fn run_ask(args: &AskArgs, hosted: Option<&dyn HostedHub>) -> AskOutcome {
             backend: &backend,
         },
     )
+}
+
+// ── discovery: which corpora could answer (MCP `xerj_hub_find`) ─────────────
+
+/// `xerj_hub_find`'s default number of candidates.
+pub const FIND_DEFAULT_K: usize = 5;
+/// `xerj_hub_find` never lists more than this (the hosted `/search` cap).
+pub const FIND_MAX_K: usize = 10;
+
+/// One candidate corpus: what the catalogue says about it, how strongly the
+/// router proposed it, and whether its pack is already on this machine.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FoundCorpus {
+    pub slug: String,
+    /// The router's merged evidence score (dependency 1.0, sketch ≤ 0.8, +0.05
+    /// when cached); 0 for a corpus proposed only because its definitions hold
+    /// the exact symbol the question names.
+    pub score: f32,
+    pub cached: bool,
+    pub ask_for: String,
+    pub domain: String,
+    pub pin_sha: String,
+    pub pin_date: String,
+    pub licence_spdx: String,
+    pub licence_class: LicenceClass,
+    pub pack_bytes: u64,
+}
+
+/// What [`find`] decided: the router's verdict and the candidates, best first.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FindOutcome {
+    /// `confident` | `ambiguous` | `no_corpus` — the verdict `xerj ask` would act on.
+    pub routing: &'static str,
+    pub corpora: Vec<FoundCorpus>,
+}
+
+/// Which corpora could answer `question` — the routing half of [`ask`], with
+/// nothing answered and nothing pulled. The evidence is exactly what
+/// [`ask`]'s corpus selection uses before it consults a hosted node: the
+/// project's dependencies (from `cwd`), the catalogue's term sketches, the
+/// exact-symbol evidence for a definition question, and the cached-pack bonus.
+/// An `excluded` corpus is never listed (it is never served either).
+pub fn find(
+    question: &str,
+    k: usize,
+    cwd: &Path,
+    hub_home: &Path,
+    catalogue: &Catalogue,
+) -> FindOutcome {
+    let k = k.clamp(1, FIND_MAX_K);
+    let cached = cached_slugs(hub_home);
+    let (_, symbol) = detect_mode(question, &ModeRequest::Auto);
+    let by_symbol = symbol
+        .map(|s| symbol_hits(catalogue, s.trim()))
+        .unwrap_or_default();
+    let (routing, ranked) = route_ranked(question, cwd, catalogue, None, &cached);
+    let routing = with_symbol_evidence(routing, &by_symbol);
+    // The verdict's own order first (a confident pick, or the ambiguous list),
+    // then everything else the router ranked, then symbol-only candidates.
+    let mut order: Vec<String> = match &routing {
+        Routing::Confident(slug) => vec![slug.clone()],
+        Routing::Ambiguous(slugs) => slugs.clone(),
+        Routing::NoCorpus => Vec::new(),
+    };
+    for slug in ranked.iter().map(|(s, _)| s).chain(by_symbol.iter()) {
+        if !order.contains(slug) {
+            order.push(slug.clone());
+        }
+    }
+    let score_of = |slug: &str| {
+        ranked
+            .iter()
+            .find(|(s, _)| s == slug)
+            .map(|(_, score)| *score)
+            .unwrap_or(0.0)
+    };
+    let corpora = order
+        .iter()
+        .filter_map(|slug| catalogue.corpora.iter().find(|e| &e.slug == slug))
+        .filter(|e| e.licence_class != LicenceClass::Excluded)
+        .take(k)
+        .map(|e| FoundCorpus {
+            slug: e.slug.clone(),
+            score: score_of(&e.slug),
+            cached: cached.contains(&e.slug),
+            ask_for: e.ask_for.clone(),
+            domain: e.domain.clone(),
+            pin_sha: e.pin_sha.clone(),
+            pin_date: e.pin_date.clone(),
+            licence_spdx: e.licence_spdx.clone(),
+            licence_class: e.licence_class,
+            pack_bytes: e.pack_bytes,
+        })
+        .collect();
+    FindOutcome {
+        routing: match routing {
+            Routing::Confident(_) => "confident",
+            Routing::Ambiguous(_) => "ambiguous",
+            Routing::NoCorpus => "no_corpus",
+        },
+        corpora,
+    }
+}
+
+/// Load the catalogue the way [`run_ask`] does and run [`find`] from the
+/// current directory.
+pub fn run_find(question: &str, k: usize) -> Result<FindOutcome, String> {
+    let hub_home = cli::hub_home();
+    let hub_url = std::env::var("XERJ_HUB_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
+    let catalogue = load_catalogue(&hub_url, &hub_home, false)
+        .map_err(|e| format!("cannot load the hub catalogue: {e:#}"))?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Ok(find(question, k, &cwd, &hub_home, &catalogue))
+}
+
+/// Render a [`FindOutcome`] as text, one corpus per line (catalogue strings
+/// made [`printable`]).
+pub fn render_find(found: &FindOutcome) -> String {
+    if found.corpora.is_empty() {
+        return NO_CORPUS_MESSAGE.to_string();
+    }
+    let mut lines: Vec<String> = found
+        .corpora
+        .iter()
+        .map(|c| {
+            format!(
+                "{} — {}  (score {:.2}, pin {}, {}{})",
+                printable(&c.slug),
+                printable(&c.ask_for),
+                c.score,
+                printable(&c.pin_date),
+                printable(&c.licence_spdx),
+                if c.cached { ", cached" } else { "" }
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "routing: {}; ask one with xerj_hub_ask {{question, corpus}}",
+        found.routing
+    ));
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -3109,5 +3273,54 @@ mod tests {
             approach_only_warning(""),
             "approach-only licence (unknown): read, do not copy"
         );
+    }
+
+    // ── find (MCP `xerj_hub_find`) ──────────────────────────────────────────
+
+    #[test]
+    fn find_lists_what_ask_would_route_to_and_never_an_excluded_corpus() {
+        let rig = Rig::new();
+        let cat = catalogue(with_fillers(vec![
+            lz4(1, LicenceClass::AdaptWithAttribution),
+            entry(
+                "lz4-closed",
+                1,
+                LicenceClass::Excluded,
+                &["lz4", "block", "decoder", "compression"],
+            ),
+        ]));
+        // A cached pack of lz4 (just a manifest: `pack_dirs` needs nothing else).
+        let pack = rig.hub.path().join("packs").join("lz4").join("00000000");
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(pack.join("pack.json"), "{}").unwrap();
+
+        let found = find(
+            "how does the lz4 block decoder work",
+            5,
+            rig.cwd.path(),
+            rig.hub.path(),
+            &cat,
+        );
+        assert_eq!(found.corpora[0].slug, "lz4", "{found:?}");
+        assert!(found.corpora[0].cached);
+        assert!(found.corpora[0].score > 0.0);
+        assert!(
+            found.corpora.iter().all(|c| c.slug != "lz4-closed"),
+            "an excluded corpus is never offered: {found:?}"
+        );
+        let text = render_find(&found);
+        assert!(text.starts_with("lz4 — "), "{text}");
+        assert!(text.contains("cached"), "{text}");
+
+        // k is clamped to 1..=FIND_MAX_K.
+        let one = find("lz4 block decoder", 0, rig.cwd.path(), rig.hub.path(), &cat);
+        assert!(one.corpora.len() <= 1);
+
+        // Nothing credible: an empty list and the llms.txt pointer.
+        let none = find("zzqx wvut", 5, rig.cwd.path(), rig.hub.path(), &cat);
+        assert_eq!(none.routing, "no_corpus");
+        if none.corpora.is_empty() {
+            assert_eq!(render_find(&none), NO_CORPUS_MESSAGE);
+        }
     }
 }
