@@ -20961,6 +20961,37 @@ impl Index {
             }
             (tf, ef, kw, num, bf)
         };
+        // #1359: `query_node_to_fts_projected` projects a `QueryNode::Term` on a
+        // `FieldType::Keyword` field into `FtsQuery::Term` so a `bool` or
+        // `dis_max` combining a text clause and a keyword `term` clause does
+        // not `?`-abort FTS projection on the keyword child. A standalone
+        // top-level `term` on a keyword field, however, is served by
+        // `scored_columnar` when `mem_doc_count == 0` and by the doc-values
+        // prefilter + stored scan (where memtable `DocValuesHits` and segment
+        // `score_doc` both assign constant score `1.0`) when `mem_doc_count > 0`
+        // or columnar bails. Routing a top-level keyword `term` into segment FTS
+        // gave segment hits BM25 (~0.00147) while memtable `DocValuesHits` gave
+        // `1.0` — so `seg_can_enter` rejected every flushed segment against a
+        // full memtable collector (`size:1` returned `mem000` over `seg0000`)
+        // and `query_needs_fts` flipped true on a `term`-on-keyword query.
+        let empty_kw_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let fts_kw_fields: &std::collections::HashSet<String> = {
+            let mut q = query;
+            loop {
+                match q {
+                    QueryNode::Constant { query, .. }
+                    | QueryNode::Boosted { query, .. }
+                    | QueryNode::Named { query, .. } => q = query,
+                    other => {
+                        break if matches!(other, QueryNode::Term { .. }) {
+                            &empty_kw_fields
+                        } else {
+                            &kw_fields
+                        };
+                    }
+                }
+            }
+        };
 
         // ── B3: peeled function_score for the brute path ──────────────────
         // The single scoring clause of the request when it is a (wrapped)
@@ -21497,7 +21528,7 @@ impl Index {
                         query,
                         &text_fields,
                         &exact_fields,
-                        &kw_fields,
+                        fts_kw_fields,
                         mem_doc_count,
                         pinned_probe,
                     )
@@ -22254,7 +22285,7 @@ impl Index {
             query,
             &text_fields,
             &exact_fields,
-            &kw_fields,
+            fts_kw_fields,
             self.segment_analyzer_binding(),
             pinned_probe,
         )
@@ -22501,7 +22532,7 @@ impl Index {
                 query,
                 &text_fields,
                 &exact_fields,
-                &kw_fields,
+                fts_kw_fields,
                 self.segment_analyzer_binding(),
                 pinned_probe,
             );
@@ -22517,7 +22548,7 @@ impl Index {
                     query,
                     &text_fields,
                     &exact_fields,
-                    &kw_fields,
+                    fts_kw_fields,
                     self.segment_analyzer_binding(),
                     pinned_probe,
                 );
@@ -22672,17 +22703,19 @@ impl Index {
                 let seg_id = meta.id.clone();
                 let fts_dir = segments_dir.clone();
 
-                // #191 — on the count-authoritative stored-scan path each
-                // segment gets its OWN `materialisation_limit` of headroom:
-                // `scan_stored_section_into` stops at
-                // `all_hits.len() >= limit`, so a collector already filled by
-                // an earlier segment would let a genuinely competitive segment
-                // contribute nothing.  Positions inside a segment ARE `seq_no`
-                // order (`drain_for_flush` and the merge both sort by
-                // `seq_no`), so this segment's first `cap` matches are its own
-                // `cap` best; the merge below then re-selects the global best
-                // `cap`.  Peak is 2×cap, trimmed at the bottom of the loop.
-                let scan_limit = if count_authoritative && !count_only && sort_topk.is_none() {
+                // #191 / #1359 — on the stored-scan path each segment gets its
+                // OWN `materialisation_limit` of headroom, whether or not
+                // `count_authoritative` is set: `scan_stored_section_into` stops
+                // materialising hits at `all_hits.len() >= limit` (continuing to
+                // tally `total_count` when `!count_authoritative`), so a
+                // collector already filled by an earlier segment or the memtable
+                // would otherwise let a genuinely competitive segment contribute
+                // zero hits.  Positions inside a segment ARE `seq_no` order
+                // (`drain_for_flush` and the merge both sort by `seq_no`), so
+                // this segment's first `cap` matches are its own `cap` best; the
+                // merge below then re-selects the global best `cap`.  Peak is
+                // 2×cap, trimmed at the bottom of the loop.
+                let scan_limit = if !count_only && sort_topk.is_none() {
                     all_hits.len().saturating_add(materialisation_limit)
                 } else {
                     materialisation_limit
@@ -22743,7 +22776,7 @@ impl Index {
                         query,
                         &text_fields,
                         &exact_fields,
-                        &kw_fields,
+                        fts_kw_fields,
                         self.segment_analyzer_binding(),
                         pinned_positions
                             .as_ref()
@@ -24129,7 +24162,7 @@ impl Index {
                 // Trimmed hits stay in `seen_ids`: the cap-th key only ever
                 // improves, so a document that lost the trim can never become
                 // competitive again.
-                if count_authoritative
+                if !fts_handled
                     && !count_only
                     && sort_topk.is_none()
                     && all_hits.len() != hits_before_segment
