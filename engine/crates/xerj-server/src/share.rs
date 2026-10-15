@@ -655,15 +655,17 @@ fn find_cloudflared() -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(Path::new(&home).join(".local").join("bin"));
+    if let Some(home) = xerj_common::home::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
     }
     dirs.into_iter().map(|d| d.join(exe)).find(|p| p.is_file())
 }
 
 fn default_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home).join(".xerj").join("brain")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".xerj")
+        .join("brain")
 }
 
 /// `--api-key` / `XERJ_API_KEY` first, then `<data-dir>/admin.key` — the same
