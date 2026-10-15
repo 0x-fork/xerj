@@ -3096,3 +3096,54 @@ fn the_fixture_dir_is_the_shared_one() {
         a.join("code-home").to_string_lossy()
     );
 }
+
+/// `Ask` hands its answer flow an empty directory with a `.git` marker as the
+/// `cwd`/`hub_home`. That directory sits under the data directory, where every
+/// index's store is `<data_dir>/<index name>` — so it must carry a name no
+/// index can take. It used to be `hub-routing`, a legal index name: an `Ask`
+/// wrote `.git` into a user's `hub-routing` index on every request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_never_writes_into_a_user_index_named_like_its_routing_dir() {
+    let h = hub(Opts::new(false, false)).await;
+    let data = PathBuf::from(&h.state.config.server.data_dir);
+    // The old name, and the shape of the new one: an index may take the first,
+    // never the second.
+    h.create("hub-routing", docs_mapping()).await;
+    let r = h
+        .admin("PUT", &format!("/{}", hub_api::ROUTING_DIR), None)
+        .await;
+    assert!(
+        !r.status.is_success(),
+        "{} must not be a legal index name: {:?}",
+        hub_api::ROUTING_DIR,
+        r.json()
+    );
+
+    let shared = hub_api::HubShared::new(h.state.clone());
+    let ask = || hub_api::HubAsk {
+        question: "what is the value of MAX_LEN".to_string(),
+        corpus: Some("mini-c".to_string()),
+        mode: None,
+        max_tokens: None,
+    };
+    let _ = hub_api::ask_answer(&shared, ask(), None).await;
+
+    let user = data.join("hub-routing");
+    assert!(user.is_dir(), "the user's index is still there");
+    assert!(
+        !user.join(".git").exists(),
+        "an Ask wrote a .git marker into the user's hub-routing index"
+    );
+    let marker = data.join(hub_api::ROUTING_DIR).join(".git");
+    assert!(marker.is_dir(), "the routing dir is made on the first Ask");
+
+    // Made once, not on every request: a second Ask does not put it back.
+    std::fs::remove_dir(&marker).expect("remove marker");
+    let _ = hub_api::ask_answer(&shared, ask(), None).await;
+    assert!(!marker.exists(), "the routing dir is made once per node");
+    assert!(!user.join(".git").exists());
+
+    // And the user's index still answers.
+    let r = h.admin("GET", "/hub-routing/_count", None).await;
+    assert!(r.status.is_success(), "{:?}", r.json());
+}
