@@ -161,15 +161,21 @@ fn text_arg(args: &Value, key: &str) -> Result<String, String> {
     Ok(t.to_string())
 }
 
+/// The longest corpus slug a tool accepts — the server's `valid_slug` cap.
+const MAX_SLUG_BYTES: usize = 64;
+
 /// A corpus slug, checked before anything is looked up or built from it.
 fn slug_arg(args: &Value, key: &str, required: bool) -> Result<Option<String>, String> {
     match args.get(key) {
         None | Some(Value::Null) if !required => Ok(None),
         None | Some(Value::Null) => Err(format!("`{key}` is required")),
-        Some(Value::String(s)) if xerj_hub::cli::valid_slug(s) => Ok(Some(s.clone())),
+        Some(Value::String(s)) if s.len() <= MAX_SLUG_BYTES && xerj_hub::cli::valid_slug(s) => {
+            Ok(Some(s.clone()))
+        }
         Some(Value::String(s)) if s.is_empty() && !required => Ok(None),
         Some(_) => Err(format!(
-            "`{key}` must be a corpus slug (lower-case letters, digits, '.', '_', '-')"
+            "`{key}` must be a corpus slug (lower-case letters, digits, '.', '_', '-'; at most \
+             {MAX_SLUG_BYTES} bytes)"
         )),
     }
 }
@@ -330,6 +336,30 @@ mod tests {
         assert!(int_arg(&json!({ "k": 51 }), "k", 50).is_err());
         assert!(int_arg(&json!({ "k": "5" }), "k", 50).is_err());
         assert_eq!(int_arg(&json!({ "k": 50 }), "k", 50).unwrap(), Some(50));
+    }
+
+    /// Review finding (rev7): `slug_arg` took a slug of any length (a 200 KB
+    /// one was accepted and echoed back in "unknown corpus '…'"). The server's
+    /// own `valid_slug` caps a slug at 64 bytes; the tool arguments do too.
+    #[test]
+    fn a_slug_longer_than_the_servers_cap_is_refused_and_never_echoed() {
+        let at_cap = "a".repeat(MAX_SLUG_BYTES);
+        assert_eq!(
+            slug_arg(&json!({ "slug": at_cap }), "slug", true).unwrap(),
+            Some(at_cap.clone())
+        );
+        for len in [MAX_SLUG_BYTES + 1, 200 * 1024] {
+            let long = "a".repeat(len);
+            for (key, required) in [("slug", true), ("corpus", false)] {
+                let err = slug_arg(&json!({ key: long }), key, required)
+                    .expect_err("over the cap is refused");
+                assert!(
+                    err.len() < 200,
+                    "the slug is not echoed back: {}",
+                    err.len()
+                );
+            }
+        }
     }
 
     #[test]
