@@ -79,7 +79,13 @@ pub struct IndexCfg {
     /// `.gitignore` / `.xerjignore` / built-in build-output rules (#276).
     /// `deep_count` is set from `--dry-run`.
     pub ignore: IgnoreOptions,
-    pub max_file_gb: u64,
+    /// Whole-file size cap in BYTES for non-streaming families (JSON, HTML,
+    /// prose, PDF, …). Streaming families are never capped. Set on the CLI by
+    /// any one of `--max-file-gb` / `--max-file-mb` / `--max-file-bytes`
+    /// (mutually exclusive), all normalised to bytes here so a sub-GB cap —
+    /// e.g. a 10 MB source-watcher budget (#1233) — is expressible. Default
+    /// 2 GB.
+    pub max_file_bytes: u64,
     pub sample: usize,
     pub no_semantic: bool,
     /// `--code-analyzer` (#1198): `code` declares the built-in identifier-aware
@@ -294,7 +300,13 @@ pub fn help_text_with(feedback: bool) -> String {
                                   not an ignore rule, it is what keeps secrets out.\n\
              --no-default-ignores keep the ignore files, drop only the built-in list\n\
                                   ({defaults})\n\
-             --max-file-gb <N>    skip+record oversized non-streamable files (default 2)\n\
+             --max-file-gb <N>    skip+record oversized non-streamable files, cap in whole\n\
+                                  GB (default 2). Use --max-file-mb/--max-file-bytes for a\n\
+                                  smaller cap; the three are mutually exclusive\n\
+             --max-file-mb <N>    same cap expressed in whole MB (e.g. 10 for a source\n\
+                                  watcher); mutually exclusive with --max-file-gb/-bytes\n\
+             --max-file-bytes <N> same cap expressed in whole bytes; mutually exclusive\n\
+                                  with --max-file-gb/--max-file-mb\n\
              --sample <N>         records sampled per file for inference (default 500)\n\
              --no-semantic        skip semantic_text on body fields (pure BM25+keyword)\n\
              --code-analyzer <A>  standard (default) or code: `code` declares the built-in\n\
@@ -637,6 +649,34 @@ pub(crate) fn xerj_url_ignored_note(xerj_url: Option<&str>, url_explicit: bool) 
     ))
 }
 
+/// Normalise one of the mutually-exclusive `--max-file-{gb,mb,bytes}` flags
+/// into the shared byte cap (#1233). `unit` is bytes-per-unit (1<<30 for GB,
+/// 1<<20 for MB, 1 for bytes). The flags are mutually exclusive: a second one
+/// is a hard usage error, not last-wins, so a resumed generation can never
+/// disagree with itself about the cap. Parsing as `u64` rejects negatives and
+/// non-numbers with the actionable exit-2 error the reporter saw; the multiply
+/// is overflow-checked.
+fn set_max_file_bytes(
+    slot: &mut Option<u64>,
+    flag: &str,
+    raw: Option<String>,
+    unit: u64,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(
+            "specify only one of --max-file-gb / --max-file-mb / --max-file-bytes".to_owned(),
+        );
+    }
+    let n: u64 = raw
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("{flag} needs a non-negative integer"))?;
+    let bytes = n
+        .checked_mul(unit)
+        .ok_or_else(|| format!("{flag} value is too large"))?;
+    *slot = Some(bytes);
+    Ok(())
+}
+
 pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut it = args.into_iter().peekable();
     let mut folder: Option<PathBuf> = None;
@@ -673,7 +713,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut stub_globs: Vec<String> = Vec::new();
     let mut no_ignore = false;
     let mut no_default_ignores = false;
-    let mut max_file_gb = 2u64;
+    // One of --max-file-gb / --max-file-mb / --max-file-bytes sets this, all
+    // normalised to bytes; `None` until one is seen so a second size flag is a
+    // hard error and the default (2 GB) applies only when none is given (#1233).
+    let mut max_file_bytes: Option<u64> = None;
     let mut sample = 500usize;
     let mut no_semantic = false;
     let mut code_analyzer = crate::infer::CodeAnalyzer::default();
@@ -822,10 +865,13 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--no-ignore" => no_ignore = true,
             "--no-default-ignores" => no_default_ignores = true,
             "--max-file-gb" => {
-                max_file_gb = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("--max-file-gb needs a number")?
+                set_max_file_bytes(&mut max_file_bytes, "--max-file-gb", it.next(), 1u64 << 30)?
+            }
+            "--max-file-mb" => {
+                set_max_file_bytes(&mut max_file_bytes, "--max-file-mb", it.next(), 1u64 << 20)?
+            }
+            "--max-file-bytes" => {
+                set_max_file_bytes(&mut max_file_bytes, "--max-file-bytes", it.next(), 1)?
             }
             "--sample" => {
                 sample = it
@@ -1535,7 +1581,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     // directory; a real run's whole point is not touching it.
                     deep_count: dry_run,
                 },
-                max_file_gb,
+                max_file_bytes: max_file_bytes.unwrap_or(2u64 << 30),
                 sample: sample.max(50),
                 no_semantic,
                 code_analyzer,
@@ -2027,6 +2073,50 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    /// #1233: the whole-file cap must be expressible below 1 GB. `--max-file-gb`
+    /// stays the whole-GB flag (default 2 GB), and `--max-file-mb` /
+    /// `--max-file-bytes` reach the sub-GB range a source watcher needs. All
+    /// three normalise to the same `max_file_bytes`.
+    #[test]
+    fn max_file_cap_defaults_to_2gb_and_accepts_mb_and_bytes() {
+        assert_eq!(index(&["data"]).max_file_bytes, 2u64 << 30);
+        assert_eq!(
+            index(&["data", "--max-file-gb", "5"]).max_file_bytes,
+            5u64 << 30
+        );
+        // The exact case the reporter could not express: a 10 MB source budget.
+        assert_eq!(
+            index(&["data", "--max-file-mb", "10"]).max_file_bytes,
+            10u64 << 20
+        );
+        assert_eq!(
+            index(&["data", "--max-file-bytes", "4096"]).max_file_bytes,
+            4096
+        );
+    }
+
+    /// Malformed, negative and overflowing values are refused with an
+    /// actionable usage error (#1233); the three size flags are mutually
+    /// exclusive so a resumed generation can never disagree with itself.
+    #[test]
+    fn max_file_cap_rejects_bad_values_and_double_specification() {
+        // Non-numeric and negative both fail the u64 parse with the actionable
+        // message (negatives are the exit-2 the reporter saw, kept actionable).
+        assert!(err(&["data", "--max-file-mb", "ten"])
+            .contains("--max-file-mb needs a non-negative integer"));
+        assert!(err(&["data", "--max-file-gb", "-1"])
+            .contains("--max-file-gb needs a non-negative integer"));
+        assert!(
+            err(&["data", "--max-file-gb"]).contains("--max-file-gb needs a non-negative integer")
+        );
+        // Overflow of the unit multiply is caught, not wrapped.
+        assert!(err(&["data", "--max-file-gb", "18446744073709551615"])
+            .contains("--max-file-gb value is too large"));
+        // Mutually exclusive: a second size flag is a hard error, not last-wins.
+        assert!(err(&["data", "--max-file-gb", "1", "--max-file-mb", "10"])
+            .contains("specify only one of --max-file-gb / --max-file-mb / --max-file-bytes"));
     }
 
     #[test]

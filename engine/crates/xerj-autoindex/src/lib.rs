@@ -145,10 +145,9 @@ pub(crate) fn code_search_hint(prefix: &str) -> String {
 }
 
 fn prepared_records_identity(cfg: &IndexCfg) -> Result<String> {
-    let value = json!({
+    let mut value = json!({
         "contract": PREPARED_RECORDS_IDENTITY,
         "sample": cfg.sample,
-        "max_file_gb": cfg.max_file_gb,
         "no_semantic": cfg.no_semantic,
         // Worker counts are operational only. The timeout can change whether
         // a PDF yields records, so it is part of the semantic contract.
@@ -162,6 +161,19 @@ fn prepared_records_identity(cfg: &IndexCfg) -> Result<String> {
                 .unwrap_or_else(|_| "unreadable".to_string())
         }),
     });
+    // Back-compat: every pre-#1233 cap was a whole number of GB, serialised as
+    // the top-level key `"max_file_gb": N`. Keep emitting exactly that whenever
+    // the byte cap is a whole number of GB, so an index built before the flag
+    // gained sub-GB granularity still re-derives its original digest and
+    // resumes cleanly. A genuinely sub-GB cap (the new capability) gets a
+    // distinct `max_file_bytes` key, which correctly reads as a different
+    // prepared-records contract and triggers a fresh generation.
+    let map = value.as_object_mut().expect("json! object");
+    if cfg.max_file_bytes.is_multiple_of(GB) {
+        map.insert("max_file_gb".into(), json!(cfg.max_file_bytes / GB));
+    } else {
+        map.insert("max_file_bytes".into(), json!(cfg.max_file_bytes));
+    }
     Ok(format!(
         "{}-{:032x}",
         PREPARED_RECORDS_IDENTITY,
@@ -931,7 +943,7 @@ fn project_reconcile_plan(
                     digest,
                     &ctx,
                     cfg.sample,
-                    cfg.max_file_gb,
+                    cfg.max_file_bytes,
                     stub_matcher.matches(&file.rel),
                 )
             })
@@ -2612,13 +2624,28 @@ impl ScanTally {
     }
 }
 
+/// Render a byte count in the largest whole binary unit that divides it, so the
+/// "skipped: oversized" note reads `2 GB` for the default and `10 MB` for a
+/// source-watcher cap (#1233) rather than a raw byte count, while an awkward
+/// value still prints exactly in bytes.
+fn human_size(bytes: u64) -> String {
+    const MB: u64 = 1 << 20;
+    if bytes != 0 && bytes.is_multiple_of(GB) {
+        format!("{} GB", bytes / GB)
+    } else if bytes != 0 && bytes.is_multiple_of(MB) {
+        format!("{} MB", bytes / MB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn scan_file(
     path: &Path,
     size: u64,
     digest: &str,
     ctx: &PhaseAContext<'_>,
     sample: usize,
-    max_file_gb: u64,
+    max_file_bytes: u64,
     stub: bool,
 ) -> FileScan {
     ctx.tally.record_parse();
@@ -2670,12 +2697,13 @@ fn scan_file(
             | Family::Ipynb
             | Family::Man
     );
-    if whole_file && size > max_file_gb * GB {
+    if whole_file && size > max_file_bytes {
         out.junk = Some((
             "skipped".into(),
             format!(
-                "oversized for non-streaming family {} (> {max_file_gb} GB)",
-                sn.family.as_str()
+                "oversized for non-streaming family {} (> {})",
+                sn.family.as_str(),
+                human_size(max_file_bytes),
             ),
         ));
         out.sniffed = Some(sn);
@@ -2842,7 +2870,7 @@ mod clustering_key_tests {
             meter: &meter,
             tally: &ScanTally::default(),
         };
-        scan_file(&path, size, "d0", &ctx, 500, 2, false)
+        scan_file(&path, size, "d0", &ctx, 500, 2 << 30, false)
     }
 
     /// The #178 mechanism, from the extractor to the clustering key: a source
@@ -2944,7 +2972,7 @@ mod phase_a_grouping_tests {
             follow_symlinks: false,
             follow_symlinks_outside_root: false,
             ignore: crate::ignore_rules::IgnoreOptions::default(),
-            max_file_gb: 2,
+            max_file_bytes: 2 << 30,
             sample: 500,
             no_semantic: false,
             code_analyzer: Default::default(),
@@ -3479,7 +3507,7 @@ fn build_phase_a(
                     digest,
                     ctx,
                     cfg.sample,
-                    cfg.max_file_gb,
+                    cfg.max_file_bytes,
                     stub_matcher.matches(&f.rel),
                 )
             })
@@ -5686,11 +5714,24 @@ fn legacy_rebuild_argv(cfg: &IndexCfg, state_dir: &Path, prefix: &str) -> Vec<St
         cfg.bulk_timeout_secs.to_string(),
         "--snapshot-max-gb".to_owned(),
         (cfg.snapshot_max_bytes >> 30).to_string(),
-        "--max-file-gb".to_owned(),
-        cfg.max_file_gb.to_string(),
         "--sample".to_owned(),
         cfg.sample.to_string(),
     ];
+    // Emit the cap in the coarsest flag that expresses it exactly, so the
+    // printed rebuild command stays readable for the whole-GB common case yet
+    // round-trips a sub-GB cap (#1233) losslessly. `cli::parse` reads any of
+    // the three back into the same `max_file_bytes`.
+    const MB: u64 = 1 << 20;
+    if cfg.max_file_bytes.is_multiple_of(GB) {
+        argv.push("--max-file-gb".to_owned());
+        argv.push((cfg.max_file_bytes / GB).to_string());
+    } else if cfg.max_file_bytes.is_multiple_of(MB) {
+        argv.push("--max-file-mb".to_owned());
+        argv.push((cfg.max_file_bytes / MB).to_string());
+    } else {
+        argv.push("--max-file-bytes".to_owned());
+        argv.push(cfg.max_file_bytes.to_string());
+    }
     if cfg.no_semantic {
         argv.push("--no-semantic".to_owned());
     }
@@ -11905,7 +11946,7 @@ mod legacy_rebuild_argv_tests {
             rebuilt.follow_symlinks_outside_root,
             cfg.follow_symlinks_outside_root
         );
-        assert_eq!(rebuilt.max_file_gb, cfg.max_file_gb);
+        assert_eq!(rebuilt.max_file_bytes, cfg.max_file_bytes);
         assert_eq!(rebuilt.sample, cfg.sample);
         assert_eq!(rebuilt.workers, cfg.workers);
         assert_eq!(rebuilt.bulk_mb, cfg.bulk_mb);
@@ -11931,6 +11972,68 @@ mod legacy_rebuild_argv_tests {
             "80",
         ]);
         assert_round_trip(&["data", "--no-graph", "--no-ignore"]);
+        // #1233: a sub-GB cap must survive the rebuild-advice round-trip, which
+        // the old integer-GB flag could not express.
+        assert_round_trip(&["data", "--no-graph", "--max-file-mb", "10"]);
+        assert_round_trip(&["data", "--no-graph", "--max-file-bytes", "4096"]);
+        assert_round_trip(&["data", "--no-graph", "--max-file-gb", "3"]);
+    }
+
+    /// #1233: the "skipped: oversized" note renders the byte cap in the
+    /// coarsest whole binary unit, so it reads `2 GB` / `10 MB` rather than a
+    /// raw byte count, and falls back to exact bytes when neither divides.
+    #[test]
+    fn human_size_reads_in_the_coarsest_whole_unit() {
+        assert_eq!(human_size(2 << 30), "2 GB");
+        assert_eq!(human_size(10 << 20), "10 MB");
+        assert_eq!(human_size(4096), "4096 bytes");
+        assert_eq!(human_size(0), "0 bytes");
+    }
+
+    /// #1233 back-compat: an index built before sub-GB caps existed serialised
+    /// its cap as the top-level `max_file_gb` integer. A whole-GB cap must still
+    /// produce that exact key (so the prepared-records digest is unchanged and
+    /// the index resumes), while a genuinely sub-GB cap gets a distinct key and
+    /// therefore a distinct, non-resumable digest.
+    #[test]
+    fn prepared_records_identity_is_byte_compatible_for_whole_gb_caps() {
+        let base = parse_index(&strings(&["data", "--no-graph"]));
+        assert_eq!(
+            base.label, None,
+            "this test assumes the default (no label set)"
+        );
+        let ident = |bytes: u64| {
+            let mut c = base.clone();
+            c.max_file_bytes = bytes;
+            prepared_records_identity(&c).unwrap()
+        };
+        let two_gb = ident(2 << 30);
+        let ten_mb = ident(10 << 20);
+        let one_gb = ident(1 << 30);
+        assert_ne!(two_gb, ten_mb, "a sub-GB cap is a different contract");
+        assert_ne!(one_gb, two_gb, "different whole-GB caps differ");
+        // The whole-GB value serialises the historical top-level `max_file_gb`
+        // integer key: the digest is the xxh3 of the JSON, so matching it to a
+        // value hand-built with that exact key (the pre-#1233 wire form) proves
+        // existing indexes still re-derive their digest and resume. serde_json
+        // sorts keys, so insertion order here is irrelevant.
+        let expected = serde_json::json!({
+            "contract": PREPARED_RECORDS_IDENTITY,
+            "sample": base.sample,
+            "no_semantic": base.no_semantic,
+            "pdf_timeout_secs": base.pdf_timeout_secs,
+            "label": serde_json::Value::Null,
+            "max_file_gb": 2,
+        });
+        let want = format!(
+            "{}-{:032x}",
+            PREPARED_RECORDS_IDENTITY,
+            xxhash_rust::xxh3::xxh3_128(&serde_json::to_vec(&expected).unwrap())
+        );
+        assert_eq!(
+            two_gb, want,
+            "whole-GB cap must keep the historical wire form"
+        );
     }
 
     #[test]
