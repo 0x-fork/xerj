@@ -144,7 +144,14 @@ its own wire form (`HubAnswer` for gRPC, rendered text + `Answer` JSON for MCP).
 `XERJ_HUB_URL` overrides the hosted base URL for both. This mirrors how the CLI
 and the `xerj_code_search` MCP tool already share `xccode::run_code_query`.
 
-## Step-7 wiring checklist (not done here)
+## Step-7 wiring checklist
+
+Status: items 1, 2 and 4's gRPC tests are implemented in
+`engine/crates/xerj-server/src/grpc_hub.rs` (the service is a thin adapter over
+`xerj_api::hub_api::{def_answer, ask_answer, catalogue_signed}` — the same
+`def_core`/`code_core` the `/_hub/v1` routes run, and for `Ask` the
+`xerj_hub::ask::ask` flow itself with a read-only backend). Item 3 (MCP) ships
+separately.
 
 1. Implement the `XerjHub` trait in `engine/crates/xerj-server/src/grpc.rs`,
    converting `HubAnswer` ↔ `hub::Answer` per the tables above.

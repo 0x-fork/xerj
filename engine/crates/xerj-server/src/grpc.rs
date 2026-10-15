@@ -1,4 +1,6 @@
-//! Real tonic gRPC server for the `XerjSearch` service (default `:8081`).
+//! Real tonic gRPC server for the `XerjSearch` service (default `:8081`), and
+//! the Corpus Hub `XerjHub` service on the same listener behind the same
+//! interceptor (`grpc_hub.rs`).
 //!
 //! Replaces the v0.1 placeholder (which only bound the port and dropped
 //! connections). The service is a thin adapter over the same `Engine`/`Index`
@@ -475,10 +477,15 @@ where
     let interceptor = GrpcAuth {
         state: state.clone(),
     };
+    let hub = pb::xerj_hub_server::XerjHubServer::with_interceptor(
+        crate::grpc_hub::HubService::new(state.clone()),
+        interceptor.clone(),
+    );
     let svc = XerjSearchServer::with_interceptor(GrpcService::new(state), interceptor);
-    info!("gRPC XerjSearch listening on {addr}");
+    info!("gRPC XerjSearch + XerjHub listening on {addr}");
     tonic::transport::Server::builder()
         .add_service(svc)
+        .add_service(hub)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .context("gRPC transport error")?;

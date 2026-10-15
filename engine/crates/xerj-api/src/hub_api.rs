@@ -523,6 +523,9 @@ struct CatalogueData {
     bytes: Bytes,
     etag: String,
     index: Result<CatalogueIndex, String>,
+    /// The whole catalogue, term sketches included, when it parses: what the
+    /// gRPC `Ask` routes a question with (`ask_answer`).
+    parsed: Option<Arc<Catalogue>>,
 }
 
 struct CatalogueIndex {
@@ -539,7 +542,7 @@ struct CorpusRule {
 impl CatalogueData {
     fn from_bytes(bytes: Bytes) -> Self {
         let etag = format!("\"{}\"", hex(&Sha256::digest(&bytes)));
-        let index = serde_json::from_slice::<Catalogue>(&bytes)
+        let parsed = serde_json::from_slice::<Catalogue>(&bytes)
             .map_err(|e| e.to_string())
             .and_then(|c| {
                 if c.format_version != CATALOGUE_FORMAT_VERSION {
@@ -548,23 +551,32 @@ impl CatalogueData {
                         c.format_version
                     ));
                 }
-                Ok(CatalogueIndex {
-                    corpora: c
-                        .corpora
-                        .into_iter()
-                        .map(|e| {
-                            (
-                                e.slug,
-                                CorpusRule {
-                                    licence_spdx: e.licence_spdx,
-                                    licence_class: e.licence_class,
-                                },
-                            )
-                        })
-                        .collect(),
-                })
+                Ok(c)
             });
-        Self { bytes, etag, index }
+        let index = parsed
+            .as_ref()
+            .map_err(Clone::clone)
+            .map(|c| CatalogueIndex {
+                corpora: c
+                    .corpora
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.slug.clone(),
+                            CorpusRule {
+                                licence_spdx: e.licence_spdx.clone(),
+                                licence_class: e.licence_class,
+                            },
+                        )
+                    })
+                    .collect(),
+            });
+        Self {
+            bytes,
+            etag,
+            index,
+            parsed: parsed.ok().map(Arc::new),
+        }
     }
 }
 
@@ -1118,7 +1130,7 @@ impl XcHttp for InProcessNode {
 /// finishes — the cap bounds blocking threads, not just waiting requests.
 async fn run_query<T, F>(
     shared: &Arc<HubShared>,
-    headers: &HeaderMap,
+    auth: Option<HeaderValue>,
     work: F,
 ) -> Result<T, Response>
 where
@@ -1141,7 +1153,7 @@ where
     // silently widen the caller to the whole `xc-*` namespace.
     let node = InProcessNode::new(
         &shared.app,
-        headers.get(header::AUTHORIZATION).cloned(),
+        auth,
         shared.tuning.response_cap_bytes,
         index_guard::current(),
     );
@@ -1425,12 +1437,20 @@ enum Outcome {
     Failed(String),
 }
 
-fn respond(outcome: Result<Outcome, Response>) -> Response {
+/// A blocking query's outcome as the answer, or the response that refuses it.
+fn settle(outcome: Result<Outcome, Response>) -> Result<Answer, Response> {
     match outcome {
-        Ok(Outcome::Done(answer)) => Json(*answer).into_response(),
-        Ok(Outcome::NotLoaded) => not_loaded(),
-        Ok(Outcome::NotServed) => unknown_corpus(),
-        Ok(Outcome::Failed(detail)) => unavailable(&detail),
+        Ok(Outcome::Done(answer)) => Ok(*answer),
+        Ok(Outcome::NotLoaded) => Err(not_loaded()),
+        Ok(Outcome::NotServed) => Err(unknown_corpus()),
+        Ok(Outcome::Failed(detail)) => Err(unavailable(&detail)),
+        Err(resp) => Err(resp),
+    }
+}
+
+fn respond(answer: Result<Answer, Response>) -> Response {
+    match answer {
+        Ok(answer) => Json(answer).into_response(),
         Err(resp) => resp,
     }
 }
@@ -1454,12 +1474,35 @@ async fn def_route(
         Ok(k) => k,
         Err(why) => return bad_request(why),
     };
-    let rule = match shared.resolve_corpus(&slug).await {
-        Ok(rule) => rule,
-        Err(resp) => return resp,
-    };
+    respond(
+        def_core(
+            &shared,
+            slug,
+            &symbol,
+            k,
+            headers.get(header::AUTHORIZATION).cloned(),
+        )
+        .await,
+    )
+}
+
+/// `def` for one corpus: the body of `GET /_hub/v1/def/{slug}/{symbol}` after
+/// its query string was read, shared with the gRPC `XerjHub.Def` RPC
+/// ([`def_answer`]) so both surfaces return the same [`Answer`] and refuse the
+/// same requests. `auth` is the caller's `Authorization` value, forwarded to
+/// the in-process node.
+async fn def_core(
+    shared: &Arc<HubShared>,
+    slug: String,
+    symbol: &str,
+    k: usize,
+    auth: Option<HeaderValue>,
+) -> Result<Answer, Response> {
+    let symbol = check_text(symbol, "symbol")?;
+    let k = k.clamp(1, MAX_K);
+    let rule = shared.resolve_corpus(&slug).await?;
     let after_check = shared.tuning.after_ledger_check;
-    let outcome = run_query(&shared, &headers, move |node| {
+    let outcome = run_query(shared, auth, move |node| {
         let root = hub_root();
         let facts = match corpus_facts(&root, &slug, &rule) {
             Ok(f) => f,
@@ -1512,7 +1555,7 @@ async fn def_route(
         Outcome::Done(Box::new(answer))
     })
     .await;
-    respond(outcome)
+    settle(outcome)
 }
 
 /// `GET /_hub/v1/code/{slug}?q=&k=&max_tokens=&mode=`.
@@ -1542,13 +1585,58 @@ async fn code_route(
         Ok(m) => m,
         Err(why) => return bad_request(why),
     };
-    let rule = match shared.resolve_corpus(&slug).await {
-        Ok(rule) => rule,
-        Err(resp) => return resp,
-    };
+    respond(
+        code_core(
+            &shared,
+            slug,
+            &query,
+            CodeOpts {
+                k,
+                max_tokens,
+                mode,
+            },
+            headers.get(header::AUTHORIZATION).cloned(),
+        )
+        .await,
+    )
+}
+
+/// What a `code` query asks for besides the corpus and the question.
+#[derive(Clone, Copy, Debug)]
+struct CodeOpts {
+    k: usize,
+    max_tokens: Option<u64>,
+    mode: Mode,
+}
+
+/// `code` for one corpus: the body of `GET /_hub/v1/code/{slug}` after its
+/// query string was read, shared with the gRPC `XerjHub.Ask` RPC (through
+/// [`ask_answer`]) so both surfaces refuse the same requests.
+async fn code_core(
+    shared: &Arc<HubShared>,
+    slug: String,
+    query: &str,
+    opts: CodeOpts,
+    auth: Option<HeaderValue>,
+) -> Result<Answer, Response> {
+    let query = check_text(query, "q")?;
+    let CodeOpts {
+        k,
+        max_tokens,
+        mode,
+    } = opts;
+    let k = k.clamp(1, MAX_K);
+    if let Some(m) = max_tokens {
+        if !(1..=MAX_TOKENS_CAP).contains(&m) {
+            return Err(bad_request(format!(
+                "`max_tokens` must be an integer from 1 to {MAX_TOKENS_CAP}, got [{m}]"
+            )));
+        }
+    }
+    let rule = shared.resolve_corpus(&slug).await?;
     let width = passage_width(max_tokens);
     let after_check = shared.tuning.after_ledger_check;
-    let outcome = run_query(&shared, &headers, move |node| {
+    let outcome = run_query(shared, auth, move |node| {
         let root = hub_root();
         let facts = match corpus_facts(&root, &slug, &rule) {
             Ok(f) => f,
@@ -1618,7 +1706,7 @@ async fn code_route(
         }
     })
     .await;
-    respond(outcome)
+    settle(outcome)
 }
 
 /// `GET /_hub/v1/search?q=&k=`.
@@ -1652,7 +1740,8 @@ async fn search_route(
         );
     }
     let blocking_shared = shared.clone();
-    let outcome = run_query(&shared, &headers, move |node| {
+    let auth = headers.get(header::AUTHORIZATION).cloned();
+    let outcome = run_query(&shared, auth, move |node| {
         // A failed read of the mappings is an outage, not an empty node.
         let fields = blocking_shared.search_fields_blocking(node)?;
         if fields.is_empty() {
@@ -1698,6 +1787,447 @@ async fn search_route(
         Ok(Err(detail)) => unavailable(&detail),
         Err(resp) => resp,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The same answers for a surface that is not HTTP (gRPC `XerjHub`, plan §7)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The gRPC service is a thin adapter: it converts its request into the
+// arguments below and the [`Answer`] that comes back into its own wire form.
+// Every check and every query is the HTTP route's own code (`def_core`,
+// `code_core`, `resolve_corpus`, the catalogue cache, the in-process node and
+// its guards), so the two surfaces cannot drift apart: the same corpus is
+// refused for the same reason on both, and `Def` returns the same `Answer`
+// field for field as `GET /_hub/v1/def/{slug}/{symbol}`.
+
+/// Why a hub request was refused, independent of the surface it arrived on:
+/// the status the `/_hub/v1` route answers with and the reason it puts in the
+/// body. A non-HTTP surface maps the status to its own error codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubRefusal {
+    pub status: StatusCode,
+    pub reason: String,
+    /// The `Retry-After` value, when the route sends one (`429`, a busy `503`).
+    pub retry_after: Option<String>,
+}
+
+impl HubRefusal {
+    fn new(status: StatusCode, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+            retry_after: None,
+        }
+    }
+}
+
+/// The refusal an error [`Response`] built by this module carries.
+async fn refusal(resp: Response) -> HubRefusal {
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let reason = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/reason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| status.canonical_reason().unwrap_or("refused").to_string());
+    HubRefusal {
+        status,
+        reason,
+        retry_after,
+    }
+}
+
+impl HubShared {
+    /// Count one request from `client` (an IP address, as text) against the same
+    /// per-address budget the HTTP routes use ([`RATE_LIMIT`] per
+    /// [`RATE_WINDOW`]); `Err` is the `429` refusal.
+    pub fn admit(&self, client: &str) -> Result<(), HubRefusal> {
+        self.limiter
+            .admit(&client_bucket(client), Instant::now())
+            .map_err(|retry_after| HubRefusal {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                reason: format!(
+                    "more than {RATE_LIMIT} requests in {} seconds from this address; retry in \
+                     {retry_after}s",
+                    RATE_WINDOW.as_secs()
+                ),
+                retry_after: Some(retry_after.to_string()),
+            })
+    }
+}
+
+/// `GET /_hub/v1/def/{slug}/{symbol}?k=` for a caller that is not HTTP: the
+/// same `def_core` the route runs. `k == 0` means [`DEFAULT_K`]; anything
+/// larger than [`MAX_K`] is clamped. `auth` is the caller's `Authorization`
+/// value (`ApiKey …`), forwarded to the in-process node exactly as the route
+/// forwards its header. Run it under the caller's visibility rule
+/// (`index_guard::scoped`): it is captured here, as on the HTTP path.
+pub async fn def_answer(
+    shared: &Arc<HubShared>,
+    slug: &str,
+    symbol: &str,
+    k: usize,
+    auth: Option<HeaderValue>,
+) -> Result<Answer, HubRefusal> {
+    let k = if k == 0 { DEFAULT_K } else { k };
+    match def_core(shared, slug.to_string(), symbol, k, auth).await {
+        Ok(answer) => Ok(answer),
+        Err(resp) => Err(refusal(resp).await),
+    }
+}
+
+/// The catalogue file and its detached signature.
+pub struct SignedCatalogue {
+    /// The file's exact bytes — what `GET /_hub/v1/catalogue` serves and what
+    /// the signature covers.
+    pub bytes: Bytes,
+    /// The raw ed25519 signature from `<hub.catalogue_path>.sig` (lower-case hex
+    /// on disk, decoded here); empty when the node has no signature file, in
+    /// which case the client must treat the catalogue as unverified.
+    pub signature: Vec<u8>,
+}
+
+/// A detached signature file is 128 hex characters; anything near this size is
+/// not one.
+const MAX_SIGNATURE_FILE_BYTES: u64 = 1024;
+
+/// `GET /_hub/v1/catalogue` for a caller that is not HTTP, plus the signature
+/// the static site serves beside it. The path is the node's configuration, never
+/// anything a request supplies.
+pub async fn catalogue_signed(shared: &Arc<HubShared>) -> Result<SignedCatalogue, HubRefusal> {
+    let data = match shared.catalogue().await {
+        Ok(d) => d,
+        Err(e) => return Err(refusal(e.into_response()).await),
+    };
+    let sig_path = format!("{}.sig", shared.app.config.hub.catalogue_path.trim());
+    let signature = tokio::task::spawn_blocking(move || read_signature(FsPath::new(&sig_path)))
+        .await
+        .unwrap_or_default();
+    Ok(SignedCatalogue {
+        bytes: data.bytes.clone(),
+        signature,
+    })
+}
+
+/// Decode the hex signature at `path`; empty when it is absent, oversized or
+/// not hex (logged — a node that serves a broken signature should be told).
+fn read_signature(path: &FsPath) -> Vec<u8> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if !meta.is_file() || meta.len() > MAX_SIGNATURE_FILE_BYTES {
+        tracing::warn!(path = %path.display(), "hub catalogue signature file is not usable");
+        return Vec::new();
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let hex = text.trim();
+    let decoded: Option<Vec<u8>> = hex
+        .len()
+        .is_multiple_of(2)
+        .then(|| {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    hex.get(i..i + 2)
+                        .and_then(|b| u8::from_str_radix(b, 16).ok())
+                })
+                .collect()
+        })
+        .flatten();
+    decoded.unwrap_or_else(|| {
+        tracing::warn!(path = %path.display(), "hub catalogue signature is not hex");
+        Vec::new()
+    })
+}
+
+/// A question for [`ask_answer`] — the gRPC `HubAskRequest`, decoded.
+#[derive(Debug, Clone)]
+pub struct HubAsk {
+    pub question: String,
+    /// `None`: route by the catalogue's term sketches.
+    pub corpus: Option<String>,
+    /// `None`: decide from the question, as `xerj ask` does.
+    pub mode: Option<AnswerMode>,
+    /// A soft budget for the rendered answer; `None` = none.
+    pub max_tokens: Option<u64>,
+}
+
+/// Distinct files a `files` answer lists at most (the `xerj ask --files` value).
+const FILES_K: usize = 10;
+
+/// Answer a question from the corpora restored on THIS node, through the one
+/// answer flow `xerj ask` runs ([`xerj_hub::ask::ask`]): the same mode
+/// detection, the same router (term sketches and exact-symbol evidence over this
+/// node's catalogue), the same licence warnings and the same token cap. Only the
+/// backend differs: [`NodeBackend`] answers through `def_core` / `code_core`,
+/// the code behind `GET /_hub/v1/def` and `/_hub/v1/code`.
+///
+/// Read-only by construction: the flow runs with `offline` and `no_fetch`, no
+/// hosted client, and a backend that refuses to pull — so a request can never
+/// download, restore, evict or delete a pack, start a process, or reach the
+/// network. An `excluded` corpus is removed from the catalogue before routing,
+/// so it can neither be routed to nor named (`404`, the same as an unknown
+/// corpus); the corpus's own ledger is checked again by the cores.
+pub async fn ask_answer(
+    shared: &Arc<HubShared>,
+    ask: HubAsk,
+    auth: Option<HeaderValue>,
+) -> Result<Answer, HubRefusal> {
+    use xerj_hub::ask::{
+        self as flow, AskArgs, AskDeps, HostedSwitch, ModeRequest, EXIT_NEEDS_DECISION, EXIT_USAGE,
+    };
+
+    let question = match check_text(&ask.question, "question") {
+        Ok(q) => q,
+        Err(resp) => return Err(refusal(resp).await),
+    };
+    if let Some(corpus) = &ask.corpus {
+        if !valid_slug(corpus) {
+            return Err(refusal(unknown_corpus()).await);
+        }
+    }
+    if let Some(m) = ask.max_tokens {
+        if !(1..=MAX_TOKENS_CAP).contains(&m) {
+            return Err(HubRefusal::new(
+                StatusCode::BAD_REQUEST,
+                format!("`max_tokens` must be an integer from 1 to {MAX_TOKENS_CAP}, got [{m}]"),
+            ));
+        }
+    }
+    let data = match shared.catalogue().await {
+        Ok(d) => d,
+        Err(e) => return Err(refusal(e.into_response()).await),
+    };
+    let Some(full) = data.parsed.clone() else {
+        tracing::warn!("hub catalogue does not parse");
+        return Err(HubRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the hub catalogue cannot be read right now",
+        ));
+    };
+    let routable = Catalogue {
+        format_version: full.format_version,
+        generated_at: full.generated_at.clone(),
+        corpora: full
+            .corpora
+            .iter()
+            .filter(|e| e.licence_class != LicenceClass::Excluded)
+            .cloned()
+            .collect(),
+    };
+    let mode = match ask.mode {
+        None => ModeRequest::Auto,
+        Some(AnswerMode::How) => ModeRequest::How,
+        Some(AnswerMode::Files) => ModeRequest::Files,
+        // `mode = def` names no symbol of its own: it is the one the question
+        // names (`what is the value of X`), else the whole question.
+        Some(AnswerMode::Def) => ModeRequest::Def(
+            flow::detect_mode(&question, &ModeRequest::Auto)
+                .1
+                .unwrap_or_else(|| question.clone()),
+        ),
+    };
+    let mut args = AskArgs::new(question);
+    args.corpus = ask.corpus;
+    args.mode = mode;
+    args.offline = true;
+    args.no_fetch = true;
+    args.hosted = HostedSwitch::Off;
+    args.json = true;
+    args.max_tokens = ask.max_tokens.map(|m| m as usize);
+
+    let root = routing_root(&shared.app).map_err(|e| {
+        tracing::warn!(error = %e, "hub routing directory");
+        HubRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the hub could not answer this request",
+        )
+    })?;
+    let backend = NodeBackend {
+        shared: shared.clone(),
+        rt: tokio::runtime::Handle::current(),
+        auth,
+        // Captured on the caller's task: a task-local does not follow the
+        // `spawn_blocking` below (see `run_query`).
+        visibility: index_guard::current(),
+        refused: std::sync::Mutex::new(None),
+    };
+    let job = tokio::task::spawn_blocking(move || {
+        let outcome = flow::ask(
+            &args,
+            &AskDeps {
+                // No pack cache and no project on the serving side: an empty
+                // directory whose `.git` marker stops the dependency walk, so
+                // the server's own working directory never steers routing.
+                hub_home: &root,
+                cwd: &root,
+                catalogue: &routable,
+                hosted: None,
+                backend: &backend,
+            },
+        );
+        let refused = backend.refused.lock().ok().and_then(|mut r| r.take());
+        (outcome, refused)
+    });
+    let (outcome, refused) = match job.await {
+        Ok(done) => done,
+        Err(e) => {
+            tracing::warn!(error = %e, "hub ask task failed");
+            return Err(HubRefusal::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the hub could not answer this request",
+            ));
+        }
+    };
+    if let Some(answer) = outcome.answer {
+        // A miss is an answer (no hits), never an error.
+        return Ok(answer);
+    }
+    if let Some(r) = refused {
+        return Err(r);
+    }
+    let said = outcome.stderr.join("; ");
+    Err(match outcome.exit {
+        // `select_corpus`: a corpus the catalogue does not list (or lists as
+        // excluded — removed above). Same words as the HTTP routes' 404.
+        EXIT_USAGE => refusal(unknown_corpus()).await,
+        EXIT_NEEDS_DECISION => HubRefusal::new(
+            StatusCode::CONFLICT,
+            format!(
+                "{said}; candidates: {}",
+                outcome.stdout.lines().collect::<Vec<_>>().join("; ")
+            ),
+        ),
+        _ => HubRefusal::new(StatusCode::NOT_FOUND, said),
+    })
+}
+
+/// `<data_dir>/hub-routing`, an empty directory holding only a `.git` marker:
+/// the `cwd` and `hub_home` [`ask_answer`] hands the answer flow. The router
+/// reads lockfiles from `cwd` up to the first `.git`, and the pack cache from
+/// `hub_home/packs`; here there must be neither.
+fn routing_root(app: &AppState) -> std::io::Result<PathBuf> {
+    let root = PathBuf::from(&app.config.server.data_dir).join("hub-routing");
+    std::fs::create_dir_all(root.join(".git"))?;
+    Ok(root)
+}
+
+/// The answer flow's [`xerj_hub::ask::Backend`] on a serving node: "the local
+/// pack" is the corpus restored on this node, answered through `def_core` /
+/// `code_core`. It never pulls.
+struct NodeBackend {
+    shared: Arc<HubShared>,
+    rt: tokio::runtime::Handle,
+    auth: Option<HeaderValue>,
+    visibility: Option<Arc<dyn IndexVisibility>>,
+    /// The refusal behind the last failed answer, so the caller can report the
+    /// route's own status rather than the flow's prose.
+    refused: std::sync::Mutex<Option<HubRefusal>>,
+}
+
+impl xerj_hub::ask::Backend for NodeBackend {
+    /// Whether the corpus is restored here is decided by the cores themselves
+    /// (`404 corpus_not_loaded` when its ledger or its indices are missing), the
+    /// same check the HTTP routes make, so it is not made twice.
+    fn local_pack_ready(&self, _slug: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn answer_local(&self, req: &xerj_hub::ask::Request<'_>) -> Result<Answer, String> {
+        let shared = self.shared.clone();
+        let auth = self.auth.clone();
+        let slug = req.slug.to_string();
+        let question = req.question.to_string();
+        let symbol = req.symbol.map(str::to_string);
+        let mode = req.mode;
+        let k = req.k;
+        let work = async move {
+            match (mode, symbol) {
+                (AnswerMode::Def, Some(symbol)) => {
+                    def_core(&shared, slug, &symbol, k.unwrap_or(DEFAULT_K), auth).await
+                }
+                _ => {
+                    let k = k.unwrap_or(if mode == AnswerMode::Files {
+                        FILES_K
+                    } else {
+                        DEFAULT_K
+                    });
+                    let opts = CodeOpts {
+                        k,
+                        max_tokens: None,
+                        mode: Mode::Bm25,
+                    };
+                    code_core(&shared, slug, &question, opts, auth)
+                        .await
+                        .map(|a| {
+                            if mode == AnswerMode::Files {
+                                files_answer(a)
+                            } else {
+                                a
+                            }
+                        })
+                }
+            }
+        };
+        // A blocking-pool thread (see `ask_answer`), so `block_on` is legal.
+        let result = self
+            .rt
+            .block_on(index_guard::scoped_opt(self.visibility.clone(), work));
+        match result {
+            Ok(answer) => Ok(answer),
+            Err(resp) => {
+                let r = self.rt.block_on(refusal(resp));
+                let reason = r.reason.clone();
+                if let Ok(mut slot) = self.refused.lock() {
+                    *slot = Some(r);
+                }
+                Err(reason)
+            }
+        }
+    }
+
+    fn pull_now(
+        &self,
+        entry: &xerj_common::hub::CatalogueEntry,
+    ) -> Result<(), xerj_hub::ask::PullFailure> {
+        Err(xerj_hub::ask::PullFailure {
+            code: xerj_hub::ask::EXIT_NO_ANSWER,
+            message: format!(
+                "'{}' is not loaded on this node; a hub node never pulls on a request's behalf",
+                xerj_hub::ask::printable(&entry.slug)
+            ),
+        })
+    }
+
+    fn pull_in_background(&self, _slug: &str) -> Result<xerj_hub::ask::BackgroundPull, String> {
+        Err("a hub node never pulls on a request's behalf".to_string())
+    }
+}
+
+/// A `how` answer reshaped as the `files` answer `xerj ask --files` prints: one
+/// hit per distinct file, best first, carrying the corpus licence.
+fn files_answer(mut answer: Answer) -> Answer {
+    let mut seen = std::collections::HashSet::new();
+    let spdx = answer.licence_spdx.clone();
+    answer.hits.retain(|h| seen.insert(h.file.clone()));
+    for hit in &mut answer.hits {
+        hit.kind = "file".to_string();
+        hit.text = format!("licence: {spdx}");
+        hit.value = None;
+    }
+    answer.mode = AnswerMode::Files;
+    answer
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
