@@ -86,13 +86,27 @@ pub fn emit(
             .unwrap_or("")
             .cmp(b.get("id").and_then(Value::as_str).unwrap_or(""))
     });
-    let mut seen_id = String::new();
+    // An empty id is refused BEFORE the duplicate scan, not folded into it:
+    // the old guard only compared NON-empty ids (`!seen_id.is_empty()`), so
+    // any number of empty-id records slipped past and collapsed to one _id
+    // at the consumer — a silent-wrong-result, not a loud refusal (#1110
+    // negative-path audit, gap 2). A record whose `id_from` fields never
+    // resolved (identity.rs defaults the id to "") has no stable identity to
+    // key `_id` on, so it cannot ship in a pack at all.
+    let mut seen_id: Option<&str> = None;
     for r in &records {
         let id = r.get("id").and_then(Value::as_str).unwrap_or("");
-        if !seen_id.is_empty() && id == seen_id {
+        if id.is_empty() {
+            bail!(
+                "a record reached the pack with an empty id: its `id_from` fields never \
+                 resolved, so it has no stable _id — fix the recipe's id mapping or the \
+                 source rather than ship a record that collapses with every other id-less one"
+            );
+        }
+        if seen_id == Some(id) {
             bail!("duplicate emitted id '{id}': identity edges failed to merge two records that claim the same id");
         }
-        seen_id = id.to_string();
+        seen_id = Some(id);
     }
 
     let shards = recipe.emit.shards.min(records.len()).max(1);
@@ -764,6 +778,96 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("duplicate emitted id"), "{err}");
+    }
+
+    #[test]
+    fn empty_ids_are_refused_not_collapsed() {
+        // #1110 gap 2: records whose id never resolved default to "" in
+        // identity.rs; the old duplicate guard compared only non-empty ids,
+        // so N of them shipped in one shard and collapsed to one _id at the
+        // consumer. emit must now refuse them loudly.
+        let tmp = tempfile::tempdir().unwrap();
+        let idless = || {
+            let mut m = Map::new();
+            m.insert("id".into(), json!(""));
+            m.insert("body".into(), json!("text"));
+            m
+        };
+        let records = vec![idless(), idless()];
+        let err = emit(
+            tmp.path(),
+            &recipe("t", 2),
+            "",
+            records.clone(),
+            &stats(),
+            &sugg(&records),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("empty id"), "{err}");
+
+        // a single id-less record is refused for the same reason — it has no
+        // stable _id even on its own.
+        let one = vec![idless()];
+        let err = emit(
+            tmp.path(),
+            &recipe("t", 2),
+            "",
+            one.clone(),
+            &stats(),
+            &sugg(&one),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("empty id"), "{err}");
+    }
+
+    #[test]
+    fn read_manifest_catches_a_record_count_lie_with_valid_checksums() {
+        // #1110 gap 3: every prior tamper test also broke a sha, so the
+        // line-count check (the only defence against a SUMS recomputed over
+        // the wrong bytes, or a torn final line) had never been reached. Here
+        // every checksum is consistent and ONLY the manifest's per-file
+        // `records` integer lies — the count check must still refuse.
+        let tmp = tempfile::tempdir().unwrap();
+        let records = vec![rec("a", &[]), rec("b", &[]), rec("c", &[])];
+        let r = emit(
+            tmp.path(),
+            &recipe("t", 1),
+            "# r\n",
+            records.clone(),
+            &stats_with_source(),
+            &sugg(&records),
+        )
+        .unwrap();
+        let fname = meta_file_name(&r.dir);
+
+        // flip the manifest's claimed record count for the shard, then make
+        // EVERY checksum honest again (manifest sha in SHA256SUMS included),
+        // so nothing but the count can be what the reader objects to.
+        let mut m: Value =
+            serde_json::from_str(&std::fs::read_to_string(r.dir.join("manifest.json")).unwrap())
+                .unwrap();
+        let real = m["files"][&fname]["records"].as_u64().unwrap();
+        m["files"][&fname]["records"] = json!(real + 1);
+        std::fs::write(
+            r.dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&m).unwrap(),
+        )
+        .unwrap();
+        // recompute SHA256SUMS from the bytes now on disk
+        let sums_raw = std::fs::read_to_string(r.dir.join("SHA256SUMS")).unwrap();
+        let mut fresh = String::new();
+        for line in sums_raw.lines() {
+            let (_, name) = line.split_once("  ").unwrap();
+            let bytes = std::fs::read(r.dir.join(name)).unwrap();
+            fresh.push_str(&format!("{}  {}\n", hex(&Sha256::digest(&bytes)), name));
+        }
+        std::fs::write(r.dir.join("SHA256SUMS"), fresh).unwrap();
+
+        let err = read_manifest(&r.dir).unwrap_err().to_string();
+        assert!(err.contains("manifest says"), "{err}");
+        assert!(err.contains(&fname), "{err}");
     }
 
     #[test]
