@@ -265,9 +265,8 @@ pub(crate) fn hub_root_from(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) ->
     if let Some(h) = env("XERJ_HUB_HOME").filter(|h| !h.is_empty()) {
         return PathBuf::from(h);
     }
-    let home = env("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // `HOME`, else `USERPROFILE` — native Windows usually has no `HOME`.
+    let home = xerj_common::home::home_dir_from(env).unwrap_or_else(|| PathBuf::from("."));
     home.join(".xerj").join("hub")
 }
 
@@ -883,6 +882,11 @@ mod tests {
         assert_eq!(
             hub_root_from(&env(&[("HOME", "/home/u")])),
             PathBuf::from("/home/u/.xerj/hub")
+        );
+        // Native Windows: no HOME, so the profile dir is the home.
+        assert_eq!(
+            hub_root_from(&env(&[("USERPROFILE", "/Users/u")])),
+            PathBuf::from("/Users/u/.xerj/hub")
         );
         // No HOME at all degrades to a relative path, never a panic.
         assert_eq!(hub_root_from(&env(&[])), PathBuf::from("./.xerj/hub"));

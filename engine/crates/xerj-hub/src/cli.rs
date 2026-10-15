@@ -1366,13 +1366,9 @@ fn emit_answer(answer: &Answer, as_json: bool) {
 /// `~/.xerj/hub`, overridable by `XERJ_HUB_HOME` (tests). Never `/tmp`: the
 /// pack cache and catalogue must survive a reboot (same rule as `code_root`).
 pub(crate) fn hub_home() -> PathBuf {
-    if let Ok(h) = std::env::var("XERJ_HUB_HOME") {
-        if !h.is_empty() {
-            return PathBuf::from(h);
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".xerj").join("hub")
+    // One rule with `lockfile::default_hub_root` (incl. the Windows
+    // `USERPROFILE` fallback), so `status` and `pull` never disagree.
+    lockfile::default_hub_root()
 }
 
 /// The hub's ed25519 public key: `XERJ_HUB_PUBKEY` (tests) else the compiled-in
