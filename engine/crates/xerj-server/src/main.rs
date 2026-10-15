@@ -340,10 +340,11 @@ fn help_text(feedback: bool) -> String {
                                              log — searches, hit rate, latency (xerj gain --help)\n\
              xerj brain      <folder>        one command: index a folder into a running, browsable\n\
                                              second brain in your browser (see xerj brain --help)\n\
-             xerj mcp        [opts]          Model Context Protocol stdio server: exposes 13 tools\n\
+             xerj mcp        [opts]          Model Context Protocol stdio server: exposes {mcp_tools} tools\n\
                                              (search, semantic, vector, hybrid, memory, second-brain,\n\
-                                             code-search) to any MCP client. Proxies to a node you\n\
-                                             already started — set XERJ_URL or --url (see xerj mcp --help)\n\
+                                             map, plan, code-search, Corpus Hub) to any MCP client.\n\
+                                             Proxies to a node you already started — set XERJ_URL or\n\
+                                             --url (see xerj mcp --help)\n\
              xerj feedback   [opts]          draft the agent field report XERJ asks every agent to\n\
                                              file, auto-filling version/OS/what-was-indexed; --open-pr\n\
                                              files it, --dry-run just prints (see xerj feedback --help)\n\
@@ -401,7 +402,16 @@ fn help_text(feedback: bool) -> String {
                 settings are resolved independently, mix and match as needed.)\n",
         env!("CARGO_PKG_VERSION"),
         xerj_common::feedback::block(feedback),
+        // Counted from the served `tools/list`, not typed: the literal "13"
+        // went stale the day the three Corpus Hub tools landed (#1443).
+        mcp_tools = mcp_tool_count(),
     )
+}
+
+/// How many tools `xerj mcp` serves — the length of the same `tool_specs()`
+/// array its `tools/list` returns.
+fn mcp_tool_count() -> usize {
+    xerj_mcp::tool_specs().as_array().map_or(0, Vec::len)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2012,6 +2022,18 @@ mod decide_flag_tests {
         assert_eq!(
             args.decide_model_dir.as_deref(),
             Some("/models/xerj-decide")
+        );
+    }
+
+    #[test]
+    fn help_counts_the_mcp_tools_actually_served() {
+        // #1443: the help said "exposes 13 tools" while `tools/list` served 16.
+        let served = super::mcp_tool_count();
+        assert!(served >= 16, "tool_specs() shrank to {served}");
+        let help = help_text(false);
+        assert!(
+            help.contains(&format!("exposes {served} tools")),
+            "help must state the served tool count {served}, got:\n{help}"
         );
     }
 
