@@ -110,6 +110,7 @@ landing/resources/xerj-sales-kit.zip
 # Re-include root OSS scaffolding so the default *.md / no-extension
 # ignore above does not swallow the standard public-repo files.
 !README.md
+!/README.zh-CN.md
 !CLA.md
 !LICENSE
 !LICENSE.md
