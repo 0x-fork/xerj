@@ -14,6 +14,8 @@
 //! ## Modules
 //!
 //! - [`config`]  — TOML-based configuration (132 settings)
+//! - [`code_query`] — query shaping shared by `xerj search` and the
+//!   `xerj_search` MCP tool (multi-word glue-token stripping, #1364)
 //! - [`feedback`] — the bug/UX-report invitation shared by every `--help`
 //! - [`error`]   — Unified error type ([`XerjError`])
 //! - [`types`]   — Core domain types (documents, fields, IDs)
@@ -34,6 +36,7 @@
 //!   definition record, and the [`hub::Answer`] every surface renders (#1374)
 
 pub mod calibration;
+pub mod code_query;
 pub mod config;
 pub mod error;
 pub mod feedback;
