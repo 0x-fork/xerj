@@ -956,8 +956,42 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     })?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let out_reader = std::thread::spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT));
-    let err_reader = std::thread::spawn(move || read_capped(stderr, MAX_WORKER_STDERR as usize));
+    // #1122: `std::thread::spawn` panics when a thread cannot be created
+    // (thread limit, memory exhaustion) and release builds are panic=abort,
+    // so one failed spawn here used to abort the whole run. A failed spawn
+    // now stops the worker and fails this one file, like any other worker
+    // start-up failure.
+    let out_reader = match std::thread::Builder::new()
+        .name("xerj-pdf-stdout".into())
+        .spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_worker_tree(&mut child);
+            return Err(error).with_context(|| {
+                format!(
+                    "could not start the PDF parser's output reader for {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    let err_reader = match std::thread::Builder::new()
+        .name("xerj-pdf-stderr".into())
+        .spawn(move || read_capped(stderr, MAX_WORKER_STDERR as usize))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_worker_tree(&mut child);
+            let _ = out_reader.join();
+            return Err(error).with_context(|| {
+                format!(
+                    "could not start the PDF parser's error reader for {}",
+                    path.display()
+                )
+            });
+        }
+    };
 
     let started = Instant::now();
     let timeout = Duration::from_secs(WORKER_TIMEOUT_SECS.load(Ordering::Relaxed));
