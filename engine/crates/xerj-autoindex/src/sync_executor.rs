@@ -355,12 +355,16 @@ pub(crate) fn replay_windowed<T: Sync>(
         }
         return Ok(());
     }
+    /// One dispatched operation: on its own thread, or — when that thread
+    /// could not be started (#1122) — already applied inline.
+    enum Dispatched<'scope> {
+        Thread(std::thread::ScopedJoinHandle<'scope, Result<()>>),
+        Inline(Result<()>),
+    }
     let failure = std::thread::scope(|scope| -> Result<Option<anyhow::Error>> {
         let mut next = items.iter();
-        let mut in_flight: std::collections::VecDeque<(
-            &T,
-            std::thread::ScopedJoinHandle<'_, Result<()>>,
-        )> = std::collections::VecDeque::new();
+        let mut in_flight: std::collections::VecDeque<(&T, Dispatched<'_>)> =
+            std::collections::VecDeque::new();
         let mut failure: Option<anyhow::Error> = None;
         loop {
             while failure.is_none() && in_flight.len() < width {
@@ -370,17 +374,32 @@ pub(crate) fn replay_windowed<T: Sync>(
                 let Some(item) = next.next() else { break };
                 hooks.begin(item)?;
                 let dispatched = item;
-                in_flight.push_back((item, scope.spawn(move || apply(dispatched))));
+                // #1122: `Scope::spawn` panics when a thread cannot be
+                // created, and release builds are panic=abort. A failed spawn
+                // never ran the closure, so the operation is applied inline
+                // instead: the window narrows, the order and the callbacks do
+                // not change.
+                let slot = match std::thread::Builder::new()
+                    .name("xerj-sync-apply".into())
+                    .spawn_scoped(scope, move || apply(dispatched))
+                {
+                    Ok(handle) => Dispatched::Thread(handle),
+                    Err(_) => Dispatched::Inline(apply(item)),
+                };
+                in_flight.push_back((item, slot));
             }
-            let Some((item, handle)) = in_flight.pop_front() else {
+            let Some((item, slot)) = in_flight.pop_front() else {
                 break;
             };
-            let outcome = handle.join().unwrap_or_else(|panic| {
-                Err(anyhow::anyhow!(
-                    "replay apply panicked: {}",
-                    panic_message(panic)
-                ))
-            });
+            let outcome = match slot {
+                Dispatched::Thread(handle) => handle.join().unwrap_or_else(|panic| {
+                    Err(anyhow::anyhow!(
+                        "replay apply panicked: {}",
+                        panic_message(panic)
+                    ))
+                }),
+                Dispatched::Inline(outcome) => outcome,
+            };
             let reported = hooks.applied(item, outcome);
             if let (None, Err(error)) = (&failure, reported) {
                 // First failure stops dispatch; the drain still reports.
@@ -1064,6 +1083,90 @@ impl<'a> EsSyncBackend<'a> {
         Ok(documents)
     }
 
+    /// A warm verify window slower than this means the server is answering
+    /// the window shape on its brute path. Measured on the #1267 resume: the
+    /// `term ax_file` + `exists` probe took 3.4 s warm on a server without the
+    /// #1260 exists arm and 2.7 ms on one with it — three orders of magnitude
+    /// either side of this line, so it separates the two generations without
+    /// being sensitive to node load.
+    const SERVER_PROBE_SLOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The operational half of #1267: before `finalize-verify` issues its
+    /// windows, time ONE representative window and, if it is slow, say so.
+    ///
+    /// The resume protocol cannot otherwise tell that the server predates the
+    /// client's fast-agg fix generation (#1260/#1270). On the cve-records
+    /// resume that cost four hours of ~3.4 s probes before anyone looked —
+    /// the client was a #1259 binary, the server an older measure build, and
+    /// nothing in the handshake differs between them. `GET /` cannot help:
+    /// its `version.number` is the ES-compat version (`8.13.0` or the
+    /// `--compat-version` override), not XERJ's. `/v1/health` does carry the
+    /// XERJ version and is quoted in the warning when it differs from the
+    /// client's, but a branch or measure build reports the same string as
+    /// the release it forked from — exactly the #1267 shape — so latency is
+    /// the signal and the version only context.
+    ///
+    /// `window_query` runs the window and returns how long it took (the caller
+    /// times it, which keeps this pinnable without a node or a clock). A slow
+    /// first answer is re-asked once before warning: the first touch after a
+    /// server boot pages the index in cold (8.8 s on the FIXED binary in
+    /// #1267), and that must not read as an old server. A probe that fails is
+    /// not this function's business — the verify window that follows asks the
+    /// same thing and fails loud — so it returns `None` without a warning.
+    /// It never aborts the run: an old server is slow, not wrong.
+    fn probe_server_generation(
+        pr: &crate::progress::Progress,
+        windows: u64,
+        threshold: std::time::Duration,
+        mut window_query: impl FnMut() -> Result<std::time::Duration>,
+        server_version: impl FnOnce() -> Option<String>,
+    ) -> Option<std::time::Duration> {
+        let cold = window_query().ok()?;
+        if cold <= threshold {
+            return Some(cold);
+        }
+        let warm = window_query().ok()?;
+        if warm <= threshold {
+            return Some(warm);
+        }
+        let client = env!("CARGO_PKG_VERSION");
+        let version = match server_version() {
+            Some(server) if server != client => {
+                format!(" The server reports XERJ {server}; this client is {client}.")
+            }
+            Some(_) => format!(
+                " The server reports the same version as this client ({client}), so it is \
+                 likely a branch or development build cut before the fix."
+            ),
+            None => String::new(),
+        };
+        let projected_s = warm.as_secs_f64() * windows as f64;
+        pr.warn(&format!(
+            "autoindex: warning: one finalize-verify window took {:.1}s (twice; under {}ms is \
+             expected). The server is likely older than this client and lacks the columnar \
+             term+exists count lane (#1260/#1270), so every verify window brute-scans its \
+             index: {windows} windows at this rate is ~{:.1}h.{version} Continuing — the \
+             result will be correct, only slow. To avoid the wait, stop this run, upgrade the \
+             server to this client's version, and re-run the same command: the journal resumes \
+             where it stopped.",
+            warm.as_secs_f64(),
+            threshold.as_millis(),
+            projected_s / 3600.0,
+        ));
+        Some(warm)
+    }
+
+    /// The XERJ version the server reports on `/v1/health` (`data.version`),
+    /// or `None` when the endpoint is absent or unreadable.
+    fn server_xerj_version(&self) -> Option<String> {
+        self.es
+            .get_json("/v1/health")
+            .ok()?
+            .pointer("/data/version")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
     fn exact_dataset_catalog_stats(
         &self,
         desired: &GenerationManifest,
@@ -1621,6 +1724,43 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             readbacks += windows(catalog_wanted.len());
         }
         self.pr.phase("finalize-verify", readbacks, 0);
+
+        // #1267 operational: one representative window, timed, before the
+        // walk. The semantic leg is preferred because its `term`+`exists`
+        // shape is exactly the one a server without the #1260 exists arm
+        // brute-scans; a generation with no semantic field probes a record
+        // window instead. One digest is enough — the brute path's cost is the
+        // index size, not the window width.
+        let probe = semantic_wanted
+            .iter()
+            .find_map(|((index, field), values)| {
+                let exists = serde_json::json!({"exists": {"field": field}});
+                values.first().map(|value| (index, value, vec![exists]))
+            })
+            .or_else(|| {
+                record_wanted
+                    .iter()
+                    .find_map(|(index, values)| values.first().map(|value| (index, value, vec![])))
+            });
+        if let Some((index, value, extra)) = probe {
+            let _probing = self.pr.file(index, 0);
+            Self::probe_server_generation(
+                self.pr,
+                readbacks,
+                Self::SERVER_PROBE_SLOW,
+                || {
+                    let started = std::time::Instant::now();
+                    self.windowed_value_counts(
+                        index,
+                        "ax_file",
+                        std::slice::from_ref(value),
+                        &extra,
+                    )?;
+                    Ok(started.elapsed())
+                },
+                || self.server_xerj_version(),
+            );
+        }
 
         let mut record_counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
         for (index, values) in &record_wanted {
@@ -5308,6 +5448,140 @@ mod tests {
             std::thread::yield_now();
         }
         drop(ticker);
+    }
+
+    // #1267 operational: the server-generation latency probe that runs before
+    // `finalize-verify`. Timings are injected, so these pin the decision
+    // without a node or a clock.
+
+    fn run_probe(
+        surface: crate::progress::Surface,
+        timings: &[std::time::Duration],
+        version: Option<&str>,
+    ) -> (Option<std::time::Duration>, usize, String) {
+        let (pr, buffer) =
+            crate::progress::Progress::capture(surface, std::time::Duration::from_secs(3600));
+        let queue = std::cell::RefCell::new(timings.to_vec());
+        let calls = std::cell::Cell::new(0usize);
+        let verdict = EsSyncBackend::probe_server_generation(
+            &pr,
+            400,
+            EsSyncBackend::SERVER_PROBE_SLOW,
+            || {
+                calls.set(calls.get() + 1);
+                let mut queue = queue.borrow_mut();
+                anyhow::ensure!(!queue.is_empty(), "transport down");
+                Ok(queue.remove(0))
+            },
+            || version.map(str::to_owned),
+        );
+        let out = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        (verdict, calls.get(), out)
+    }
+
+    #[test]
+    fn a_fast_verify_window_probes_once_and_stays_silent() {
+        let ms = std::time::Duration::from_millis;
+        let (verdict, calls, out) =
+            run_probe(crate::progress::Surface::Plain, &[ms(3)], Some("0.0.0-old"));
+        assert_eq!(verdict, Some(ms(3)));
+        assert_eq!(calls, 1, "a fast first answer is not re-asked");
+        assert!(
+            !out.contains("warning"),
+            "a fixed server is not warned about: {out}"
+        );
+    }
+
+    #[test]
+    fn a_cold_first_window_is_reasked_and_not_mistaken_for_an_old_server() {
+        // #1267's own numbers: 8.8 s cold page-in on the FIXED binary, then 2.7 ms.
+        let ms = std::time::Duration::from_millis;
+        let (verdict, calls, out) =
+            run_probe(crate::progress::Surface::Plain, &[ms(8800), ms(3)], None);
+        assert_eq!(verdict, Some(ms(3)));
+        assert_eq!(calls, 2);
+        assert!(
+            !out.contains("warning"),
+            "cold page-in is not an old server: {out}"
+        );
+    }
+
+    #[test]
+    fn a_slow_warm_window_warns_on_the_plain_surface_and_does_not_abort() {
+        let ms = std::time::Duration::from_millis;
+        let (verdict, calls, out) = run_probe(
+            crate::progress::Surface::Plain,
+            &[ms(8800), ms(3400)],
+            Some("1.0.0-rc.80"),
+        );
+        assert_eq!(
+            verdict,
+            Some(ms(3400)),
+            "the probe reports and the run continues"
+        );
+        assert_eq!(calls, 2);
+        for needle in [
+            "warning",
+            "3.4s",
+            "older than this client",
+            "#1260",
+            "400 windows",
+            "~0.4h",
+            "XERJ 1.0.0-rc.80",
+            env!("CARGO_PKG_VERSION"),
+            "upgrade the server",
+            "Continuing",
+        ] {
+            assert!(out.contains(needle), "warning lacks {needle:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_slow_server_with_the_same_version_is_named_a_development_build() {
+        let ms = std::time::Duration::from_millis;
+        let (_, _, out) = run_probe(
+            crate::progress::Surface::Plain,
+            &[ms(3400), ms(3400)],
+            Some(env!("CARGO_PKG_VERSION")),
+        );
+        assert!(out.contains("same version as this client"), "{out}");
+        assert!(out.contains("development build"), "{out}");
+    }
+
+    #[test]
+    fn the_slow_server_warning_is_one_json_event_on_the_machine_surface() {
+        let ms = std::time::Duration::from_millis;
+        let (_, _, out) = run_probe(crate::progress::Surface::Json, &[ms(3400), ms(3400)], None);
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect();
+        assert_eq!(events.len(), 1, "{out}");
+        assert_eq!(events[0]["event"], "warning");
+        assert!(events[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("older than this client"));
+    }
+
+    #[test]
+    fn the_slow_server_warning_survives_the_silent_surface() {
+        // `--quiet` drops routine notes; a four-hour wait is not routine.
+        let ms = std::time::Duration::from_millis;
+        let (_, _, out) = run_probe(
+            crate::progress::Surface::Silent,
+            &[ms(3400), ms(3400)],
+            None,
+        );
+        assert!(out.contains("older than this client"), "{out}");
+    }
+
+    #[test]
+    fn a_failing_probe_neither_warns_nor_propagates() {
+        let (verdict, calls, out) = run_probe(crate::progress::Surface::Plain, &[], None);
+        assert_eq!(verdict, None);
+        assert_eq!(calls, 1);
+        assert!(out.is_empty(), "{out}");
     }
 
     #[test]

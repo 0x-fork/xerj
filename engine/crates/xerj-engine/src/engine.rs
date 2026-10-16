@@ -3437,6 +3437,13 @@ impl Engine {
             .collect()
     }
 
+    /// Cheap O(1) sync check whether an open index with `name` exists and is
+    /// visible to the current request (issue #79), avoiding `list_indices()`
+    /// or full-map enumeration on single-index operations (#1226).
+    pub fn has_open_index(&self, name: &str) -> bool {
+        crate::index_guard::visible(name) && self.indices.contains_key(name)
+    }
+
     /// The WAL-consumer retention floor the tap is currently configured with.
     ///
     /// Read from the tap, never from `self.config`: the tap's copy is the one
@@ -5070,5 +5077,18 @@ mod api_key_record_migration_tests {
             );
             assert!(!rec.verify_secret("anything"));
         }
+    }
+
+    #[tokio::test]
+    async fn has_open_index_tracks_created_and_deleted_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        assert!(!engine.has_open_index("alpha"));
+        engine.get_or_create_index("alpha").unwrap();
+        assert!(engine.has_open_index("alpha"));
+        engine.delete_index("alpha").await.unwrap();
+        assert!(!engine.has_open_index("alpha"));
     }
 }

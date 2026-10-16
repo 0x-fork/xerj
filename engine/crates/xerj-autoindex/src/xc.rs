@@ -30,8 +30,9 @@ pub fn code_root() -> PathBuf {
             return PathBuf::from(home);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".xerj-code")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xerj-code")
 }
 
 /// `--url` flag > `XERJ_URL` > `http://localhost:9200`. Unlike `autoindex`
@@ -112,8 +113,8 @@ fn emit(out: &CodeOutcome) {
 
 const CODE_USAGE: &str =
     "usage: xerj code <corpus> \"<what you need>\" [-k N] [--mode bm25|semantic|hybrid]
-       [--hybrid] [--lang <lg>] [--full N] [--no-symbol] [--json] [--meatl] [--stale-ok]
-       [--url URL] [--api-key KEY]
+       [--hybrid] [--lang <lg>] [--full N] [--no-symbol] [--fuse-symbols]
+       [--json] [--meatl] [--stale-ok] [--url URL] [--api-key KEY]
 
 retrieval over a reference corpus (see `xerj corpus list`):
   -k N            passages to return (default 5)
@@ -122,6 +123,7 @@ retrieval over a reference corpus (see `xerj corpus list`):
   --lang LG       filter to one language field (e.g. rust, go)
   --full N        max chars per passage (default 800; 0 = file head only)
   --no-symbol     window selection instead of the matching definition
+  --fuse-symbols  fuse file-level BM25 with symbol-impl BM25 by RRF(k=60)
   --json          raw server response on stdout
   --meatl         machine-readable one-line-per-hit output
   --stale-ok      override the 30-day staleness refusal
@@ -183,6 +185,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
                 }
             }
             "--no-symbol" => p.no_symbol = true,
+            "--fuse-symbols" => p.fuse_symbols = true,
             "--json" => p.as_json = true,
             "--meatl" => p.meatl = true,
             "--stale-ok" => p.stale_ok = true,

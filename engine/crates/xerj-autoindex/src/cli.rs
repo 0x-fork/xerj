@@ -126,7 +126,9 @@ pub struct IndexCfg {
 pub struct MapCfg {
     pub url: String,
     pub api_key: Option<String>,
-    pub prefix: String,
+    /// Explicit `--prefix` filter (`None` when the user did not pass `--prefix`,
+    /// preserving the #971 multi-corpus view on a bare `autoindex map`).
+    pub prefix: Option<String>,
     pub json: bool,
     pub dataset: Option<String>,
     /// A startup note when `XERJ_URL` was set but ignored (endpoint comes from
@@ -704,6 +706,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut snapshot_max_bytes = 64u64 << 30;
     let mut bulk_timeout_explicit = false;
     let mut prefix = "ax".to_string();
+    let mut prefix_explicit = false;
     let mut state_dir: Option<PathBuf> = None;
     let mut endpoint_url: Option<String> = None;
     let mut endpoint_explicit = false;
@@ -832,7 +835,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--in-flight" => {
                 let _ = it.next(); // reserved (bulks are worker-synchronous in v1)
             }
-            "--prefix" => prefix = it.next().ok_or("--prefix needs a value")?,
+            "--prefix" => {
+                prefix = it.next().ok_or("--prefix needs a value")?;
+                prefix_explicit = true;
+            }
             "--state-dir" => state_dir = it.next().map(PathBuf::from),
             "--endpoint-url" => {
                 let value = it.next().ok_or(
@@ -1502,7 +1508,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         (Some("map"), _) => Ok(Cmd::Map(MapCfg {
             url,
             api_key,
-            prefix,
+            prefix: prefix_explicit.then_some(prefix),
             json,
             dataset,
             xerj_url_note,
@@ -2947,5 +2953,25 @@ mod tests {
             text.contains("--dataset needs a dataset slug"),
             "a valueless --dataset must be refused: {text}"
         );
+    }
+
+    #[test]
+    fn map_records_explicit_prefix_and_leaves_unscoped_map_none() {
+        match parse(["map"].iter().map(|s| s.to_string()).collect()).expect("bare map must parse") {
+            Cmd::Map(cfg) => assert_eq!(cfg.prefix, None),
+            other => panic!("expected a map config, got {other:?}"),
+        }
+
+        match parse(
+            ["map", "--prefix", "xc-tantivy"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .expect("map --prefix must parse")
+        {
+            Cmd::Map(cfg) => assert_eq!(cfg.prefix.as_deref(), Some("xc-tantivy")),
+            other => panic!("expected a map config, got {other:?}"),
+        }
     }
 }
