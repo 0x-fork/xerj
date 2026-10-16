@@ -30,8 +30,9 @@ pub fn code_root() -> PathBuf {
             return PathBuf::from(home);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".xerj-code")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xerj-code")
 }
 
 /// `--url` flag > `XERJ_URL` > `http://localhost:9200`. Unlike `autoindex`
