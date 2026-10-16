@@ -57,7 +57,9 @@ fn doc_values_text_schema() -> Schema {
 async fn terms_on_text_with_doc_values_is_flush_invariant() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("dvt", doc_values_text_schema()).unwrap();
+    engine
+        .create_index("dvt", doc_values_text_schema())
+        .unwrap();
     let idx: Arc<Index> = engine.get_index("dvt").unwrap();
     for (id, t) in [
         ("d1", "quick brown fox"),
@@ -80,7 +82,9 @@ async fn terms_on_text_with_doc_values_is_flush_invariant() {
     assert_eq!(pre_total, 2);
     assert_eq!(count_total(&idx, &token_q).await, 2, "count before flush");
 
-    // The whole-value query both sides agree on.
+    // The whole-value query both sides agree on. NOTE: this pins flush
+    // invariance of XERJ's current answer, not ES semantics — ES's term-level
+    // `terms` on indexed text would match no token "quick brown fox" (0 hits).
     let whole_q = json!({"terms": {"text": ["quick brown fox"]}});
     assert_eq!(search(&idx, &whole_q).await.1, set(&["d1", "d2"]));
 
@@ -130,4 +134,37 @@ async fn terms_on_text_with_doc_values_is_flush_invariant() {
         (0, set(&[])),
         "term on text stays whole-value"
     );
+}
+
+/// `"index": false` + doc-values text (the ES `mapper.text.doc_values` preview
+/// pinned by `aggregations/terms_text_docvalues.yml`): there are no postings,
+/// so ES answers `term`/`terms` from the doc-values column — WHOLE values only.
+/// A token-only value must not match once the segment answers.
+#[tokio::test]
+async fn terms_on_unindexed_text_with_doc_values_stays_whole_value() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let mut schema = Schema::empty();
+    let mut text = FieldConfig::new("text", FieldType::Text);
+    text.options.doc_values = true;
+    text.options.indexed = false;
+    schema.fields.push(text);
+    engine.create_index("dvn", schema).unwrap();
+    let idx: Arc<Index> = engine.get_index("dvn").unwrap();
+    for (id, t) in [("d1", "foo bar"), ("d2", "foo bar"), ("d3", "baz qux")] {
+        idx.index_document(Some(id.into()), json!({"text": t}))
+            .await
+            .unwrap();
+    }
+    idx.flush().await.unwrap();
+
+    let whole = json!({"terms": {"text": ["foo bar", "baz qux"]}});
+    assert_eq!(search(&idx, &whole).await.0, 3, "whole values match");
+    let token = json!({"terms": {"text": ["foo"]}});
+    assert_eq!(
+        search(&idx, &token).await,
+        (0, set(&[])),
+        "unindexed doc-values text answers whole values, never tokens"
+    );
+    assert_eq!(count_total(&idx, &token).await, 0);
 }

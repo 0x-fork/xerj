@@ -41472,8 +41472,14 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
 /// (the term/terms prefilters, the doc-values count shortcuts) silently drops
 /// the token-only matches once the document flushes. Those paths must decline
 /// and let the stored scan answer.
+///
+/// Only INDEXED text qualifies. An `"index": false` text field with doc-values
+/// has no token stream to match against: ES answers `term`/`terms` on it from
+/// the column, by whole value (`aggregations/terms_text_docvalues.yml`), so the
+/// column-derived set is exactly right there and must keep being used.
 fn field_is_analyzed_text(schema: &Schema, field: &str) -> bool {
-    declared_field(schema, field).is_some_and(|f| matches!(f.field_type, FieldType::Text))
+    declared_field(schema, field)
+        .is_some_and(|f| matches!(f.field_type, FieldType::Text) && f.options.indexed)
 }
 
 /// Does `q` carry a `term`/`terms` leaf naming an analyzed `text` field?
