@@ -185,6 +185,13 @@ before.
   symbol bodies is fused with the file ranking by Reciprocal Rank Fusion
   (`k = 60`). Without the flag the default ranking is unchanged.
   Pre-existing state dirs resume without a rebuild.
+- **`--auto-port`, opt-in** (PR
+  [#1487](https://github.com/xerj-org/xerj/pull/1487), mininxd) — with
+  `--auto-port`, `XERJ_AUTO_PORT=true` or `[server] auto_port = true`, a
+  node whose ports are taken binds the next free ones, and a data dir held by
+  another live node moves to a `<data_dir>-N` sibling, so several agents can
+  start nodes side by side. Off by default: a taken port stays a fatal
+  startup error.
 
 ### Performance
 
