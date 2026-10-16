@@ -555,7 +555,9 @@ jobs:
           printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
           unset HUB_SIGNING_SEED
           trap 'rm -f "$RUNNER_TEMP/pack.key"' EXIT
-          bin/xerj hub build-catalogue --registry "$REGISTRY" --packs "$RUNNER_TEMP/packs" \
+          # --tags: the release each pack came from, so a -rN retag gets its real URL.
+          bin/xerj hub build-catalogue --registry "$REGISTRY" --backlog "$BACKLOG" \
+            --packs "$RUNNER_TEMP/packs" --tags "$RUNNER_TEMP/fetch.tsv" \
             --out catalogue.json --sign-key "$RUNNER_TEMP/pack.key"
           test -s catalogue.json
           test -s catalogue.json.sig || { echo "::error::build-catalogue wrote no catalogue.json.sig"; exit 1; }
