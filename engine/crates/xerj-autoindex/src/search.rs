@@ -42,12 +42,23 @@ pub(crate) fn passage_text(hit: &Value) -> Option<String> {
     let first = hit.pointer("/fields/_passage/0")?;
     match first {
         Value::String(s) => Some(s.clone()),
-        Value::Object(o) => o
-            .get("text")
-            .or_else(|| o.get("passage"))
-            .or_else(|| o.get("snippet"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        Value::Object(o) => {
+            if matches!(
+                o.get("field").and_then(Value::as_str),
+                Some("name" | "title" | "defs")
+            ) && hit
+                .pointer("/_source/code")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            {
+                return None;
+            }
+            o.get("text")
+                .or_else(|| o.get("passage"))
+                .or_else(|| o.get("snippet"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
         _ => None,
     }
 }
@@ -59,6 +70,27 @@ pub(crate) fn is_identifier(q: &str) -> bool {
     !q.is_empty()
         && !q.contains(char::is_whitespace)
         && q.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Build the ES search request body used by `xerj search`.
+pub fn search_query_body(query: &str, k: usize) -> Value {
+    let shaped = xerj_common::code_query::normalize_code_search_query(query);
+    json!({
+        "size": k,
+        "query": { "bool": { "should": [
+            { "multi_match": {
+                "query": shaped,
+                "fields": ["name^4", "code^2", "body", "defs^3", "title"],
+                "type": "most_fields"
+            }},
+            { "match_phrase": { "defs": { "query": shaped, "boost": 8 } } },
+            { "term": { "name": { "value": query.trim(), "boost": 10 } } }
+        ]}},
+        // No `body` here: whole-file bodies are the token flood (measured ~9x
+        // the size of the matching passage). `_passage` carries the snippet.
+        "_source": ["ax_path", "line", "start_line", "language", "kind", "code", "title"],
+        "fields": ["_passage"]
+    })
 }
 
 /// Entry point for the `search` subcommand. Returns a process exit code.
@@ -137,22 +169,7 @@ pub fn run_search_cli() -> i32 {
     // simply contributes no score). `name` is a keyword field on symbol docs
     // (issue #500), so the `term` clause fires only when the whole query IS
     // the identifier — the strongest possible signal.
-    let body = json!({
-        "size": k,
-        "query": { "bool": { "should": [
-            { "multi_match": {
-                "query": query,
-                "fields": ["name^4", "defs^3", "code^2", "body", "title"],
-                "type": "most_fields"
-            }},
-            { "match_phrase": { "defs": { "query": query, "boost": 8 } } },
-            { "term": { "name": { "value": query, "boost": 10 } } }
-        ]}},
-        // No `body` here: whole-file bodies are the token flood (measured ~9x
-        // the size of the matching passage). `_passage` carries the snippet.
-        "_source": ["ax_path", "line", "start_line", "language", "kind", "code", "title"],
-        "fields": ["_passage"]
-    });
+    let body = search_query_body(&query, k);
 
     let pattern = format!("{prefix}-*");
     let resp = match es.search(&pattern, &body) {
@@ -231,4 +248,95 @@ pub fn run_search_cli() -> i32 {
         hits.len()
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xerj_common::code_query::normalize_code_search_query;
+
+    /// #1364: multi-word natural-language queries strip repeated/glue particles
+    /// (`de`, `la`, `por`, `en`, `the`, `of`) so a 2-letter function named `de`
+    /// cannot hijack `name^4`/`title` and unrelated questions do not return
+    /// identical top hits, while single-identifier lookups (`de`), acronyms
+    /// (`IO`, `WAL`), and 2-letter tech terms (`db`, `gc`, `tx`) are preserved.
+    #[test]
+    fn normalize_code_search_query_strips_multiword_glue_and_deduplicates() {
+        assert_eq!(
+            normalize_code_search_query(
+                "factor de calibracion de la encuesta multiplicador de ponderacion"
+            ),
+            "factor calibracion encuesta multiplicador ponderacion"
+        );
+        assert_eq!(
+            normalize_code_search_query("ponderacion de hogares por departamento en la encuesta"),
+            "ponderacion hogares departamento encuesta"
+        );
+        assert_eq!(
+            normalize_code_search_query("ingreso total del hogar correccion por inflacion"),
+            "ingreso total hogar correccion inflacion"
+        );
+        // Single-token lookup for a function literally named `de` is untouched.
+        assert_eq!(normalize_code_search_query("de"), "de");
+        // Identifier punctuation survives a short lookup verbatim: the
+        // reporter's control query `.mensaje_motor` (an R name with a leading
+        // dot) must still reach the exact-`name` term clause unchanged.
+        assert_eq!(
+            normalize_code_search_query(".mensaje_motor"),
+            ".mensaje_motor"
+        );
+        let lookup = search_query_body(".mensaje_motor", 5);
+        assert_eq!(
+            lookup["query"]["bool"]["should"][2]["term"]["name"]["value"],
+            ".mensaje_motor"
+        );
+        assert_eq!(
+            lookup["query"]["bool"]["should"][0]["multi_match"]["query"],
+            ".mensaje_motor"
+        );
+        // Two-letter technical terms, uppercase acronyms, and alphanumeric tokens stay.
+        assert_eq!(
+            normalize_code_search_query("fsync the WAL segment on db tx rotation v2"),
+            "fsync WAL segment db tx rotation v2"
+        );
+        assert_eq!(
+            normalize_code_search_query("indicador de agua potable o68"),
+            "indicador agua potable o68"
+        );
+
+        let body = search_query_body(
+            "factor de calibracion de la encuesta multiplicador de ponderacion",
+            5,
+        );
+        assert_eq!(
+            body["query"]["bool"]["should"][0]["multi_match"]["query"],
+            "factor calibracion encuesta multiplicador ponderacion"
+        );
+    }
+
+    /// #1364: if `_passage` came back from a bare identifier metadata field
+    /// (`name` or `title`) on a symbol doc that carries `_source.code`,
+    /// `passage_text` yields `None` so the caller falls back to `_source.code`
+    /// (`de <- function(col)`) instead of printing bare `de`.
+    #[test]
+    fn passage_text_skips_bare_name_field_when_source_code_is_present() {
+        let hit = json!({
+            "_source": {
+                "ax_path": "hogares_ech.R",
+                "line": 1221,
+                "kind": "function",
+                "name": "de",
+                "title": "de",
+                "code": "de <- function(col)"
+            },
+            "fields": {
+                "_passage": [{
+                    "field": "name",
+                    "ordinal": 0,
+                    "text": "de"
+                }]
+            }
+        });
+        assert_eq!(passage_text(&hit), None);
+    }
 }
