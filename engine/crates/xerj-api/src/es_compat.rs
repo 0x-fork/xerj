@@ -10669,8 +10669,7 @@ async fn search_impl(
         .iter()
         .any(|n| *n == "_all" || n.contains('*') || state.engine.aliases.contains_key(*n));
     let index_names: Vec<String> = if needs_resolve {
-        let all = state.engine.list_indices().await;
-        let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
+        let all_names = state.engine.index_name_list();
         let mut resolved: Vec<String> = Vec::new();
         for pattern in &raw_names {
             if *pattern == "_all" || *pattern == "*" {
@@ -12653,13 +12652,7 @@ async fn search_impl(
                 // ES-compat tests and set unconditionally in `error.rs` — this
                 // only adds the additive `_xerj` hint alongside it.
                 if matches!(api_err.inner, xerj_common::XerjError::IndexNotFound { .. }) {
-                    let available: Vec<String> = state
-                        .engine
-                        .list_indices()
-                        .await
-                        .into_iter()
-                        .map(|i| i.name)
-                        .collect();
+                    let available = state.engine.index_name_list();
                     api_err = api_err.with_hint(index_not_found_hint(idx_name, &available));
                 }
                 return api_err.into_response();
@@ -20644,16 +20637,16 @@ pub async fn count_docs(
         || index.contains('*')
         || alias_selector
     {
-        let all = state.engine.list_indices().await;
-        let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
         let wanted: Vec<String> = if index == "_all" || index == "*" {
-            all_names.clone()
+            state.engine.index_name_list()
         } else {
+            let mut all_names: Option<Vec<String>> = None;
             let mut out = Vec::new();
             for pat in index.split(',') {
                 let pat = pat.trim();
                 if pat.contains('*') {
-                    for n in &all_names {
+                    let all_names = all_names.get_or_insert_with(|| state.engine.index_name_list());
+                    for n in all_names.iter() {
                         if glob_match_simple(pat, n) && !out.contains(n) {
                             out.push(n.clone());
                         }
@@ -22380,17 +22373,12 @@ async fn resolve_selector_with_filters(
 }
 
 async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
-    let all: Vec<String> = state
-        .engine
-        .list_indices()
-        .await
-        .into_iter()
-        .map(|i| i.name)
-        .collect();
+    let mut all: Option<Vec<String>> = None;
     let mut out: Vec<String> = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if part == "_all" || part == "*" {
-            for n in &all {
+            let all = all.get_or_insert_with(|| state.engine.index_name_list());
+            for n in all.iter() {
                 if !out.contains(n) {
                     out.push(n.clone());
                 }
@@ -22398,7 +22386,8 @@ async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
             continue;
         }
         if part.contains('*') {
-            for n in &all {
+            let all = all.get_or_insert_with(|| state.engine.index_name_list());
+            for n in all.iter() {
                 if glob_match_simple(part, n) && !out.contains(n) {
                     out.push(n.clone());
                 }
@@ -22451,17 +22440,12 @@ async fn resolve_indices_for_op(
     spec: &str,
 ) -> Result<Vec<(String, std::sync::Arc<xerj_engine::Index>)>, xerj_common::XerjError> {
     let is_selector = spec == "_all" || spec.contains('*') || spec.contains(',');
-    let all: Vec<String> = state
-        .engine
-        .list_indices()
-        .await
-        .into_iter()
-        .map(|i| i.name)
-        .collect();
+    let mut all: Option<Vec<String>> = None;
     let mut names: Vec<String> = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if part == "_all" || part.contains('*') {
-            for n in &all {
+            let all = all.get_or_insert_with(|| state.engine.index_name_list());
+            for n in all.iter() {
                 // ES excludes hidden (dot-prefixed) indices from default
                 // wildcard/_all expansion — `POST /*/_close` must never
                 // sweep in `.xerj_users`-class system indices. A pattern
@@ -22479,7 +22463,7 @@ async fn resolve_indices_for_op(
             // A concrete name may be a real index OR an alias. An index of
             // that name wins, matching ES, where an alias may not share a
             // name with an index.
-            if all.iter().any(|n| n == part) {
+            if state.engine.has_open_index(part) {
                 if !names.iter().any(|n| n == part) {
                     names.push(part.to_string());
                 }
@@ -24823,13 +24807,7 @@ pub async fn field_caps(
     // any other wildcard as a literal (non-existent) index/alias name,
     // silently returning empty field caps for wildcarded index patterns.
     let resolved_indices: Vec<String> = if index == "*" || index == "_all" {
-        state
-            .engine
-            .list_indices()
-            .await
-            .into_iter()
-            .map(|i| i.name)
-            .collect()
+        state.engine.index_name_list()
     } else {
         resolve_index_selector(&state, &index).await
     };
@@ -25893,13 +25871,7 @@ async fn msearch_impl(
         let index_names: Vec<String> = if let Some(pit) = pit_context.as_ref() {
             pit.indices.clone()
         } else if index_name == "*" || index_name == "_all" {
-            state
-                .engine
-                .list_indices()
-                .await
-                .into_iter()
-                .map(|i| i.name)
-                .collect()
+            state.engine.index_name_list()
         } else {
             index_name
                 .split(',')
@@ -36263,13 +36235,7 @@ async fn msearch_template_impl(
         };
 
         let index_names: Vec<String> = if index_name == "*" || index_name == "_all" {
-            state
-                .engine
-                .list_indices()
-                .await
-                .into_iter()
-                .map(|i| i.name)
-                .collect()
+            state.engine.index_name_list()
         } else {
             index_name
                 .split(',')
@@ -38880,14 +38846,13 @@ pub async fn global_field_caps(
     Query(params): Query<GlobalFieldCapsParams>,
     _body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    let indices = state.engine.list_indices().await;
-    let index_names: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
+    let index_names = state.engine.index_name_list();
     let fields_filter = params.fields.as_deref().unwrap_or("*");
 
     let mut fields_map: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
 
-    for index_info in &indices {
-        let idx = match state.engine.get_index(&index_info.name) {
+    for index_name in &index_names {
+        let idx = match state.engine.get_index(index_name) {
             Ok(i) => i,
             Err(_) => continue,
         };
@@ -38900,7 +38865,7 @@ pub async fn global_field_caps(
         let stored_mapping = state
             .engine
             .index_mappings
-            .get(index_info.name.as_str())
+            .get(index_name.as_str())
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
         let mut live_properties = schema_to_es_properties(&schema);
@@ -38931,7 +38896,7 @@ pub async fn global_field_caps(
                 "",
                 &properties,
                 fields_filter,
-                &index_info.name,
+                index_name,
                 &mut fields_map,
             );
         }
@@ -38964,11 +38929,8 @@ pub async fn global_field_caps(
                 })
             });
             if let Some(arr) = type_entry["indices"].as_array_mut() {
-                if !arr
-                    .iter()
-                    .any(|v| v.as_str() == Some(index_info.name.as_str()))
-                {
-                    arr.push(Value::String(index_info.name.clone()));
+                if !arr.iter().any(|v| v.as_str() == Some(index_name.as_str())) {
+                    arr.push(Value::String(index_name.clone()));
                 }
             }
         }
@@ -43643,10 +43605,10 @@ async fn run_rollup_job(state: &AppState, job_id: &str, config: &Value) -> Resul
     }
 
     // Resolve source indices (exclude the rollup_index itself).
-    let all = state.engine.list_indices().await;
-    let matches: Vec<String> = all
-        .iter()
-        .map(|i| i.name.clone())
+    let matches: Vec<String> = state
+        .engine
+        .index_name_list()
+        .into_iter()
         .filter(|n| n != &rollup_index && wildcard_match(&index_pattern, n))
         .collect();
     if matches.is_empty() {
