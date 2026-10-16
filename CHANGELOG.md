@@ -311,7 +311,7 @@ before.
   and a fresh resolve failed); PR #1494 adds a manual workflow that prints
   the public half of the hub signing seed. It bakes no key into the binary:
   `HUB_PUBKEY_HEX` is still empty in rc.96. PR
-  [#1507](https://github.com/xerj-org/xerj/pull/1507) repairs two merge skews
+  [#1506](https://github.com/xerj-org/xerj/pull/1506) repairs two merge skews
   that made main red during the cut: the `auto_port` tests (#1487) against
   #1452's `Result`-returning argument parser, and a comma the #1499 merge
   dropped from `.contributors`.
