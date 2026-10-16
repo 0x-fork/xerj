@@ -407,6 +407,19 @@ fn install_dataset_mappings(
 fn dataset_create_body(dataset: &PlanDataset) -> Value {
     let mut create_body = build_mapping(&dataset.specs);
     create_body["mappings"]["properties"]["ax_paths"] = json!({"type": "keyword"});
+    if dataset.family == "docs" || dataset.family == "code" {
+        if let Some(props) = create_body
+            .pointer_mut("/mappings/properties")
+            .and_then(Value::as_object_mut)
+        {
+            props
+                .entry("impl".to_string())
+                .or_insert_with(|| json!({"type": "text"}));
+            props
+                .entry("end_line".to_string())
+                .or_insert_with(|| json!({"type": "long"}));
+        }
+    }
     if let Some(analyzer) = &dataset.text_analyzer {
         create_body["settings"] = json!({"analysis": {"analyzer": {
             "default": {"type": analyzer}
