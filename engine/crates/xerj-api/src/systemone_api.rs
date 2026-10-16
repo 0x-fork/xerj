@@ -282,6 +282,21 @@ fn write_back_doc(answer: &CachedAnswer, cfg: &DecisionsConfig, ts: &str) -> Val
     Value::Object(doc)
 }
 
+/// The document id one cached answer is written under: a hash of the text
+/// that was decided, so each distinct payload holds at most ONE cached answer
+/// per index. Since #1094 a low-share history vote escalates to the local
+/// head, and the same question asked again can escalate again (its own cached
+/// answer is one neighbour among several); appending a fresh document each
+/// time would let the local head out-vote the history — human corrections
+/// included — by repetition alone. Re-deciding the same text overwrites the
+/// earlier cached answer instead. Pure, and unit-tested.
+fn write_back_id(text: &str) -> String {
+    format!(
+        "decide-{:032x}",
+        xxhash_rust::xxh3::xxh3_128(text.as_bytes())
+    )
+}
+
 /// Cache `answers` into the configured decisions index — the flywheel's
 /// write-back. Spawned and never awaited by the request, so it can neither
 /// delay nor fail it: every error (index cannot be created or reached,
@@ -313,7 +328,10 @@ fn spawn_write_back(state: &AppState, cfg: &DecisionsConfig, answers: Vec<Cached
         for answer in &answers {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             match idx
-                .index_document(None, write_back_doc(answer, &cfg, &ts))
+                .index_document(
+                    Some(write_back_id(&answer.text)),
+                    write_back_doc(answer, &cfg, &ts),
+                )
                 .await
             {
                 Ok(_) => state.metrics.record_doc_indexed(&cfg.index),
@@ -2178,6 +2196,17 @@ mod tests {
     /// configured text/label fields (so it votes like any seeded example) and
     /// the fixed p / source / ts the issue names. Nothing else — a cached
     /// answer is NOT marked human, or it would outrank itself forever.
+    #[test]
+    fn write_back_id_is_one_per_decided_text() {
+        let a = write_back_id("refund money back check");
+        assert_eq!(a, write_back_id("refund money back check"));
+        assert_ne!(a, write_back_id("refund money back check!"));
+        assert!(
+            a.starts_with("decide-") && a.len() == "decide-".len() + 32,
+            "{a}"
+        );
+    }
+
     #[test]
     fn write_back_doc_carries_the_flywheel_fields() {
         let cfg = DecisionsConfig {

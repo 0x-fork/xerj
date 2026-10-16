@@ -352,6 +352,15 @@ mod write_back {
     /// The same armed node as `systemone_local_decide.rs`: a tiny untrained
     /// fixture model, `[decisions] index` set to `index`.
     async fn local_node(index: &str, min_confidence: f64) -> LocalNode {
+        local_node_escalating(index, min_confidence, 0.8).await
+    }
+
+    /// [`local_node`] with `[decisions] escalate_below` set (#1094).
+    async fn local_node_escalating(
+        index: &str,
+        min_confidence: f64,
+        escalate_below: f64,
+    ) -> LocalNode {
         let dir = tempfile::tempdir().expect("tempdir");
         let model_dir = tempfile::tempdir().expect("model tempdir");
         xerj_ai::decide::testing::write_fixture(model_dir.path())
@@ -362,6 +371,7 @@ mod write_back {
         config.storage.wal_sync = xerj_common::config::WalSync::Async;
         config.decisions.index = index.to_string();
         config.decisions.min_confidence = min_confidence;
+        config.decisions.escalate_below = escalate_below;
         let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
         let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
         let mut state = AppState::new(config, engine, metrics);
@@ -604,5 +614,71 @@ mod write_back {
             3,
             "/v1/systemone escalation wrote back to history_s1: {docs2:?}"
         );
+    }
+
+    /// #1094 follow-up: a question that keeps escalating (its own cached
+    /// answer is one neighbour among split ones) must not append a fresh
+    /// cached document every time — repetition alone would then let the
+    /// local head out-vote the history. Re-deciding the same text overwrites
+    /// its one cached answer. `escalate_below = 1.0` makes every split vote
+    /// escalate, so the second request is guaranteed to reach the local head.
+    #[tokio::test]
+    async fn re_escalating_the_same_question_keeps_one_cached_answer() {
+        let ln = local_node_escalating("history", 0.0, 1.0).await;
+        let node = &ln.node;
+        node.create_index("history").await;
+        node.put_doc(
+            "history",
+            "h_true",
+            json!({"text": "refund money back request", "label": "true"}),
+        )
+        .await;
+        node.put_doc(
+            "history",
+            "h_false",
+            json!({"text": "refund inquiry status", "label": "not true"}),
+        )
+        .await;
+        node.refresh("history").await;
+
+        let question = json!({"index": "history", "question": "refund money back check"});
+        let (st, r) = node.decide(question.clone()).await;
+        assert!(st.is_success(), "{st} {r}");
+        assert_eq!(r["tier"], "local", "{r}");
+        let docs = node.wait_for_docs("history", 3).await;
+        let cached_ts = |docs: &[Value]| -> Vec<String> {
+            docs.iter()
+                .filter(|d| d["source"] == "local")
+                .map(|d| d["ts"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let first = cached_ts(&docs);
+        assert_eq!(first.len(), 1, "one cached answer: {docs:?}");
+
+        // Same question again: still a split vote, so it escalates again.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (st, r) = node.decide(question).await;
+        assert!(st.is_success(), "{st} {r}");
+        assert_eq!(r["tier"], "local", "the re-asked split vote escalates: {r}");
+        // Wait for the second write-back to land (its ts differs), then the
+        // index must still hold exactly one cached answer for that text.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let docs = node.docs("history").await;
+            let ts = cached_ts(&docs);
+            assert!(
+                ts.len() <= 1,
+                "a repeat escalation appended a duplicate: {docs:?}"
+            );
+            if ts.len() == 1 && ts[0] != first[0] {
+                assert_eq!(docs.len(), 3, "{docs:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second write-back never landed: {docs:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
