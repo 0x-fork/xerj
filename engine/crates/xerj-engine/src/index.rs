@@ -33117,6 +33117,17 @@ async fn do_flush_shard(
     warm_caches: PublishWarmCaches,
     #[cfg(test)] test_hook: Option<FlushPublisherTestHook>,
 ) -> Result<()> {
+    // #1226 — re-check emptiness BEFORE the process-global finalize gate.
+    // `Index::refresh`/`Index::flush` already skip shards that look empty
+    // when they build the fan-out (#1319), but this task may have waited on
+    // `flush_sema` since then while a concurrent flush drained the shard,
+    // and the ingest-triggered paths call in here directly. Same outcome as
+    // the empty-drain branch below (`on_drained` fired, nothing published),
+    // minus a wait behind every other index's in-flight finalize.
+    if memtable.shard_load(shard_idx).0 == 0 {
+        on_drained();
+        return Ok(());
+    }
     // Acquire admission before draining. Once the memtable has been drained
     // there must be no cancellation point until a non-cancellable blocking
     // worker owns both rollback data and the publication barrier.
@@ -59854,5 +59865,63 @@ mod exact_scan_hydration_tests {
         let doc = serde_json::json!({"_id": "shadowed", "tag": "t"});
         assert!(KnnFilterPlan::FullSource.matches(&filter, "real", &doc, &schema));
         assert!(!KnnFilterPlan::FullSource.matches(&filter, "other", &doc, &schema));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn do_flush_shard_skips_finalize_gate_for_empty_shard() {
+        // #1226 follow-up to #1319. `Index::refresh` / `Index::flush` already
+        // skip shards that look empty when the fan-out is built, but a shard
+        // task spawned for a non-empty shard can find it drained by a
+        // concurrent flush by the time it holds its `flush_sema` permit, and
+        // the ingest-triggered flush paths call `do_flush_shard` directly.
+        // Those calls must not queue on the process-global
+        // `flush_finalize_gate` just to discover there is nothing to drain.
+        //
+        // Exhaust the global gate, then flush an empty shard directly: it
+        // must return at once and still fire `on_drained` (callers use it to
+        // release their `flush_sema` permit). Without the pre-gate check the
+        // call blocks on `acquire()` and the timeout fires. The permits are
+        // held only for the duration of one no-op call, so concurrent tests
+        // that flush are delayed by microseconds, not stalled.
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(&dir);
+        let idx = eng.get_or_create_index("empty-shard-skip").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.memtable.shard_load(0).0, 0, "precondition: empty shard");
+
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drained_flag = Arc::clone(&drained);
+        let permits_n = crate::pools::sizing().flush_finalize as u32;
+        let held = crate::flush_finalize_gate()
+            .acquire_many(permits_n)
+            .await
+            .unwrap();
+        assert_eq!(crate::flush_finalize_gate().available_permits(), 0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            do_flush_shard(
+                0,
+                Arc::clone(&idx.store),
+                Arc::clone(&idx.memtable),
+                Arc::clone(&idx.collection_publication),
+                Arc::clone(&idx.registry),
+                idx.data_dir.clone(),
+                HashMap::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                move || drained_flag.store(true, std::sync::atomic::Ordering::SeqCst),
+                idx.publish_warm_caches(),
+                None,
+            ),
+        )
+        .await;
+        drop(held);
+        result
+            .expect("#1226: an empty shard must not wait on flush_finalize_gate")
+            .expect("flushing an empty shard must succeed");
+        assert!(
+            drained.load(std::sync::atomic::Ordering::SeqCst),
+            "on_drained must fire on the empty-shard fast path"
+        );
     }
 }

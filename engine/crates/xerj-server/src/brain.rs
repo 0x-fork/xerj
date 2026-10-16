@@ -160,8 +160,10 @@ fn parse(args: Vec<String>) -> Result<Option<BrainCfg>, String> {
 }
 
 fn default_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home).join(".xerj").join("brain")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".xerj")
+        .join("brain")
 }
 
 /// (host, port) out of an `http://host[:port]` URL. Only plain-http local

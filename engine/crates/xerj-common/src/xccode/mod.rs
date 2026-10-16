@@ -90,6 +90,9 @@ pub struct CodeParams {
     /// issue #368, so this is a cap, never an opt-out).
     pub full: usize,
     pub no_symbol: bool,
+    /// #1237: opt-in second BM25 leg over symbol-record `impl` fields, fused
+    /// with file-level BM25 at the file level by RRF(k=60).
+    pub fuse_symbols: bool,
     pub stale_ok: bool,
     pub meatl: bool,
     /// CLI `--json`: raw server response on stdout. MCP never sets this.
@@ -110,6 +113,7 @@ impl CodeParams {
             mode: Mode::Bm25,
             full: 800,
             no_symbol: false,
+            fuse_symbols: false,
             stale_ok: false,
             meatl: false,
             as_json: false,
@@ -273,7 +277,30 @@ pub fn run_code_query(
     let (mut resp, hits) = match params.mode {
         Mode::Bm25 => match http.search(&pattern, &bm25_body(&query, fetch, &params.lang, &fields))
         {
-            Ok(r) => (r.clone(), hit_list(&r)),
+            Ok(mut r) => {
+                let mut h = hit_list(&r);
+                if params.fuse_symbols
+                    && !params.no_symbol
+                    && fields::has_symbol_impl(mapping.as_ref())
+                {
+                    if let Ok(sym_resp) =
+                        http.search(&pattern, &symbol_bm25_body(&query, fetch, &params.lang))
+                    {
+                        let sym_hits = hit_list(&sym_resp);
+                        if !sym_hits.is_empty() {
+                            h = fuse_file_and_symbol_hits(http, &pattern, h, sym_hits, fetch);
+                            if let Some(hits_arr) =
+                                r.pointer_mut("/hits/hits").and_then(Value::as_array_mut)
+                            {
+                                *hits_arr = h.clone();
+                            }
+                            rrf_scores = true;
+                            note = Some(format!("BM25 file+symbol RRF(k={RRF_K})"));
+                        }
+                    }
+                }
+                (r, h)
+            }
             Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
         },
         Mode::Semantic => {
@@ -627,6 +654,234 @@ pub(crate) fn bm25_body(query: &str, k: usize, lang: &Option<String>, fields: &[
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
     serde_json::json!({ "size": k, "query": { "bool": { "must": must } } })
+}
+
+/// #1237: second BM25 leg over symbol-record `impl` fields. Excludes `impl`
+/// and `body` from `_source` so the symbol leg never transfers symbol body
+/// text over the wire — only provenance (`ax_path`, `ax_file`, `path`) and
+/// the winning symbol span (`name`, `kind`, `line`, `end_line`).
+pub(crate) fn symbol_bm25_body(query: &str, k: usize, lang: &Option<String>) -> Value {
+    let mut must = vec![serde_json::json!({
+        "multi_match": { "query": query, "fields": ["impl"] }
+    })];
+    if let Some(lg) = lang {
+        must.push(serde_json::json!({ "match": { "language": lg } }));
+    }
+    serde_json::json!({
+        "size": k,
+        "_source": { "excludes": ["impl", "body"] },
+        "query": { "bool": { "must": must } }
+    })
+}
+
+fn hit_file_key(hit: &Value) -> Option<String> {
+    hit.pointer("/_source/ax_path")
+        .and_then(Value::as_str)
+        .or_else(|| hit.pointer("/_source/ax_file").and_then(Value::as_str))
+        .or_else(|| hit.pointer("/_source/path").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// #1237: roll both BM25 legs up to the file level first (each file gets its
+/// best 1-indexed file-leg rank and its best 1-indexed symbol-leg rank so a
+/// file with ten matching functions does not get ten RRF votes), fuse by
+/// `1 / (60 + rank_file) + 1 / (60 + rank_sym)`, and stamp the winning
+/// symbol's `line..=end_line` onto `_source.symbols` for passage selection.
+pub(crate) fn fuse_file_and_symbol_hits(
+    http: &impl XcHttp,
+    pattern: &str,
+    file_hits: Vec<Value>,
+    sym_hits: Vec<Value>,
+    limit: usize,
+) -> Vec<Value> {
+    struct FileEntry {
+        file_rank: Option<usize>,
+        sym_rank: Option<usize>,
+        file_hit: Option<Value>,
+        sym_hit: Option<Value>,
+        win_sym: Option<(String, String, i64, Option<i64>)>,
+    }
+
+    let mut by_file: HashMap<String, FileEntry> = HashMap::new();
+    let mut unkeyed: Vec<Value> = Vec::new();
+    let mut next_file_rank = 0usize;
+
+    for hit in file_hits {
+        let Some(key) = hit_file_key(&hit) else {
+            unkeyed.push(hit);
+            continue;
+        };
+        let has_body = hit
+            .pointer("/_source/body")
+            .and_then(Value::as_str)
+            .is_some();
+        let entry = by_file.entry(key).or_insert_with(|| {
+            next_file_rank += 1;
+            FileEntry {
+                file_rank: Some(next_file_rank),
+                sym_rank: None,
+                file_hit: None,
+                sym_hit: None,
+                win_sym: None,
+            }
+        });
+        if entry.file_hit.is_none()
+            || (has_body
+                && entry
+                    .file_hit
+                    .as_ref()
+                    .and_then(|h| h.pointer("/_source/body"))
+                    .and_then(Value::as_str)
+                    .is_none())
+        {
+            entry.file_hit = Some(hit);
+        }
+    }
+
+    let mut next_sym_rank = 0usize;
+    for hit in sym_hits {
+        let Some(key) = hit_file_key(&hit) else {
+            continue;
+        };
+        let sym_span = hit.get("_source").and_then(|src| {
+            let name = src.get("name")?.as_str()?.to_string();
+            let line = src.get("line")?.as_i64()?;
+            let kind = src
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let end_line = src
+                .get("end_line")
+                .and_then(Value::as_i64)
+                .filter(|&e| e >= line);
+            Some((name, kind, line, end_line))
+        });
+        let entry = by_file.entry(key).or_insert_with(|| FileEntry {
+            file_rank: None,
+            sym_rank: None,
+            file_hit: None,
+            sym_hit: None,
+            win_sym: None,
+        });
+        if entry.sym_rank.is_none() {
+            next_sym_rank += 1;
+            entry.sym_rank = Some(next_sym_rank);
+            entry.sym_hit = Some(hit);
+            entry.win_sym = sym_span;
+        }
+    }
+
+    let mut ranked: Vec<(String, f64, usize, FileEntry)> = by_file
+        .into_iter()
+        .map(|(key, entry)| {
+            let f_score = entry
+                .file_rank
+                .map(|r| 1.0 / (RRF_K as f64 + r as f64))
+                .unwrap_or(0.0);
+            let s_score = entry
+                .sym_rank
+                .map(|r| 1.0 / (RRF_K as f64 + r as f64))
+                .unwrap_or(0.0);
+            let best_rank = entry
+                .file_rank
+                .unwrap_or(usize::MAX)
+                .min(entry.sym_rank.unwrap_or(usize::MAX));
+            (key, f_score + s_score, best_rank, entry)
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(limit);
+
+    let mut out = Vec::with_capacity(ranked.len());
+    for (key, score, _, mut entry) in ranked {
+        let has_body = entry
+            .file_hit
+            .as_ref()
+            .and_then(|h| h.pointer("/_source/body"))
+            .and_then(Value::as_str)
+            .is_some();
+        if !has_body {
+            // File entered via the symbol leg alone: fetch its file record so
+            // passage selection has `body` to slice.
+            let lookup = serde_json::json!({
+                "size": 1,
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "exists": { "field": "body" } },
+                            { "match_phrase": { "ax_path": key } }
+                        ]
+                    }
+                }
+            });
+            let target = entry
+                .sym_hit
+                .as_ref()
+                .and_then(|h| h.get("_index"))
+                .and_then(Value::as_str)
+                .unwrap_or(pattern);
+            if let Ok(resp) = http.search(target, &lookup) {
+                if let Some(fetched) = hit_list(&resp)
+                    .into_iter()
+                    .find(|h| hit_file_key(h).as_deref() == Some(key.as_str()))
+                {
+                    entry.file_hit = Some(fetched);
+                }
+            }
+        }
+        let Some(mut hit) = entry.file_hit.or(entry.sym_hit) else {
+            continue;
+        };
+        if let Some((name, kind, line, end_line)) = entry.win_sym {
+            if let Some(src) = hit.get_mut("_source").and_then(Value::as_object_mut) {
+                let syms = src
+                    .entry("symbols")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(arr) = syms.as_array_mut() {
+                    let mut updated = false;
+                    for s in arr.iter_mut() {
+                        if s.get("name").and_then(Value::as_str) == Some(name.as_str())
+                            && s.get("line").and_then(Value::as_i64) == Some(line)
+                        {
+                            if let (Some(obj), Some(end)) = (s.as_object_mut(), end_line) {
+                                obj.insert("end_line".to_string(), serde_json::json!(end));
+                            }
+                            updated = true;
+                            break;
+                        }
+                    }
+                    if !updated {
+                        let mut sym_obj = serde_json::Map::new();
+                        sym_obj.insert("name".to_string(), Value::String(name));
+                        sym_obj.insert("kind".to_string(), Value::String(kind));
+                        sym_obj.insert("line".to_string(), serde_json::json!(line));
+                        if let Some(end) = end_line {
+                            sym_obj.insert("end_line".to_string(), serde_json::json!(end));
+                        }
+                        arr.push(Value::Object(sym_obj));
+                    }
+                }
+            }
+        }
+        if let Some(obj) = hit.as_object_mut() {
+            obj.insert("_score".to_string(), serde_json::json!(score));
+        }
+        out.push(hit);
+    }
+    for hit in unkeyed {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(hit);
+    }
+    out
 }
 
 /// The vector-only body. Aimed ONLY at indices whose `body` is semantic_text
@@ -1499,5 +1754,92 @@ mod tests {
             })
             .collect();
         assert_eq!(files, vec!["file1", "fileX"], "fileX's slot was not burned");
+    }
+
+    #[test]
+    fn fuse_file_and_symbol_hits_rolls_up_per_file_and_stamps_winning_symbol_span() {
+        struct NoopHttp;
+        impl XcHttp for NoopHttp {
+            fn get_mapping(&self, _: &str) -> Result<Value, String> {
+                Err("unused".into())
+            }
+            fn cat_indices_json(&self, _: &str) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+            fn search(&self, _: &str, _: &Value) -> Result<Value, String> {
+                Ok(serde_json::json!({ "hits": { "hits": [] } }))
+            }
+        }
+
+        // File leg ranks monolith.rs #1 and Target.rs #2; symbol leg ranks two
+        // functions in Target.rs at #1 and #2 (must roll up to ONE vote at
+        // rank 1, not two votes) and monolith.rs absent from symbol leg.
+        // RRF(k=60):
+        //   Target.rs   = 1/(60+2) + 1/(60+1) = 1/62 + 1/61 = 0.032522...
+        //   monolith.rs = 1/(60+1) + 0        = 1/61        = 0.016393...
+        let file_hits = vec![
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 12.0,
+                "_source": {
+                    "ax_path": "src/monolith.rs",
+                    "ax_file": "src/monolith.rs",
+                    "body": "fn big() {}\n",
+                    "symbols": [{ "name": "big", "kind": "function", "line": 1 }]
+                }
+            }),
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 9.0,
+                "_source": {
+                    "ax_path": "src/target.rs",
+                    "ax_file": "src/target.rs",
+                    "body": "fn helper() {\n    let x = 1;\n}\n",
+                    "symbols": [{ "name": "helper", "kind": "function", "line": 1 }]
+                }
+            }),
+        ];
+        let sym_hits = vec![
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 18.0,
+                "_source": {
+                    "ax_path": "src/target.rs",
+                    "ax_file": "src/target.rs",
+                    "name": "helper",
+                    "kind": "function",
+                    "line": 1,
+                    "end_line": 3
+                }
+            }),
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 17.0,
+                "_source": {
+                    "ax_path": "src/target.rs",
+                    "ax_file": "src/target.rs",
+                    "name": "second_fn",
+                    "kind": "function",
+                    "line": 10,
+                    "end_line": 15
+                }
+            }),
+        ];
+        let fused = fuse_file_and_symbol_hits(&NoopHttp, "xc-test*", file_hits, sym_hits, 5);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(
+            fused[0].pointer("/_source/ax_path").and_then(Value::as_str),
+            Some("src/target.rs")
+        );
+        let expected_rrf = 1.0 / 62.0 + 1.0 / 61.0;
+        let got_score = fused[0].get("_score").and_then(Value::as_f64).unwrap();
+        assert!((got_score - expected_rrf).abs() < 1e-12);
+        assert_eq!(
+            fused[0]
+                .pointer("/_source/symbols/0/end_line")
+                .and_then(Value::as_i64),
+            Some(3),
+            "winning symbol end_line stamped onto file record's symbols entry"
+        );
     }
 }

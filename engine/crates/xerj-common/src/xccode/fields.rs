@@ -192,7 +192,10 @@ fn own_text_fields(obj: &serde_json::Map<String, Value>, min_indices: usize) -> 
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|t| t == "text" || t == "semantic_text");
-            if searchable && !key.starts_with(AX) {
+            // #1237: `impl` is the symbol-record implementation field queried
+            // by its own dedicated BM25 leg under `--fuse-symbols`; never fold
+            // it into the file-level `multi_match` over `body`/`defs`/`title`.
+            if searchable && !key.starts_with(AX) && key != "impl" {
                 *counts.entry(key.clone()).or_insert(0) += 1;
             }
         }
@@ -233,6 +236,7 @@ fn own_recall_legs(obj: &serde_json::Map<String, Value>, min_union_indices: usiz
             .iter()
             .filter(|(key, spec)| {
                 !key.starts_with("ax_")
+                    && *key != "impl"
                     && spec
                         .get("type")
                         .and_then(Value::as_str)
@@ -262,6 +266,19 @@ fn own_recall_legs(obj: &serde_json::Map<String, Value>, min_union_indices: usiz
         .take(MAX_OWN_FIELDS)
         .map(|(f, _)| f)
         .collect()
+}
+
+/// Whether at least one index under the prefix maps the symbol-record `impl`
+/// field (#1237) as searchable text (`text` or `semantic_text`).
+pub fn has_symbol_impl(mapping: Option<&Value>) -> bool {
+    let Some(mapping) = mapping.and_then(Value::as_object) else {
+        return false;
+    };
+    mapping.values().any(|m| {
+        m.pointer("/mappings/properties/impl/type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "text" || t == "semantic_text")
+    })
 }
 
 /// Indices under the prefix whose `field` (default `body`) is mapped as
@@ -692,5 +709,18 @@ mod tests {
         assert!(got.contains(&"a01^0.5".to_string()) && got.contains(&"a22^0.5".to_string()));
         assert_eq!(got.first().unwrap(), "body");
         assert_eq!(got.len(), 1 + 24 - 1); // body full-weight + 23 own legs
+    }
+
+    #[test]
+    fn symbol_impl_is_detected_and_excluded_from_file_leg_fields() {
+        let m = mapping(&[("xc-code-000", &["body", "defs", "title", "impl"], false)]);
+        assert!(has_symbol_impl(Some(&m)));
+        assert_eq!(
+            resolve_fields(Some(&m)),
+            vec!["body".to_string(), "defs".into(), "title".into()],
+            "impl is queried by its own BM25 leg under --fuse-symbols, never folded into file multi_match"
+        );
+        let no_impl = mapping(&[("xc-code-000", &["body", "defs", "title"], false)]);
+        assert!(!has_symbol_impl(Some(&no_impl)));
     }
 }

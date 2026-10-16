@@ -35,6 +35,10 @@ config for each — with a .bak backup for any file it edits:
     AGENTS.md                    a short XERJ section (appended if the file
                                  exists, created otherwise)
 
+The teaching files carry an `xerj-init-version` marker. A re-run upgrades one
+an older init wrote and nobody edited (with a .bak); an edited file, or one
+without the marker, is yours and is kept.
+
 OPTIONS:
     --url <U>       node endpoint baked into the MCP config
                     (default $XERJ_URL or http://localhost:9200)
@@ -246,14 +250,107 @@ fn self_bin() -> String {
         .unwrap_or_else(|| "xerj".to_string())
 }
 
-/// Write `content` to `path` unless a file is already there, so a skill the
-/// user has edited is never overwritten. Returns the report line for it.
-fn write_if_absent(path: &Path, content: &str, dry: bool) -> Result<String, String> {
-    if path.exists() {
-        return Ok(report("kept", path));
+/// The generation of the teaching files init writes. Bump it whenever
+/// `skill_md()` or `HUB_SKILL_MD` changes, so a file an older init wrote (and
+/// the user never edited) is upgraded on the next run. A unit test pins the
+/// texts' hashes to this number, so a text change without a bump fails CI.
+const INIT_FILES_VERSION: u32 = 1;
+
+/// The marker's prefix. The full line is
+/// `<!-- xerj-init-version: <N> sha256:<16 hex> -->`: the generation, and the
+/// hash of the file as written minus this line, so a re-run can tell a file
+/// init wrote and nobody touched from one the user edited.
+const MARKER_PREFIX: &str = "<!-- xerj-init-version: ";
+
+/// The first 8 bytes of SHA-256, hex. Line endings are normalised first, so a
+/// checkout or editor that turned `\n` into `\r\n` is not mistaken for an edit.
+fn content_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.replace("\r\n", "\n").as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `content` with the version marker inserted: after the YAML frontmatter
+/// when there is one (a skill loader reads `---` on line 1), at the top
+/// otherwise. Removing the marker line gives back `content` exactly.
+fn stamped(content: &str) -> String {
+    let marker = format!(
+        "{MARKER_PREFIX}{INIT_FILES_VERSION} sha256:{} -->\n",
+        content_hash(content)
+    );
+    let at = content
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---\n").map(|i| 4 + i + "\n---\n".len()))
+        .unwrap_or(0);
+    format!("{}{marker}{}", &content[..at], &content[at..])
+}
+
+/// What a re-run found in an existing teaching file.
+#[derive(Debug, PartialEq)]
+enum Stamp {
+    /// No marker: written by hand or by an init that predates markers. The
+    /// user owns it.
+    None,
+    /// A marker, and the text still hashes to what init wrote.
+    Pristine(u32),
+    /// A marker, but the text changed since init wrote it.
+    Edited(u32),
+}
+
+fn read_stamp(text: &str) -> Stamp {
+    let mut found = None;
+    let mut rest = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if found.is_none() {
+            if let Some(m) = line.strip_prefix(MARKER_PREFIX) {
+                let mut parts = m.split_whitespace();
+                let version = parts.next().and_then(|v| v.parse::<u32>().ok());
+                let hash = parts.next().and_then(|h| h.strip_prefix("sha256:"));
+                if let (Some(v), Some(h)) = (version, hash) {
+                    found = Some((v, h.to_string()));
+                    continue;
+                }
+            }
+        }
+        rest.push_str(line);
     }
-    write_file(path, content, dry).map_err(|e| e.to_string())?;
-    Ok(report("wrote", path))
+    match found {
+        None => Stamp::None,
+        Some((v, h)) if h == content_hash(&rest) => Stamp::Pristine(v),
+        Some((v, _)) => Stamp::Edited(v),
+    }
+}
+
+/// Write the teaching file `content` (stamped with the version marker) to
+/// `path`. An existing file is upgraded only when an older init wrote it and
+/// nobody edited it since, after a `.bak` backup (fail-closed, as for
+/// `.mcp.json`); an edited or unmarked file is the user's and is kept.
+/// Returns the report line for it.
+fn write_teaching_file(path: &Path, content: &str, dry: bool) -> Result<String, String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_file(path, &stamped(content), dry).map_err(|e| e.to_string())?;
+            return Ok(report("wrote", path));
+        }
+        // Present but unreadable (not UTF-8, no permission): the user's.
+        Err(_) => return Ok(report("kept", path)),
+    };
+    match read_stamp(&existing) {
+        Stamp::Pristine(v) if v < INIT_FILES_VERSION => {
+            backup(path, dry)?;
+            write_file(path, &stamped(content), dry).map_err(|e| e.to_string())?;
+            Ok(report("upgraded", path))
+        }
+        Stamp::Edited(v) if v < INIT_FILES_VERSION => Ok(format!(
+            "{} (edited since xerj init wrote it; not upgraded to v{INIT_FILES_VERSION})",
+            report("kept", path)
+        )),
+        _ => Ok(report("kept", path)),
+    }
 }
 
 /// Back up `path` to `path.bak` before the first edit. Returns true if a
@@ -399,12 +496,12 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
             .map(|h| h.join(".claude").is_dir())
             .unwrap_or(false);
     if claude_dir_present {
-        out.push(write_if_absent(
+        out.push(write_teaching_file(
             &cwd.join(".claude/skills/xerj/SKILL.md"),
             &skill_md(),
             dry,
         )?);
-        out.push(write_if_absent(
+        out.push(write_teaching_file(
             &cwd.join(".claude/skills/xerj-hub/SKILL.md"),
             HUB_SKILL_MD,
             dry,
@@ -414,12 +511,12 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
     // 3) Cursor rules — only when the project already has a .cursor directory.
     //    The same two teaching files, one rule each.
     if cwd.join(".cursor").is_dir() {
-        out.push(write_if_absent(
+        out.push(write_teaching_file(
             &cwd.join(".cursor/rules/xerj.mdc"),
             &skill_md(),
             dry,
         )?);
-        out.push(write_if_absent(
+        out.push(write_teaching_file(
             &cwd.join(".cursor/rules/xerj-hub.mdc"),
             HUB_SKILL_MD,
             dry,
@@ -641,8 +738,8 @@ mod tests {
         let lines = run_init_in(d.path(), "http://x:1", false).unwrap();
         let local = fs::read_to_string(d.path().join(".claude/skills/xerj/SKILL.md")).unwrap();
         let hub = fs::read_to_string(d.path().join(".claude/skills/xerj-hub/SKILL.md")).unwrap();
-        assert_eq!(local, skill_md());
-        assert_eq!(hub, HUB_SKILL_MD);
+        assert_eq!(local, stamped(&skill_md()));
+        assert_eq!(hub, stamped(HUB_SKILL_MD));
         assert_ne!(local, hub);
         assert!(
             has_report(&lines, "wrote", "skills/xerj-hub/SKILL.md"),
@@ -660,7 +757,7 @@ mod tests {
         let lines = run_init_in(d.path(), "http://x:1", false).unwrap();
         assert_eq!(
             fs::read_to_string(d.path().join(".cursor/rules/xerj-hub.mdc")).unwrap(),
-            HUB_SKILL_MD
+            stamped(HUB_SKILL_MD)
         );
         assert!(
             has_report(&lines, "wrote", "rules/xerj-hub.mdc"),
@@ -894,6 +991,120 @@ mod tests {
         ] {
             assert!(USAGE.contains(file), "--help does not list {file}");
         }
+    }
+
+    // ── the version marker: upgrade only what init wrote and nobody edited ──
+
+    /// The marker sits after the frontmatter (a loader reads `---` on line 1),
+    /// and removing it gives back the text exactly.
+    #[test]
+    fn stamp_goes_after_the_frontmatter_and_reads_back_pristine() {
+        for text in [skill_md(), HUB_SKILL_MD.to_string()] {
+            let s = stamped(&text);
+            assert!(s.starts_with("---\n"), "{s}");
+            assert_eq!(read_stamp(&s), Stamp::Pristine(INIT_FILES_VERSION));
+            let (front, _) = s[4..].split_once("\n---\n").unwrap();
+            assert!(!front.contains(MARKER_PREFIX));
+        }
+        assert!(stamped("plain\n").starts_with(MARKER_PREFIX));
+        assert_eq!(read_stamp("my own rules\n"), Stamp::None);
+    }
+
+    /// `text` as an init of generation `v` would have written it.
+    fn stamped_as(v: u32, text: &str) -> String {
+        stamped(text).replacen(
+            &format!("{MARKER_PREFIX}{INIT_FILES_VERSION} "),
+            &format!("{MARKER_PREFIX}{v} "),
+            1,
+        )
+    }
+
+    /// Case 1: an older marker on an unedited file — upgraded, old text in
+    /// `.bak`.
+    #[test]
+    fn an_unedited_file_from_an_older_init_is_upgraded_with_a_backup() {
+        let d = tmp();
+        let hub = d.path().join(".claude/skills/xerj-hub/SKILL.md");
+        fs::create_dir_all(hub.parent().unwrap()).unwrap();
+        let old = stamped_as(0, "---\nname: xerj-hub\n---\n\nold text\n");
+        fs::write(&hub, &old).unwrap();
+        let lines = run_init_in(d.path(), "http://x:1", false).unwrap();
+        assert!(
+            has_report(&lines, "upgraded", "skills/xerj-hub/SKILL.md"),
+            "{lines:?}"
+        );
+        assert_eq!(fs::read_to_string(&hub).unwrap(), stamped(HUB_SKILL_MD));
+        assert_eq!(
+            fs::read_to_string(hub.with_extension("md.bak")).unwrap(),
+            old
+        );
+    }
+
+    /// The upgrade is fail-closed like `.mcp.json`: no backup, no edit.
+    #[test]
+    fn a_failed_backup_blocks_the_upgrade() {
+        let d = tmp();
+        let hub = d.path().join(".claude/skills/xerj-hub/SKILL.md");
+        fs::create_dir_all(hub.with_extension("md.bak")).unwrap();
+        let old = stamped_as(0, "old text\n");
+        fs::write(&hub, &old).unwrap();
+        let err = run_init_in(d.path(), "http://x:1", false).unwrap_err();
+        assert!(err.contains("could not back up"), "{err}");
+        assert_eq!(fs::read_to_string(&hub).unwrap(), old);
+    }
+
+    /// Case 2: an older marker on a file the user edited — kept, one line
+    /// saying why, no backup made.
+    #[test]
+    fn an_edited_file_from_an_older_init_is_kept_with_a_notice() {
+        let d = tmp();
+        let hub = d.path().join(".claude/skills/xerj-hub/SKILL.md");
+        fs::create_dir_all(hub.parent().unwrap()).unwrap();
+        let edited = format!("{}my addition\n", stamped_as(0, "old text\n"));
+        fs::write(&hub, &edited).unwrap();
+        let lines = run_init_in(d.path(), "http://x:1", false).unwrap();
+        assert_eq!(fs::read_to_string(&hub).unwrap(), edited);
+        assert!(!hub.with_extension("md.bak").exists());
+        let notice: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("xerj-hub") && l.contains("edited since xerj init"))
+            .collect();
+        assert_eq!(notice.len(), 1, "{lines:?}");
+        assert!(notice[0].contains("kept"), "{lines:?}");
+    }
+
+    /// Case 3: no marker — the user's file, kept untouched (also covered for
+    /// plain text by `an_edited_hub_skill_is_kept_not_overwritten`). Even the
+    /// exact current text without a marker is not claimed.
+    #[test]
+    fn a_file_without_a_marker_is_user_owned() {
+        let d = tmp();
+        let rule = d.path().join(".cursor/rules/xerj-hub.mdc");
+        fs::create_dir_all(rule.parent().unwrap()).unwrap();
+        fs::write(&rule, "old unmarked text\n").unwrap();
+        let lines = run_init_in(d.path(), "http://x:1", false).unwrap();
+        assert_eq!(fs::read_to_string(&rule).unwrap(), "old unmarked text\n");
+        assert!(!rule.with_extension("mdc.bak").exists());
+        assert!(
+            has_report(&lines, "kept", "rules/xerj-hub.mdc"),
+            "{lines:?}"
+        );
+    }
+
+    /// A text change without a version bump would leave every pristine older
+    /// file un-upgraded. Changing either text fails here until
+    /// `INIT_FILES_VERSION` is bumped and these hashes are re-pinned.
+    #[test]
+    fn teaching_texts_are_pinned_to_the_init_files_version() {
+        assert_eq!(
+            (
+                INIT_FILES_VERSION,
+                content_hash(&skill_md()).as_str(),
+                content_hash(HUB_SKILL_MD).as_str()
+            ),
+            (1, "2431e2257fd251e5", "c2ee5047ba667c35"),
+            "a teaching text changed: bump INIT_FILES_VERSION and re-pin"
+        );
     }
 
     // ── auth note (#961) ────────────────────────────────────────────────
