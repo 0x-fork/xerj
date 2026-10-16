@@ -40142,21 +40142,6 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                 Vec::new();
             for spec in &field_specs {
                 for (field_name, text) in collect_passage_field_texts(&hit.source, spec) {
-                    // `defs` is autoindex's synthetic symbol-list field on
-                    // whole-file code docs whose actual source lives in `body`.
-                    // Ensure `body` is a candidate ahead of `defs` even when a
-                    // query lists `defs^3` first or queries `defs` without
-                    // naming `body` (`xerj search` / `xerj def`, #1365).
-                    if field_name == "defs" && !seen_fields.contains("body") {
-                        for (body_name, body_text) in
-                            collect_passage_field_texts(&hit.source, "body")
-                        {
-                            if seen_fields.insert(body_name.clone()) {
-                                let (lower, map) = build_lower_offset_map(&body_text);
-                                candidates.push((body_name, body_text, lower, map));
-                            }
-                        }
-                    }
                     if seen_fields.insert(field_name.clone()) {
                         let (lower, map) = build_lower_offset_map(&text);
                         candidates.push((field_name, text, lower, map));
@@ -56529,14 +56514,16 @@ mod lexical_passage_tests {
         assert_eq!(passage.ordinal, 80);
     }
 
-    /// #1365: when `defs` is listed before `body` (as in `xerj search`'s
-    /// `["name^4", "defs^3", "code^2", "body", "title"]`) or when a query
-    /// matches `defs` without naming `body` (as in `xerj def`), a single-symbol
-    /// match whose window score ties between `defs` and `body` must extract the
-    /// passage from `body` at the declaration's line ordinal, never from the
-    /// synthetic `defs` symbol-list field at `ordinal: 0`.
+    /// #1365: when `defs` is listed before `body` (as `xerj def`'s and the
+    /// pre-#1364 `xerj search` field lists did), a single-symbol match whose
+    /// window score ties between `defs` and `body` on an autoindex code
+    /// document must extract the passage from `body` at the declaration's
+    /// line ordinal, never from the synthetic `defs` symbol list at
+    /// `ordinal: 0`. When the query does NOT target `body`, the passage stays
+    /// in a field it did target (the #174 contract) — `xerj search` then
+    /// prints the bare path rather than a wrong `:1`.
     #[test]
-    fn defs_field_never_captures_passage_over_code_body_even_when_listed_first_or_alone() {
+    fn defs_field_never_captures_passage_over_a_targeted_code_body() {
         let body = format!(
             "{}pub fn check_invariants(x: i32) -> bool {{\n    x > 0\n}}\n{}",
             "// header filler\n".repeat(40),
@@ -56549,20 +56536,26 @@ mod lexical_passage_tests {
             "symbol_count": 1
         });
 
-        for fields in [
-            vec![
-                "name^4".to_string(),
-                "defs^3".to_string(),
-                "code^2".to_string(),
-                "body".to_string(),
-                "title".to_string(),
-            ],
-            vec![
-                "name^4".to_string(),
-                "defs^3".to_string(),
-                "code^2".to_string(),
-                "title".to_string(),
-            ],
+        for (fields, body_targeted) in [
+            (
+                vec![
+                    "name^4".to_string(),
+                    "defs^3".to_string(),
+                    "code^2".to_string(),
+                    "body".to_string(),
+                    "title".to_string(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "name^4".to_string(),
+                    "defs^3".to_string(),
+                    "code^2".to_string(),
+                    "title".to_string(),
+                ],
+                false,
+            ),
         ] {
             let query = QueryNode::MultiMatch {
                 fields,
@@ -56589,6 +56582,13 @@ mod lexical_passage_tests {
             };
             let out = apply_lexical_passages(vec![hit], &query);
             let passage = out[0].passage.as_ref().expect("lexical passage filled");
+            if !body_targeted {
+                assert_eq!(
+                    passage.field, "defs",
+                    "`body` was not targeted, so it must not be the source: {passage:?}"
+                );
+                continue;
+            }
             assert_eq!(passage.field, "body");
             assert!(
                 passage.text.starts_with("pub fn check_invariants"),

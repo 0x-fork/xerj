@@ -96,6 +96,11 @@ pub fn search_query_body(query: &str, k: usize) -> Value {
 /// Extract the 1-based starting line number from `fields._passage[0].ordinal`
 /// when `_passage` comes from a document body field (ignoring synthetic
 /// single-line or symbol-list metadata fields such as `defs` or `title`).
+///
+/// Only valid for LEXICAL passages, where the engine defines `ordinal` as
+/// the zero-based line index (`PassageMatch` in xerj-query). On a semantic
+/// hit it is a chunk ordinal instead; `xerj search` and `xerj def` send
+/// lexical queries only, so every passage they render is lexical.
 pub(crate) fn passage_line(hit: &Value) -> Option<u64> {
     let first = hit.pointer("/fields/_passage/0")?.as_object()?;
     if matches!(
