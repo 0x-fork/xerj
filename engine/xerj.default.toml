@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 55 of XERJ's 132 user-facing settings to their
+# This file sets 56 of XERJ's 133 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -38,6 +38,14 @@ grpc_port = 8081
 # Port for the Elasticsearch-compatible REST API (ES 8.x wire format).
 # Point existing ES clients, Kibana, or Logstash here.
 es_compat_port = 9200
+
+# Multi-instance opt-in. When true, a taken port makes this node bind the next
+# free one (the banner prints the ports actually bound), and a data_dir held by
+# another live xerj process makes it use "<data_dir>-2", "-3", ... instead.
+# Off by default everywhere: a taken port is a fatal startup error so a client
+# pointed at the configured port can never silently reach another instance.
+# Also: --auto-port / --no-auto-port, or env XERJ_AUTO_PORT=true|false.
+auto_port = false
 
 # Directory where all index data, WAL files, and segments are stored.
 # Ensure this path has sufficient disk space and fast I/O.
