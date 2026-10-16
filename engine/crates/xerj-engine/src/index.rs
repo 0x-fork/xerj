@@ -39795,6 +39795,27 @@ fn refine_code_passage(
     crate::code_blocks::enclosing_block(language, text, start, end)
 }
 
+/// Whether `source` has the shape autoindex's code extractor writes
+/// (`xerj-autoindex/src/extract/code.rs`): a whole-file document carries a
+/// numeric `symbol_count` (the signal [`refine_code_passage`] keys on); a
+/// per-symbol document carries exactly `name` + `kind` + `code` + a numeric
+/// `line` + `language`. Same conservatism as `refine_code_passage`: a field
+/// called `name` or `body` on an arbitrary document is not enough.
+fn is_autoindex_code_document(source: &Value) -> bool {
+    if matches!(
+        get_field_value(source, "symbol_count"),
+        Some(Value::Number(_))
+    ) {
+        return true;
+    }
+    let is_str = |field: &str| matches!(get_field_value(source, field), Some(Value::String(_)));
+    is_str("name")
+        && is_str("kind")
+        && is_str("code")
+        && is_str("language")
+        && matches!(get_field_value(source, "line"), Some(Value::Number(_)))
+}
+
 /// Maximum byte length of a query-time lexical `_passage` window.
 ///
 /// Sized so an agent gets enough surrounding code to read an implementation
@@ -40161,6 +40182,22 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
             if candidates.is_empty() {
                 return hit;
             }
+            // #1364: on an autoindex CODE document, `name`/`defs`/`title` are
+            // synthetic identifier fields (a one-word symbol name, a symbol
+            // list) whose source lives in `code` (per-symbol docs) or `body`
+            // (whole-file docs). Cross-field ties go to the first candidate,
+            // so `xerj search`'s `name^4`-first field list returned the bare
+            // word `de` as the passage of `de <- function(col) {...}`. Move the
+            // source fields ahead — a stable reorder of fields the query
+            // ALREADY targets, never an added field: a passage must come from
+            // a field the query named (the #174 contract), and an ordinary
+            // document that merely has `name`/`body` fields keeps the query's
+            // own field order.
+            if is_autoindex_code_document(&hit.source) {
+                candidates.sort_by_key(|(field_name, ..)| {
+                    !matches!(field_name.as_str(), "code" | "body")
+                });
+            }
             // Document-level term rarity across all candidate fields,
             // squared so one term's total contribution stays bounded (see
             // the weighting note in this function's doc comment).
@@ -40187,26 +40224,29 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                         // `refine_code_passage` would usually force it back
                         // to the tree root (the padding routinely spills
                         // outside the enclosing function) and silently no-op
-                        // the refinement. Anchor on one actual query-term
-                        // occurrence inside the window instead — any point
-                        // inside the matched region resolves to the same
-                        // enclosing block. ASCII-lowercase only (not the
-                        // Unicode-aware `lower`/`map` used above): it never
-                        // changes byte length, so `pos` lines up with `text`
-                        // without a second offset table; source identifiers
+                        // the refinement. Anchor on the highest-weight (rarest)
+                        // query-term occurrence inside the window (#1364) so a
+                        // common term in the leading context padding cannot pull
+                        // the AST refinement onto an adjacent block. ASCII-lowercase
+                        // only (not the Unicode-aware `lower`/`map` used above):
+                        // it never changes byte length, so `pos` lines up with
+                        // `text` without a second offset table; source identifiers
                         // are ASCII in the overwhelming case, and a missed
                         // non-ASCII anchor just skips the refinement, not a
                         // correctness bug.
-                        let (start, end) = weighted_terms
-                            .iter()
-                            .find_map(|&(term, _)| {
-                                if term.is_empty() {
-                                    return None;
-                                }
-                                text.get(start..end)?
-                                    .to_ascii_lowercase()
-                                    .find(term)
-                                    .map(|pos| start + pos)
+                        let window_lower = text.get(start..end).map(str::to_ascii_lowercase);
+                        let (start, end) = window_lower
+                            .as_deref()
+                            .and_then(|win| {
+                                weighted_terms
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, &(term, _))| !term.is_empty())
+                                    .filter_map(|(idx, &(term, weight))| {
+                                        win.find(term).map(|pos| (weight, idx, start + pos))
+                                    })
+                                    .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                                    .map(|(_, _, anchor)| anchor)
                             })
                             .and_then(|anchor| {
                                 let anchor_end = (anchor + 1).min(text.len());
@@ -56560,6 +56600,227 @@ mod lexical_passage_tests {
             passage.text,
             &body[passage.start_offset as usize..passage.end_offset as usize]
         );
+    }
+
+    /// #1364: on a per-symbol code hit (`name: "de"`, `title: "de"`, `code:
+    /// "de <- function(col)"`), `_passage` must come from `code` rather than
+    /// the single-word `name` field; and when a multi-word query hits a
+    /// whole-file document where a common glue token (`"de"`) appears in an
+    /// adjacent function just above the rarer target token
+    /// (`"factor_calibracion"`), `refine_code_passage` must anchor on the
+    /// highest-weight matched query term in the window rather than the first
+    /// alphabetically sorted term.
+    #[test]
+    fn code_lexical_passage_prefers_code_over_name_and_anchors_on_rarest_term() {
+        // 1. Per-symbol hit: `code` wins over `name` and `title`.
+        let symbol_source = serde_json::json!({
+            "ax_path": "R/utils.R",
+            "language": "r",
+            "symbol_count": 1,
+            "name": "de",
+            "title": "de",
+            "code": "de <- function(col) {\n  trimws(col)\n}",
+        });
+        let symbol_query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "defs^3".into(),
+                "code^2".into(),
+                "body".into(),
+                "title".into(),
+            ],
+            query: "de".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let symbol_hit = Hit {
+            id: "sym-de".into(),
+            score: 1.0,
+            source: symbol_source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![symbol_hit], &symbol_query);
+        let passage = out[0].passage.as_ref().expect("symbol passage filled");
+        assert_eq!(passage.field, "code");
+        assert!(
+            passage.text.starts_with("de <- function(col)"),
+            "expected function body from `code`, got {:?}",
+            passage.text
+        );
+
+        // 2. Whole-file hit: common token `de` appears frequently across the
+        // file and in an adjacent helper right above `pub fn compute_calibration`,
+        // while `factor_calibracion` appears only inside `compute_calibration`.
+        let mut body = String::new();
+        for i in 0..25 {
+            body.push_str(&format!("// comentario de relleno linea {i}\n"));
+        }
+        body.push_str(
+            "pub fn helper_anterior() {\n    // nota de control\n    let x = 1;\n}\n\n\
+             pub fn compute_calibration() -> f64 {\n    let factor_calibracion = 0.85;\n    factor_calibracion\n}\n",
+        );
+        let file_source = serde_json::json!({
+            "ax_path": "src/calib.rs",
+            "language": "rust",
+            "symbol_count": 2,
+            "defs": "helper_anterior compute_calibration",
+            "title": "calib",
+            "body": body,
+        });
+        let file_query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "code^2".into(),
+                "body".into(),
+                "defs^3".into(),
+                "title".into(),
+            ],
+            query: "de factor_calibracion".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let file_hit = Hit {
+            id: "file-calib".into(),
+            score: 1.0,
+            source: file_source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![file_hit], &file_query);
+        let passage = out[0].passage.as_ref().expect("file passage filled");
+        assert_eq!(passage.field, "body");
+        assert!(
+            passage.text.starts_with("pub fn compute_calibration"),
+            "expected enclosing function of rarest matched term, got {:?}",
+            passage.text
+        );
+    }
+
+    fn passage_hit(id: &str, source: serde_json::Value) -> Hit {
+        Hit {
+            id: id.into(),
+            score: 1.0,
+            source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    /// #1364 review: the `code`-over-`name` preference must never make a
+    /// field the query did NOT target the `_passage` source. An ordinary
+    /// (non-autoindex) document that happens to carry `name` and `body`
+    /// fields, queried on `name` alone, must get its passage from `name` —
+    /// the contract is "the best window across every text field the query
+    /// targets". The first cut of #1396 injected `body`/`code` whenever it
+    /// met a `name`/`defs` field, so this returned `field: "body"`.
+    #[test]
+    fn lexical_passage_never_uses_a_field_the_query_did_not_target() {
+        let source = json!({
+            "name": "alpha widget",
+            "body": "alpha alpha alpha\nalpha beta alpha\nalpha",
+        });
+        let query = QueryNode::Match {
+            field: "name".into(),
+            query: "alpha".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+            lenient: false,
+        };
+        let out = apply_lexical_passages(vec![passage_hit("es-doc", source)], &query);
+        let passage = out[0].passage.as_ref().expect("passage filled");
+        assert_eq!(passage.field, "name", "got {passage:?}");
+        assert_eq!(passage.text, "alpha widget");
+
+        // Same shape through multi_match on `name` + `defs`: neither `body`
+        // nor `code` was targeted, so neither may be chosen.
+        let source = json!({
+            "name": "alpha",
+            "defs": "alpha beta",
+            "code": "alpha alpha alpha alpha",
+            "body": "alpha alpha alpha alpha alpha",
+        });
+        let query = QueryNode::MultiMatch {
+            fields: vec!["name^4".into(), "defs^3".into()],
+            query: "alpha".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let out = apply_lexical_passages(vec![passage_hit("es-doc-2", source)], &query);
+        let passage = out[0].passage.as_ref().expect("passage filled");
+        assert!(
+            matches!(passage.field.as_str(), "name" | "defs"),
+            "passage must come from a targeted field, got {passage:?}"
+        );
+    }
+
+    /// #1364: the realistic autoindex per-symbol document (exactly the
+    /// fields `extract/code.rs` emits — no `symbol_count`, which only the
+    /// whole-file document carries) still gets its passage from `code`
+    /// rather than the bare `name`, when `xerj search` targets both.
+    #[test]
+    fn autoindex_symbol_doc_passage_prefers_code_over_name() {
+        let source = json!({
+            "title": "de",
+            "path": "tests/testthat/test-aplicabilidad.R",
+            "language": "r",
+            "name": "de",
+            "kind": "function",
+            "line": 241,
+            "code": "de <- function(col) {\n  trimws(col)\n}",
+        });
+        let query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "defs^3".into(),
+                "code^2".into(),
+                "body".into(),
+                "title".into(),
+            ],
+            query: "de".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let out = apply_lexical_passages(vec![passage_hit("sym", source)], &query);
+        let passage = out[0].passage.as_ref().expect("passage filled");
+        assert_eq!(passage.field, "code", "got {passage:?}");
     }
 
     /// #174: a document that merely carries a field named `language` (not
