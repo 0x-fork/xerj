@@ -21537,6 +21537,8 @@ impl Index {
                 .clone()
         };
 
+        let unindexed_dv_text_match = has_unindexed_doc_values_text_match(query, &dmq_schema);
+
         let mem_snapshot = {
             let mem = &*self.memtable;
             if mem_doc_count == 0 {
@@ -21631,6 +21633,12 @@ impl Index {
                     let extra = total.saturating_sub(ids.len() as u64);
                     MemSnapshot::AllDocIds(ids, extra)
                 }
+            } else if unindexed_dv_text_match {
+                // These fields have no memtable postings. Route direct Match,
+                // normalized bool-Match, and DisMax-of-Match shapes through
+                // the mapping-aware scan so pre-flush answers use the same
+                // whole-value column semantics as flushed documents.
+                MemSnapshot::DocsForScan(mem.all_docs_with_seq_arc())
             } else if let Some((dm_subs, dm_tie)) = dis_max_mem_fts_subs(query) {
                 // #834: a `dis_max` of single-field text `match` subs used
                 // to fall through to the stored-doc scan, whose scorer has
@@ -41527,6 +41535,45 @@ fn field_is_analyzed_text(schema: &Schema, field: &str) -> bool {
         .is_some_and(|f| matches!(f.field_type, FieldType::Text) && f.options.indexed)
 }
 
+/// Does `q` contain a `match` leaf for declared doc-values-only text?
+fn has_unindexed_doc_values_text_match(q: &QueryNode, schema: &Schema) -> bool {
+    match q {
+        QueryNode::Match { field, .. } => declared_field(schema, field).is_some_and(|f| {
+            matches!(f.field_type, FieldType::Text) && !f.options.indexed && f.options.doc_values
+        }),
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .any(|child| has_unindexed_doc_values_text_match(child, schema)),
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .any(|child| has_unindexed_doc_values_text_match(child, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => {
+            has_unindexed_doc_values_text_match(query, schema)
+        }
+        QueryNode::Pinned { organic, .. } => has_unindexed_doc_values_text_match(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => {
+            has_unindexed_doc_values_text_match(positive, schema)
+                || has_unindexed_doc_values_text_match(negative, schema)
+        }
+        _ => false,
+    }
+}
+
 /// Does `q` carry a `term`/`terms` leaf naming an analyzed `text` field?
 ///
 /// The doc-values shapes [`field_is_analyzed_text`] cannot resolve are
@@ -45738,6 +45785,15 @@ fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Schema) -> bo
             if values.iter().any(|v| json_values_equal(&doc_val, v)) {
                 return true;
             }
+            // A declared unindexed text field has no analyzed token stream.
+            // With doc values, ES answers term-level queries from whole raw
+            // column values; do not manufacture a whitespace-token match.
+            // Undeclared fields retain the legacy fallback below.
+            if declared_field(schema, field)
+                .is_some_and(|f| matches!(f.field_type, FieldType::Text) && !f.options.indexed)
+            {
+                return false;
+            }
             // Text-field fallback: if the doc has a string with whitespace
             // (i.e. looks tokenized), treat each space-separated token as a
             // candidate match. This mirrors ES's behavior of running `terms`
@@ -46185,6 +46241,50 @@ fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Schema) -> bo
             // default (standard/simple/lowercase etc.) lowercases both
             // sides like the existing path.
             let preserve_case = matches!(analyzer.as_deref(), Some("whitespace") | Some("keyword"));
+            let unindexed_doc_values_text = declared_field(schema, field).is_some_and(|f| {
+                matches!(f.field_type, FieldType::Text)
+                    && !f.options.indexed
+                    && f.options.doc_values
+            });
+
+            if unindexed_doc_values_text {
+                // ES analyzes only the query for this mapping, then compares
+                // its tokens against whole, case-sensitive doc-value strings.
+                // The field's `_source` value is never tokenized.
+                let q_tokens: Vec<String> = match analyzer.as_deref() {
+                    Some("keyword") => vec![query.clone()],
+                    Some("whitespace") => query.split_whitespace().map(str::to_string).collect(),
+                    _ => phrase_tokens(query),
+                };
+                if q_tokens.is_empty() {
+                    return false;
+                }
+                let need = match operator {
+                    xerj_query::ast::BoolOperator::And => q_tokens.len(),
+                    xerj_query::ast::BoolOperator::Or => match minimum_should_match {
+                        None => 1,
+                        Some(MinShouldMatch::Fixed(n)) => *n as usize,
+                        Some(MinShouldMatch::Percentage(pct)) => {
+                            ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
+                                .max(1)
+                        }
+                        Some(other) => other.required(q_tokens.len()).unwrap_or(1),
+                    },
+                };
+                let raw_values: Vec<String> = match get_field_value(source, field) {
+                    Some(Value::String(value)) => vec![value],
+                    Some(Value::Array(values)) => values
+                        .into_iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let matched = q_tokens
+                    .iter()
+                    .filter(|token| raw_values.iter().any(|value| value == *token))
+                    .count();
+                return matched >= need;
+            }
             // When the query string parses as a date AND the field value
             // is a date (or array of dates), switch to date-aware equality:
             // the field value is coerced to epoch ms so
@@ -60308,6 +60408,18 @@ mod exact_scan_hydration_tests {
                 "must not project: {filter:?}"
             );
         }
+    }
+
+    #[test]
+    fn terms_on_undeclared_strings_keeps_legacy_word_matching() {
+        let query = QueryNode::Terms {
+            field: "text".into(),
+            values: vec![Value::from("brown")],
+            boost: None,
+        };
+        let source = serde_json::json!({ "text": "quick brown fox" });
+
+        assert!(doc_matches_query_typed(&query, &source, &Schema::empty()));
     }
 
     /// The full-source plan IS the old behaviour: the whole source with `_id`
