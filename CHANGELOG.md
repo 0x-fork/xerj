@@ -14,7 +14,7 @@ dynamic-mapping doc values, autoindex progress and resume reporting, the
 finalize gate, Windows home-directory resolution and `xerj init`, plus two
 dependency security updates. Contributors in this window: Tong-bit-art,
 todie, fjjjuv, redwolf2019, riazrahaman, sebollin, Tyagiquamar, driphtyio and
-mininxd. Parts of
+mininxd, whelanh and Jarvis636431. Parts of
 this section's wording for the PRs merged before 2026-10-14 are adapted from
 todie's draft release PR #1397, with thanks.
 
@@ -79,12 +79,17 @@ before.
   gate, and resolves concrete index names and aliases in O(1) instead of
   listing (and computing stats for) every open index. No latency figure is
   claimed here; each change is pinned by a regression test.
-- **Parent memory breaker watermark is live-tunable** (PR
-  [#1323](https://github.com/xerj-org/xerj/pull/1323), partial for issue
-  [#1250](https://github.com/xerj-org/xerj/issues/1250), which stays open) —
-  the ES dynamic cluster setting `indices.breaker.total.limit` (a percentage
-  of machine memory or an absolute size) now re-tunes the watermark without a
-  restart; the 429 breaker message names the knob.
+- **Multi-index ingest against the memory breaker** (issue
+  [#1250](https://github.com/xerj-org/xerj/issues/1250), closed during the
+  window) — the parent breaker watermark is live-tunable through the ES
+  dynamic cluster setting `indices.breaker.total.limit` (a percentage of
+  machine memory or an absolute size), without a restart, and the 429 message
+  names the knob (PR [#1323](https://github.com/xerj-org/xerj/pull/1323)).
+  The autoindex bulk client damps its AIMD oscillation (a 15 s episode
+  cooldown, an ssthresh, a permit per HTTP attempt) and the breaker's drain
+  churn is reduced (PR [#1482](https://github.com/xerj-org/xerj/pull/1482),
+  carries todie's #1400). Per-index admission and a server-side shed signal
+  are not part of this.
 - **Native `/v1/cluster/health` reports the configured topology** (PR
   [#1316](https://github.com/xerj-org/xerj/pull/1316), partial for issue
   [#1170](https://github.com/xerj-org/xerj/issues/1170)) — it hardcoded one
@@ -134,6 +139,20 @@ before.
   [#1428](https://github.com/xerj-org/xerj/pull/1428)) — a slow view could
   snap back over the one the user had moved to; also the root cause of a
   flaky browser test.
+- **`xerj search` on multi-word natural-language queries** (partial for
+  issue [#1364](https://github.com/xerj-org/xerj/issues/1364), which stays
+  open) — for queries of three or more distinct tokens, short glue words
+  (EN/ES/PT/FR/IT/DE) are dropped from the match clauses so a symbol named
+  `de` no longer wins, and passages on autoindex code documents prefer the
+  `code`/`body` field over a bare name (PR
+  [#1484](https://github.com/xerj-org/xerj/pull/1484), carries todie's
+  #1396).
+- **Whole-file `xerj search` / `xerj def` hits print a 1-based line** (issue
+  [#1365](https://github.com/xerj-org/xerj/issues/1365), PR
+  [#1502](https://github.com/xerj-org/xerj/pull/1502), carries todie's
+  #1392) — the engine also recomputes a refined code passage's start line. A
+  hit whose best passage is a `defs`/`title` field still prints the bare
+  path, a residual left open.
 - **A failed thread spawn degrades instead of aborting the process**
   (partial for issue [#1122](https://github.com/xerj-org/xerj/issues/1122),
   which stays open) — under memory exhaustion `std::thread::spawn` panics,
@@ -143,7 +162,9 @@ before.
   thread fails its file rather than the whole run (PR
   [#1480](https://github.com/xerj-org/xerj/pull/1480)), and autoindex index
   workers, sync replay and object fetch degrade (PR
-  [#1481](https://github.com/xerj-org/xerj/pull/1481)). Spawn sites elsewhere
+  [#1481](https://github.com/xerj-org/xerj/pull/1481)), and the phase-A scan
+  pool falls back to the calling thread (PR
+  [#1501](https://github.com/xerj-org/xerj/pull/1501)). Spawn sites elsewhere
   are tracked by the issue.
 - **`xerj --help` states the served MCP tool count** (issue
   [#1443](https://github.com/xerj-org/xerj/issues/1443), PR
@@ -165,7 +186,12 @@ before.
 
 - **autoindex indexes the plan once per snapshot** instead of rescanning it
   for every file (PR [#1483](https://github.com/xerj-org/xerj/pull/1483),
-  carries part of todie's #1394). No figure is claimed here.
+  carries part of todie's #1394). Also from #1394: read-lease counting moved
+  off writer-hot cache lines and the graveyard lock (PR
+  [#1496](https://github.com/xerj-org/xerj/pull/1496)), and the PDF worker
+  supervisor wakes on pipe EOF instead of a 20 ms sleep poll (PR
+  [#1486](https://github.com/xerj-org/xerj/pull/1486)). No figures are
+  claimed here.
 
 ### Security
 
@@ -242,11 +268,15 @@ before.
   shared-cluster retrieval and an `llms.txt` audit (PR
   [#1373](https://github.com/xerj-org/xerj/pull/1373), todie), Windows
   autoindex + MCP (PR [#1420](https://github.com/xerj-org/xerj/pull/1420),
-  fjjjuv), and a Hermes agent autoindexing skills and blog corpora (PR
-  [#1492](https://github.com/xerj-org/xerj/pull/1492), driphtyio).
+  fjjjuv), a Hermes agent autoindexing skills and blog corpora (PR
+  [#1492](https://github.com/xerj-org/xerj/pull/1492), driphtyio), and two
+  reference-coding reports, end to end and across the Omarchy-port and
+  Fedora repos (PRs [#1463](https://github.com/xerj-org/xerj/pull/1463),
+  [#1465](https://github.com/xerj-org/xerj/pull/1465), whelanh).
 - CLA signatures: Tyagiquamar (#1327), Tong-bit-art (#1328), redwolf2019
   (#1342), riazrahaman (#1355), sebollin (#1366), fjjjuv (#1421), todie
-  (#1429) and mininxd (#1488). The CLA check no longer deadlocks on a contributor's own
+  (#1429), mininxd (#1488), Jarvis636431 (#1499), and leninworld, whelanh,
+  bryanbans, YongxinFu and ChenShuo2004 (#1495). The CLA check no longer deadlocks on a contributor's own
   self-signature PR (PR [#1432](https://github.com/xerj-org/xerj/pull/1432),
   carries todie's #1404, with the inputs pinned to the event SHA).
 
@@ -256,7 +286,9 @@ before.
 - CI and test reliability: PR #1422 (fjjjuv, transport auth tests retry a
   port bind race); PR #1490 (the fuzz workspace's lockfile is seeded from
   `engine/Cargo.lock`, because every `zip` 8.x release was yanked upstream
-  and a fresh resolve failed).
+  and a fresh resolve failed); PR #1494 adds a manual workflow that prints
+  the public half of the hub signing seed. It bakes no key into the binary:
+  `HUB_PUBKEY_HEX` is still empty in rc.96.
 
 <!-- notes-exempt: #1347 (ops: the xerj.org metrics Cloudflare Worker; ships nothing in the binary) -->
 
