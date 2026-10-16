@@ -43,6 +43,12 @@ before.
   [#1331](https://github.com/xerj-org/xerj/pull/1331) (`agg_bucket_cap_terms`)
   and PR [#1356](https://github.com/xerj-org/xerj/pull/1356) (Tong-bit-art,
   the `graph_expand` fixture declares its `edges` mapping).
+- **`term`/`terms` on a `text` field with `doc_values: true` no longer drop
+  to 0 hits after a flush** (PR
+  [#1489](https://github.com/xerj-org/xerj/pull/1489), Tong-bit-art) — the
+  doc-values term prefilter answered against the whole-value column for
+  analyzed text; it now declines analyzed text and the query takes the full,
+  correct path.
 - **Total tie order (#191) held on two more `term` routes** (issue
   [#1359](https://github.com/xerj-org/xerj/issues/1359), PR
   [#1393](https://github.com/xerj-org/xerj/pull/1393), todie) — a `term` on a
@@ -170,6 +176,11 @@ before.
   pool falls back to the calling thread (PR
   [#1501](https://github.com/xerj-org/xerj/pull/1501)). Spawn sites elsewhere
   are tracked by the issue.
+- **`xerj` and `xerj index` refuse a missing or non-numeric flag value**
+  (issue [#1435](https://github.com/xerj-org/xerj/issues/1435), PR
+  [#1452](https://github.com/xerj-org/xerj/pull/1452)) — `xerj --data-dir`
+  with no value booted on `./data` and swallowed the next flag; it is now a
+  usage error.
 - **`xerj --help` states the served MCP tool count** (issue
   [#1443](https://github.com/xerj-org/xerj/issues/1443), PR
   [#1455](https://github.com/xerj-org/xerj/pull/1455)) — computed from the
