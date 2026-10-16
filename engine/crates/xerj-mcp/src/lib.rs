@@ -1528,12 +1528,13 @@ fn normalize_code_search_query(query: &str) -> String {
             dedup.push(clean);
         }
     }
+    // Under three distinct tokens the query is a lookup, not a question:
+    // return it verbatim. Re-joining the trimmed tokens here would strip
+    // identifier punctuation — R's `.mensaje_motor` (the #1364 reporter's own
+    // control query) would lose its leading dot and miss the exact-`name`
+    // `term` clause.
     if dedup.len() < 3 {
-        return if dedup.is_empty() {
-            query.trim().to_string()
-        } else {
-            dedup.join(" ")
-        };
+        return query.trim().to_string();
     }
     let content: Vec<&str> = dedup
         .iter()
@@ -1579,7 +1580,7 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
                         "type": "most_fields"
                     }},
                     { "match_phrase": { "defs": { "query": shaped, "boost": 8 } } },
-                    { "term": { "name": { "value": shaped, "boost": 10 } } }
+                    { "term": { "name": { "value": q.trim(), "boost": 10 } } }
                 ]}}),
             );
         }
@@ -2173,6 +2174,18 @@ mod tests {
         assert_eq!(
             single["query"]["bool"]["should"][0]["multi_match"]["query"],
             "de"
+        );
+
+        // A short identifier lookup keeps its punctuation, and the exact-name
+        // term clause always sees the caller's identifier, never a shaped one.
+        let (_, _, dotted) = built(build_search(&json!({ "query": ".mensaje_motor" })));
+        assert_eq!(
+            dotted["query"]["bool"]["should"][0]["multi_match"]["query"],
+            ".mensaje_motor"
+        );
+        assert_eq!(
+            dotted["query"]["bool"]["should"][2]["term"]["name"]["value"],
+            ".mensaje_motor"
         );
     }
 

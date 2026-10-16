@@ -233,12 +233,13 @@ pub(crate) fn normalize_code_search_query(query: &str) -> String {
             dedup.push(clean);
         }
     }
+    // Under three distinct tokens the query is a lookup, not a question:
+    // return it verbatim. Re-joining the trimmed tokens here would strip
+    // identifier punctuation — R's `.mensaje_motor` (the #1364 reporter's own
+    // control query) would lose its leading dot and miss the exact-`name`
+    // `term` clause.
     if dedup.len() < 3 {
-        return if dedup.is_empty() {
-            query.trim().to_string()
-        } else {
-            dedup.join(" ")
-        };
+        return query.trim().to_string();
     }
     let content: Vec<&str> = dedup
         .iter()
@@ -264,7 +265,7 @@ pub fn search_query_body(query: &str, k: usize) -> Value {
                 "type": "most_fields"
             }},
             { "match_phrase": { "defs": { "query": shaped, "boost": 8 } } },
-            { "term": { "name": { "value": shaped, "boost": 10 } } }
+            { "term": { "name": { "value": query.trim(), "boost": 10 } } }
         ]}},
         // No `body` here: whole-file bodies are the token flood (measured ~9x
         // the size of the matching passage). `_passage` carries the snippet.
@@ -457,6 +458,22 @@ mod tests {
         );
         // Single-token lookup for a function literally named `de` is untouched.
         assert_eq!(normalize_code_search_query("de"), "de");
+        // Identifier punctuation survives a short lookup verbatim: the
+        // reporter's control query `.mensaje_motor` (an R name with a leading
+        // dot) must still reach the exact-`name` term clause unchanged.
+        assert_eq!(
+            normalize_code_search_query(".mensaje_motor"),
+            ".mensaje_motor"
+        );
+        let lookup = search_query_body(".mensaje_motor", 5);
+        assert_eq!(
+            lookup["query"]["bool"]["should"][2]["term"]["name"]["value"],
+            ".mensaje_motor"
+        );
+        assert_eq!(
+            lookup["query"]["bool"]["should"][0]["multi_match"]["query"],
+            ".mensaje_motor"
+        );
         // Two-letter technical terms, uppercase acronyms, and alphanumeric tokens stay.
         assert_eq!(
             normalize_code_search_query("fsync the WAL segment on db tx rotation v2"),
