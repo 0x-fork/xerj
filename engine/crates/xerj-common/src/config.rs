@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **133 settings** versus
+//! Configuration is intentionally minimal: **134 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 133 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 134 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -563,13 +563,13 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (133 user-facing settings total; counted by
+// Sub-configs  (134 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Network and data-directory settings.
 ///
-/// **7 settings.**
+/// **8 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -631,6 +631,12 @@ pub struct ServerConfig {
     /// right-most address that is *not* itself a listed proxy is used — the
     /// left end of the chain is written by the caller and cannot be trusted.
     pub trusted_proxies: Vec<String>,
+    /// Multi-instance opt-in (default `false`). When `true`, a listener port
+    /// that is already in use makes the node bind the next free one, and a
+    /// `data_dir` held by another live process makes it use `<data_dir>-N`.
+    /// Off by default so a taken port stays a fatal startup error (#465).
+    #[serde(default)]
+    pub auto_port: bool,
 }
 
 impl Default for ServerConfig {
@@ -646,6 +652,7 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".into(),
             allow_insecure_network_bind: false,
             trusted_proxies: Vec::new(),
+            auto_port: false,
         }
     }
 }
@@ -3673,7 +3680,7 @@ mod tests {
     /// module header, in `xerj-common/src/lib.rs`, in `engine/README.md` and in
     /// `xerj.default.toml`) — change the table and the prose together.
     const SETTINGS_BY_SECTION: &[(&str, usize)] = &[
-        ("server", 7),
+        ("server", 8),
         ("auth", 3),
         ("cors", 2),
         ("tls", 4),
@@ -3739,7 +3746,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 133,
+            total, 134,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
