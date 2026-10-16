@@ -101,7 +101,11 @@ before.
   [#1110](https://github.com/xerj-org/xerj/issues/1110), which stays open) —
   a missing source root used to prune every stored envelope with exit 0, and
   records with an empty id shipped together and collapsed to one `_id`. Both
-  now fail loudly.
+  now fail loudly. PR [#1500](https://github.com/xerj-org/xerj/pull/1500) (carries
+  todie's #1468) also fails the build on an unreadable or invalid stored
+  envelope and deletes stale shards before writing new ones, and adds a
+  `cisa-kev` pack definition (not published or signed). The fresh-machine
+  portability matrix of #1110 is still open.
 - **Native Windows: home directory falls back to `%USERPROFILE%`** when
   `HOME` is unset (PR [#1427](https://github.com/xerj-org/xerj/pull/1427)) —
   `xerj init` skipped every home-scoped agent config and caches resolved
