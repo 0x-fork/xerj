@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **132 settings** versus
+//! Configuration is intentionally minimal: **133 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 132 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 133 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -550,13 +550,13 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (132 user-facing settings total; counted by
+// Sub-configs  (133 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Network and data-directory settings.
 ///
-/// **7 settings.**
+/// **8 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -3659,7 +3659,7 @@ mod tests {
     /// module header, in `xerj-common/src/lib.rs`, in `engine/README.md` and in
     /// `xerj.default.toml`) — change the table and the prose together.
     const SETTINGS_BY_SECTION: &[(&str, usize)] = &[
-        ("server", 7),
+        ("server", 8),
         ("auth", 3),
         ("cors", 2),
         ("tls", 4),
@@ -3725,7 +3725,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 132,
+            total, 133,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
