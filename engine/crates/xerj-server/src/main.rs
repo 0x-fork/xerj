@@ -131,13 +131,21 @@ fn parse_args() -> CliArgs {
 /// followed straight by another `--flag`, has no value: that is an error, not
 /// a silent "unset" — `xerj --insecure --data-dir` used to boot on the default
 /// data directory, and `xerj --data-dir --insecure` used a directory literally
-/// named `--insecure` and left auth on (#1435).
+/// named `--insecure` and left auth on (#1435). The short forms are the same
+/// trap — `xerj --data-dir -k` must not name the directory `-k` and drop
+/// `--insecure` — so a single dash plus one letter counts as a flag too; any
+/// longer single-dash value (`-data`, `-1`, `::1`) is still a value.
 fn flag_value(flag: &str, next: Option<String>) -> Result<String, String> {
     match next {
-        Some(v) if !v.starts_with("--") => Ok(v),
+        Some(v) if !looks_like_flag(&v) => Ok(v),
         Some(v) => Err(format!("{flag} needs a value, got the flag {v}")),
         None => Err(format!("{flag} needs a value")),
     }
+}
+
+/// `--anything`, or a short flag such as `-k` / `-d`.
+fn looks_like_flag(v: &str) -> bool {
+    v.starts_with("--") || matches!(v.as_bytes(), [b'-', c] if c.is_ascii_alphabetic())
 }
 
 /// The body of [`parse_args`], over any iterator of arguments — the same
@@ -2070,6 +2078,8 @@ mod decide_flag_tests {
             &["--data-dir", "--insecure"][..],
             &["--bind", "--port", "9300"][..],
             &["--decide-model-dir"][..],
+            &["--data-dir", "-k"][..],
+            &["-d", "-c", "xerj.toml"][..],
         ] {
             let err = parse_args_from(argv(line)).err();
             assert!(
@@ -2081,6 +2091,8 @@ mod decide_flag_tests {
         let args = parse_args_from(argv(&["-d", "-data", "--bind", "::1"])).unwrap();
         assert_eq!(args.data_dir.as_deref(), Some("-data"));
         assert_eq!(args.bind.as_deref(), Some("::1"));
+        let args = parse_args_from(argv(&["--port", "-1"])).unwrap();
+        assert_eq!(args.port.as_deref(), Some("-1"), "left to the port check");
     }
 
     #[test]
