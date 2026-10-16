@@ -152,7 +152,9 @@ jobs:
         run: python3 tools/hub-packs/test_hub_packs.py
 
       - name: Shell syntax
-        run: bash -n tools/hub-packs/ed25519.sh
+        run: |
+          bash -n tools/hub-packs/ed25519.sh
+          bash -n tools/hub-packs/consumer_e2e.sh
 
   # ── is there a key to sign with and verify against? ────────────────────────
   preflight:
@@ -426,6 +428,39 @@ jobs:
           gh release create "$PACK_TAG" "$ARCHIVE" "$ARCHIVE.sig" --repo "$GITHUB_REPOSITORY" \
             --draft --prerelease --latest=false --target "$GITHUB_SHA" \
             --title "hub pack: $SLUG @ $PIN8" --notes-file "$RUNNER_TEMP/notes.md"
+
+      # §12.3: the consumer path, with the real binary, BEFORE anything is
+      # published. A real run pulls the bytes back out of the DRAFT release (what a
+      # client will download, not the builder's local copy); a dry run uses the
+      # builder's output. A fresh node, an empty HOME, `hub pull` through a signed
+      # catalogue, then `--def` for a symbol from the pack's own defs.jsonl and one
+      # question. A failure fails the job and leaves the release a draft.
+      - name: Consumer end-to-end (pull, --def, one question)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          FILE="$SLUG-$PIN8.hubpack.tar.zst"
+          SRC="$RUNNER_TEMP/e2e-src"; mkdir -p "$SRC"
+          if [ "$DRY_RUN" = "true" ]; then
+            TAG="pack-$SLUG-$PIN8"
+            cp "$PACK_OUT/$FILE" "$PACK_OUT/$FILE.sig" "$SRC/"
+          else
+            TAG="$PACK_TAG"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$SRC" \
+              --pattern "$FILE" --pattern "$FILE.sig"
+            cmp "$SRC/$FILE" "$PACK_OUT/$FILE"
+            cmp "$SRC/$FILE.sig" "$PACK_OUT/$FILE.sig"
+          fi
+          umask 077
+          printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/e2e.key"
+          unset HUB_SIGNING_SEED
+          trap 'rm -f "$RUNNER_TEMP/e2e.key"' EXIT
+          bash tools/hub-packs/consumer_e2e.sh bin/xerj "$SLUG" "$PIN8" "$TAG" "$SRC" "$RUNNER_TEMP/e2e.key" \
+            | tee "$RUNNER_TEMP/e2e.txt"
+          { echo "### consumer e2e: $SLUG @ $PIN8"; echo; sed 's/^/    /' "$RUNNER_TEMP/e2e.txt"; } >> "$GITHUB_STEP_SUMMARY"
 
       # Draft first, publish last: the step GitHub's own error message prescribes
       # for immutable-release repositories. A tag whose release was DELETED is burned
