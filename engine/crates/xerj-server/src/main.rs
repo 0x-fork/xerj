@@ -3677,11 +3677,11 @@ mod auto_port_tests {
     #[test]
     fn auto_port_is_off_unless_asked_for() {
         // No config file, no flag: a taken port must stay fatal (#465).
-        let args = parse_args_from(["--insecure".to_string()].into_iter());
+        let args = parse_args_from(["--insecure".to_string()].into_iter()).unwrap();
         if std::env::var_os("XERJ_AUTO_PORT").is_none() {
             assert!(!load_config(&args).unwrap().server.auto_port);
         }
-        let args = parse_args_from(["--auto-port".to_string()].into_iter());
+        let args = parse_args_from(["--auto-port".to_string()].into_iter()).unwrap();
         assert!(load_config(&args).unwrap().server.auto_port);
     }
 
