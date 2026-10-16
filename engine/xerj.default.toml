@@ -39,10 +39,12 @@ grpc_port = 8081
 # Point existing ES clients, Kibana, or Logstash here.
 es_compat_port = 9200
 
-# When true, automatically scan and bind the next available ports if the
-# requested ports are already in use by another running instance.
-# Default in TOML is false (fail closed on taken ports); enabled by default for
-# CLI runs when no config file is passed.
+# Multi-instance opt-in. When true, a taken port makes this node bind the next
+# free one (the banner prints the ports actually bound), and a data_dir held by
+# another live xerj process makes it use "<data_dir>-2", "-3", ... instead.
+# Off by default everywhere: a taken port is a fatal startup error so a client
+# pointed at the configured port can never silently reach another instance.
+# Also: --auto-port / --no-auto-port, or env XERJ_AUTO_PORT=true|false.
 auto_port = false
 
 # Directory where all index data, WAL files, and segments are stored.

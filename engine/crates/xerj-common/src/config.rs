@@ -618,8 +618,10 @@ pub struct ServerConfig {
     /// right-most address that is *not* itself a listed proxy is used — the
     /// left end of the chain is written by the caller and cannot be trusted.
     pub trusted_proxies: Vec<String>,
-    /// When `true`, automatically pick the next available port if a listener port
-    /// is already in use by another instance.
+    /// Multi-instance opt-in (default `false`). When `true`, a listener port
+    /// that is already in use makes the node bind the next free one, and a
+    /// `data_dir` held by another live process makes it use `<data_dir>-N`.
+    /// Off by default so a taken port stays a fatal startup error (#465).
     #[serde(default)]
     pub auto_port: bool,
 }
