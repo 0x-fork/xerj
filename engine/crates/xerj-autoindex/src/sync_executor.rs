@@ -2689,6 +2689,10 @@ fn create_snapshot_inner(
         used: 0,
         limit: hard_budget_bytes,
     };
+    // Built once per snapshot: per-file preparation used to rebuild the
+    // dataset/coercion maps, rescan every duplicate alias, and re-serialize
+    // each assigned dataset for every file — O(files × (aliases + datasets)).
+    let lookup = plan.map(PreparationLookup::new).transpose()?;
     // #971: the reuse index. Sealing is O(corpus) because every file is
     // re-copied, re-verified and re-extracted per generation — a one-file
     // change in a 10,000-file corpus sealed 10,000 blobs twice over (verify,
@@ -2738,10 +2742,10 @@ fn create_snapshot_inner(
         // mutable tree, and the inventory it is verified against lists the
         // file), but there is nothing to prepare for it: `prepared: None`.
         let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
-        let prepared_identity = match (plan, assignment) {
-            (Some(plan), Some(assignment)) => Some(prepared_artifact_identity(
+        let prepared_identity = match (lookup.as_ref(), assignment) {
+            (Some(lookup), Some(assignment)) => Some(prepared_artifact_identity(
                 chunker_identity,
-                plan,
+                lookup,
                 content_id.as_str(),
                 assignment,
             )?),
@@ -2801,14 +2805,15 @@ fn create_snapshot_inner(
                         })
                     }
                     _ => match assignment {
-                        Some(_) => Some(prepare_artifact(
+                        Some(assignment) => Some(prepare_artifact(
                             &staging,
                             ordinal,
                             tx_id,
                             source,
                             content_id,
                             &destination,
-                            plan.expect("assignment implies a plan"),
+                            assignment,
+                            lookup.as_ref().expect("assignment implies a plan"),
                             &mut budget,
                             labeler,
                         )?),
@@ -2831,14 +2836,15 @@ fn create_snapshot_inner(
                 #[cfg(test)]
                 apply_post_seal_source_replacement(&source.path)?;
                 let prepared = match assignment {
-                    Some(_) => Some(prepare_artifact(
+                    Some(assignment) => Some(prepare_artifact(
                         &staging,
                         ordinal,
                         tx_id,
                         source,
                         content_id,
                         &destination,
-                        plan.expect("assignment implies a plan"),
+                        assignment,
+                        lookup.as_ref().expect("assignment implies a plan"),
                         &mut budget,
                         labeler,
                     )?),
@@ -2969,6 +2975,50 @@ pub fn open_snapshot(state_dir: &Path, tx_id: &str) -> Result<SourceSnapshot> {
     Ok(snapshot)
 }
 
+/// Per-snapshot index over the plan, built once by `create_snapshot_inner`
+/// so preparing F files costs O(F + aliases + datasets) instead of
+/// O(F × (aliases + datasets)). Duplicate slugs resolve last-wins, exactly
+/// as the per-file `collect()`/`insert` loops it replaces did, so
+/// `prepared_artifact_identity` stays byte-identical (it is a persisted
+/// reuse key).
+struct PreparationLookup<'a> {
+    datasets: HashMap<&'a str, &'a crate::state::PlanDataset>,
+    dataset_values: HashMap<&'a str, Value>,
+    coercions: HashMap<&'a str, HashMap<String, crate::coerce::Coerce>>,
+    /// `file_key` -> sorted `(rel, path_id)` of its duplicate aliases.
+    aliases_by_key: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+}
+
+impl<'a> PreparationLookup<'a> {
+    fn new(plan: &'a Plan) -> Result<Self> {
+        let mut datasets = HashMap::with_capacity(plan.datasets.len());
+        let mut dataset_values = HashMap::with_capacity(plan.datasets.len());
+        let mut coercions = HashMap::with_capacity(plan.datasets.len());
+        for dataset in &plan.datasets {
+            let slug = dataset.slug.as_str();
+            datasets.insert(slug, dataset);
+            dataset_values.insert(slug, serde_json::to_value(dataset)?);
+            coercions.insert(slug, crate::coerce::plan_from_specs(&dataset.specs));
+        }
+        let mut aliases_by_key: HashMap<&'a str, Vec<(&'a str, &'a str)>> = HashMap::new();
+        for alias in &plan.duplicate_files {
+            aliases_by_key
+                .entry(alias.file_key.as_str())
+                .or_default()
+                .push((alias.rel.as_str(), alias.path_id.as_str()));
+        }
+        for aliases in aliases_by_key.values_mut() {
+            aliases.sort_unstable();
+        }
+        Ok(Self {
+            datasets,
+            dataset_values,
+            coercions,
+            aliases_by_key,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_artifact(
     staging: &Path,
@@ -2977,7 +3027,8 @@ fn prepare_artifact(
     source: &crate::walk::FileEntry,
     content_id: &str,
     snapshot_blob: &Path,
-    plan: &Plan,
+    assignment: &crate::state::FileAssignment,
+    lookup: &PreparationLookup<'_>,
     budget: &mut PayloadBudget,
     // #1062: `--label` runs each record's payload through the node's
     // `/_decide` HERE, before the record is sealed, so the labels become part
@@ -2989,32 +3040,12 @@ fn prepare_artifact(
     // without `--label` — seals unlabelled exactly as before.
     labeler: Option<&crate::label::Labeler>,
 ) -> Result<PreparedArtifact> {
-    let assignment = plan
-        .files
-        .get(content_id)
-        .with_context(|| format!("plan has no assignment for {}", source.rel))?;
-    let datasets: HashMap<&str, &crate::state::PlanDataset> = plan
-        .datasets
-        .iter()
-        .map(|dataset| (dataset.slug.as_str(), dataset))
-        .collect();
-    let coercions: HashMap<&str, HashMap<String, crate::coerce::Coerce>> = plan
-        .datasets
-        .iter()
-        .map(|dataset| {
-            (
-                dataset.slug.as_str(),
-                crate::coerce::plan_from_specs(&dataset.specs),
-            )
-        })
-        .collect();
+    let datasets = &lookup.datasets;
+    let coercions = &lookup.coercions;
     let mut paths = vec![assignment.rel.clone()];
-    paths.extend(
-        plan.duplicate_files
-            .iter()
-            .filter(|alias| alias.file_key == content_id)
-            .map(|alias| alias.rel.clone()),
-    );
+    if let Some(aliases) = lookup.aliases_by_key.get(content_id) {
+        paths.extend(aliases.iter().map(|(rel, _)| (*rel).to_owned()));
+    }
     paths.sort();
     paths.dedup();
     let assignments: HashMap<Option<String>, &str> = assignment
@@ -3201,29 +3232,19 @@ fn prepare_artifact(
 /// behaviour change, which is what makes this safe across builds.
 fn prepared_artifact_identity(
     chunker_identity: &str,
-    plan: &Plan,
+    lookup: &PreparationLookup<'_>,
     content_id: &str,
     assignment: &crate::state::FileAssignment,
 ) -> Result<String> {
-    let mut aliases: Vec<(&str, &str)> = plan
-        .duplicate_files
-        .iter()
-        .filter(|alias| alias.file_key == content_id)
-        .map(|alias| (alias.rel.as_str(), alias.path_id.as_str()))
-        .collect();
-    aliases.sort_unstable();
-    let slugs: BTreeSet<&str> = assignment
-        .assignments
-        .iter()
-        .map(|(_, slug)| slug.as_str())
-        .collect();
-    let mut datasets: BTreeMap<&str, Value> = BTreeMap::new();
-    for dataset in plan
-        .datasets
-        .iter()
-        .filter(|dataset| slugs.contains(&dataset.slug.as_str()))
-    {
-        datasets.insert(dataset.slug.as_str(), serde_json::to_value(dataset)?);
+    let aliases: &[(&str, &str)] = lookup
+        .aliases_by_key
+        .get(content_id)
+        .map_or(&[], Vec::as_slice);
+    let mut datasets: BTreeMap<&str, &Value> = BTreeMap::new();
+    for (_, slug) in &assignment.assignments {
+        if let Some(value) = lookup.dataset_values.get(slug.as_str()) {
+            datasets.insert(slug.as_str(), value);
+        }
     }
     let encoded = serde_json::to_vec(&serde_json::json!({
         "chunker_identity": chunker_identity,
@@ -3465,6 +3486,112 @@ mod tests {
             )]),
             alias_paths_indexed: false,
             ..Plan::default()
+        }
+    }
+
+    /// `prepared_artifact_identity` is a persisted reuse key: the
+    /// once-per-snapshot `PreparationLookup` must hash exactly what the old
+    /// per-file plan scan hashed, including unordered aliases, aliases of other
+    /// files, a duplicate slug (last wins) and an assigned slug with no dataset.
+    #[test]
+    fn preparation_lookup_identity_matches_the_per_file_plan_scan() {
+        fn legacy_identity(
+            chunker_identity: &str,
+            plan: &Plan,
+            content_id: &str,
+            assignment: &FileAssignment,
+        ) -> String {
+            let mut aliases: Vec<(&str, &str)> = plan
+                .duplicate_files
+                .iter()
+                .filter(|alias| alias.file_key == content_id)
+                .map(|alias| (alias.rel.as_str(), alias.path_id.as_str()))
+                .collect();
+            aliases.sort_unstable();
+            let slugs: BTreeSet<&str> = assignment
+                .assignments
+                .iter()
+                .map(|(_, slug)| slug.as_str())
+                .collect();
+            let mut datasets: BTreeMap<&str, Value> = BTreeMap::new();
+            for dataset in plan
+                .datasets
+                .iter()
+                .filter(|dataset| slugs.contains(&dataset.slug.as_str()))
+            {
+                datasets.insert(
+                    dataset.slug.as_str(),
+                    serde_json::to_value(dataset).unwrap(),
+                );
+            }
+            let encoded = serde_json::to_vec(&serde_json::json!({
+                "chunker_identity": chunker_identity,
+                "document_ids": crate::DOCUMENT_IDS_IDENTITY,
+                "assignment": serde_json::to_value(assignment).unwrap(),
+                "aliases": aliases,
+                "datasets": datasets,
+            }))
+            .unwrap();
+            format!("axfi1-{:032x}", xxhash_rust::xxh3::xxh3_128(&encoded))
+        }
+        let dataset = |slug: &str, index: &str| PlanDataset {
+            slug: slug.into(),
+            index: index.into(),
+            family: "text".into(),
+            group: None,
+            specs: vec![],
+            time_field: None,
+            semantic_field: None,
+            text_analyzer: None,
+            scope: None,
+            sampled_records: 1,
+            file_count: 1,
+        };
+        let alias = |file_key: &str, rel: &str| crate::state::DuplicateFile {
+            file_key: file_key.into(),
+            rel: rel.into(),
+            path_id: format!("id-{rel}"),
+            is_symlink: Some(false),
+            duplicate_of: "canon".into(),
+            bytes: 1,
+        };
+        let assignment = FileAssignment {
+            rel: "canon".into(),
+            path_id: "id-canon".into(),
+            is_symlink: Some(false),
+            family: "text".into(),
+            gzip: false,
+            content_digest: None,
+            assignments: vec![
+                (None, "docs".into()),
+                (Some("g".into()), "logs".into()),
+                (Some("h".into()), "missing".into()),
+            ],
+            as_document: false,
+        };
+        let plan = Plan {
+            datasets: vec![
+                dataset("docs", "ax-docs"),
+                dataset("logs", "ax-logs-old"),
+                dataset("other", "ax-other"),
+                dataset("logs", "ax-logs"),
+            ],
+            files: HashMap::from([("k1".to_string(), assignment.clone())]),
+            duplicate_files: vec![
+                alias("k1", "z/copy"),
+                alias("k2", "elsewhere"),
+                alias("k1", "a/copy"),
+                alias("k1", "m/copy"),
+            ],
+            ..Plan::default()
+        };
+        let lookup = PreparationLookup::new(&plan).unwrap();
+        for content_id in ["k1", "k2", "k3"] {
+            assert_eq!(
+                prepared_artifact_identity("chunker-v1", &lookup, content_id, &assignment).unwrap(),
+                legacy_identity("chunker-v1", &plan, content_id, &assignment),
+                "identity drifted for {content_id}"
+            );
         }
     }
 
