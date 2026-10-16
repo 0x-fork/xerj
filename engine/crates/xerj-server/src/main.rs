@@ -1487,6 +1487,10 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
         config: cmd.config.clone(),
         // No listener is bound for in-process indexing, so no port applies.
         port: None,
+        // Never relocate the data dir here: indexing into `<dir>-2` because a
+        // server holds `<dir>` would report success into a directory nobody
+        // serves. The engine's node.lock error is the right answer.
+        auto_port: Some(false),
         data_dir: cmd.data_dir.clone(),
         // In-process CLI indexing binds no listener at all, so the bind
         // address is irrelevant here — take whatever the config says.
@@ -3575,11 +3579,11 @@ mod auto_port_tests {
     #[test]
     fn auto_port_is_off_unless_asked_for() {
         // No config file, no flag: a taken port must stay fatal (#465).
-        let args = parse_args_from(["--insecure".to_string()]);
+        let args = parse_args_from(["--insecure".to_string()].into_iter());
         if std::env::var_os("XERJ_AUTO_PORT").is_none() {
             assert!(!load_config(&args).unwrap().server.auto_port);
         }
-        let args = parse_args_from(["--auto-port".to_string()]);
+        let args = parse_args_from(["--auto-port".to_string()].into_iter());
         assert!(load_config(&args).unwrap().server.auto_port);
     }
 
