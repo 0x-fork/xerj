@@ -33,8 +33,26 @@ SHA-256 so the three cannot drift apart.
   `shortDescription`, `requiredAction`, `knownRansomwareCampaignUse`, `cwes`).
 - **Derived fields** via `regex_extract` (`cwe_ids`) and `map`
   (`ransomware_status`: `"known"` vs `"unknown"`).
-- **Public domain licence (`CC0-1.0`)**: US federal government work under
-  17 U.S.C. § 105.
+- **Licence (`CC0-1.0`)**: CISA distributes the KEV catalog under Creative
+  Commons CC0 1.0 (stated in the `LICENSE` of CISA's official mirror,
+  [cisagov/kev-data](https://github.com/cisagov/kev-data/blob/develop/LICENSE)),
+  consistent with its status as a US federal government work
+  (17 U.S.C. § 105). Two caveats from that licence travel with the pack:
+  content at third-party links inside the `notes` field is governed by those
+  sites' own terms, and using the data does not authorize use of the CISA logo
+  or DHS seal, nor imply endorsement by CISA or DHS.
+
+## Snapshot and provenance
+
+The source is CISA's live feed URL, which is **not version-pinned** and grows
+as CISA adds entries; a rebuild on a later day produces more records than the
+table above. The numbers above were measured against catalog version
+`2026.10.15` (`dateReleased` 2026-10-15T17:00:11Z, `count` 1746) and
+independently re-counted from that same feed during review. Refresh them with
+`cargo test -p xerj-autoindex --test pack_claims measure_cisa_kev_pack_live -- --ignored --nocapture`.
+
+This pack is **not** published or signed by `.github/workflows/pack-publish.yml`
+and ships no signing key; build it locally from the recipe.
 
 ## Build, consume, query
 

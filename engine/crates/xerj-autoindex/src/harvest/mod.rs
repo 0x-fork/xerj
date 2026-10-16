@@ -376,10 +376,19 @@ fn parse_file(path: &Path, records_field: Option<&str>) -> Result<Vec<Value>> {
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_lowercase();
-    if name.ends_with(".md") || name.ends_with(".markdown") {
+    let markdown = name.ends_with(".md") || name.ends_with(".markdown");
+    let jsonl = name.ends_with(".jsonl") || name.ends_with(".ndjson");
+    // `records_field` only means something for a wrapped `.json` catalog; on
+    // any other file type it would be silently ignored, so refuse instead.
+    if let (Some(field), true) = (records_field, markdown || jsonl) {
+        bail!(
+            "{}: records_field '{field}' applies only to .json files, not .md/.jsonl",
+            path.display()
+        );
+    }
+    if markdown {
         return Ok(vec![Value::String(raw)]);
     }
-    let jsonl = name.ends_with(".jsonl") || name.ends_with(".ndjson");
     if jsonl {
         let mut out = Vec::new();
         for (n, line) in raw.lines().enumerate() {
@@ -511,6 +520,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing or not a JSON array"), "{err}");
+        let err = parse_file(&b, Some("vulnerabilities"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("applies only to .json files"), "{err}");
+        let err = parse_file(&d, Some("vulnerabilities"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("applies only to .json files"), "{err}");
     }
 
     // ── end to end: recipe → harvest → identity → pack, twice ─────────────
