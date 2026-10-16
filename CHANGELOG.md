@@ -13,7 +13,8 @@ Window since v1.0.0-rc.95: a fix-and-honesty sweep across search tie order,
 dynamic-mapping doc values, autoindex progress and resume reporting, the
 finalize gate, Windows home-directory resolution and `xerj init`, plus two
 dependency security updates. Contributors in this window: Tong-bit-art,
-todie, fjjjuv, redwolf2019, riazrahaman, sebollin and Tyagiquamar. Parts of
+todie, fjjjuv, redwolf2019, riazrahaman, sebollin, Tyagiquamar, driphtyio and
+mininxd. Parts of
 this section's wording for the PRs merged before 2026-10-14 are adapted from
 todie's draft release PR #1397, with thanks.
 
@@ -133,6 +134,17 @@ before.
   [#1428](https://github.com/xerj-org/xerj/pull/1428)) — a slow view could
   snap back over the one the user had moved to; also the root cause of a
   flaky browser test.
+- **A failed thread spawn degrades instead of aborting the process**
+  (partial for issue [#1122](https://github.com/xerj-org/xerj/issues/1122),
+  which stays open) — under memory exhaustion `std::thread::spawn` panics,
+  and the engine is `panic=abort`. These paths now handle the error: the
+  `xerj share` tunnel fails on its own (PR
+  [#1479](https://github.com/xerj-org/xerj/pull/1479)), an extractor reader
+  thread fails its file rather than the whole run (PR
+  [#1480](https://github.com/xerj-org/xerj/pull/1480)), and autoindex index
+  workers, sync replay and object fetch degrade (PR
+  [#1481](https://github.com/xerj-org/xerj/pull/1481)). Spawn sites elsewhere
+  are tracked by the issue.
 - **`xerj --help` states the served MCP tool count** (issue
   [#1443](https://github.com/xerj-org/xerj/issues/1443), PR
   [#1455](https://github.com/xerj-org/xerj/pull/1455)) — computed from the
@@ -148,6 +160,12 @@ before.
   symbol bodies is fused with the file ranking by Reciprocal Rank Fusion
   (`k = 60`). Without the flag the default ranking is unchanged.
   Pre-existing state dirs resume without a rebuild.
+
+### Performance
+
+- **autoindex indexes the plan once per snapshot** instead of rescanning it
+  for every file (PR [#1483](https://github.com/xerj-org/xerj/pull/1483),
+  carries part of todie's #1394). No figure is claimed here.
 
 ### Security
 
@@ -222,12 +240,13 @@ before.
   natural-language search on a Spanish-language R package (PR
   [#1367](https://github.com/xerj-org/xerj/pull/1367), sebollin),
   shared-cluster retrieval and an `llms.txt` audit (PR
-  [#1373](https://github.com/xerj-org/xerj/pull/1373), todie), and Windows
+  [#1373](https://github.com/xerj-org/xerj/pull/1373), todie), Windows
   autoindex + MCP (PR [#1420](https://github.com/xerj-org/xerj/pull/1420),
-  fjjjuv).
+  fjjjuv), and a Hermes agent autoindexing skills and blog corpora (PR
+  [#1492](https://github.com/xerj-org/xerj/pull/1492), driphtyio).
 - CLA signatures: Tyagiquamar (#1327), Tong-bit-art (#1328), redwolf2019
-  (#1342), riazrahaman (#1355), sebollin (#1366), fjjjuv (#1421) and todie
-  (#1429). The CLA check no longer deadlocks on a contributor's own
+  (#1342), riazrahaman (#1355), sebollin (#1366), fjjjuv (#1421), todie
+  (#1429) and mininxd (#1488). The CLA check no longer deadlocks on a contributor's own
   self-signature PR (PR [#1432](https://github.com/xerj-org/xerj/pull/1432),
   carries todie's #1404, with the inputs pinned to the event SHA).
 
@@ -235,7 +254,9 @@ before.
 
 - Dead-code and comment cleanups: PRs #1447, #1448, #1449, #1453, #1454.
 - CI and test reliability: PR #1422 (fjjjuv, transport auth tests retry a
-  port bind race).
+  port bind race); PR #1490 (the fuzz workspace's lockfile is seeded from
+  `engine/Cargo.lock`, because every `zip` 8.x release was yanked upstream
+  and a fresh resolve failed).
 
 <!-- notes-exempt: #1347 (ops: the xerj.org metrics Cloudflare Worker; ships nothing in the binary) -->
 
