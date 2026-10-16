@@ -153,7 +153,9 @@ const SHRINK_COOLDOWN: Duration = Duration::from_secs(1);
 /// While no bulk has succeeded since the last shrink, coalesce repeated 429
 /// retries from the same parent-breaker trip into a single halving for up to
 /// 15 s (issue #1250) instead of cascading 32 → 16 → 8 → 4 → 2 → 1 once per
-/// second while the server drains.
+/// second while the server drains. Sized from the issue's data: the server's
+/// breaker/drain cycle repeated every ~12 s, so a window shorter than that
+/// (1 s before, or 2 s) still lets one trip halve the window five times.
 const EPISODE_MAX_COOLDOWN: Duration = Duration::from_secs(15);
 /// Clean bulks required before the limit is probed upward by one below
 /// `ssthresh` (above `ssthresh`, congestion avoidance scales this by `limit`).
@@ -175,10 +177,12 @@ struct AdmissionState {
     /// True after a shrink until at least one bulk succeeds, so sustained 429
     /// retries during a single breaker trip do not halve repeatedly every 1 s.
     shrunk_in_episode: bool,
-    /// Slow-start threshold: below `ssthresh`, recovery steps every
-    /// `RECOVER_AFTER` bulks; at or above `ssthresh` (near the concurrency that
-    /// last tripped the breaker), congestion avoidance requires
-    /// `RECOVER_AFTER * limit` clean bulks per +1 step.
+    /// Slow-start threshold, set on each shrink to 3/4 of the limit that
+    /// tripped (kept above the halved limit). Below it, recovery steps every
+    /// `RECOVER_AFTER` clean bulks; at or above it — the band just under the
+    /// concurrency that last tripped the breaker — congestion avoidance needs
+    /// `RECOVER_AFTER * limit` clean bulks per +1 step, so the client creeps
+    /// up to the old ceiling instead of sprinting back into it.
     ssthresh: usize,
     /// When the last "raising" line was printed, and the limit it named —
     /// so the next line can name the whole climb since.
@@ -4053,5 +4057,43 @@ mod mapping_refusal_tests {
             admission.on_success();
         }
         assert_eq!(admission.limit(), 25);
+    }
+
+    /// #1250 data: the parent breaker's drain cycle measured ~12 s on the
+    /// reporter's box (`memory breaker engaged ... every ~12 seconds`), and
+    /// the 1 s cooldown let one such cycle collapse the window 32 → 1. The
+    /// episode cooldown must therefore outlast one cycle (15 s), still let a
+    /// genuinely longer stall keep shrinking, and reset on the first clean
+    /// bulk so the NEXT trip is answered immediately.
+    #[test]
+    fn episode_cooldown_outlasts_one_breaker_cycle_and_resets_on_success() {
+        use std::time::{Duration, Instant};
+        let admission = super::BulkAdmission::new(32, false);
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 16);
+
+        // 12 s into the same trip, nothing has succeeded: still one halving.
+        admission.inner.lock().unwrap().last_shrink =
+            Some(Instant::now() - Duration::from_secs(12));
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 16, "one ~12 s breaker cycle = one cut");
+        assert_eq!(super::EPISODE_MAX_COOLDOWN, Duration::from_secs(15));
+
+        // A stall that outlives the episode window keeps converging.
+        admission.inner.lock().unwrap().last_shrink =
+            Some(Instant::now() - Duration::from_secs(16));
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 8);
+        assert_eq!(admission.congestion_events(), 2);
+        // ssthresh is 3/4 of the limit that tripped (16), above the new 8.
+        assert_eq!(admission.inner.lock().unwrap().ssthresh, 12);
+
+        // One clean bulk ends the episode; a new 429 past the 1 s
+        // de-duplication window is a NEW trip and halves at once.
+        admission.on_success();
+        admission.inner.lock().unwrap().last_shrink = Some(Instant::now() - Duration::from_secs(2));
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 4);
+        assert_eq!(admission.congestion_events(), 3);
     }
 }
