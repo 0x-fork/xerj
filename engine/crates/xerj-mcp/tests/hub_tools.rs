@@ -441,9 +441,10 @@ async fn hub_tools_answer_from_a_local_pack_and_never_download() {
     );
 
     // No cache at all: every tool says what would help, and still fetches
-    // nothing. With a hub key that is `xerj hub sync`; in a build with no key
-    // (HUB_PUBKEY_HEX empty) sync cannot help, so the tools say the hub is not
-    // available in this build instead of sending the agent round a loop.
+    // nothing. With a hub key (the compiled-in one, here) that is `xerj hub
+    // sync`; with no key (`XERJ_HUB_PUBKEY=none`, see xerj-hub's no_hub_key.rs)
+    // sync cannot help, so the tools say the hub is not available in this build
+    // instead of sending the agent round a loop.
     std::fs::remove_file(hub.join("catalogue.json")).unwrap();
     let wanted = if xerj_common::hub::hub_key_configured() {
         "xerj hub sync"

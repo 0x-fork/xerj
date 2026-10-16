@@ -1,5 +1,6 @@
-//! A build with no hub signing key (`HUB_PUBKEY_HEX` empty, `XERJ_HUB_PUBKEY`
-//! unset) can verify no catalogue and no pack. Every hub surface must say so
+//! A build with no hub signing key can verify no catalogue and no pack. A real
+//! key is compiled in now, so the test asks for that state explicitly with
+//! `XERJ_HUB_PUBKEY=none` (`HUB_PUBKEY_NONE`). Every hub surface must say so
 //! plainly with exit 5 — not fail on whatever the hub URL serves (a 200 HTML
 //! page made `xerj ask` print "parse catalogue JSON: expected value at line 1
 //! column 1", exit 1) and not send an MCP agent to `xerj hub sync`, which
@@ -12,11 +13,11 @@ use xerj_hub::cli::{run_ask, run_hub_cli};
 
 #[test]
 fn every_hub_surface_says_the_build_has_no_key() {
+    std::env::set_var("XERJ_HUB_PUBKEY", xerj_common::hub::HUB_PUBKEY_NONE);
     assert!(
-        xerj_hub::HUB_PUBKEY_HEX.is_empty(),
-        "precondition: no compiled-in key"
+        !xerj_common::hub::hub_key_configured(),
+        "precondition: the override takes the key away"
     );
-    std::env::remove_var("XERJ_HUB_PUBKEY");
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("XERJ_HUB_HOME", home.path());
     // A hub that serves a 200 HTML page for every path, like hub.xerj.org's

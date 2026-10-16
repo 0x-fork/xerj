@@ -578,8 +578,14 @@ async fn pack_build_pull_def_roundtrip() {
     {
         let hh = work.join("hub-nokey");
         write_catalogue(&hh, &archive, &good_sha);
-        // HUB_PUBKEY_HEX is "" in this build, so an unset env var leaves no key.
-        let rc = run_pull(&work.join("code-nokey"), &hh, None, &url_b).await;
+        // A real key is compiled in, so "no key" is the explicit test override.
+        let rc = run_pull(
+            &work.join("code-nokey"),
+            &hh,
+            Some(xerj_common::hub::HUB_PUBKEY_NONE),
+            &url_b,
+        )
+        .await;
         assert_eq!(
             rc, 5,
             "no key → \"this build cannot verify anything\" (5), which is not exit 3: the \

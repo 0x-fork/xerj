@@ -39,10 +39,13 @@
 #   verify; clients independently refuse any pack whose sha256 or signature fails
 #   (`xerj hub pull`), and extract nothing before both pass.
 #
-# DORMANT UNTIL THE KEY EXISTS
-#   HUB_PUBKEY_HEX is "" until the hub signing key is generated and committed.
-#   Until then the `preflight` job reports "dormant" and every publishing job is
-#   skipped; the re-pin job does not need the key and runs regardless.
+# DORMANT WITHOUT A KEY
+#   HUB_PUBKEY_HEX holds the public half of HUB_SIGNING_SEED (derived by
+#   hub-pubkey.yml, committed in #1505). On a branch where it is empty (one
+#   that predates that commit) the `preflight` job reports "dormant" and every
+#   publishing job is skipped; the re-pin job does not need the key and runs
+#   regardless. The key and the secret change only together; preflight fails
+#   if they disagree.
 #
 # DEPLOY (opt-in)
 #   The catalogue job always builds, checks and uploads the signed catalogue as an
@@ -288,8 +291,8 @@ jobs:
     if: needs.plan.result == 'success' && needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     # The repo-wide ceiling (.github/scripts/workflow-timeout-guard.py, 1..90).
-    # This pipeline has not run for real yet (HUB_PUBKEY_HEX is unset), so there
-    # is no measured job time to justify more; if a real pack needs longer, that
+    # This pipeline had never run for real before HUB_PUBKEY_HEX was committed,
+    # so there is no measured job time to justify more; if a real pack needs longer, that
     # is a measured case for raising MAX_TIMEOUT there, not an exception here.
     timeout-minutes: 90
     permissions:

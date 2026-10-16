@@ -31,7 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use xerj_autoindex::harvest::sign::{sign_bytes, verify_bytes};
 use xerj_common::hub::{
-    Catalogue, CatalogueEntry, LicenceClass, CATALOGUE_FORMAT_VERSION, HUB_PUBKEY_HEX,
+    hub_pubkey, Catalogue, CatalogueEntry, LicenceClass, CATALOGUE_FORMAT_VERSION,
 };
 
 /// Path of the catalogue under the hub's API root.
@@ -415,17 +415,6 @@ fn cache_is_fresh(cache_file: &Path) -> bool {
     }
 }
 
-/// The pubkey to verify with: `XERJ_HUB_PUBKEY` (tests), else the compiled-in
-/// [`HUB_PUBKEY_HEX`]. `None` when neither is set — the real key lands later, so
-/// an empty configured key means "skip verification with a warning", never a
-/// hard failure.
-fn configured_pubkey() -> Option<String> {
-    std::env::var("XERJ_HUB_PUBKEY")
-        .ok()
-        .and_then(|s| non_empty(Some(&s)))
-        .or_else(|| non_empty(Some(HUB_PUBKEY_HEX)))
-}
-
 /// Warn when the cached copy being served is a day or more old.
 fn warn_if_old(cat: &Catalogue) {
     if let Ok(generated) = chrono::DateTime::parse_from_rfc3339(&cat.generated_at) {
@@ -442,9 +431,16 @@ fn warn_if_old(cat: &Catalogue) {
 }
 
 /// Fetch, verify and cache the catalogue. The signature guards the replacement:
-/// the fetched bytes are only written to the cache after they verify (or after a
-/// deliberate, warned skip when no key is configured).
+/// the fetched bytes are only written to the cache after they verify against
+/// [`hub_pubkey`]. With no key (`XERJ_HUB_PUBKEY=none`, or a build without one)
+/// nothing is fetched at all: there is no unverified path into the cache.
 fn fetch_and_store(hub_url: &str, cache_file: &Path, etag_file: &Path) -> Result<Catalogue> {
+    let Some(pubkey) = hub_pubkey() else {
+        bail!(
+            "no hub public key is configured, so the hub catalogue cannot be verified; \
+             nothing was fetched"
+        );
+    };
     let base = hub_url.trim_end_matches('/');
     let cat_url = format!("{base}/{CATALOGUE_API_PATH}");
     let sig_url = format!("{cat_url}.sig");
@@ -504,14 +500,8 @@ fn fetch_and_store(hub_url: &str, cache_file: &Path, etag_file: &Path) -> Result
         .to_string();
 
     // Verify BEFORE these bytes are allowed anywhere near the cache.
-    match configured_pubkey() {
-        Some(key) => verify_bytes(&body, &sig_hex, &key)
-            .context("catalogue signature did not verify; refusing to replace the cache")?,
-        None => eprintln!(
-            "xerj hub: no hub public key configured (HUB_PUBKEY_HEX empty, XERJ_HUB_PUBKEY \
-             unset) — caching the catalogue WITHOUT verifying its signature"
-        ),
-    }
+    verify_bytes(&body, &sig_hex, &pubkey)
+        .context("catalogue signature did not verify; refusing to replace the cache")?;
 
     // Only trusted bytes get parsed and cached.
     let cat = parse_catalogue(&body)?;
@@ -972,25 +962,49 @@ mod tests {
     }
 
     #[test]
-    fn load_without_a_key_skips_verification_rather_than_failing() {
+    fn load_with_no_key_fetches_nothing_and_caches_nothing() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // no XERJ_HUB_PUBKEY, and HUB_PUBKEY_HEX is empty on this branch, so the
-        // loader must cache the fetched copy WITHOUT verifying — not hard-fail.
-        std::env::remove_var("XERJ_HUB_PUBKEY");
-        assert!(
-            HUB_PUBKEY_HEX.is_empty(),
-            "precondition: no compiled-in key"
-        );
-
-        let fx = tempfile::tempdir().unwrap();
-        let (good_bytes, _good_sig, _public) = fixture_bytes(fx.path());
+        // The loader used to fail OPEN here (cache the fetched copy unverified,
+        // with a warning). With no key it now refuses before dialing the hub.
+        std::env::set_var("XERJ_HUB_PUBKEY", xerj_common::hub::HUB_PUBKEY_NONE);
+        let hub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        hub.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", hub.local_addr().unwrap());
         let cache = tempfile::tempdir().unwrap();
-        // the sig is irrelevant here: with no key we never check it
-        let (url, handle) = spawn_hub(good_bytes.clone(), "00".repeat(64));
 
-        let cat = load_catalogue(&url, cache.path(), false).expect("unverified fetch is allowed");
+        let err = load_catalogue(&url, cache.path(), false).unwrap_err();
+        std::env::remove_var("XERJ_HUB_PUBKEY");
+
+        assert!(
+            format!("{err:#}").contains("no hub public key"),
+            "the error says why: {err:#}"
+        );
+        assert!(
+            matches!(hub.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing may be fetched without a key"
+        );
+        assert!(!cache.path().join(CACHE_FILE).exists(), "nothing cached");
+    }
+
+    #[test]
+    fn the_compiled_in_key_verifies_and_refuses_a_test_signed_catalogue() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // No override: the shipping key (HUB_PUBKEY_HEX) is what verifies. A
+        // catalogue signed by any other key — here a throwaway test key — must be
+        // refused and must not reach the cache.
+        std::env::remove_var("XERJ_HUB_PUBKEY");
+        let fx = tempfile::tempdir().unwrap();
+        let (good_bytes, good_sig, _public) = fixture_bytes(fx.path());
+        let cache = tempfile::tempdir().unwrap();
+        let (url, handle) = spawn_hub(good_bytes, good_sig);
+
+        let err = load_catalogue(&url, cache.path(), false).unwrap_err();
         handle.join().unwrap();
 
-        assert_eq!(cat.corpora.len(), 2);
+        let msg = format!("{err:#}");
+        // "does not verify" (not a parse error) also proves the constant parses
+        // as a 32-byte key in the very function the client verifies with.
+        assert!(msg.contains("signature does not verify"), "{msg}");
+        assert!(!cache.path().join(CACHE_FILE).exists(), "nothing cached");
     }
 }

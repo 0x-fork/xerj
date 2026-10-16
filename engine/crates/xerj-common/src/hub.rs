@@ -36,21 +36,44 @@ pub const AUTO_PULL_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// The local pack cache is pruned (least-recently-used) to stay under this.
 pub const DISK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Hex of the ed25519 public key the hub signs catalogues and packs with.
-/// Filled when the hub signing key is generated (Step 2 / CI). Overridable by
-/// the `XERJ_HUB_PUBKEY` environment variable for tests only.
-pub const HUB_PUBKEY_HEX: &str = "";
+/// Hex of the ed25519 public key every hub catalogue and pack must verify
+/// against: the public half of the `HUB_SIGNING_SEED` CI secret, derived from
+/// it by `.github/workflows/hub-pubkey.yml` (run 38869497662, #1494).
+///
+/// It changes ONLY together with that secret. Rotating the seed without this
+/// constant (or the other way round) makes every client refuse every pack;
+/// `hub-packs.yml` and `hub-pubkey.yml` both compare the two and fail loudly on
+/// a mismatch. Tests point the client at a throwaway key with the
+/// `XERJ_HUB_PUBKEY` environment variable — see [`hub_pubkey`].
+pub const HUB_PUBKEY_HEX: &str = "b68899321ec01ad8d0130d6e4790d9c75ffbc03bb0271f0a1522114c43562936";
 
-/// True when this build can verify hub catalogues and packs: a key is compiled
-/// in ([`HUB_PUBKEY_HEX`]) or supplied through `XERJ_HUB_PUBKEY` (tests). A
-/// build without one cannot use Corpus Hub packs at all, so the hub surfaces
-/// (`xerj ask`, `xerj hub sync|pull`, the MCP hub tools, `xerj init`'s hub
-/// skill) say so plainly instead of failing on whatever the network returns.
+/// The `XERJ_HUB_PUBKEY` value that makes this process behave as a build with
+/// no hub key (tests only): the no-key paths stay reachable now that a real key
+/// is compiled in. It can only take capability away — with no key every hub
+/// surface refuses to fetch or extract anything, it never skips a check.
+pub const HUB_PUBKEY_NONE: &str = "none";
+
+/// The key to verify hub catalogues and packs with: a non-empty
+/// `XERJ_HUB_PUBKEY` (tests) wins over the compiled-in [`HUB_PUBKEY_HEX`].
+/// `None` means "this build cannot verify anything": the override is
+/// [`HUB_PUBKEY_NONE`], or no key is compiled in. Callers refuse rather than
+/// proceed unverified.
+pub fn hub_pubkey() -> Option<String> {
+    match std::env::var("XERJ_HUB_PUBKEY") {
+        Ok(k) if k.trim().eq_ignore_ascii_case(HUB_PUBKEY_NONE) => None,
+        Ok(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
+        _ => Some(HUB_PUBKEY_HEX.to_string()).filter(|k| !k.is_empty()),
+    }
+}
+
+/// True when this build can verify hub catalogues and packs, i.e. when
+/// [`hub_pubkey`] has a key: the compiled-in [`HUB_PUBKEY_HEX`], or a test
+/// `XERJ_HUB_PUBKEY`. With `XERJ_HUB_PUBKEY=none` ([`HUB_PUBKEY_NONE`]) it is
+/// false, and the hub surfaces (`xerj ask`, `xerj hub sync|pull`, the MCP hub
+/// tools, `xerj init`'s hub skill) say plainly that the hub is unavailable
+/// instead of failing on whatever the network returns.
 pub fn hub_key_configured() -> bool {
-    !HUB_PUBKEY_HEX.is_empty()
-        || std::env::var("XERJ_HUB_PUBKEY")
-            .map(|k| !k.trim().is_empty())
-            .unwrap_or(false)
+    hub_pubkey().is_some()
 }
 
 /// What every hub surface says in a build with no hub key.
@@ -317,6 +340,28 @@ pub fn render(answer: &Answer) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_compiled_in_hub_key_is_32_bytes_of_lower_hex() {
+        // The workflows read it with a `[0-9a-fA-F]*` sed and compare lower-case;
+        // ed25519.sh and verify_bytes both want exactly 64 hex characters.
+        assert_eq!(HUB_PUBKEY_HEX.len(), 64, "{HUB_PUBKEY_HEX}");
+        assert!(
+            HUB_PUBKEY_HEX
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{HUB_PUBKEY_HEX}"
+        );
+    }
+
+    #[test]
+    fn the_hub_key_stays_on_the_one_line_the_workflows_read() {
+        // hub-packs.yml and hub-pubkey.yml extract the key with a single-line
+        // sed over this file. If a reformat ever wrapped the declaration, they
+        // would read "" and go quietly dormant instead of publishing.
+        let line = format!("\npub const HUB_PUBKEY_HEX: &str = \"{HUB_PUBKEY_HEX}\";\n");
+        assert!(include_str!("hub.rs").contains(&line), "{line}");
+    }
 
     #[test]
     fn licence_class_is_kebab_case() {
