@@ -560,7 +560,11 @@ mod write_back {
         );
         assert_eq!(r["source"], "local", "{r}");
         let docs = node.wait_for_docs("history", 3).await;
-        assert_eq!(docs.len(), 3, "local escalation wrote back to history: {docs:?}");
+        assert_eq!(
+            docs.len(),
+            3,
+            "local escalation wrote back to history: {docs:?}"
+        );
 
         // 2. `/v1/systemone` on another split index also escalates and writes back.
         let ln2 = local_node("history_s1", 0.0).await;
@@ -602,4 +606,3 @@ mod write_back {
         );
     }
 }
-

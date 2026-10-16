@@ -2161,10 +2161,9 @@ mod tests {
         )
         .expect("toml");
         assert_eq!(cfg.decisions.escalate_below, 0.65);
-        let disabled = xerj_common::config::Config::from_toml_str(
-            "[decisions]\nescalate_below = 0.0\n",
-        )
-        .expect("0.0 disables confidence escalation");
+        let disabled =
+            xerj_common::config::Config::from_toml_str("[decisions]\nescalate_below = 0.0\n")
+                .expect("0.0 disables confidence escalation");
         assert_eq!(disabled.decisions.escalate_below, 0.0);
         for bad in ["-0.1", "1.1", "nan"] {
             let err = xerj_common::config::Config::from_toml_str(&format!(
