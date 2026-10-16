@@ -545,8 +545,17 @@ jobs:
             done
           done < "$RUNNER_TEMP/fetch.tsv"
           echo "$(wc -l < "$RUNNER_TEMP/fetch.tsv") packs, $(du -sh "$RUNNER_TEMP/packs" | cut -f1)"
+          # No live corpus has a PUBLISHED pack yet (a dry run before the first real
+          # publish): there is nothing to catalogue, and an empty catalogue is not
+          # fit to publish. Say so and skip the rest, rather than fail.
+          if [ ! -s "$RUNNER_TEMP/fetch.tsv" ]; then
+            echo "::notice title=catalogue::no live corpus has a published pack yet; nothing to catalogue"
+            { echo "### catalogue: skipped"; echo; echo "No live corpus has a published pack release yet."; } >> "$GITHUB_STEP_SUMMARY"
+            echo "NO_PACKS=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Build and sign the catalogue
+        if: env.NO_PACKS != '1'
         env:
           HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
         run: |
@@ -555,7 +564,9 @@ jobs:
           printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
           unset HUB_SIGNING_SEED
           trap 'rm -f "$RUNNER_TEMP/pack.key"' EXIT
-          bin/xerj hub build-catalogue --registry "$REGISTRY" --packs "$RUNNER_TEMP/packs" \
+          # --tags: the release each pack came from, so a -rN retag gets its real URL.
+          bin/xerj hub build-catalogue --registry "$REGISTRY" --backlog "$BACKLOG" \
+            --packs "$RUNNER_TEMP/packs" --tags "$RUNNER_TEMP/fetch.tsv" \
             --out catalogue.json --sign-key "$RUNNER_TEMP/pack.key"
           test -s catalogue.json
           test -s catalogue.json.sig || { echo "::error::build-catalogue wrote no catalogue.json.sig"; exit 1; }
@@ -564,6 +575,7 @@ jobs:
       # publish: it verifies under the key clients embed, agrees with the registry
       # (pins, release URLs), is under 2 MB, and drops no live corpus.
       - name: Check the catalogue
+        if: env.NO_PACKS != '1'
         env:
           ALLOW_DROPS: ${{ inputs.allow_drops }}
         run: |
@@ -585,6 +597,7 @@ jobs:
           python3 tools/hub-packs/hub_packs.py "${args[@]}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: env.NO_PACKS != '1'
         with:
           name: catalogue
           path: |
@@ -595,7 +608,7 @@ jobs:
       # Same generator, validation and Pages project as deploy-hub-pages.yml, with the
       # catalogue added under api/v1/ (the path the client fetches).
       - name: Generate the hub site with the catalogue
-        if: ${{ !inputs.dry_run && vars.HUB_CATALOGUE_DEPLOY == 'true' }}
+        if: ${{ !inputs.dry_run && vars.HUB_CATALOGUE_DEPLOY == 'true' && env.NO_PACKS != '1' }}
         run: |
           set -euo pipefail
           python3 tools/corpus-hub-site/test_gen.py
@@ -605,14 +618,14 @@ jobs:
           cp catalogue.json catalogue.json.sig tools/corpus-hub-site/out/api/v1/
 
       - name: Deploy to Cloudflare Pages
-        if: ${{ !inputs.dry_run && vars.HUB_CATALOGUE_DEPLOY == 'true' }}
+        if: ${{ !inputs.dry_run && vars.HUB_CATALOGUE_DEPLOY == 'true' && env.NO_PACKS != '1' }}
         run: npx wrangler@3 pages deploy tools/corpus-hub-site/out --project-name=xerj-hub --branch=corpus-hub
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deploy skipped
-        if: ${{ inputs.dry_run || vars.HUB_CATALOGUE_DEPLOY != 'true' }}
+        if: ${{ env.NO_PACKS != '1' && (inputs.dry_run || vars.HUB_CATALOGUE_DEPLOY != 'true') }}
         run: |
           {
             echo "### catalogue built and checked, NOT deployed"

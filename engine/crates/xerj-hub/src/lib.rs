@@ -14,6 +14,7 @@
 //! router + ask (Step 5). Alongside them this file re-exports the shared types.
 
 pub mod ask;
+pub mod build_catalogue;
 pub mod catalogue;
 pub mod cli;
 pub mod def;
