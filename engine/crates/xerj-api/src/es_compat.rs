@@ -2056,9 +2056,8 @@ async fn get_index_inner(
         };
 
         // Settings: replay what was written (normalized to strings), merged
-        // with engine defaults; `analysis` is the block in force (#1092).
-        // Creation timestamps are synthesized because we don't persist them
-        // yet (TODO).
+        // with engine defaults; `analysis` is the block in force (#1092) and
+        // `creation_date` is the persisted creation time (#1573).
         let settings_inner = index_settings_response(&state, name, idx.as_ref(), human).await;
 
         let mut index_obj = serde_json::Map::new();
@@ -2110,7 +2109,12 @@ async fn index_settings_response(
             stored = i.get_settings().await;
         }
     }
-    let mut settings = merge_settings_defaults(&stored, name, human);
+    // Creation timestamps: the real persisted value (#1573), not a fresh
+    // `Utc::now()` per request. `index_created_at` is recorded at create and
+    // loaded from `created_at.json` on boot; the fallback only covers an
+    // index that has no recorded time (e.g. a failed create).
+    let created_at_ms = state.engine.index_created_at.get(name).map(|v| *v);
+    let mut settings = merge_settings_defaults(&stored, name, human, created_at_ms);
     if let Some(i) = idx {
         let in_force = i.analysis_in_force().await;
         if let Some(inner) = settings.get_mut("index").and_then(Value::as_object_mut) {
@@ -2128,7 +2132,12 @@ async fn index_settings_response(
 /// ES always wraps user settings under `{ "index": { ... } }` and coerces
 /// all simple values to strings. Missing fields fall through to engine
 /// defaults (single shard, zero replicas).
-fn merge_settings_defaults(user_settings: &Value, provided_name: &str, human: bool) -> Value {
+fn merge_settings_defaults(
+    user_settings: &Value,
+    provided_name: &str,
+    human: bool,
+    created_at_ms: Option<i64>,
+) -> Value {
     // Pull the inner `index` block if the user used `{ "index": { ... } }`
     // syntax; otherwise treat the whole blob as the inner block.
     let raw_inner = user_settings
@@ -2161,11 +2170,14 @@ fn merge_settings_defaults(user_settings: &Value, provided_name: &str, human: bo
         }
     }
 
-    // Synthesize required fields if absent.
-    let now_ms = Utc::now().timestamp_millis();
+    // Synthesize required fields if absent. `creation_date` prefers the
+    // persisted creation time: a client comparing two `GET /{index}` calls
+    // must see one stable value (index age, ILM-style tooling). The `now`
+    // fallback is only for an index with no recorded time.
+    let created_ms = created_at_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
     inner
         .entry("creation_date".to_string())
-        .or_insert_with(|| Value::String(now_ms.to_string()));
+        .or_insert_with(|| Value::String(created_ms.to_string()));
     // Emit the stable, deterministic index uuid — the SAME value
     // _cat/indices reports — rather than a fresh random one per request.
     inner.insert(
