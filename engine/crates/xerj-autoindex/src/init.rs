@@ -75,7 +75,9 @@ fn agents_md_section() -> String {
      This project uses XERJ for reference coding. Before writing code that touches\n\
      unfamiliar territory: `xerj def \"<symbol>\"` for go-to-definition, or\n\
      `xerj search \"<plain words>\"` for ranked, definition-first passages.\n\
-     Index a repo with `xerj autoindex <folder>`. Cite file:line for anything you rely on.\n"
+     Index each repo under its own prefix: `xerj autoindex <folder> --prefix <name>`, then\n\
+     pass the same `--prefix <name>` to `xerj search` and `xerj def` (without it they search\n\
+     the default `ax` prefix). Cite file:line for anything you rely on.\n"
         .to_string()
 }
 
@@ -1112,6 +1114,29 @@ mod tests {
         assert!(
             has_report(&lines, "kept", "rules/xerj-hub.mdc"),
             "{lines:?}"
+        );
+    }
+
+    /// The generated AGENTS.md section used to teach
+    /// `xerj search "<words>"` with no `--prefix`, so an agent on a node whose
+    /// repos were indexed under their own prefixes ran the bare command, hit
+    /// the default `ax-*` pattern, and found nothing (field report
+    /// 2026-10-15-reference-coding-installed-xerj-indexed-this-repo). The
+    /// section must show the flag on the index step AND on the query step.
+    #[test]
+    fn agents_md_section_shows_prefix_on_index_and_query() {
+        let text = agents_md_section();
+        assert!(
+            text.contains("xerj autoindex <folder> --prefix <name>"),
+            "AGENTS.md must show --prefix on the index step:\n{text}"
+        );
+        assert!(
+            text.contains("same `--prefix <name>`"),
+            "AGENTS.md must tell search/def to reuse the prefix:\n{text}"
+        );
+        assert!(
+            text.contains("default `ax` prefix"),
+            "AGENTS.md must name what a bare search reads:\n{text}"
         );
     }
 
