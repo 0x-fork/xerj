@@ -68,7 +68,7 @@ index in it, bounded by `limits.max_body_bytes`; a body over that limit is
 refused with `413` rather than being authorized unread (`authz.rs:1251-1262`).
 
 A denial at this layer is an ES-shaped `403` with `type: security_exception`
-(`forbidden`, `authz.rs:242`; body shape in `xerj-api/src/error.rs:52`). It is
+(`forbidden`, `authz.rs:282`; body shape in `xerj-api/src/error.rs:52`). It is
 returned before any existence check, so `403` versus `404` cannot be used to
 enumerate what exists.
 
