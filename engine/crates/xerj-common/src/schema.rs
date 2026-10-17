@@ -179,9 +179,9 @@ impl ManagedSchema {
 
     /// Check whether `other` is compatible with `self` for a schema upgrade.
     ///
-    /// Compatible means: every field in `self` also exists in `other` with the
-    /// same type. `other` may have additional fields. Changing a field's type
-    /// is never compatible.
+    /// Compatible means: every field present in both `self` and `other` has
+    /// the same type. Either side may have fields the other lacks (schemas
+    /// grow additively). Changing a field's type is never compatible.
     pub fn is_compatible_with(&self, other: &ManagedSchema) -> Result<(), XerjError> {
         for field in &self.schema.fields {
             // A field missing from `other` is fine — schemas grow additively,
