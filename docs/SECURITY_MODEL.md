@@ -29,7 +29,7 @@ reasons.
 
 ### Layer 1: the authz middleware
 
-`authz_middleware` (`xerj-api/src/authz.rs:1224`) runs on both HTTP routers. It
+`authz_middleware` (`xerj-api/src/authz.rs:1300`) runs on both HTTP routers. It
 is added to the router before `auth_middleware`, so it runs after it
 (`xerj-api/src/router.rs:786-789`): authentication has already resolved the
 caller to a `Principal`, and this layer decides what that principal may reach.
