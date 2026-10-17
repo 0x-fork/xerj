@@ -470,7 +470,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
   http://localhost:9200/_xerj-console/setup#token=T8AC0tmun3Ca-DNrepOawL42uOZaDSTkXBoFI6TIPZg
 ├──────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│ Need a fresh link?  `xerj admin magic-link --role owner`                    │
+│ Need a fresh link?  Restart this node: a new one is printed on boot.         │
 └──────────────────────────────────────────────────────────────────────────────┘
 <span class="prompt">$ </span># From a second shell — first /_cluster/health 200 in <span class="num">47 ms</span> (median of 5 cold-boots, 5ms poll)
 <span class="prompt">$ </span>curl -s localhost:9200/_cluster/health | jq .status
@@ -688,7 +688,7 @@ node demo/scripts/full-demo-flow.js
   http://localhost:9200/_xerj-console/setup#token=T8AC0tmun3Ca-DNrepOawL42uOZaDSTkXBoFI6TIPZg
 ├──────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│ Need a fresh link?  `xerj admin magic-link --role owner`                    │
+│ Need a fresh link?  Restart this node: a new one is printed on boot.         │
 └──────────────────────────────────────────────────────────────────────────────┘
 ↑ captured live 2026-04-27 19:11:41Z · single-use · token never lands on disk (only sha256 in .xerj_magic_links)</code></pre>
 
