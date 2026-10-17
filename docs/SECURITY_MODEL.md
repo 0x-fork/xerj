@@ -36,9 +36,9 @@ caller to a `Principal`, and this layer decides what that principal may reach.
 
 It does four things:
 
-1. Classifies the path (`classify`, `authz.rs:444`) into a brain, a memory
+1. Classifies the path (`classify`, `authz.rs:497`) into a brain, a memory
    namespace, one or more index expressions, a cluster endpoint, or exempt.
-   Path segments are percent-decoded first (`percent_decode`, `authz.rs:421`),
+   Path segments are percent-decoded first (`percent_decode`, `authz.rs:474`),
    so `%2Exerj-memory-alice` cannot slip past a check that
    `.xerj-memory-alice` would fail.
 2. Works out the privilege the request needs (`required_privilege`,
