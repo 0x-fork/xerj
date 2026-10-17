@@ -86,7 +86,7 @@ The resulting binary is at `target/release/xerj`.
 ## Configuration
 
 See [`xerj.default.toml`](xerj.default.toml) for the commonly-tuned settings, and
-[`crates/xerj-common/src/config.rs`](crates/xerj-common/src/config.rs) for all 115
+[`crates/xerj-common/src/config.rs`](crates/xerj-common/src/config.rs) for all 134
 — every one of them optional.
 
 The minimal config to get started:
