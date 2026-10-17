@@ -42,10 +42,10 @@ It does four things:
    so `%2Exerj-memory-alice` cannot slip past a check that
    `.xerj-memory-alice` would fail.
 2. Works out the privilege the request needs (`required_privilege`,
-   `authz.rs:505`). `GET`/`HEAD` need read. A `POST` whose operation segment is
+   `authz.rs:561`). `GET`/`HEAD` need read. A `POST` whose operation segment is
    in `POST_READ_OPS` (`_search`, `_count`, `_msearch`, `_mget`, `_sql` and
-   others, `authz.rs:349`) needs read. Operations in `ADMIN_OPS` (`_settings`,
-   `_mapping`, `_close`, `_alias`, `_forcemerge` and others, `authz.rs:388`)
+   others, `authz.rs:402`) needs read. Operations in `ADMIN_OPS` (`_settings`,
+   `_mapping`, `_close`, `_alias`, `_forcemerge` and others, `authz.rs:441`)
    need manage, as does a request with no operation segment at all, because that
    creates or destroys the index. Everything else is treated as a write.
 3. Extracts the indices the request body names (`body_targets`, `authz.rs:730`)
