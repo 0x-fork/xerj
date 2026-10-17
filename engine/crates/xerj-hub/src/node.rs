@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
-use xerj_common::localauth::{discover_local_admin_key, url_is_loopback};
+use xerj_common::localauth::{discover_local_admin_key_for_url, url_is_loopback};
 use xerj_common::xccode::XcHttp;
 
 use crate::flock::{held_by, FileLock, LockError};
@@ -113,13 +113,15 @@ impl HubNode {
             Some(k) => Some(k),
             None => match std::env::var("XERJ_API_KEY").ok().filter(|k| !k.is_empty()) {
                 Some(k) => Some(k),
-                None if url_is_loopback(&base) => discover_local_admin_key().map(|(k, path)| {
-                    eprintln!(
-                        "xerj hub: no --api-key/XERJ_API_KEY given; using the admin key at {}",
-                        path.display()
-                    );
-                    k
-                }),
+                None if url_is_loopback(&base) => {
+                    discover_local_admin_key_for_url(&base).map(|(k, path)| {
+                        eprintln!(
+                            "xerj hub: no --api-key/XERJ_API_KEY given; using the admin key at {}",
+                            path.display()
+                        );
+                        k
+                    })
+                }
                 None => None,
             },
         };

@@ -596,7 +596,7 @@ pub(crate) fn run_init_with(
     // we only tell the user which of the two worlds they are in — the key
     // itself is never printed or written.
     if xerj_common::localauth::url_is_loopback(url) {
-        match xerj_common::localauth::discover_local_admin_key() {
+        match xerj_common::localauth::discover_local_admin_key_for_url(url) {
             Some((_, path)) => out.push(format!(
                 "  auth     MCP authenticates with the admin key at {} (local node)",
                 path.display()

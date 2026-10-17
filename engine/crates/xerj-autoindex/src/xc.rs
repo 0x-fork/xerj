@@ -15,7 +15,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use xerj_common::localauth::{discover_local_admin_key, url_is_loopback};
+use xerj_common::localauth::{discover_local_admin_key_for_url, url_is_loopback};
 use xerj_common::xccode::{self, manifest, state, CodeOutcome, CodeParams, Mode, XcHttp};
 
 use crate::esclient::{Count, Es};
@@ -55,7 +55,7 @@ fn build_es(url: &str, api_key: Option<String>) -> Result<Es> {
                 Some(k) => Some(k),
                 None => {
                     if url_is_loopback(url) {
-                        discover_local_admin_key().map(|(k, path)| {
+                        discover_local_admin_key_for_url(url).map(|(k, path)| {
                             eprintln!(
                                 "xerj code: no --api-key/XERJ_API_KEY given; using the admin \
                                  key at {}",

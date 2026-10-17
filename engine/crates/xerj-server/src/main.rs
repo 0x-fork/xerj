@@ -2737,6 +2737,23 @@ async fn async_main() -> Result<()> {
 
     // 5. Admin key (first-run)
     ensure_admin_key(&mut cfg)?;
+    // Point later loopback clients at this listener's key. The file stores
+    // the path, not a second copy of the secret. A failure here does not
+    // stop the node: discovery still has its path candidates.
+    if cfg.auth.enabled {
+        let key_path = Path::new(&cfg.server.data_dir).join("admin.key");
+        if key_path.is_file() {
+            if let Err(error) = xerj_common::localauth::publish_admin_key_for_port(
+                cfg.server.es_compat_port,
+                &key_path,
+            ) {
+                warn!(
+                    "could not publish the admin-key path for port {}: {error}",
+                    cfg.server.es_compat_port
+                );
+            }
+        }
+    }
 
     // 6. TLS certificate — fail closed (issue #200). The operator asked for
     //    TLS; if the certificate step cannot deliver it, refuse to start

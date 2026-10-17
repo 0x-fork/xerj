@@ -296,6 +296,15 @@ pub fn run_def_cli() -> i32 {
     if url.is_empty() {
         url = "http://localhost:9200".to_string();
     }
+    if api_key.is_none() && xerj_common::localauth::url_is_loopback(&url) {
+        if let Some((key, path)) = xerj_common::localauth::discover_local_admin_key_for_url(&url) {
+            eprintln!(
+                "xerj def: no --api-key/XERJ_API_KEY given; using the admin key at {}",
+                path.display()
+            );
+            api_key = Some(key);
+        }
+    }
 
     let es = match Es::new(&url, api_key) {
         Ok(es) => es,
@@ -305,6 +314,10 @@ pub fn run_def_cli() -> i32 {
         }
     };
     if let Err(e) = es.ping() {
+        if crate::esclient::Es::ping_failure_is_auth(&e) {
+            eprintln!("xerj def: the node at {url} answered, but authentication failed.\n{e:#}");
+            return 2;
+        }
         eprintln!(
             "xerj def: no XERJ node reachable at {url} ({e}).\n\n\
              Start one, then index a repo:\n  \

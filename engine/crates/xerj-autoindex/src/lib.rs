@@ -5945,6 +5945,12 @@ fn run_index_report_inner(
     // gets the same recipe `xerj def` already prints: start one, or aim at
     // an existing node.
     if let Err(e) = es.ping() {
+        if esclient::Es::ping_failure_is_auth(&e) {
+            anyhow::bail!(
+                "the node at {url} answered, but authentication failed.\n{e:#}",
+                url = cfg.url
+            );
+        }
         anyhow::bail!(
             "no XERJ node reachable at {url} ({e:#})\n\n\
              Start one, then re-run this command:\n  \

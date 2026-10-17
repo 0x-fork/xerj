@@ -221,7 +221,7 @@ fn resolve_auth(
     if !xerj_common::localauth::url_is_loopback(base_url) {
         return (None, None);
     }
-    match xerj_common::localauth::discover_local_admin_key() {
+    match xerj_common::localauth::discover_local_admin_key_for_url(base_url) {
         // `XERJ_AUTH` is a complete header value ("ApiKey <token>"), so the
         // discovered bare key is formatted to the same documented shape.
         Some((key, path)) => (Some(format!("ApiKey {key}")), Some(path)),

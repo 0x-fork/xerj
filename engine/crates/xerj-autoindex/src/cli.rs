@@ -11,7 +11,7 @@ use std::time::Duration;
 // are pinned by the `local admin-key discovery` tests at the bottom of this
 // file: they stayed here when the helpers moved to `xerj-common`, so they
 // are the shared helpers' tests wherever the helpers live.
-use xerj_common::localauth::{discover_local_admin_key, url_is_loopback};
+use xerj_common::localauth::{discover_local_admin_key_for_url, url_is_loopback};
 
 /// Largest `--max-minutes` accepted: one week. Past that the flag is a typo,
 /// and `--max-minutes 0` already exists to mean "never ask".
@@ -1306,7 +1306,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     // we are talking to a server on this machine, and sending it anywhere else
     // would leak a credential to a host it does not belong to.
     if api_key.is_none() && url_is_loopback(&url) {
-        if let Some((key, path)) = discover_local_admin_key() {
+        if let Some((key, path)) = discover_local_admin_key_for_url(&url) {
             // Announced, never silent: a blind onboarding run found this
             // fallback made success depend on the working directory, because
             // `./data/admin.key` is resolved relative to cwd. Saying which
@@ -2722,6 +2722,8 @@ mod tests {
 
     // ─── local admin-key discovery ──────────────────────────────────────
 
+    use xerj_common::localauth::{discover_local_admin_key, discover_local_admin_key_for_url};
+
     /// `url_is_loopback` decides whether a credential read off this machine's
     /// disk is put on the wire, so a false positive is a credential leak, not
     /// a cosmetic bug. The negatives below are the shapes an attacker would
@@ -2869,32 +2871,46 @@ mod tests {
     #[test]
     fn discovery_walks_the_candidates_in_order_and_trims_the_key() {
         let sandbox = Sandbox::new();
-        assert_eq!(super::discover_local_admin_key(), None, "nothing to find");
+        assert_eq!(discover_local_admin_key(), None, "nothing to find");
 
         // Weakest candidate first, then override it one rung at a time.
         sandbox.write("home/.xerj/admin.key", "home-key\n");
         assert_eq!(
-            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
             Some("home-key")
+        );
+
+        sandbox.write("home/xerj-data/admin.key", "llms-home-key\n");
+        assert_eq!(
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("llms-home-key"),
+            "~/xerj-data is the data dir llms.txt tells an agent to start"
         );
 
         sandbox.write("home/.xerj/brain/admin.key", "  brain-key \t\r\n");
         assert_eq!(
-            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
             Some("brain-key"),
             "the brain data dir outranks the bare ~/.xerj key, and is trimmed"
         );
 
         sandbox.write("xerj-data/admin.key", "xerj-data-key\n");
         assert_eq!(
-            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
             Some("xerj-data-key"),
             "a data dir in the working directory outranks anything in $HOME"
         );
 
+        sandbox.write(".xerj-data/admin.key", "dot-data-key\n");
+        assert_eq!(
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("dot-data-key"),
+            "./.xerj-data is the directory the search/def start hint names"
+        );
+
         sandbox.write("data/admin.key", "\ndata-key\n");
         assert_eq!(
-            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
             Some("data-key"),
             "./data is the quickstart's own path and wins outright"
         );
@@ -2909,17 +2925,59 @@ mod tests {
         sandbox.write("data/admin.key", "   \n\t\n");
         sandbox.write("xerj-data/admin.key", "");
         assert_eq!(
-            super::discover_local_admin_key(),
+            discover_local_admin_key(),
             None,
             "whitespace-only and zero-byte files are not credentials"
         );
 
         sandbox.write("home/.xerj/admin.key", "real-key\n");
         assert_eq!(
-            super::discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
             Some("real-key"),
             "an empty candidate must be skipped over, not stop the search"
         );
+    }
+
+    /// The server writes `~/.xerj/by-port/<port>` with the path of that
+    /// listener's admin.key. That pointer outranks a leftover `./data` key,
+    /// and a different port does not read it.
+    #[test]
+    fn a_port_pointer_names_the_key_for_that_listener() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "cwd-key\n");
+        sandbox.write("elsewhere/admin.key", "port-key\n");
+        let abs = sandbox.dir.path().join("elsewhere/admin.key");
+        xerj_common::localauth::publish_admin_key_for_port(9200, &abs).unwrap();
+        let (key, _) = discover_local_admin_key_for_url("http://localhost:9200").unwrap();
+        assert_eq!(key, "port-key");
+        let (key, _) = discover_local_admin_key_for_url("http://127.0.0.1:9201").unwrap();
+        assert_eq!(
+            key, "cwd-key",
+            "another port must not reuse the 9200 pointer"
+        );
+        assert_eq!(
+            discover_local_admin_key().map(|(k, _)| k).as_deref(),
+            Some("cwd-key"),
+            "discovery without a URL does not guess a port"
+        );
+        assert_eq!(
+            xerj_common::localauth::xerj_url_port("localhost:9207"),
+            9207
+        );
+        assert_eq!(
+            xerj_common::localauth::xerj_url_port("http://localhost"),
+            9200
+        );
+    }
+
+    #[test]
+    fn an_auth_rejection_is_not_reported_as_an_unreachable_node() {
+        let auth = anyhow::anyhow!(
+            "the server at http://localhost:9200 requires authentication and no API key was supplied (HTTP 401)."
+        );
+        assert!(crate::esclient::Es::ping_failure_is_auth(&auth));
+        let down = anyhow::anyhow!("endpoint unreachable: http://localhost:9200");
+        assert!(!crate::esclient::Es::ping_failure_is_auth(&down));
     }
 
     /// The wiring: discovery only ever fires when the run has no credential of

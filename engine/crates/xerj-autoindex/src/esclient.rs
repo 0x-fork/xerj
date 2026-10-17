@@ -992,6 +992,13 @@ impl Es {
         r
     }
 
+    /// True when `ping` failed because the node answered 401/403. That is not
+    /// "no node reachable" — the node is up and the key is missing or wrong.
+    pub fn ping_failure_is_auth(err: &anyhow::Error) -> bool {
+        let text = format!("{err:#}");
+        text.contains("(HTTP 401)") || text.contains("(HTTP 403)")
+    }
+
     pub fn ping(&self) -> Result<Value> {
         let resp = self
             .req(reqwest::Method::GET, "/")
