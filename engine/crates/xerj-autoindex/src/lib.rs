@@ -9726,8 +9726,12 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
 pub struct CatalogSummary {
     /// The most recent `doc_kind: run` document, if any run has been recorded.
     pub run: Option<Value>,
-    /// Every `doc_kind: dataset` document, most records first — the same order
-    /// `run_map` renders them in.
+    /// Dataset documents for the sentence in [`CatalogSummary::one_line`].
+    ///
+    /// When the latest run carries a `run_id` and the catalog has dataset docs
+    /// stamped with that id, this is only those docs (most records first). A
+    /// catalog that predates `run_id` on dataset docs keeps the unscoped list,
+    /// because those docs cannot be told apart from this run.
     pub datasets: Vec<Value>,
 }
 
@@ -9737,26 +9741,39 @@ impl CatalogSummary {
     /// rather than a sentence that says "0 records"). Never fabricates: every
     /// number here comes straight from the catalog the server wrote.
     pub fn one_line(&self) -> Option<String> {
-        if self.datasets.is_empty() {
+        // The record total and the dataset count have to describe the same
+        // run. Pairing `records_total` from the newest run document with
+        // `datasets.len()` counted every `doc_kind: dataset` doc on the shared
+        // catalog (other prefixes, older runs), so a field report said the
+        // last run's records were spread across the whole node.
+        let scoped = self.datasets_for_latest_run();
+        if scoped.is_empty() && self.datasets.is_empty() {
             return None;
         }
         let get = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
-        // Prefer the run document's own total; fall back to summing datasets so
-        // a node whose run doc predates that field still reports a real count.
-        let records = self
+        let records_from_run = self
             .run
             .as_ref()
-            .and_then(|r| get(r, "records_total").as_u64())
-            .unwrap_or_else(|| {
-                self.datasets
+            .and_then(|r| get(r, "records_total").as_u64());
+        let (records, dataset_count) = if scoped.is_empty() {
+            // Dataset docs are present, but none belong to this run. Report
+            // the run document's own total and omit the dataset count. With
+            // no total, say nothing rather than summing the other runs.
+            let records = records_from_run?;
+            (records, None)
+        } else {
+            let records = records_from_run.unwrap_or_else(|| {
+                scoped
                     .iter()
                     .filter_map(|d| d.get("record_count").and_then(Value::as_u64))
                     .sum()
             });
-        let mut sentence = format!(
-            "{records} records across {} dataset(s)",
-            self.datasets.len()
-        );
+            (records, Some(scoped.len()))
+        };
+        let mut sentence = match dataset_count {
+            Some(n) => format!("{records} records across {n} dataset(s)"),
+            None => format!("{records} records"),
+        };
         if let Some(root) = self
             .run
             .as_ref()
@@ -9776,6 +9793,42 @@ impl CatalogSummary {
             sentence.push_str(&format!(" (autoindex run {run_id})"));
         }
         Some(sentence)
+    }
+
+    /// Dataset docs that belong to the latest run.
+    ///
+    /// A matching `run_id` wins. When no dataset doc carries that id, untagged
+    /// docs (catalogs written before dataset docs stored `run_id`) are kept,
+    /// and docs tagged with a *different* run are dropped so they cannot inflate
+    /// the count.
+    fn datasets_for_latest_run(&self) -> Vec<&Value> {
+        let run_id = self
+            .run
+            .as_ref()
+            .and_then(|r| r.get("run_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let Some(run_id) = run_id else {
+            return self.datasets.iter().collect();
+        };
+        let matched: Vec<&Value> = self
+            .datasets
+            .iter()
+            .filter(|d| d.get("run_id").and_then(Value::as_str) == Some(run_id))
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+        let any_other_run = self.datasets.iter().any(|d| {
+            d.get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        });
+        if any_other_run {
+            Vec::new()
+        } else {
+            self.datasets.iter().collect()
+        }
     }
 }
 
@@ -9804,11 +9857,6 @@ pub fn fetch_catalog_summary(url: &str, api_key: Option<String>) -> Result<Catal
             })
             .unwrap_or_default())
     };
-    let datasets = fetch(
-        json!({"term": {"doc_kind": "dataset"}}),
-        500,
-        Some(json!([{"record_count": "desc"}])),
-    )?;
     let mut runs = fetch(json!({"term": {"doc_kind": "run"}}), 50, None)?;
     runs.sort_by_key(|r| {
         std::cmp::Reverse(
@@ -9818,10 +9866,36 @@ pub fn fetch_catalog_summary(url: &str, api_key: Option<String>) -> Result<Catal
                 .to_string(),
         )
     });
-    Ok(CatalogSummary {
-        run: runs.into_iter().next(),
-        datasets,
-    })
+    let run = runs.into_iter().next();
+    let run_id = run
+        .as_ref()
+        .and_then(|r| r.get("run_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // Scope the dataset query to the latest run so a catalog with more than
+    // the fetch cap of older datasets cannot crowd this run's docs out of the
+    // page. An empty scoped page falls back to the unscoped list: catalogs
+    // written before dataset docs stored `run_id` have nothing to match, and
+    // [`CatalogSummary::one_line`] still refuses to count docs tagged with a
+    // different run.
+    let dataset_sort = Some(json!([{"record_count": "desc"}]));
+    let mut datasets = if let Some(id) = &run_id {
+        fetch(
+            json!({"bool": {"filter": [
+                {"term": {"doc_kind": "dataset"}},
+                {"term": {"run_id": id}},
+            ]}}),
+            500,
+            dataset_sort.clone(),
+        )?
+    } else {
+        Vec::new()
+    };
+    if datasets.is_empty() {
+        datasets = fetch(json!({"term": {"doc_kind": "dataset"}}), 500, dataset_sort)?;
+    }
+    Ok(CatalogSummary { run, datasets })
 }
 
 // ─── status subcommand ───────────────────────────────────────────────────
