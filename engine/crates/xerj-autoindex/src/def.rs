@@ -11,8 +11,13 @@
 //! agent act in one call instead of re-searching (~570 output tokens vs a
 //! whole-file dump).
 
+use std::collections::BTreeSet;
+
 use crate::esclient::Es;
-use crate::search::{hit_location, is_identifier, passage_text};
+use crate::search::{
+    field_mapped, hit_location, is_identifier, mapped_property_names, passage_text,
+    weighted_query_fields,
+};
 use serde_json::{json, Value};
 
 const USAGE: &str = "\
@@ -38,9 +43,51 @@ SEE ALSO:
     xerj search \"<plain words>\"    ranked passages when you don't know the name
 ";
 
+/// Historical `xerj def` multi_match weights. Order is part of the
+/// code-corpus query.
+const DEF_MM_FIELDS: &[(&str, &str)] = &[
+    ("name", "name^4"),
+    ("defs", "defs^3"),
+    ("code", "code^2"),
+    ("title", "title"),
+];
+
+/// Joined into the recall floor only when the target maps no `name` /
+/// `code` / `defs` (#1601). `body` is not in the code-shaped list above.
+const DEF_PROSE_EXTRA_FIELDS: &[&str] = &["body", "text", "impl", "message"];
+
 /// The `xerj def` query body: definition-first ranking over the per-symbol
 /// docs, narrowed by the optional `--kind` / `--lang` filters.
-fn def_query(query: &str, kind: Option<&str>, lang: Option<&str>, k: usize) -> Value {
+///
+/// `mapped` is the union of property names under the prefix. `None` keeps
+/// the historical code-shaped clauses. A read mapping drops every lookup
+/// clause whose field no index maps, including `--kind` / `--lang` — those
+/// `term` filters 400 a strict index the same way `name` does (#1601).
+fn def_query(
+    query: &str,
+    kind: Option<&str>,
+    lang: Option<&str>,
+    k: usize,
+    mapped: Option<&BTreeSet<String>>,
+) -> Value {
+    let built = build_def_query(query, kind, lang, k, mapped);
+    let empty = built
+        .pointer("/query/bool/should")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    if empty {
+        return build_def_query(query, kind, lang, k, None);
+    }
+    built
+}
+
+fn build_def_query(
+    query: &str,
+    kind: Option<&str>,
+    lang: Option<&str>,
+    k: usize,
+    mapped: Option<&BTreeSet<String>>,
+) -> Value {
     // Definition-first ranking, measured at 94% correct-file-at-rank-1 on an
     // 80-task cross-file benchmark (vs 38% for body-text search):
     //   - `term name`: the whole query IS the identifier — keyword-exact on
@@ -49,26 +96,36 @@ fn def_query(query: &str, kind: Option<&str>, lang: Option<&str>, k: usize) -> V
     //     pre-#500 indexes that have no symbol docs, boost 8.
     //   - `multi_match`: recall floor so plain-words queries ("euler angles to
     //     rotation matrix") still surface the definer via `defs`/`code` text.
-    let mut should = vec![
-        json!({ "term": { "name": { "value": query, "boost": 12 } } }),
-        json!({ "match_phrase": { "defs": { "query": query, "boost": 8 } } }),
-        json!({ "multi_match": {
+    let mut should = Vec::new();
+    if field_mapped(mapped, "name") {
+        should.push(json!({ "term": { "name": { "value": query, "boost": 12 } } }));
+    }
+    if field_mapped(mapped, "defs") {
+        should.push(json!({ "match_phrase": { "defs": { "query": query, "boost": 8 } } }));
+    }
+    let fields = weighted_query_fields(DEF_MM_FIELDS, DEF_PROSE_EXTRA_FIELDS, mapped);
+    if !fields.is_empty() {
+        should.push(json!({ "multi_match": {
             "query": query,
-            "fields": ["name^4", "defs^3", "code^2", "title"],
+            "fields": fields,
             "type": "most_fields"
-        }}),
-    ];
-    if is_identifier(query) {
+        }}));
+    }
+    if is_identifier(query) && field_mapped(mapped, "code") {
         // `code` holds the declaration text; a phrase hit there ("def <name>(",
         // "class <name>:") is a definition even when `name` casing differs.
         should.push(json!({ "match_phrase": { "code": { "query": query, "boost": 4 } } }));
     }
     let mut filter = Vec::new();
     if let Some(kd) = kind {
-        filter.push(json!({ "term": { "kind": kd } }));
+        if field_mapped(mapped, "kind") {
+            filter.push(json!({ "term": { "kind": kd } }));
+        }
     }
     if let Some(lg) = lang {
-        filter.push(json!({ "term": { "language": lg } }));
+        if field_mapped(mapped, "language") {
+            filter.push(json!({ "term": { "language": lg } }));
+        }
     }
     json!({
         "size": k,
@@ -151,9 +208,20 @@ pub fn run_def_cli() -> i32 {
         return 2;
     }
 
-    let body = def_query(&query, kind.as_deref(), lang.as_deref(), k);
-
     let pattern = format!("{prefix}-*");
+    let mapped = es
+        .get_json(&format!("/{pattern}/_mapping"))
+        .ok()
+        .and_then(|body| mapped_property_names(&body));
+    if let Some(set) = mapped.as_ref().filter(|s| !s.is_empty()) {
+        if kind.is_some() && !set.contains("kind") {
+            eprintln!("xerj def: --kind ignored; no index under this prefix maps `kind`");
+        }
+        if lang.is_some() && !set.contains("language") {
+            eprintln!("xerj def: --lang ignored; no index under this prefix maps `language`");
+        }
+    }
+    let body = def_query(&query, kind.as_deref(), lang.as_deref(), k, mapped.as_ref());
     let resp = match es.search(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
@@ -233,12 +301,73 @@ mod tests {
             (Some("class"), Some("rust")),
             (None, None),
         ] {
-            let body = def_query("zzqq_nonexistent", kind, lang, 5);
+            let body = def_query("zzqq_nonexistent", kind, lang, 5, None);
             let b = &body["query"]["bool"];
             assert_eq!(b["minimum_should_match"], 1, "{body}");
             assert!(!b["should"].as_array().unwrap().is_empty());
             let filters = b["filter"].as_array().unwrap().len();
             assert_eq!(filters, kind.is_some() as usize + lang.is_some() as usize);
         }
+    }
+
+    fn names_of(fields: &[&str]) -> BTreeSet<String> {
+        let mut props = serde_json::Map::new();
+        for f in fields {
+            props.insert((*f).to_string(), json!({ "type": "text" }));
+        }
+        mapped_property_names(&json!({
+            "c-docs": { "mappings": { "properties": props } }
+        }))
+        .expect("mapping shape")
+    }
+
+    /// #1601: `xerj def` on a corpus with no symbol fields must not send
+    /// `term name`, `match_phrase defs`, or `match_phrase code`. An identifier
+    /// query is the case that used to add the `code` leg.
+    #[test]
+    fn prose_mapping_drops_unmapped_definition_legs() {
+        let prose = names_of(&["body", "title", "text", "impl"]);
+        let body = def_query(
+            "compressPayload",
+            Some("function"),
+            Some("markdown"),
+            5,
+            Some(&prose),
+        );
+        let should = body["query"]["bool"]["should"].as_array().unwrap();
+        assert_eq!(should.len(), 1, "{body}");
+        assert_eq!(
+            should[0]["multi_match"]["fields"],
+            json!(["title", "body", "text", "impl"])
+        );
+        assert!(
+            body["query"]["bool"]["filter"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "kind and language are unmapped, so their term filters must not 400 the query: {body}"
+        );
+        let rendered = body["query"].to_string();
+        assert!(!rendered.contains("\"defs\""), "{rendered}");
+        assert!(!rendered.contains("\"name\""), "{rendered}");
+        assert!(!rendered.contains("\"code\""), "{rendered}");
+        assert!(!rendered.contains("\"kind\""), "{rendered}");
+    }
+
+    /// The measured code-corpus query is unchanged when those fields are mapped.
+    #[test]
+    fn code_mapping_keeps_the_historical_def_query() {
+        let code = names_of(&[
+            "name", "defs", "code", "title", "body", "kind", "language", "text",
+        ]);
+        let query = "compressPayload";
+        assert_eq!(
+            def_query(query, Some("function"), Some("rust"), 5, Some(&code)),
+            def_query(query, Some("function"), Some("rust"), 5, None)
+        );
+        assert_eq!(
+            def_query(query, None, None, 5, Some(&BTreeSet::new())),
+            def_query(query, None, None, 5, None)
+        );
     }
 }
