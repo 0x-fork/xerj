@@ -13,6 +13,7 @@ cookies or identifiers are stored or read.
 - **Dashboard:** `/?key=$REFRESH_KEY` — Chart.js over the recorded data. Every route is key-gated (403 without the key); nothing is public.
 - **Raw data:** `/data.json?key=$REFRESH_KEY`.
 - **Manual snapshot:** `/refresh?key=$REFRESH_KEY`.
+- **GitHub-trending history:** `/trending-history?key=$REFRESH_KEY` lists the dated snapshots; add `&date=YYYY-MM-DD` for one day. Each daily snapshot also writes `trending/<date>.json` to R2.
 
 ## Deploy
 
