@@ -2695,10 +2695,39 @@ pub async fn get_settings_all(State(state): State<AppState>) -> impl IntoRespons
     get_settings(State(state), Path("_all".to_string())).await
 }
 
+/// ES `indices.get_mapping`: a concrete name that is not an index or an
+/// alias is `404 index_not_found_exception`. A wildcard (including one that
+/// matches nothing) is not this case — that stays the empty-target path,
+/// same split `_cat/indices` already documents.
+pub(crate) fn first_missing_concrete_name(
+    spec: &str,
+    known: impl Fn(&str) -> bool,
+) -> Option<&str> {
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "_all" || part == "*" || part.contains('*') {
+            continue;
+        }
+        if !known(part) {
+            return Some(part);
+        }
+    }
+    None
+}
+
 pub async fn get_mapping(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
+    let names = state.engine.index_name_list();
+    let failed = state.engine.list_failed_indices();
+    if let Some(missing) = first_missing_concrete_name(&index, |part| {
+        names.iter().any(|n| n == part)
+            || failed.iter().any(|f| f.name == part)
+            || state.engine.aliases.contains_key(part)
+    }) {
+        let e = xerj_common::XerjError::index_not_found(missing);
+        return ApiError::new(e).into_response();
+    }
     let targets = resolve_index_selector(&state, &index).await;
     if targets.is_empty() {
         let e = xerj_common::XerjError::index_not_found(&index);
@@ -2816,6 +2845,101 @@ fn inject_bbq_rescore_defaults(node: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod get_mapping_missing_index {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn a_concrete_missing_name_is_reported_and_a_wildcard_is_not() {
+        let known = |p: &str| p == "logs" || p == "metrics";
+        assert_eq!(first_missing_concrete_name("nope", known), Some("nope"));
+        assert_eq!(first_missing_concrete_name("logs", known), None);
+        assert_eq!(
+            first_missing_concrete_name("logs,nope", known),
+            Some("nope")
+        );
+        // A wildcard that matches nothing is not a concrete miss. The empty
+        // result stays on the existing path so the YAML suite's wildcard
+        // cases are unchanged.
+        assert_eq!(first_missing_concrete_name("nope*", known), None);
+        assert_eq!(first_missing_concrete_name("_all", known), None);
+        assert_eq!(first_missing_concrete_name("*", known), None);
+        assert_eq!(first_missing_concrete_name("logs*", known), None);
+    }
+
+    /// ES `indices.get_mapping`: `GET /nope/_mapping` is 404, not 200 `{}`.
+    /// A name that exists still returns its mapping. A wildcard is not this
+    /// check — `nope*` stays on the empty-target path.
+    #[tokio::test]
+    async fn get_mapping_404s_a_concrete_missing_name_and_returns_a_real_one() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        state.engine.create_index("logs", schema).unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        let missing = router
+            .clone()
+            .oneshot(Request::get("/nope/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "index_not_found_exception");
+        assert_eq!(json["error"]["reason"], "no such index [nope]");
+
+        let mixed = router
+            .clone()
+            .oneshot(
+                Request::get("/logs,nope/_mapping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed.status(), StatusCode::NOT_FOUND);
+
+        let found = router
+            .clone()
+            .oneshot(Request::get("/logs/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(found.status(), StatusCode::OK);
+        let bytes = to_bytes(found.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("logs").is_some(), "{json}");
+
+        // Wildcard miss is not rewritten by the concrete check. Empty targets
+        // already 404; this pins that the new branch did not turn it into 200.
+        let wild = router
+            .oneshot(Request::get("/nope*/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wild.status(), StatusCode::NOT_FOUND);
     }
 }
 
