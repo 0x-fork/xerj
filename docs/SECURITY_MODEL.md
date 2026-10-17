@@ -48,15 +48,15 @@ It does four things:
    `_mapping`, `_close`, `_alias`, `_forcemerge` and others, `authz.rs:441`)
    need manage, as does a request with no operation segment at all, because that
    creates or destroys the index. Everything else is treated as a write.
-3. Extracts the indices the request body names (`body_targets`, `authz.rs:730`)
+3. Extracts the indices the request body names (`body_targets`, `authz.rs:786`)
    and authorizes each one. The shapes it parses are enumerated in `BodyShape`
-   (`authz.rs:578`): `_bulk` action lines, `_msearch` header lines, `_mget`
+   (`authz.rs:634`): `_bulk` action lines, `_msearch` header lines, `_mget`
    `docs[]._index`, `_aliases` actions, `_reindex` `source`/`dest`, snapshot
    `indices`, `PUT /{index}` `aliases`, index-template `index_patterns`, ML job
    and datafeed configs, the native `POST /v1/indices` body, and a `terms`
    lookup or `lookup` runtime field at any depth inside a search body. Aliases
    are resolved to their backing indices before the decision
-   (`authorize_expression`, `authz.rs:1168`).
+   (`authorize_expression`, `authz.rs:1224`).
 4. Installs the principal as the engine's visibility rule for the rest of the
    request and prunes reserved index names out of metadata responses
    (`prune_response`, `authz.rs:1431`).
