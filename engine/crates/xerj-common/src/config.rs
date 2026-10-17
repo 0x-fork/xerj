@@ -1583,8 +1583,9 @@ impl LogsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// Backend selector: `"auto"` (default), `"lexical"`, `"neural"`, or
-    /// `"proxy"`. Unknown values are treated as `"auto"`.
+    /// Backend selector: `"auto"` (default), `"lexical"`, `"neural"`,
+    /// `"proxy"`, or `"onnx-experimental"`. Unknown values are treated as
+    /// `"auto"`.
     pub mode: String,
     /// OpenAI-compatible endpoint URL (default: `""` — disabled).
     pub default_endpoint: String,
