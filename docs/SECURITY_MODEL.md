@@ -73,7 +73,7 @@ returned before any existence check, so `403` versus `404` cannot be used to
 enumerate what exists.
 
 A body that should have named its targets but cannot be parsed is refused, not
-ignored (`unresolvable`, `authz.rs:709`).
+ignored (`unresolvable`, `authz.rs:765`).
 
 ### Layer 2: the index_guard visibility funnel
 
