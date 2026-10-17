@@ -1299,8 +1299,17 @@ fn resolve_action(action: &str, params: &serde_yaml::Mapping) -> (String, String
             ("GET".into(), path, None)
         }
         "cluster.state" => ("GET".into(), "/_cluster/state".into(), None),
-        "cluster.get_settings" => ("GET".into(), "/_cluster/settings".into(), None),
-        "cluster.put_settings" => ("PUT".into(), "/_cluster/settings".into(), body),
+        "cluster.get_settings" | "cluster.put_settings" => {
+            let path = match get_param_str(params, "flat_settings") {
+                Some(v) => format!("/_cluster/settings?flat_settings={}", v),
+                None => "/_cluster/settings".to_string(),
+            };
+            if action == "cluster.get_settings" {
+                ("GET".into(), path, None)
+            } else {
+                ("PUT".into(), path, body)
+            }
+        }
 
         // Cat
         "cat.indices" => ("GET".into(), "/_cat/indices".into(), None),

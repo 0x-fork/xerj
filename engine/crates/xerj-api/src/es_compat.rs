@@ -33268,13 +33268,15 @@ pub async fn restore_snapshot(
 // GET  /_cluster/pending_tasks
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn get_cluster_settings(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_cluster_settings(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let settings = state.engine.cluster_settings.read().await;
-    let persistent = settings.get("persistent").cloned().unwrap_or(json!({}));
-    let transient = settings.get("transient").cloned().unwrap_or(json!({}));
+    let flat = flat_settings_param(&params);
     Json(json!({
-        "persistent": persistent,
-        "transient": transient,
+        "persistent": render_settings(settings.get("persistent"), flat),
+        "transient": render_settings(settings.get("transient"), flat),
         "defaults": {},
     }))
     .into_response()
@@ -33282,23 +33284,79 @@ pub async fn get_cluster_settings(State(state): State<AppState>) -> impl IntoRes
 
 pub async fn put_cluster_settings(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let mut settings = state.engine.cluster_settings.write().await;
-    if let Some(persistent) = body.get("persistent") {
-        settings["persistent"] = persistent.clone();
+    // ES merges an update into the stored settings, keyed by the flat dotted
+    // name whichever form the request used, and `null` removes a setting.
+    // The response lists only the settings this request set.
+    let mut updated = json!({ "persistent": {}, "transient": {} });
+    for scope in ["persistent", "transient"] {
+        let Some(update) = body.get(scope) else {
+            continue;
+        };
+        let mut flat = serde_json::Map::new();
+        flatten_settings("", update, &mut flat);
+        if !settings[scope].is_object() {
+            settings[scope] = json!({});
+        }
+        if let Some(stored) = settings[scope].as_object_mut() {
+            for (key, value) in flat {
+                if value.is_null() {
+                    stored.remove(&key);
+                } else {
+                    updated[scope][key.as_str()] = value.clone();
+                    stored.insert(key, value);
+                }
+            }
+        }
     }
-    if let Some(transient) = body.get("transient") {
-        settings["transient"] = transient.clone();
-    }
-    let persistent = settings.get("persistent").cloned().unwrap_or(json!({}));
-    let transient = settings.get("transient").cloned().unwrap_or(json!({}));
+    let flat = flat_settings_param(&params);
     Json(json!({
         "acknowledged": true,
-        "persistent": persistent,
-        "transient": transient,
+        "persistent": render_settings(updated.get("persistent"), flat),
+        "transient": render_settings(updated.get("transient"), flat),
     }))
     .into_response()
+}
+
+/// `?flat_settings` / `?flat_settings=true`; ES defaults to the nested form.
+fn flat_settings_param(params: &std::collections::HashMap<String, String>) -> bool {
+    matches!(
+        params.get("flat_settings").map(String::as_str),
+        Some("" | "true")
+    )
+}
+
+/// Settings are stored under flat dotted keys; render them nested unless the
+/// caller asked for `flat_settings`.
+fn render_settings(stored: Option<&Value>, flat: bool) -> Value {
+    let stored = stored.cloned().unwrap_or(json!({}));
+    if flat {
+        stored
+    } else {
+        expand_dotted_keys(stored)
+    }
+}
+
+/// Flattens `{"a": {"b": 1}}` into `{"a.b": 1}`.
+fn flatten_settings(prefix: &str, value: &Value, out: &mut serde_json::Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let key = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_settings(&key, child, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string(), value.clone());
+        }
+    }
 }
 
 pub async fn cluster_reroute(
