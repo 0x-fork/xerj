@@ -128,6 +128,10 @@ pub struct ResourceGovernor {
     /// lets an operator clear/relax the block without a restart, matching
     /// ES's `PUT _cluster/settings` recovery flow.
     disk_flood_pct: AtomicU8,
+    /// `false` while the `cluster.routing.allocation.disk.threshold_enabled`
+    /// cluster setting is `false`: the flood stage never engages, and an
+    /// engaged block is released on the next sample, as in ES.
+    disk_threshold_enabled: AtomicBool,
     /// Latched: the data-dir filesystem is at/over the flood-stage watermark.
     disk_blocked: AtomicBool,
     /// Last sampled used-percentage of the data-dir filesystem.
@@ -247,6 +251,13 @@ impl ResourceGovernor {
         }
         let effective = override_pct.unwrap_or(self.disk_flood_pct_default).min(100);
         self.disk_flood_pct.store(effective, Ordering::Relaxed);
+    }
+
+    /// Applies the `cluster.routing.allocation.disk.threshold_enabled` cluster
+    /// setting (`None` = unset = enabled).
+    pub fn set_disk_threshold_enabled(&self, enabled: Option<bool>) {
+        self.disk_threshold_enabled
+            .store(enabled.unwrap_or(true), Ordering::Relaxed);
     }
 
     /// Applies (or clears) a runtime override of the parent RSS watermark, read
@@ -428,7 +439,10 @@ impl ResourceGovernor {
             self.disk_used_pct.store(disk_used_pct, Ordering::Relaxed);
             let cur = self.disk_blocked.load(Ordering::Relaxed);
             let release_pct = (flood_pct as u64).saturating_sub(1);
-            let next = if cur {
+            let enabled = self.disk_threshold_enabled.load(Ordering::Relaxed);
+            let next = if !enabled {
+                false
+            } else if cur {
                 disk_used_pct >= release_pct
             } else {
                 disk_used_pct >= flood_pct as u64
@@ -440,6 +454,11 @@ impl ResourceGovernor {
                         flood_pct = flood_pct,
                         free = %human_bytes(disk_avail_bytes),
                         "disk flood-stage watermark crossed — engaging read_only_allow_delete write block"
+                    );
+                } else if !enabled {
+                    tracing::info!(
+                        used_pct = disk_used_pct,
+                        "disk threshold disabled by cluster setting — releasing write block"
                     );
                 } else {
                     tracing::info!(
@@ -968,6 +987,7 @@ fn build(config: &Config) -> ResourceGovernor {
         max_concurrent_bulks,
         disk_flood_pct_default: limits.disk_flood_stage_percent.min(100),
         disk_flood_pct: AtomicU8::new(limits.disk_flood_stage_percent.min(100)),
+        disk_threshold_enabled: AtomicBool::new(true),
         disk_blocked: AtomicBool::new(false),
         disk_used_pct: AtomicU64::new(0),
     }
@@ -1212,6 +1232,16 @@ pub fn parse_flood_stage_pct(v: &Value) -> Option<u8> {
         _ => return None,
     };
     Some(pct.min(100) as u8)
+}
+
+/// Parses a boolean cluster setting: a JSON bool or the string `"true"` /
+/// `"false"` (what `PUT _cluster/settings` stores for either form).
+pub fn parse_setting_bool(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// Parses the parent memory-breaker watermark override from an
@@ -1882,6 +1912,28 @@ mod tests {
     }
 
     #[test]
+    fn disk_threshold_disabled_releases_and_suppresses_block() {
+        let mut cfg = Config::default();
+        cfg.limits.disk_flood_stage_percent = 95;
+        let g = build(&cfg);
+        g.refresh(0, 0, 97);
+        assert!(g.check_disk_block("i").is_err());
+
+        // `threshold_enabled: false` releases an engaged block on the next
+        // sample and keeps it off however full the disk gets.
+        g.set_disk_threshold_enabled(Some(false));
+        g.refresh(0, 0, 97);
+        assert!(g.check_disk_block("i").is_ok());
+        g.refresh(0, 0, 100);
+        assert!(g.check_disk_block("i").is_ok());
+
+        // Unsetting it (`None`) turns the watermark back on.
+        g.set_disk_threshold_enabled(None);
+        g.refresh(0, 0, 97);
+        assert!(g.check_disk_block("i").is_err());
+    }
+
+    #[test]
     fn disk_flood_pct_override_is_noop_when_disabled_at_startup() {
         let mut cfg = Config::default();
         cfg.limits.disk_flood_stage_percent = 0; // feature off
@@ -1901,6 +1953,15 @@ mod tests {
         // ES's byte-size form isn't supported — no silent misinterpretation.
         assert_eq!(parse_flood_stage_pct(&Value::from("500mb")), None);
         assert_eq!(parse_flood_stage_pct(&Value::Null), None);
+    }
+
+    #[test]
+    fn parse_setting_bool_accepts_es_shapes() {
+        assert_eq!(parse_setting_bool(&Value::from(false)), Some(false));
+        assert_eq!(parse_setting_bool(&Value::from("false")), Some(false));
+        assert_eq!(parse_setting_bool(&Value::from("true")), Some(true));
+        assert_eq!(parse_setting_bool(&Value::from("no")), None);
+        assert_eq!(parse_setting_bool(&Value::Null), None);
     }
 
     /// The `indices.breaker.total.limit` override parser (#1250) must accept

@@ -3987,6 +3987,7 @@ impl Engine {
         let cluster_settings = self.cluster_settings.clone();
         const FLOOD_STAGE_SETTING: &str = "cluster.routing.allocation.disk.watermark.flood_stage";
         const BREAKER_LIMIT_SETTING: &str = "indices.breaker.total.limit";
+        const DISK_THRESHOLD_SETTING: &str = "cluster.routing.allocation.disk.threshold_enabled";
         // Snapshot the uncapped machine memory once: a percentage override is
         // resolved against it, and it is the hard clamp for an absolute one.
         let machine_memory_bytes = crate::governor::effective_memory_limit_bytes();
@@ -4053,6 +4054,19 @@ impl Engine {
                             })
                             .and_then(crate::governor::parse_flood_stage_pct);
                         governor.set_disk_flood_pct_override(flood_override);
+
+                        // `threshold_enabled: false` turns the flood stage
+                        // off and releases an engaged block, as in ES.
+                        let threshold_enabled = settings
+                            .get("persistent")
+                            .and_then(|p| p.get(DISK_THRESHOLD_SETTING))
+                            .or_else(|| {
+                                settings
+                                    .get("transient")
+                                    .and_then(|t| t.get(DISK_THRESHOLD_SETTING))
+                            })
+                            .and_then(crate::governor::parse_setting_bool);
+                        governor.set_disk_threshold_enabled(threshold_enabled);
 
                         // Runtime parent-memory-breaker watermark override
                         // (#1250): raise the watermark on a big box live via
