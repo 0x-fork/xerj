@@ -242,6 +242,18 @@ pub fn run_code_query(
     let pattern = format!("{prefix}*");
     let mapping = http.get_mapping(&format!("/{pattern}/_mapping")).ok();
     let mut fields = fields::resolve_fields(mapping.as_ref());
+    if fields.is_empty() {
+        // resolve_fields returns empty only when every candidate, including
+        // `body`, is numeric on some index. Sending the historical floor
+        // would be the #1284 rejection.
+        return CodeOutcome::refused(
+            format!(
+                "no text field under '{pattern}' can take this query — a mapped \
+                 field is numeric, and a text query against it is rejected"
+            ),
+            2,
+        );
+    }
     // #1254: a corpus may DECLARE the weight of its `text` recall leg. The
     // 0.5 default is the #1238 calibration, measured on the live exploit
     // group where `text` carries sibling-CVE mirror demos that must not
