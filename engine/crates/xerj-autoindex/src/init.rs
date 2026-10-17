@@ -46,7 +46,9 @@ OPTIONS:
     -h, --help      this help
 
 After init: restart the agent session so it picks up the new tools, then
-`xerj autoindex <folder>` anything you want searchable. Public libraries,
+`xerj autoindex <folder> --prefix <name>` anything you want searchable.
+Pass that same `--prefix <name>` to `xerj search` and `xerj def`; without it
+they search the default `ax` prefix. Public libraries,
 standards and advisories need no indexing: `xerj \"<question>\"` asks the hub.
 init also prints the MCP registration line for each client.
 
@@ -105,7 +107,8 @@ Pick the source before you search:
 - **HUB**: public material you cannot quote exactly. A library's source at a pinned commit, a
   standard, a regulation, an advisory feed.
 - **LOCAL**: files only this machine has. This project, private documents, exports.
-  `xerj autoindex <folder>` once, then `xerj search "<words>"` or `xerj def "<symbol>"`.
+  `xerj autoindex <folder> --prefix <name>` once, then pass that `--prefix <name>` to
+  `xerj search` and `xerj def`. Without `--prefix` they search the default `ax` prefix.
 - **NEITHER**: a fact you can already state exactly. Retrieval on memorised content only adds cost.
 
 ## Ask the hub
@@ -243,7 +246,9 @@ fn closing_message(bin: &str, url: &str, hub: bool) -> String {
     };
     format!(
         "\ndone. Restart the agent session to pick up the tools, then\n\
-         `xerj autoindex <folder>` anything you want searchable.\n\n\
+         `xerj autoindex <folder> --prefix <name>` anything you want searchable.\n\
+         Pass that same `--prefix <name>` to `xerj search` and `xerj def`\n\
+         (without it they search the default `ax` prefix).\n\n\
          {hub_line}{}",
         mcp_registration(bin, url)
     )
@@ -261,7 +266,7 @@ fn self_bin() -> String {
 /// `skill_md()` or `HUB_SKILL_MD` changes, so a file an older init wrote (and
 /// the user never edited) is upgraded on the next run. A unit test pins the
 /// texts' hashes to this number, so a text change without a bump fails CI.
-const INIT_FILES_VERSION: u32 = 2;
+const INIT_FILES_VERSION: u32 = 3;
 
 /// The marker's prefix. The full line is
 /// `<!-- xerj-init-version: <N> sha256:<16 hex> -->`: the generation, and the
@@ -933,7 +938,8 @@ mod tests {
         let closing = closing_message("/usr/local/bin/xerj", DEFAULT_URL, true);
         assert!(closing.contains(&printed));
         assert!(closing.contains(r#"xerj "<question>""#));
-        assert!(closing.contains("xerj autoindex <folder>"));
+        assert!(closing.contains("xerj autoindex <folder> --prefix <name>"));
+        assert!(closing.contains("default `ax` prefix"));
     }
 
     /// The printed Claude Code line is pasteable in any shell: it carries the
@@ -1017,6 +1023,11 @@ mod tests {
         ] {
             assert!(USAGE.contains(file), "--help does not list {file}");
         }
+        assert!(
+            USAGE.contains("xerj autoindex <folder> --prefix <name>"),
+            "{USAGE}"
+        );
+        assert!(USAGE.contains("default `ax` prefix"), "{USAGE}");
     }
 
     // ── the version marker: upgrade only what init wrote and nobody edited ──
@@ -1140,6 +1151,23 @@ mod tests {
         );
     }
 
+    /// The hub skill's LOCAL bullet used to teach a bare `xerj autoindex` and
+    /// a bare `xerj search` / `xerj def`, the same omission as the project
+    /// skill (#1580). An agent that followed it searched the default `ax`
+    /// prefix.
+    #[test]
+    fn hub_skill_shows_prefix_on_index_and_query() {
+        assert!(
+            HUB_SKILL_MD.contains("xerj autoindex <folder> --prefix <name>"),
+            "{HUB_SKILL_MD}"
+        );
+        assert!(HUB_SKILL_MD.contains("`--prefix <name>`"), "{HUB_SKILL_MD}");
+        assert!(
+            HUB_SKILL_MD.contains("default `ax` prefix"),
+            "{HUB_SKILL_MD}"
+        );
+    }
+
     /// The skill used to teach `xerj search` / `xerj def` with no `--prefix`,
     /// so an agent on a node whose repos sit under their own prefixes searched
     /// the default `ax-*` and found nothing (#1580).
@@ -1165,7 +1193,7 @@ mod tests {
                 content_hash(&skill_md()).as_str(),
                 content_hash(HUB_SKILL_MD).as_str()
             ),
-            (2, "c59537bc1064a30f", "c2ee5047ba667c35"),
+            (3, "c59537bc1064a30f", "6040c97600edc004"),
             "a teaching text changed: bump INIT_FILES_VERSION and re-pin"
         );
     }
@@ -1280,7 +1308,11 @@ mod tests {
         );
         let closing = closing_message("/usr/local/bin/xerj", DEFAULT_URL, false);
         assert!(!closing.contains(r#"xerj "<question>""#), "{closing}");
-        assert!(closing.contains("xerj autoindex <folder>"), "{closing}");
+        assert!(
+            closing.contains("xerj autoindex <folder> --prefix <name>"),
+            "{closing}"
+        );
+        assert!(closing.contains("default `ax` prefix"), "{closing}");
     }
 
     /// A non-loopback URL never triggers discovery, even with a local key
