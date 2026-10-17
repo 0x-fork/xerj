@@ -15,7 +15,28 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "\
+/// `--help` for `xerj init`. `hub` is this build's [`xerj_common::hub::hub_key_configured`]:
+/// a build with no signing key does not write the hub teaching files and must
+/// not tell the reader that `xerj "<question>"` asks the hub (that command
+/// exits 5 there).
+fn usage(hub: bool) -> String {
+    let hub_skill = if hub {
+        "    .claude/skills/xerj-hub/SKILL.md\n                                 teach `xerj \"<question>\"`: when to ask the\n                                 hub, `--def`, the MCP registration per client\n"
+    } else {
+        ""
+    };
+    let hub_rule = if hub {
+        "    .cursor/rules/xerj-hub.mdc   the hub teaching file for Cursor (if .cursor/)\n"
+    } else {
+        ""
+    };
+    let hub_next = if hub {
+        "Public libraries,\nstandards and advisories need no indexing: `xerj \"<question>\"` asks the hub.\n"
+    } else {
+        "This build has no hub signing key, so `xerj \"<question>\"` is not available\n(it exits 5). For public libraries, use `xerj corpus` and `xerj code`.\n"
+    };
+    format!(
+        "\
 xerj init — wire XERJ into the coding agents installed in this project
 
 USAGE:
@@ -27,12 +48,8 @@ config for each — with a .bak backup for any file it edits:
     .mcp.json                    register the `xerj mcp` server (Claude Code
                                  project scope; merged, other servers kept)
     .claude/skills/xerj/SKILL.md teach `xerj search` / `xerj def` (10 lines)
-    .claude/skills/xerj-hub/SKILL.md
-                                 teach `xerj \"<question>\"`: when to ask the
-                                 hub, `--def`, the MCP registration per client
-    .cursor/rules/xerj.mdc       same teaching file for Cursor (if .cursor/)
-    .cursor/rules/xerj-hub.mdc   the hub teaching file for Cursor (if .cursor/)
-    AGENTS.md                    a short XERJ section (appended if the file
+{hub_skill}    .cursor/rules/xerj.mdc       same teaching file for Cursor (if .cursor/)
+{hub_rule}    AGENTS.md                    a short XERJ section (appended if the file
                                  exists, created otherwise)
 
 The teaching files carry an `xerj-init-version` marker. A re-run upgrades one
@@ -48,15 +65,15 @@ OPTIONS:
 After init: restart the agent session so it picks up the new tools, then
 `xerj autoindex <folder> --prefix <name>` anything you want searchable.
 Pass that same `--prefix <name>` to `xerj search` and `xerj def`; without it
-they search the default `ax` prefix. Public libraries,
-standards and advisories need no indexing: `xerj \"<question>\"` asks the hub.
-init also prints the MCP registration line for each client.
+they search the default `ax` prefix. {hub_next}init also prints the MCP registration line for each client.
 
 Auth: nothing secret is written (`.mcp.json` is meant to be committed). For a
 loopback node the MCP server reads <data-dir>/admin.key by itself and says so
 on stderr; for any other node add \"XERJ_AUTH\": \"ApiKey <key>\" to the env
 block — init prints which case you are in.
-";
+"
+    )
+}
 
 /// The ten-line teaching file. One idea per line, no filler: what the tools
 /// are, when to reach for them, what comes back.
@@ -448,13 +465,16 @@ pub fn run_init_cli() -> i32 {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage(xerj_common::hub::hub_key_configured()));
                 return 0;
             }
             "--url" => url = it.next().unwrap_or(url),
             "--dry-run" => dry = true,
             other => {
-                eprintln!("xerj init: unexpected argument '{other}'\n\n{USAGE}");
+                eprintln!(
+                    "xerj init: unexpected argument '{other}'\n\n{}",
+                    usage(xerj_common::hub::hub_key_configured())
+                );
                 return 2;
             }
         }
@@ -1010,9 +1030,12 @@ mod tests {
         assert!(printed.contains("xerj_search"));
     }
 
-    /// `--help` lists every file init can write, the hub pair included.
+    /// `--help` lists every file init can write. The hub pair is listed only
+    /// when this build can verify hub packs; otherwise the help must not
+    /// teach `xerj "<question>"`, which exits 5.
     #[test]
     fn help_lists_every_file_init_writes() {
+        let with_hub = usage(true);
         for file in [
             ".mcp.json",
             ".claude/skills/xerj/SKILL.md",
@@ -1021,13 +1044,36 @@ mod tests {
             ".cursor/rules/xerj-hub.mdc",
             "AGENTS.md",
         ] {
-            assert!(USAGE.contains(file), "--help does not list {file}");
+            assert!(with_hub.contains(file), "--help does not list {file}");
         }
         assert!(
-            USAGE.contains("xerj autoindex <folder> --prefix <name>"),
-            "{USAGE}"
+            with_hub.contains("xerj autoindex <folder> --prefix <name>"),
+            "{with_hub}"
         );
-        assert!(USAGE.contains("default `ax` prefix"), "{USAGE}");
+        assert!(with_hub.contains("default `ax` prefix"), "{with_hub}");
+        assert!(with_hub.contains("asks the hub"), "{with_hub}");
+
+        let no_hub = usage(false);
+        for file in [
+            ".mcp.json",
+            ".claude/skills/xerj/SKILL.md",
+            ".cursor/rules/xerj.mdc",
+            "AGENTS.md",
+        ] {
+            assert!(no_hub.contains(file), "--help does not list {file}");
+        }
+        assert!(
+            !no_hub.contains("xerj-hub"),
+            "a no-key build must not list hub teaching files it will not write:\n{no_hub}"
+        );
+        assert!(
+            !no_hub.contains(r#"asks the hub"#),
+            "a no-key build must not say the hub answers:\n{no_hub}"
+        );
+        assert!(
+            no_hub.contains("exits 5") && no_hub.contains("xerj code"),
+            "{no_hub}"
+        );
     }
 
     // ── the version marker: upgrade only what init wrote and nobody edited ──

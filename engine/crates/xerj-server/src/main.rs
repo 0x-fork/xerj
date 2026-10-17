@@ -2296,11 +2296,23 @@ mod decide_flag_tests {
     fn help_counts_the_mcp_tools_actually_served() {
         // #1443: the help said "exposes 13 tools" while `tools/list` served 16.
         let served = super::mcp_tool_count();
-        assert!(served >= 16, "tool_specs() shrank to {served}");
+        if xerj_common::hub::hub_key_configured() {
+            assert!(served >= 16, "tool_specs() shrank to {served}");
+        } else {
+            assert_eq!(
+                served, 13,
+                "a no-key process must not count the hub tools it does not serve"
+            );
+        }
         let help = help_text(false);
         assert!(
             help.contains(&format!("exposes {served} tools")),
             "help must state the served tool count {served}, got:\n{help}"
+        );
+        let mcp_help = xerj_mcp::help_text(false);
+        assert!(
+            mcp_help.contains(&format!("proxies {served} tools")),
+            "xerj mcp --help must state the same count {served}, got:\n{mcp_help}"
         );
     }
 

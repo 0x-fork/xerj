@@ -118,21 +118,7 @@ USAGE:
     xerj mcp [OPTIONS]              (or the standalone binary: xerj-mcp [OPTIONS])
 
 Speaks MCP over stdio (newline-delimited JSON-RPC 2.0 on stdin/stdout) and
-proxies thirteen tools — xerj_search, xerj_semantic_search, xerj_vector_search,
-xerj_hybrid_search, xerj_memory_store, xerj_memory_recall, xerj_brain_ego,
-xerj_brain_link, xerj_brain_unlink, xerj_brain_overview, xerj_code_search,
-xerj_map, xerj_plan — to a
-XERJ node that
-is ALREADY RUNNING. This command does not start a node; start one first with
-`xerj --data-dir ./data`.
-
-It also serves three Corpus Hub tools — xerj_hub_find, xerj_hub_def,
-xerj_hub_ask — which run the `xerj ask` flow: answered from packs already on
-this machine (a tool call never downloads one; it names the `xerj hub pull`
-line instead), from the catalogue already cached (never fetched; with none
-cached they say to run `xerj hub sync`). Like `xerj ask`, they use the node above when it answers and
-otherwise the automatic hub node.
-
+@@TOOLS@@
 OPTIONS:
     --url <URL>     Base URL of the XERJ ES-compatible listener.
                     Overrides XERJ_URL. Default: http://localhost:9200
@@ -187,6 +173,57 @@ pub fn help_text(feedback: bool) -> String {
         "{first}\n{}USAGE:{rest}",
         xerj_common::feedback::block(feedback)
     )
+    .replace("@@TOOLS@@", &tools_paragraph(hub_tools_served()))
+}
+
+/// Whether this process serves the `xerj_hub_*` tools. A build with no hub
+/// signing key cannot verify a pack, so those tools are omitted from
+/// `tools/list` and from this help — advertising them only produced a call
+/// that exits with the no-key message.
+fn hub_tools_served() -> bool {
+    xerj_common::hub::hub_key_configured()
+}
+
+/// The tool sentence in `--help`. The count and the names are `tool_specs()`,
+/// the same list `tools/list` returns, so this screen cannot say "thirteen"
+/// while the root help says however many tools are actually served.
+fn tools_paragraph(include_hub: bool) -> String {
+    let specs = tool_specs_with(include_hub);
+    let names: Vec<&str> = specs
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let list = names.join(", ");
+    let mut para = format!(
+        "proxies {n} tools — {list} — to a\n\
+         XERJ node that\n\
+         is ALREADY RUNNING. This command does not start a node; start one first with\n\
+         `xerj --insecure --data-dir ~/xerj-data`.\n",
+        n = names.len(),
+    );
+    let hub: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with("xerj_hub_"))
+        .collect();
+    if !hub.is_empty() {
+        para.push_str(&format!(
+            "\nIt also serves {n} Corpus Hub tools — {list} — which run the `xerj ask` flow: \
+             answered from packs already on\n\
+             this machine (a tool call never downloads one; it names the `xerj hub pull`\n\
+             line instead), from the catalogue already cached (never fetched; with none\n\
+             cached they say to run `xerj hub sync`). Like `xerj ask`, they use the node above when it answers and\n\
+             otherwise the automatic hub node.\n",
+            n = hub.len(),
+            list = hub.join(", "),
+        ));
+    }
+    para
 }
 
 /// Resolve the `Authorization` header value every proxied request will carry.
@@ -630,9 +667,11 @@ fn max_tokens_arg_schema() -> Value {
     })
 }
 
-/// The sixteen tool specifications advertised via `tools/list` (the three
-/// `xerj_hub_*` specs come from `hub::specs`, appended last). Input schemas
-/// are plain JSON Schema; every property maps onto a field the engine accepts.
+/// The tool specifications advertised via `tools/list`. The three `xerj_hub_*`
+/// specs (`hub::specs`, appended last) are included only when this process
+/// has a hub signing key; without one they cannot answer and are not listed.
+/// Input schemas are plain JSON Schema; every property maps onto a field the
+/// engine accepts.
 ///
 /// Public because this is the single source of truth for the published
 /// agent-facing schema at `landing/docs/agents/schemas/mcp-tools.json`, which
@@ -640,6 +679,12 @@ fn max_tokens_arg_schema() -> Value {
 /// once advertised six tools while the binary served ten — nobody noticed,
 /// because nothing compared them.
 pub fn tool_specs() -> Value {
+    tool_specs_with(hub_tools_served())
+}
+
+/// [`tool_specs`] with the hub tools forced in or out. Tests use this so they
+/// do not have to mutate `XERJ_HUB_PUBKEY`, which is process-global.
+pub fn tool_specs_with(include_hub: bool) -> Value {
     let mut specs = json!([
         {
             "name": "xerj_search",
@@ -1104,8 +1149,10 @@ pub fn tool_specs() -> Value {
             }
         }
     ]);
-    if let Value::Array(tools) = &mut specs {
-        tools.extend(hub::specs());
+    if include_hub {
+        if let Value::Array(tools) = &mut specs {
+            tools.extend(hub::specs());
+        }
     }
     specs
 }
@@ -1164,10 +1211,16 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         "xerj_code_search" => return run_code_search(ctx, &args).await,
         // Corpus Hub v2 (plan §7): the `xerj ask` flow itself, not a proxy.
         hub_tool if hub_tool.starts_with("xerj_hub_") => {
+            // Hidden from tools/list when there is no key. A client that still
+            // calls one (a cached tool list) gets the same sentence `xerj ask`
+            // prints, not a catalogue fetch that cannot be verified.
+            if !hub_tools_served() {
+                return tool_text(xerj_common::hub::NO_HUB_KEY_MESSAGE.to_string(), true);
+            }
             return match hub::call(ctx, hub_tool, &args).await {
                 Some(result) => result,
                 None => tool_text(format!("unknown tool: {hub_tool}"), true),
-            }
+            };
         }
         other => return tool_text(format!("unknown tool: {other}"), true),
     };
@@ -2813,7 +2866,7 @@ mod tests {
 
     #[test]
     fn tools_list_has_all_sixteen() {
-        let specs = tool_specs();
+        let specs = tool_specs_with(true);
         let names: Vec<&str> = specs
             .as_array()
             .unwrap()
@@ -2853,6 +2906,41 @@ mod tests {
                 "must not expose {forbidden}"
             );
         }
+    }
+
+    /// A process with no hub signing key must not advertise tools that can
+    /// only answer with the no-key message. The count `--help` prints is that
+    /// same list, so the two cannot disagree.
+    #[test]
+    fn hub_tools_are_hidden_without_a_hub_key_and_help_counts_them() {
+        let names = |include_hub: bool| -> Vec<String> {
+            tool_specs_with(include_hub)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let without = names(false);
+        assert_eq!(without.len(), 13, "{without:?}");
+        assert!(
+            without.iter().all(|n| !n.starts_with("xerj_hub_")),
+            "{without:?}"
+        );
+        let with = names(true);
+        assert_eq!(with.len(), 16, "{with:?}");
+        for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
+            assert!(with.iter().any(|name| name == n), "missing {n}");
+        }
+
+        let help = tools_paragraph(false);
+        assert!(help.contains("proxies 13 tools"), "{help}");
+        assert!(!help.contains("xerj_hub_"), "{help}");
+        assert!(help.contains("~/xerj-data"), "{help}");
+        let help = tools_paragraph(true);
+        assert!(help.contains("proxies 16 tools"), "{help}");
+        assert!(help.contains("xerj_hub_ask"), "{help}");
+        assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }
 
     /// #1055: the field map is an orientation tool an agent calls before it
