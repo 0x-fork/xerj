@@ -102,8 +102,9 @@ impl ManagedSchema {
     ///
     /// Fails if:
     /// - A field with the same name already exists.
-    /// - The field type is incompatible with an existing field (checked via
-    ///   [`is_compatible_with`]).
+    /// - The field config is invalid (checked by [`validate_field_config`]:
+    ///   empty, padded or `_`-prefixed name, missing or zero vector
+    ///   `dimensions`, non-positive boost, an indexed `binary` field).
     pub fn add_field(&mut self, field: FieldConfig) -> Result<(), XerjError> {
         validate_field_config(&field)?;
         self.schema.add_field(field)
