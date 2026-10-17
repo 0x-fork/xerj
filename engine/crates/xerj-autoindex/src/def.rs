@@ -15,8 +15,8 @@ use std::collections::BTreeSet;
 
 use crate::esclient::Es;
 use crate::search::{
-    corpus_snapshot, empty_lookup_report, field_mapped, hit_location, is_identifier,
-    mapped_property_names, passage_text, weighted_query_fields,
+    corpus_snapshot, empty_lookup_report, field_lookup_ok, hit_location, is_identifier,
+    mapped_property_names, numeric_property_names, passage_text, weighted_query_fields,
 };
 use serde_json::{json, Value};
 
@@ -92,10 +92,17 @@ const DEMOTED_PATH_GLOBS: &[&str] = &[
     "*/bench/*",
 ];
 
+/// Fields `xerj def` may name. A numeric mapping of one of these on any
+/// index drops it from the wildcard (#1284), including `term` / `match_phrase`
+/// and the kind/`pub` ranking weights.
+const DEF_LOOKUP_FIELDS: &[&str] = &[
+    "name", "defs", "code", "title", "body", "text", "impl", "message", "kind", "language",
+];
+
 /// True only when a mapping was actually read and names `field`. `None` and
 /// an empty set stay on the historical query (`field_mapped` treats both as
 /// "assume the code fields"), so a new clause that is not in that historical
-/// shape must use this and not [`field_mapped`].
+/// shape must use this and not [`field_lookup_ok`].
 fn explicitly_mapped(mapped: Option<&BTreeSet<String>>, field: &str) -> bool {
     mapped.is_some_and(|set| set.contains(field))
 }
@@ -113,14 +120,20 @@ fn def_query(
     lang: Option<&str>,
     k: usize,
     mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
 ) -> Value {
-    let built = build_def_query(query, kind, lang, k, mapped);
+    let built = build_def_query(query, kind, lang, k, mapped, numeric);
     let empty = built
         .pointer("/query/bool/should")
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty);
-    if empty {
-        return build_def_query(query, kind, lang, k, None);
+    // A numeric field must stay dropped. Restoring the historical query
+    // would name it again. `minimum_should_match: 1` with an empty `should`
+    // matches nothing, which is the safe result.
+    let numeric_lookup =
+        numeric.is_some_and(|set| DEF_LOOKUP_FIELDS.iter().any(|name| set.contains(*name)));
+    if empty && !numeric_lookup {
+        return build_def_query(query, kind, lang, k, None, None);
     }
     built
 }
@@ -131,6 +144,7 @@ fn build_def_query(
     lang: Option<&str>,
     k: usize,
     mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
 ) -> Value {
     // Definition-first ranking, measured at 94% correct-file-at-rank-1 on an
     // 80-task cross-file benchmark (vs 38% for body-text search):
@@ -141,18 +155,21 @@ fn build_def_query(
     //   - `multi_match`: recall floor so plain-words queries ("euler angles to
     //     rotation matrix") still surface the definer via `defs`/`code` text.
     let mut should = Vec::new();
-    if field_mapped(mapped, "name") {
+    if field_lookup_ok(mapped, numeric, "name") {
         should.push(json!({ "term": { "name": { "value": query, "boost": 12 } } }));
     }
-    if field_mapped(mapped, "defs") {
+    if field_lookup_ok(mapped, numeric, "defs") {
         should.push(json!({ "match_phrase": { "defs": { "query": query, "boost": 8 } } }));
     }
-    let mut fields = weighted_query_fields(DEF_MM_FIELDS, DEF_PROSE_EXTRA_FIELDS, mapped);
+    let mut fields = weighted_query_fields(DEF_MM_FIELDS, DEF_PROSE_EXTRA_FIELDS, mapped, numeric);
     // A phrase ("flush the tree to disk") lives in the symbol body (`impl`),
-    // not in the declaration. Only when the read mapping actually has `impl`:
-    // the historical code query (mapped = None) does not name that field.
+    // not in the declaration. Only when the read mapping actually has `impl`
+    // and no index maps it as numeric: the historical code query
+    // (mapped = None) does not name that field, and a numeric `impl` would
+    // fail the wildcard the same way a numeric `name` does.
     if !is_identifier(query)
         && explicitly_mapped(mapped, "impl")
+        && !numeric.is_some_and(|set| set.contains("impl"))
         && !fields.iter().any(|f| f.split('^').next() == Some("impl"))
     {
         fields.push("impl^2".to_string());
@@ -164,19 +181,19 @@ fn build_def_query(
             "type": "most_fields"
         }}));
     }
-    if is_identifier(query) && field_mapped(mapped, "code") {
+    if is_identifier(query) && field_lookup_ok(mapped, numeric, "code") {
         // `code` holds the declaration text; a phrase hit there ("def <name>(",
         // "class <name>:") is a definition even when `name` casing differs.
         should.push(json!({ "match_phrase": { "code": { "query": query, "boost": 4 } } }));
     }
     let mut filter = Vec::new();
     if let Some(kd) = kind {
-        if field_mapped(mapped, "kind") {
+        if field_lookup_ok(mapped, numeric, "kind") {
             filter.push(json!({ "term": { "kind": kd } }));
         }
     }
     if let Some(lg) = lang {
-        if field_mapped(mapped, "language") {
+        if field_lookup_ok(mapped, numeric, "language") {
             filter.push(json!({ "term": { "language": lg } }));
         }
     }
@@ -193,7 +210,7 @@ fn build_def_query(
     // Kind and `pub` weights sit on function_score, not on a bare `should`:
     // a should clause would match every struct in the index. The negative
     // boosting clause only multiplies hits that already matched.
-    let query = rank_adjusted_query(bool_query, mapped);
+    let query = rank_adjusted_query(bool_query, mapped, numeric);
     json!({
         "size": k,
         "query": query,
@@ -202,13 +219,20 @@ fn build_def_query(
     })
 }
 
-fn rank_adjusted_query(bool_query: Value, mapped: Option<&BTreeSet<String>>) -> Value {
+fn rank_adjusted_query(
+    bool_query: Value,
+    mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
+) -> Value {
     // `function_score` (boost_mode sum) adds weight only to hits the bool
     // already matched. A `boosting` wrapper was tried first; this engine's
     // planner rewrites it to a bool and every hit came back with `_score`
     // 1.0, so the weights never moved the order.
     let mut functions = Vec::new();
-    if field_mapped(mapped, "kind") {
+    // A numeric `kind` or `code` cannot carry the ranking filter: the
+    // wildcard would fail on that index the same way a `term` on a numeric
+    // `name` does. Unreadable mappings (numeric = None) keep both weights.
+    if field_lookup_ok(mapped, numeric, "kind") {
         let mut kind_filter = json!({
             "bool": { "must": [ { "terms": { "kind": PREFERRED_KINDS } } ] }
         });
@@ -226,7 +250,7 @@ fn rank_adjusted_query(bool_query: Value, mapped: Option<&BTreeSet<String>>) -> 
         }
         functions.push(json!({ "filter": kind_filter, "weight": 20.0 }));
     }
-    if field_mapped(mapped, "code") {
+    if field_lookup_ok(mapped, numeric, "code") {
         functions.push(json!({
             "filter": { "bool": { "should": [
                 { "match": { "code": "pub" } },
@@ -329,10 +353,11 @@ pub fn run_def_cli() -> i32 {
     }
 
     let pattern = format!("{prefix}-*");
-    let mapped = es
-        .get_json(&format!("/{pattern}/_mapping"))
-        .ok()
-        .and_then(|body| mapped_property_names(&body));
+    let raw_mapping = es.get_json(&format!("/{pattern}/_mapping")).ok();
+    let mapped = raw_mapping.as_ref().and_then(mapped_property_names);
+    let numeric = mapped
+        .as_ref()
+        .and(raw_mapping.as_ref().map(numeric_property_names));
     if let Some(set) = mapped.as_ref().filter(|s| !s.is_empty()) {
         if kind.is_some() && !set.contains("kind") {
             eprintln!("xerj def: --kind ignored; no index under this prefix maps `kind`");
@@ -341,7 +366,14 @@ pub fn run_def_cli() -> i32 {
             eprintln!("xerj def: --lang ignored; no index under this prefix maps `language`");
         }
     }
-    let body = def_query(&query, kind.as_deref(), lang.as_deref(), k, mapped.as_ref());
+    let body = def_query(
+        &query,
+        kind.as_deref(),
+        lang.as_deref(),
+        k,
+        mapped.as_ref(),
+        numeric.as_ref(),
+    );
     let resp = match es.search(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
@@ -424,7 +456,7 @@ mod tests {
             (Some("class"), Some("rust")),
             (None, None),
         ] {
-            let body = def_query("zzqq_nonexistent", kind, lang, 5, None);
+            let body = def_query("zzqq_nonexistent", kind, lang, 5, None, None);
             // Kind/pub weights wrap the bool; the filter still has to sit on
             // that bool, not replace the name clauses.
             let b = body
@@ -461,6 +493,7 @@ mod tests {
             Some("markdown"),
             5,
             Some(&prose),
+            None,
         );
         let should = body["query"]["bool"]["should"].as_array().unwrap();
         assert_eq!(should.len(), 1, "{body}");
@@ -490,12 +523,12 @@ mod tests {
         ]);
         let query = "compressPayload";
         assert_eq!(
-            def_query(query, Some("function"), Some("rust"), 5, Some(&code)),
-            def_query(query, Some("function"), Some("rust"), 5, None)
+            def_query(query, Some("function"), Some("rust"), 5, Some(&code), None),
+            def_query(query, Some("function"), Some("rust"), 5, None, None)
         );
         assert_eq!(
-            def_query(query, None, None, 5, Some(&BTreeSet::new())),
-            def_query(query, None, None, 5, None)
+            def_query(query, None, None, 5, Some(&BTreeSet::new()), None),
+            def_query(query, None, None, 5, None, None)
         );
     }
 
@@ -504,7 +537,7 @@ mod tests {
     /// function_score filter, not a `should`, so it cannot match every struct.
     #[test]
     fn preferred_kinds_and_pub_are_weighted_and_aliases_are_demoted() {
-        let body = def_query("Db", None, None, 5, None);
+        let body = def_query("Db", None, None, 5, None, None);
         let rendered = body["query"].to_string();
         assert!(rendered.contains("function_score"), "{body}");
         assert!(
@@ -530,7 +563,7 @@ mod tests {
         );
         assert!(!rendered.contains("ax_path"), "{body}");
         let with_path = names_of(&["name", "defs", "code", "title", "kind", "ax_path"]);
-        let body = def_query("Db", None, None, 5, Some(&with_path));
+        let body = def_query("Db", None, None, 5, Some(&with_path), None);
         let rendered = body["query"].to_string();
         assert!(rendered.contains("*/tests/*"), "{body}");
         assert!(rendered.contains("*/examples/*"), "{body}");
@@ -544,7 +577,7 @@ mod tests {
     #[test]
     fn a_phrase_searches_impl_only_when_the_mapping_has_it() {
         let code = names_of(&["name", "defs", "code", "title", "impl", "kind"]);
-        let phrase = def_query("flush the tree to disk", None, None, 5, Some(&code));
+        let phrase = def_query("flush the tree to disk", None, None, 5, Some(&code), None);
         let fields = phrase["query"]["function_score"]["query"]["bool"]["should"]
             .as_array()
             .unwrap()
@@ -559,15 +592,81 @@ mod tests {
                 .any(|f| f.as_str() == Some("impl^2")),
             "{phrase}"
         );
-        let ident = def_query("flush", None, None, 5, Some(&code));
+        let ident = def_query("flush", None, None, 5, Some(&code), None);
         let rendered = ident.to_string();
         assert!(!rendered.contains("impl^2"), "{ident}");
         let no_impl = names_of(&["name", "defs", "code", "title", "kind"]);
-        let phrase = def_query("flush the tree to disk", None, None, 5, Some(&no_impl));
+        let phrase = def_query(
+            "flush the tree to disk",
+            None,
+            None,
+            5,
+            Some(&no_impl),
+            None,
+        );
         let fields = phrase.to_string();
         assert!(
             !fields.contains("impl^2"),
             "no impl field, so the body leg must stay out: {phrase}"
         );
+    }
+
+    /// #1284: `name` mapped `long` on any index must not be a `term` or a
+    /// `multi_match` leg, and `defs` mapped `double` must not be a phrase.
+    /// `keyword` is not numeric, so a keyword-only `name` stays.
+    #[test]
+    fn a_numeric_name_or_defs_field_is_not_looked_up() {
+        assert!(!numeric_property_names(&json!({
+            "only": { "mappings": { "properties": { "name": { "type": "keyword" } } } }
+        }))
+        .contains("name"));
+        let mapping = json!({
+            "symbols": { "mappings": { "properties": {
+                "name": { "type": "keyword" },
+                "defs": { "type": "text" },
+                "code": { "type": "text" },
+                "title": { "type": "text" },
+                "kind": { "type": "keyword" }
+            }}},
+            "metrics": { "mappings": { "properties": {
+                "name": { "type": "long" },
+                "defs": { "type": "double" },
+                "kind": { "type": "integer" }
+            }}}
+        });
+        let names = mapped_property_names(&mapping).unwrap();
+        let numeric = numeric_property_names(&mapping);
+        let body = def_query(
+            "compressPayload",
+            Some("function"),
+            None,
+            5,
+            Some(&names),
+            Some(&numeric),
+        );
+        let query = body["query"].to_string();
+        assert!(!query.contains("\"name\""), "{query}");
+        assert!(!query.contains("defs"), "{query}");
+        assert!(!query.contains("kind"), "{query}");
+        assert!(query.contains("code"), "{query}");
+        assert!(query.contains("title"), "{query}");
+        // `code` is still text, so the pub ranking weight wraps function_score.
+        // The numeric `kind` must not: that filter would name `kind`.
+        let should = body
+            .pointer("/query/function_score/query/bool/should")
+            .or_else(|| body.pointer("/query/bool/should"))
+            .and_then(Value::as_array)
+            .expect("should clauses");
+        let fields = should
+            .iter()
+            .find_map(|clause| clause.get("multi_match"))
+            .expect("recall floor")["fields"]
+            .as_array()
+            .unwrap();
+        let bare: Vec<&str> = fields
+            .iter()
+            .map(|f| f.as_str().unwrap().split('^').next().unwrap())
+            .collect();
+        assert_eq!(bare, vec!["code", "title"]);
     }
 }

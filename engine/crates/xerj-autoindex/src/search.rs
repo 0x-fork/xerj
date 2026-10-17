@@ -97,6 +97,13 @@ const SEARCH_MM_FIELDS: &[(&str, &str)] = &[
 /// #916 shape exactly.
 const PROSE_EXTRA_FIELDS: &[&str] = &["text", "impl", "message"];
 
+/// Every field `xerj search` might name in `multi_match`, `term`, or
+/// `match_phrase`. A numeric mapping of one of these on any index in the
+/// wildcard fails the whole request (`For input string`, #1284).
+const SEARCH_LOOKUP_FIELDS: &[&str] = &[
+    "name", "code", "body", "defs", "title", "text", "impl", "message",
+];
+
 /// Union of property names in a `GET /{pattern}/_mapping` body.
 ///
 /// `None` when `mapping` is not that shape, so a transport failure keeps the
@@ -126,6 +133,72 @@ pub(crate) fn mapped_property_names(mapping: &Value) -> Option<BTreeSet<String>>
     Some(names)
 }
 
+/// Types stored as `long` or `double`. A `multi_match`, `term`, or
+/// `match_phrase` that names one fails with `For input string: "<query>"`
+/// (#1284). `keyword` is not in this list: `name` stays an exact term.
+fn is_numeric_mapping_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "long"
+            | "integer"
+            | "short"
+            | "byte"
+            | "unsigned_long"
+            | "double"
+            | "float"
+            | "half_float"
+            | "scaled_float"
+    )
+}
+
+/// Field names any index in a `GET /{pattern}/_mapping` body maps as numeric.
+///
+/// One numeric mapping is enough to drop the field from a wildcard query:
+/// the request is refused for every index, the way `xerj code` drops a
+/// numeric field from its union (#1605). An unreadable body yields an empty
+/// set; callers ignore that unless [`mapped_property_names`] also succeeded.
+pub(crate) fn numeric_property_names(mapping: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(obj) = mapping.as_object() else {
+        return out;
+    };
+    for body in obj.values() {
+        let Some(props) = body
+            .pointer("/mappings/properties")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (key, spec) in props {
+            if spec
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_numeric_mapping_type)
+            {
+                out.insert(key.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A lookup clause may name `field` when it is mapped (or the mapping was
+/// unreadable) and no index maps it as numeric.
+pub(crate) fn field_lookup_ok(
+    mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
+    field: &str,
+) -> bool {
+    field_mapped(mapped, field) && !numeric.is_some_and(|set| set.contains(field))
+}
+
+/// True when a numeric mapping removed a field this command would look up,
+/// so the historical query must not be restored — it would name that field
+/// again and the wildcard would fail.
+fn numeric_drops_a_lookup(numeric: Option<&BTreeSet<String>>, candidates: &[&str]) -> bool {
+    numeric.is_some_and(|set| candidates.iter().any(|name| set.contains(*name)))
+}
+
 /// Whether `field` may be named in a lookup clause.
 ///
 /// An unreadable mapping (`None`) or an empty union keeps every historical
@@ -153,16 +226,20 @@ pub(crate) fn weighted_query_fields(
     preferred: &[(&str, &str)],
     extras: &[&str],
     mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
 ) -> Vec<String> {
     let mut out: Vec<String> = preferred
         .iter()
-        .filter(|(name, _)| field_mapped(mapped, name))
+        .filter(|(name, _)| field_lookup_ok(mapped, numeric, name))
         .map(|(_, weighted)| (*weighted).to_string())
         .collect();
     if code_symbol_fields_absent(mapped) {
         if let Some(set) = mapped {
             for name in extras {
-                if set.contains(*name) && !out.iter().any(|f| f.split('^').next() == Some(*name)) {
+                if set.contains(*name)
+                    && !numeric.is_some_and(|nums| nums.contains(*name))
+                    && !out.iter().any(|f| f.split('^').next() == Some(*name))
+                {
                     out.push((*name).to_string());
                 }
             }
@@ -176,20 +253,29 @@ pub(crate) fn weighted_query_fields(
 /// `mapped` is the union of property names under the prefix. `None` (and an
 /// empty union) is the historical code-shaped query.
 pub fn search_query_body(query: &str, k: usize) -> Value {
-    search_query_body_for_mapping(query, k, None)
+    search_query_body_for_mapping(query, k, None, None)
 }
 
-/// [`search_query_body`] with the target's mapped field names (#1601).
+/// [`search_query_body`] with the target's mapped field names (#1601) and
+/// the names any index maps as numeric (#1284).
 pub fn search_query_body_for_mapping(
     query: &str,
     k: usize,
     mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
 ) -> Value {
-    let built = build_search_query(query, k, mapped);
+    let built = build_search_query(query, k, mapped, numeric);
     if should_clauses(&built).is_empty() {
+        if numeric_drops_a_lookup(numeric, SEARCH_LOOKUP_FIELDS) {
+            // Restoring the historical query would name the numeric field
+            // again. An empty `should` matches every document; match nothing.
+            let mut built = built;
+            built["query"] = json!({ "match_none": {} });
+            return built;
+        }
         // Nothing we can name is mapped. The historical shape is what the
         // server's 400 then explains, listing the searchable fields.
-        return build_search_query(query, k, None);
+        return build_search_query(query, k, None, None);
     }
     built
 }
@@ -201,10 +287,15 @@ fn should_clauses(body: &Value) -> &[Value] {
         .unwrap_or(&[])
 }
 
-fn build_search_query(query: &str, k: usize, mapped: Option<&BTreeSet<String>>) -> Value {
+fn build_search_query(
+    query: &str,
+    k: usize,
+    mapped: Option<&BTreeSet<String>>,
+    numeric: Option<&BTreeSet<String>>,
+) -> Value {
     let shaped = xerj_common::code_query::normalize_code_search_query(query);
     let mut should = Vec::new();
-    let fields = weighted_query_fields(SEARCH_MM_FIELDS, PROSE_EXTRA_FIELDS, mapped);
+    let fields = weighted_query_fields(SEARCH_MM_FIELDS, PROSE_EXTRA_FIELDS, mapped, numeric);
     if !fields.is_empty() {
         should.push(json!({ "multi_match": {
             "query": shaped,
@@ -212,10 +303,10 @@ fn build_search_query(query: &str, k: usize, mapped: Option<&BTreeSet<String>>) 
             "type": "most_fields"
         }}));
     }
-    if field_mapped(mapped, "defs") {
+    if field_lookup_ok(mapped, numeric, "defs") {
         should.push(json!({ "match_phrase": { "defs": { "query": shaped, "boost": 8 } } }));
     }
-    if field_mapped(mapped, "name") {
+    if field_lookup_ok(mapped, numeric, "name") {
         should.push(json!({ "term": { "name": { "value": query.trim(), "boost": 10 } } }));
     }
     json!({
@@ -490,11 +581,15 @@ pub fn run_search_cli() -> i32 {
     // (#1601). Read the mapping and drop a leg no resolved index maps; an
     // unreadable mapping keeps the code-shaped query.
     let pattern = format!("{prefix}-*");
-    let mapped = es
-        .get_json(&format!("/{pattern}/_mapping"))
-        .ok()
-        .and_then(|body| mapped_property_names(&body));
-    let body = search_query_body_for_mapping(&query, k, mapped.as_ref());
+    let raw_mapping = es.get_json(&format!("/{pattern}/_mapping")).ok();
+    let mapped = raw_mapping.as_ref().and_then(mapped_property_names);
+    // Types are only trusted when the name union was readable. An error body
+    // has no properties, and treating that as "nothing is numeric" while the
+    // names fall back to the historical query is the #1601 contract.
+    let numeric = mapped
+        .as_ref()
+        .and(raw_mapping.as_ref().map(numeric_property_names));
+    let body = search_query_body_for_mapping(&query, k, mapped.as_ref(), numeric.as_ref());
     let resp = match es.search(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
@@ -735,7 +830,7 @@ mod tests {
     #[test]
     fn prose_mapping_drops_unmapped_code_legs() {
         let mapped = names_of(&["body", "title", "text", "impl"]);
-        let body = search_query_body_for_mapping("retention ceiling", 5, Some(&mapped));
+        let body = search_query_body_for_mapping("retention ceiling", 5, Some(&mapped), None);
         let should = body["query"]["bool"]["should"].as_array().unwrap();
         assert_eq!(should.len(), 1, "{body}");
         assert!(should[0].get("match_phrase").is_none(), "{body}");
@@ -755,7 +850,7 @@ mod tests {
     #[test]
     fn log_mapping_searches_message_and_names_no_code_field() {
         let mapped = names_of(&["message", "ts", "host"]);
-        let body = search_query_body_for_mapping("SIP 403 Forbidden", 3, Some(&mapped));
+        let body = search_query_body_for_mapping("SIP 403 Forbidden", 3, Some(&mapped), None);
         let should = body["query"]["bool"]["should"].as_array().unwrap();
         assert_eq!(should.len(), 1, "{body}");
         assert_eq!(should[0]["multi_match"]["fields"], json!(["message"]));
@@ -767,23 +862,26 @@ mod tests {
     fn code_mapping_and_unreadable_mapping_keep_the_historical_query() {
         let query = "fsync the WAL segment";
         let historical = search_query_body(query, 5);
-        assert_eq!(search_query_body_for_mapping(query, 5, None), historical);
+        assert_eq!(
+            search_query_body_for_mapping(query, 5, None, None),
+            historical
+        );
         let empty = BTreeSet::new();
         assert_eq!(
-            search_query_body_for_mapping(query, 5, Some(&empty)),
+            search_query_body_for_mapping(query, 5, Some(&empty), None),
             historical
         );
         assert!(mapped_property_names(&json!({"error": "no such index"})).is_none());
         let code = names_of(&["name", "code", "body", "defs", "title", "text", "impl"]);
         assert_eq!(
-            search_query_body_for_mapping(query, 5, Some(&code)),
+            search_query_body_for_mapping(query, 5, Some(&code), Some(&BTreeSet::new())),
             historical
         );
         // One index in the union mapping `defs` is enough to keep the leg:
         // strict mode refuses a field no resolved index maps, not a field
         // some index does not map.
         let partial = names_of(&["body", "defs", "title"]);
-        let body = search_query_body_for_mapping(query, 5, Some(&partial));
+        let body = search_query_body_for_mapping(query, 5, Some(&partial), None);
         let should = body["query"]["bool"]["should"].as_array().unwrap();
         assert!(
             should.iter().any(|c| c.get("match_phrase").is_some()),
@@ -924,5 +1022,76 @@ mod tests {
         );
         assert!(text.contains("catalog lists no prefixes"), "{text}");
         assert!(!text.contains("xerj autoindex"), "{text}");
+    }
+
+    /// #1284: one index mapping `code` as `long` fails a wildcard `multi_match`
+    /// or `match_phrase` on `code` for every index. Drop it. `keyword` `name`
+    /// stays. A prose field that is numeric on any index is dropped too, and
+    /// when that was the only lookup the query matches nothing rather than
+    /// restoring the historical legs.
+    #[test]
+    fn a_numeric_field_is_dropped_from_multi_match_term_and_phrase() {
+        let mapping = json!({
+            "p-code": { "mappings": { "properties": {
+                "name": { "type": "keyword" },
+                "code": { "type": "text" },
+                "defs": { "type": "text" },
+                "title": { "type": "text" },
+                "body": { "type": "text" }
+            }}},
+            "p-metrics": { "mappings": { "properties": {
+                "code": { "type": "long" },
+                "title": { "type": "integer" },
+                "line": { "type": "long" }
+            }}}
+        });
+        let names = mapped_property_names(&mapping).expect("mapping");
+        let numeric = numeric_property_names(&mapping);
+        assert!(numeric.contains("code") && numeric.contains("title") && numeric.contains("line"));
+        assert!(!numeric.contains("name"), "keyword is not numeric");
+        assert!(
+            numeric_property_names(&json!({
+                "only": { "mappings": { "properties": {
+                    "half": { "type": "half_float" },
+                    "scaled": { "type": "scaled_float" },
+                    "unsigned": { "type": "unsigned_long" }
+                }}}
+            }))
+            .len()
+                == 3
+        );
+
+        let body = search_query_body_for_mapping("timeout", 5, Some(&names), Some(&numeric));
+        let query = body["query"].to_string();
+        assert!(!query.contains("code"), "{query}");
+        assert!(!query.contains("title"), "{query}");
+        assert!(query.contains("name"), "{query}");
+        assert!(query.contains("defs"), "{query}");
+        assert!(query.contains("body"), "{query}");
+        let fields = body["query"]["bool"]["should"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|clause| clause.get("multi_match"))
+            .unwrap()["fields"]
+            .as_array()
+            .unwrap();
+        assert!(fields
+            .iter()
+            .all(|f| f.as_str().unwrap().split('^').next() != Some("code")));
+        assert!(fields
+            .iter()
+            .all(|f| f.as_str().unwrap().split('^').next() != Some("title")));
+
+        let prose = json!({
+            "logs": { "mappings": { "properties": {
+                "message": { "type": "double" }
+            }}}
+        });
+        let prose_names = mapped_property_names(&prose).unwrap();
+        let prose_numeric = numeric_property_names(&prose);
+        let none =
+            search_query_body_for_mapping("timeout", 5, Some(&prose_names), Some(&prose_numeric));
+        assert!(none["query"].get("match_none").is_some(), "{none}");
     }
 }
