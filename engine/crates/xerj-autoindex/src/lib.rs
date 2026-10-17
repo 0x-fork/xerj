@@ -9542,27 +9542,56 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         duplicate_files.retain(|f| catalog::file_matches_prefix(f, prefix));
     }
     if cfg.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let (start, end) =
+            catalog::detail_bounds(datasets.len(), cfg.detail_offset, cfg.detail_limit);
+        let truncated = start > 0 || end < datasets.len();
+        let body = if truncated {
+            let summary: Vec<Value> = datasets
+                .iter()
+                .map(|d| {
+                    json!({
+                        "index_name": d.get("index_name"),
+                        "slug": d.get("slug"),
+                        "record_count": d.get("record_count"),
+                        "file_count": d.get("file_count"),
+                    })
+                })
+                .collect();
+            json!({
+                "run": runs.first(),
+                "datasets_total": datasets.len(),
+                "detail_offset": start,
+                "datasets": &datasets[start..end],
+                "datasets_summary": summary,
+                "detail_note": "field detail is paged; `autoindex map --dataset <slug>` or `--offset`/`--limit`",
+                "correlations": correlations,
+                "junk_files": junk_files,
+                "duplicate_files": duplicate_files,
+                "gotchas": catalog::GOTCHAS,
+            })
+        } else {
+            json!({
                 "run": runs.first(),
                 "datasets": datasets,
                 "correlations": correlations,
                 "junk_files": junk_files,
                 "duplicate_files": duplicate_files,
                 "gotchas": catalog::GOTCHAS,
-            }))?
-        );
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&body)?);
     } else {
         print!(
             "{}",
-            catalog::render_map(
+            catalog::render_map_page(
                 runs.first(),
                 &datasets,
                 &correlations,
                 &junk_files,
                 &duplicate_files,
-                junk_files.len() as u64
+                junk_files.len() as u64,
+                cfg.detail_offset,
+                cfg.detail_limit,
             )
         );
         // Second-brain summary (§6.1): live edge count straight from the

@@ -131,6 +131,12 @@ pub struct MapCfg {
     pub prefix: Option<String>,
     pub json: bool,
     pub dataset: Option<String>,
+    /// `--offset` for the map's per-dataset field detail. The summary table
+    /// always lists every dataset.
+    pub detail_offset: usize,
+    /// `--limit` for that detail page. `None` uses the default page when
+    /// there are more datasets than [`crate::catalog::MAP_DETAIL_PAGE`].
+    pub detail_limit: Option<usize>,
     /// A startup note when `XERJ_URL` was set but ignored (endpoint comes from
     /// `--url` only). `map` reads the catalog, so a stale var shows the wrong
     /// node's map without a word — same trap as the index path, read side.
@@ -363,6 +369,11 @@ pub fn help_text_with(feedback: bool) -> String {
                                   exactly like an agent-driven run. See ESTIMATE + DECISION\n\
                                   GATE.\n\
              --dataset <SLUG>     (map) show a single dataset\n\
+             --offset <N>         (map) skip the first N dataset detail sections\n\
+             --limit <N>          (map) how many dataset detail sections to print\n\
+                                  (default: all of them when there are few, otherwise\n\
+                                  the first page — the summary table always lists every\n\
+                                  dataset)\n\
              --disable-feedback   do not print the feedback invitation above; honoured in\n\
                                   any position, including after --help (env\n\
                                   XERJ_DISABLE_FEEDBACK=true)\n\
@@ -737,6 +748,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut progress: Option<ProgressMode> = None;
     let mut progress_interval: Option<Duration> = None;
     let mut dataset: Option<String> = None;
+    let mut detail_offset: Option<usize> = None;
+    let mut detail_limit: Option<usize> = None;
     // Object-storage watch (`--watch` on an s3:// root). Kept in their own
     // variables so the watch route can refuse an index-only flag instead of
     // accepting it and doing nothing with it (#204's class).
@@ -992,6 +1005,25 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     Some(it.next().ok_or(
                         "--dataset needs a dataset slug: `autoindex map --dataset <SLUG>`",
                     )?);
+            }
+            "--offset" => {
+                let n: usize = it
+                    .next()
+                    .ok_or("--offset needs a non-negative integer: `autoindex map --offset <N>`")?
+                    .parse()
+                    .map_err(|_| "--offset needs a non-negative integer".to_string())?;
+                detail_offset = Some(n);
+            }
+            "--limit" => {
+                let n: usize = it
+                    .next()
+                    .ok_or("--limit needs an integer from 1 to 100: `autoindex map --limit <N>`")?
+                    .parse()
+                    .map_err(|_| "--limit needs an integer from 1 to 100".to_string())?;
+                if !(1..=100).contains(&n) {
+                    return Err("--limit must be from 1 to 100".into());
+                }
+                detail_limit = Some(n);
             }
             "--poll-interval" => {
                 watch_flags_used.push("--poll-interval");
@@ -1526,8 +1558,15 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             prefix: prefix_explicit.then_some(prefix),
             json,
             dataset,
+            detail_offset: detail_offset.unwrap_or(0),
+            detail_limit,
             xerj_url_note,
         })),
+        (_, _) if detail_offset.is_some() || detail_limit.is_some() => Err(format!(
+            "--offset and --limit page the data map and are only supported with \
+             `autoindex map`, not `autoindex {}`",
+            sub.as_deref().unwrap_or("<root>")
+        )),
         // #1231: --dataset only selects which dataset `autoindex map` prints;
         // it is NOT an indexing destination filter. Accepting it on the
         // indexing/status routes and then dropping it is the silent no-op this

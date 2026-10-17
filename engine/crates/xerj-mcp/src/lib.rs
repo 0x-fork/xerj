@@ -987,7 +987,9 @@ pub fn tool_specs() -> Value {
                 "cardinality is an estimate (with `cardinality_overflow:true` it means ",
                 "AT LEAST that many), and min/max/coverage describe the sample, not ",
                 "the whole index. Up to 100 indexes per call (`indexes_omitted` ",
-                "reports more)."
+                "reports more). When more than 8 indexes match and you did not pass ",
+                "`index`, the answer is a SUMMARY page (index, records, field names) ",
+                "— pass `index` or `detail: true` with `offset`/`limit` for full fields."
             ),
             "inputSchema": {
                 "type": "object",
@@ -997,6 +999,24 @@ pub fn tool_specs() -> Value {
                         "description": "Index name or `*`-glob (e.g. `ax-logs`, `ax-*`). Default: every \
                          catalogued index. An exact name filters engine-side; a glob filters \
                          against the catalog before the 100-index limit."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Skip this many datasets (largest record count first) before rendering. Default 0."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": map::MAX_INDEXES,
+                        "description": format!(
+                            "How many datasets to return (1..={}). Default: {} on a summary page, otherwise every dataset this call fetched (up to {}).",
+                            map::MAX_INDEXES, map::SUMMARY_PAGE, map::MAX_INDEXES
+                        )
+                    },
+                    "detail": {
+                        "type": "boolean",
+                        "description": "true = full field entries. false = summary rows (index, records, field names). Default: summary when more than 8 indexes match and `index` was not passed; full entries otherwise."
                     },
                     "max_bytes": {
                         "type": "integer",

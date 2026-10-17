@@ -545,6 +545,25 @@ pub fn file_matches_prefix(doc: &Value, prefix: &str) -> bool {
         == Some(prefix)
 }
 
+/// How many dataset detail sections the default map prints before it asks
+/// for a page. The summary table always lists every dataset; the per-dataset
+/// field tables and sample queries are what blow the map up to hundreds of
+/// kilobytes.
+pub const MAP_DETAIL_PAGE: usize = 8;
+
+/// `(start, end)` of the detail page. `limit = None` prints every dataset
+/// when there are at most [`MAP_DETAIL_PAGE`], and the first page otherwise.
+pub fn detail_bounds(total: usize, offset: usize, limit: Option<usize>) -> (usize, usize) {
+    let start = offset.min(total);
+    let limit = limit.unwrap_or(if total > MAP_DETAIL_PAGE {
+        MAP_DETAIL_PAGE
+    } else {
+        total
+    });
+    let end = start.saturating_add(limit).min(total);
+    (start, end)
+}
+
 pub fn render_map(
     run: Option<&Value>,
     datasets: &[Value],
@@ -552,6 +571,29 @@ pub fn render_map(
     junk_files: &[Value],
     duplicate_files: &[Value],
     junk_total: u64,
+) -> String {
+    render_map_page(
+        run,
+        datasets,
+        correlations,
+        junk_files,
+        duplicate_files,
+        junk_total,
+        0,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // paging is two extra args on the existing map renderer
+pub fn render_map_page(
+    run: Option<&Value>,
+    datasets: &[Value],
+    correlations: &[Value],
+    junk_files: &[Value],
+    duplicate_files: &[Value],
+    junk_total: u64,
+    detail_offset: usize,
+    detail_limit: Option<usize>,
 ) -> String {
     let mut s = String::new();
     s.push_str("# Data map (xerj autoindex)\n\n");
@@ -626,7 +668,24 @@ pub fn render_map(
     }
     s.push('\n');
 
-    for d in datasets {
+    let (detail_start, detail_end) = detail_bounds(datasets.len(), detail_offset, detail_limit);
+    let detail_truncated = detail_start > 0 || detail_end < datasets.len();
+    if detail_truncated {
+        s.push_str(&format!(
+            "Field detail for datasets {}–{} of {} (largest first). \
+             One dataset: `xerj autoindex map --dataset <slug>`. \
+             Next page: `--offset {detail_end}`.\n\n",
+            detail_start + 1,
+            detail_end,
+            datasets.len()
+        ));
+    }
+
+    for d in datasets
+        .iter()
+        .skip(detail_start)
+        .take(detail_end - detail_start)
+    {
         let g = |k: &str| d.get(k).map(pretty_val).unwrap_or_default();
         s.push_str(&format!("### `{}`\n\n", g("index_name")));
         if let Some(sem) = d.get("semantic_field").filter(|v| v.is_string()) {
@@ -844,6 +903,57 @@ fn trunc_f(s: &str) -> String {
 #[cfg(test)]
 mod duplicate_tests {
     use super::*;
+
+    #[test]
+    fn a_long_catalog_pages_field_detail_and_keeps_the_summary_table() {
+        let datasets: Vec<Value> = (0..20)
+            .map(|i| {
+                json!({
+                    "index_name": format!("ax-d{i:02}"),
+                    "slug": format!("d{i:02}"),
+                    "record_count": 100 - i,
+                    "file_count": 1,
+                    "formats": "json",
+                    "fields_json": serde_json::to_string(&vec![crate::infer::FieldSpec {
+                        name: format!("col{i}"),
+                        es_type: "keyword".into(),
+                        date_enc: None,
+                        semantic: None,
+                        cardinality_est: 1,
+                        cardinality_overflow: false,
+                        null_ratio: 0.0,
+                        avg_len: 3.0,
+                        coverage: 1.0,
+                        examples: vec!["v".into()],
+                        notes: vec![],
+                        date_min: None,
+                        date_max: None,
+                        date_evidence: vec![],
+                        num_min: None,
+                        num_max: None,
+                    }]).unwrap()
+                })
+            })
+            .collect();
+        let rendered = render_map(None, &datasets, &[], &[], &[], 0);
+        assert!(
+            rendered.contains("`ax-d00`"),
+            "summary table lists every dataset"
+        );
+        assert!(rendered.contains("`ax-d19`"));
+        assert_eq!(
+            rendered.matches("### `").count(),
+            super::MAP_DETAIL_PAGE,
+            "detail sections stop at the page: {rendered}"
+        );
+        assert!(rendered.contains("Field detail for datasets 1–8 of 20"));
+        assert!(rendered.contains("--offset 8"));
+        let page = render_map_page(None, &datasets, &[], &[], &[], 0, 8, Some(2));
+        assert!(page.contains("### `ax-d08`"));
+        assert!(page.contains("### `ax-d09`"));
+        assert!(!page.contains("### `ax-d10`"));
+        assert!(page.contains("Field detail for datasets 9–10 of 20"));
+    }
 
     #[test]
     fn duplicate_aliases_render_separately_from_junk() {
