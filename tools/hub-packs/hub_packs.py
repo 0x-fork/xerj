@@ -611,10 +611,19 @@ def check_catalogue(
             errors.append(f"{slug}: pack_bytes is not a positive integer")
 
     if previous is not None:
+        # The guard must never switch itself off: a "previous catalogue" that is
+        # not one (a static site's HTML page answering with 200, say) is an error,
+        # not an empty list of corpora.
+        before_list = None
         try:
-            before = {x.get("slug") for x in json.loads(previous).get("corpora", [])}
-        except (json.JSONDecodeError, AttributeError):
-            before = set()
+            prev = json.loads(previous)
+            if isinstance(prev, dict) and isinstance(prev.get("corpora"), list):
+                before_list = prev["corpora"]
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        if before_list is None or not all(isinstance(x, dict) for x in before_list):
+            return [*errors, "the previous (live) catalogue is not a catalogue; cannot tell which corpora it lists"]
+        before = {x.get("slug") for x in before_list}
         for slug in sorted((before & set(live)) - listed):
             errors.append(f"{slug}: in the live catalogue and still live, but missing from the new one")
     return errors

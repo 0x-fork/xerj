@@ -592,6 +592,13 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(errors, ["beta: in the live catalogue and still live, but missing from the new one"])
         self.assertEqual(self.check(live, previous=live), [])
 
+    def test_a_previous_catalogue_that_is_not_one_never_switches_the_guard_off(self):
+        raw = self.cat(self.entry("alpha", SHA_A))
+        for prev in (b"<!doctype html><html><body>hub</body></html>", b"", b"[]", b'{"corpora": "x"}',
+                     b'{"corpora": [1]}', b"\xff\xfe"):
+            errors = self.check(raw, previous=prev)
+            self.assertTrue(any("not a catalogue" in e for e in errors), (prev, errors))
+
     def test_a_corpus_that_is_no_longer_live_may_leave_the_catalogue(self):
         previous = self.cat(self.entry("alpha", SHA_A), self.entry("retired", SHA_C))
         raw = self.cat(self.entry("alpha", SHA_A))
@@ -620,6 +627,11 @@ class CatalogueTests(unittest.TestCase):
         self.assertIn("::error title=catalogue::beta", refused.stderr)
         self.assertIn("NOT fit to publish", refused.stderr)
         self.assertEqual(run("--previous", str(live_path), "--allow-drops").returncode, 0, "the explicit override")
+
+        live_path.write_text("<!doctype html><html></html>")
+        html = run("--previous", str(live_path), "--allow-drops")
+        self.assertEqual(html.returncode, 1, "--allow-drops does not excuse an unreadable live catalogue")
+        self.assertIn("not a catalogue", html.stderr)
 
     def test_fetch_list_command_prints_tab_separated_rows(self):
         tags = self.root / "tags.txt"
