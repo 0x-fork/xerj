@@ -103,8 +103,9 @@ enabled = false   # NOT the default — the default is true
 `auth.enabled` defaults to **true**; `enabled = false` above is an explicit
 opt-out, appropriate only for a trusted private network or local development.
 Leave it out (or set it to `true`) and the server mints an admin key on first
-boot, prints it, and writes it to `<data_dir>/admin.key`. Every client then has
-to send it — including `xerj autoindex`, which never reads the key out of
+boot and writes it to `<data_dir>/admin.key` (mode 0600). The key is not
+printed: the first-run notice names that path. Every client then has to send
+it — including `xerj autoindex`, which never reads the key out of
 `xerj.toml`; give it `--api-key` or `XERJ_API_KEY`:
 
 ```bash

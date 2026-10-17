@@ -960,26 +960,44 @@ fn ensure_admin_key(cfg: &mut Config) -> Result<()> {
     let raw: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let key: String = raw.iter().map(|b| format!("{b:02x}")).collect();
 
-    println!();
-    println!("╔══════════════════════════════════════════════════╗");
-    println!("║  First-run: admin API key auto-generated         ║");
-    println!("║                                                  ║");
-    println!("║  {:<48} ║", key);
-    println!("║                                                  ║");
-    println!("║  Keep this secret. Written to:                   ║");
-    println!("║  {:<48} ║", format!("{}/admin.key", cfg.server.data_dir));
-    println!("╚══════════════════════════════════════════════════╝");
-    println!();
-
-    if std::fs::create_dir_all(data_dir).is_ok() {
+    // Persist before announcing. The notice names the path and never the
+    // secret: stdout is what agents capture, and a first-run banner that
+    // prints the key lands in those logs (field report 2026-10-17).
+    if let Err(e) = std::fs::create_dir_all(data_dir).and_then(|_| {
         // 0600 — this file IS the admin credential (RC4 W2 #21).
-        if let Err(e) = write_secret_file(&key_path, key.as_bytes()) {
-            warn!("could not persist admin.key: {e}");
-        }
+        write_secret_file(&key_path, key.as_bytes())
+    }) {
+        warn!(
+            "could not persist admin key to {}: {e}. The key was not printed. \
+             Fix the data directory and restart so a key can be written.",
+            key_path.display()
+        );
+    } else {
+        println!("{}", first_run_admin_key_notice(&key, &key_path));
     }
 
     cfg.auth.admin_api_key = key;
     Ok(())
+}
+
+/// Text printed once, when an admin key is minted.
+///
+/// `key` is accepted so a test can prove the rendered text does not contain
+/// it. The function refuses to return a notice that includes the secret.
+fn first_run_admin_key_notice(key: &str, key_path: &Path) -> String {
+    let path = key_path.display().to_string();
+    let notice = format!(
+        "\n\
+         First-run: admin API key auto-generated.\n\
+         The key is not printed here. Read it from (owner-only, mode 0600):\n\
+         {path}\n\
+         Keep that file secret. Clients send it as `Authorization: ApiKey $(cat {path})`.\n"
+    );
+    assert!(
+        !key.is_empty() && !notice.contains(key),
+        "first-run notice must not contain the admin key"
+    );
+    notice
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3757,6 +3775,68 @@ mod server_correctness_tests {
         let mode = std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "rewritten secret must be tightened to 0600");
         assert_eq!(std::fs::read(&stale).unwrap(), b"new");
+    }
+
+    /// The first-run banner used to print the 64-hex admin key on stdout.
+    /// Agents that capture server output then hold the credential. The notice
+    /// names the file and nothing else that is the key.
+    #[test]
+    fn first_run_notice_names_the_key_file_and_not_the_key() {
+        let key = "ab".repeat(32);
+        assert_eq!(key.len(), 64);
+        let path = Path::new("/var/lib/xerj/admin.key");
+        let notice = first_run_admin_key_notice(&key, path);
+        assert!(
+            !notice.contains(&key),
+            "notice leaked the admin key:\n{notice}"
+        );
+        assert!(notice.contains(path.to_str().unwrap()), "{notice}");
+        assert!(
+            notice.contains("not printed"),
+            "notice must say the key is withheld: {notice}"
+        );
+        assert!(
+            notice.split_whitespace().all(|word| {
+                let bare = word.trim_matches(|c: char| !c.is_ascii_hexdigit());
+                !(bare.len() >= 64 && bare.bytes().all(|b| b.is_ascii_hexdigit()))
+            }),
+            "notice contains a 64-hex token:\n{notice}"
+        );
+    }
+
+    /// A fresh data dir gets a 0600 admin.key, and a second call reuses it
+    /// instead of minting another. The in-memory key matches the file.
+    #[test]
+    fn ensure_admin_key_writes_the_file_and_reuses_it() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        cfg.auth.enabled = true;
+        cfg.auth.admin_api_key.clear();
+        cfg.server.data_dir = dir.path().to_str().unwrap().to_string();
+
+        ensure_admin_key(&mut cfg).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("admin.key")).unwrap();
+        assert_eq!(written, cfg.auth.admin_api_key);
+        assert_eq!(written.len(), 64);
+        assert!(written.bytes().all(|b| b.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("admin.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "admin.key must be 0600, got {mode:o}");
+        }
+
+        let first = cfg.auth.admin_api_key.clone();
+        cfg.auth.admin_api_key.clear();
+        ensure_admin_key(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.auth.admin_api_key, first,
+            "a restart must reuse admin.key"
+        );
     }
 }
 
