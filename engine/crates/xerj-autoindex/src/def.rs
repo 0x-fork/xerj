@@ -56,6 +56,50 @@ const DEF_MM_FIELDS: &[(&str, &str)] = &[
 /// `code` / `defs` (#1601). `body` is not in the code-shaped list above.
 const DEF_PROSE_EXTRA_FIELDS: &[&str] = &["body", "text", "impl", "message"];
 
+/// Symbol kinds that are the definition a `xerj def` caller wants when
+/// several hits share the name. A type alias and a `mod` line are not in
+/// this list.
+const PREFERRED_KINDS: &[&str] = &[
+    "struct",
+    "class",
+    "function",
+    "method",
+    "enum",
+    "trait",
+    "interface",
+    "impl",
+    "protocol",
+];
+
+/// `ax_path` globs for tests, examples, fuzz targets, and benches. `*`
+/// matches across `/` (the engine's wildcard is "zero or more chars").
+const DEMOTED_PATH_GLOBS: &[&str] = &[
+    "tests/*",
+    "*/tests/*",
+    "test/*",
+    "*/test/*",
+    "examples/*",
+    "*/examples/*",
+    "example/*",
+    "*/example/*",
+    "fuzz/*",
+    "*/fuzz/*",
+    "fuzz_targets/*",
+    "*/fuzz_targets/*",
+    "benches/*",
+    "*/benches/*",
+    "bench/*",
+    "*/bench/*",
+];
+
+/// True only when a mapping was actually read and names `field`. `None` and
+/// an empty set stay on the historical query (`field_mapped` treats both as
+/// "assume the code fields"), so a new clause that is not in that historical
+/// shape must use this and not [`field_mapped`].
+fn explicitly_mapped(mapped: Option<&BTreeSet<String>>, field: &str) -> bool {
+    mapped.is_some_and(|set| set.contains(field))
+}
+
 /// The `xerj def` query body: definition-first ranking over the per-symbol
 /// docs, narrowed by the optional `--kind` / `--lang` filters.
 ///
@@ -103,7 +147,16 @@ fn build_def_query(
     if field_mapped(mapped, "defs") {
         should.push(json!({ "match_phrase": { "defs": { "query": query, "boost": 8 } } }));
     }
-    let fields = weighted_query_fields(DEF_MM_FIELDS, DEF_PROSE_EXTRA_FIELDS, mapped);
+    let mut fields = weighted_query_fields(DEF_MM_FIELDS, DEF_PROSE_EXTRA_FIELDS, mapped);
+    // A phrase ("flush the tree to disk") lives in the symbol body (`impl`),
+    // not in the declaration. Only when the read mapping actually has `impl`:
+    // the historical code query (mapped = None) does not name that field.
+    if !is_identifier(query)
+        && explicitly_mapped(mapped, "impl")
+        && !fields.iter().any(|f| f.split('^').next() == Some("impl"))
+    {
+        fields.push("impl^2".to_string());
+    }
     if !fields.is_empty() {
         should.push(json!({ "multi_match": {
             "query": query,
@@ -127,18 +180,72 @@ fn build_def_query(
             filter.push(json!({ "term": { "language": lg } }));
         }
     }
-    json!({
-        "size": k,
-        // A filter clause makes every `should` optional, so without this a
-        // `--kind`/`--lang` filter alone matches: a name defined nowhere came
-        // back as every definition of that kind instead of "no definition".
-        "query": { "bool": {
+    // A filter clause makes every `should` optional, so without this a
+    // `--kind`/`--lang` filter alone matches: a name defined nowhere came
+    // back as every definition of that kind instead of "no definition".
+    let bool_query = json!({
+        "bool": {
             "should": should,
             "filter": filter,
             "minimum_should_match": 1
-        } },
+        }
+    });
+    // Kind and `pub` weights sit on function_score, not on a bare `should`:
+    // a should clause would match every struct in the index. The negative
+    // boosting clause only multiplies hits that already matched.
+    let query = rank_adjusted_query(bool_query, mapped);
+    json!({
+        "size": k,
+        "query": query,
         "_source": ["ax_path", "path", "line", "start_line", "kind", "language", "name", "code"],
         "fields": ["_passage"]
+    })
+}
+
+fn rank_adjusted_query(bool_query: Value, mapped: Option<&BTreeSet<String>>) -> Value {
+    // `function_score` (boost_mode sum) adds weight only to hits the bool
+    // already matched. A `boosting` wrapper was tried first; this engine's
+    // planner rewrites it to a bool and every hit came back with `_score`
+    // 1.0, so the weights never moved the order.
+    let mut functions = Vec::new();
+    if field_mapped(mapped, "kind") {
+        let mut kind_filter = json!({
+            "bool": { "must": [ { "terms": { "kind": PREFERRED_KINDS } } ] }
+        });
+        // A preferred kind under tests/examples/fuzz/benches does not get
+        // the weight. `ax_path` is only named when the read mapping has it,
+        // so the historical query (mapped = None) stays free of that field.
+        if explicitly_mapped(mapped, "ax_path") {
+            let globs: Vec<Value> = DEMOTED_PATH_GLOBS
+                .iter()
+                .map(|glob| json!({ "wildcard": { "ax_path": glob } }))
+                .collect();
+            kind_filter["bool"]["must_not"] = json!([{
+                "bool": { "should": globs, "minimum_should_match": 1 }
+            }]);
+        }
+        functions.push(json!({ "filter": kind_filter, "weight": 20.0 }));
+    }
+    if field_mapped(mapped, "code") {
+        functions.push(json!({
+            "filter": { "bool": { "should": [
+                { "match": { "code": "pub" } },
+                { "match": { "code": "public" } },
+                { "match": { "code": "export" } }
+            ], "minimum_should_match": 1 } },
+            "weight": 5.0
+        }));
+    }
+    if functions.is_empty() {
+        return bool_query;
+    }
+    json!({
+        "function_score": {
+            "query": bool_query,
+            "functions": functions,
+            "score_mode": "sum",
+            "boost_mode": "sum"
+        }
     })
 }
 
@@ -302,7 +409,12 @@ mod tests {
             (None, None),
         ] {
             let body = def_query("zzqq_nonexistent", kind, lang, 5, None);
-            let b = &body["query"]["bool"];
+            // Kind/pub weights wrap the bool; the filter still has to sit on
+            // that bool, not replace the name clauses.
+            let b = body
+                .pointer("/query/function_score/query/bool")
+                .or_else(|| body.pointer("/query/bool"))
+                .expect("bool query");
             assert_eq!(b["minimum_should_match"], 1, "{body}");
             assert!(!b["should"].as_array().unwrap().is_empty());
             let filters = b["filter"].as_array().unwrap().len();
@@ -368,6 +480,78 @@ mod tests {
         assert_eq!(
             def_query(query, None, None, 5, Some(&BTreeSet::new())),
             def_query(query, None, None, 5, None)
+        );
+    }
+
+    /// A struct/function outranks a type alias and a `mod` line of the same
+    /// name, and a `pub` declaration outranks a private one. The weight is a
+    /// function_score filter, not a `should`, so it cannot match every struct.
+    #[test]
+    fn preferred_kinds_and_pub_are_weighted_and_aliases_are_demoted() {
+        let body = def_query("Db", None, None, 5, None);
+        let rendered = body["query"].to_string();
+        assert!(rendered.contains("function_score"), "{body}");
+        assert!(
+            rendered.contains("\"weight\":20.0") || rendered.contains("\"weight\":20"),
+            "{body}"
+        );
+        for kind in ["struct", "function", "enum", "trait"] {
+            assert!(
+                rendered.contains(&format!("\"{kind}\"")),
+                "{kind} missing: {body}"
+            );
+        }
+        // A type alias is not a preferred kind, so it does not receive the
+        // weight. Path globs are not part of the historical query.
+        let kinds = body.pointer("/query/function_score/functions/0/filter/bool/must/0/terms/kind");
+        assert!(
+            kinds
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .all(|k| k.as_str() != Some("type") && k.as_str() != Some("module")),
+            "{kinds:?}"
+        );
+        assert!(!rendered.contains("ax_path"), "{body}");
+        let with_path = names_of(&["name", "defs", "code", "title", "kind", "ax_path"]);
+        let body = def_query("Db", None, None, 5, Some(&with_path));
+        let rendered = body["query"].to_string();
+        assert!(rendered.contains("*/tests/*"), "{body}");
+        assert!(rendered.contains("*/examples/*"), "{body}");
+        assert!(rendered.contains("*/fuzz/*"), "{body}");
+        assert!(rendered.contains("*/benches/*"), "{body}");
+        assert!(rendered.contains("must_not"), "{body}");
+    }
+
+    /// "flush the tree to disk" has to search the symbol body. An identifier
+    /// does not grow that leg, and a mapping without `impl` does not either.
+    #[test]
+    fn a_phrase_searches_impl_only_when_the_mapping_has_it() {
+        let code = names_of(&["name", "defs", "code", "title", "impl", "kind"]);
+        let phrase = def_query("flush the tree to disk", None, None, 5, Some(&code));
+        let fields = phrase["query"]["function_score"]["query"]["bool"]["should"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|c| c.get("multi_match"))
+            .expect("multi_match");
+        assert!(
+            fields["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f.as_str() == Some("impl^2")),
+            "{phrase}"
+        );
+        let ident = def_query("flush", None, None, 5, Some(&code));
+        let rendered = ident.to_string();
+        assert!(!rendered.contains("impl^2"), "{ident}");
+        let no_impl = names_of(&["name", "defs", "code", "title", "kind"]);
+        let phrase = def_query("flush the tree to disk", None, None, 5, Some(&no_impl));
+        let fields = phrase.to_string();
+        assert!(
+            !fields.contains("impl^2"),
+            "no impl field, so the body leg must stay out: {phrase}"
         );
     }
 }
