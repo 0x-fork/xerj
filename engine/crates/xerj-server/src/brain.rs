@@ -649,6 +649,7 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         watch: false,
         label: None,
         debounce: std::time::Duration::from_millis(0),
+        exclude_rels: Vec::new(),
     }
 }
 

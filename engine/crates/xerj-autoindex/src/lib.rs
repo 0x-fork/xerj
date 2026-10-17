@@ -1688,6 +1688,64 @@ pub fn run_cli() -> i32 {
     }
 }
 
+/// The hub manifest at the root of a corpus directory. Excluded only by
+/// [`run_with_options`]; a folder named the same way is still indexed.
+const CORPUS_MANIFEST_REL: &str = "corpus.json";
+
+/// Drop walk entries whose root-relative path is in `exclude`. An empty list
+/// returns the walk unchanged, so this is not a global skip of that filename.
+fn without_excluded_rels(
+    files: Vec<walk::FileEntry>,
+    exclude: &[String],
+) -> (Vec<walk::FileEntry>, usize) {
+    if exclude.is_empty() {
+        return (files, 0);
+    }
+    let before = files.len();
+    let kept: Vec<walk::FileEntry> = files
+        .into_iter()
+        .filter(|file| !exclude.contains(&file.rel))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
+#[cfg(test)]
+mod exclude_rels_tests {
+    use super::*;
+
+    fn entry(rel: &str) -> walk::FileEntry {
+        walk::FileEntry {
+            path: std::path::PathBuf::from(rel),
+            rel: rel.to_string(),
+            rel_id: rel.to_string(),
+            is_symlink: false,
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn the_corpus_manifest_is_dropped_and_a_nested_copy_is_kept() {
+        let files = vec![
+            entry("corpus.json"),
+            entry("src/lib.rs"),
+            entry("vendor/corpus.json"),
+        ];
+        let (kept, dropped) = without_excluded_rels(files, &[CORPUS_MANIFEST_REL.to_string()]);
+        assert_eq!(dropped, 1);
+        let rels: Vec<&str> = kept.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(rels, ["src/lib.rs", "vendor/corpus.json"]);
+    }
+
+    #[test]
+    fn an_empty_exclusion_list_keeps_a_root_corpus_json() {
+        let files = vec![entry("corpus.json"), entry("README.md")];
+        let (kept, dropped) = without_excluded_rels(files, &[]);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 2);
+    }
+}
+
 /// In-process autoindex for the `xerj corpus` lifecycle (issue #977): builds
 /// the same argv the wrapper script passed and routes it through the same
 /// parse → run → error-route path as `run_cli`, so there is exactly ONE
@@ -1726,7 +1784,14 @@ pub fn run_with_options(
         }
     };
     let res = match cmd {
-        Cmd::Index(cfg) => run_index(*cfg),
+        Cmd::Index(cfg) => {
+            // The corpus directory's own manifest is bookkeeping, not a
+            // source file. A normal folder index leaves `exclude_rels` empty,
+            // so a project that happens to contain `corpus.json` still indexes it.
+            let mut cfg = *cfg;
+            cfg.exclude_rels = vec![CORPUS_MANIFEST_REL.to_string()];
+            run_index(cfg)
+        }
         _ => return 2,
     };
     match res {
@@ -3024,6 +3089,7 @@ mod phase_a_grouping_tests {
             watch: false,
             label: None,
             debounce: std::time::Duration::from_millis(0),
+            exclude_rels: Vec::new(),
         }
     }
 
@@ -6201,6 +6267,13 @@ fn run_index_report_inner(
         cfg.follow_symlinks_outside_root,
         cfg.ignore,
     )?;
+    let (discovered_files, excluded) = without_excluded_rels(discovered_files, &cfg.exclude_rels);
+    if excluded > 0 {
+        pr.note(&format!(
+            "autoindex: left out {excluded} path(s) ({}) — not part of this corpus index",
+            cfg.exclude_rels.join(", ")
+        ));
+    }
     let discovered_bytes: u64 = discovered_files.iter().map(|f| f.size).sum();
     pr.note(&format!(
         "autoindex: {} files ({} MB) under {}",

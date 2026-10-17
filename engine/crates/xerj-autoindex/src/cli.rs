@@ -120,6 +120,10 @@ pub struct IndexCfg {
     /// `--watch`'s quiet period. One editor save is several filesystem events,
     /// so a pass waits for the tree to go quiet for this long before running.
     pub debounce: Duration,
+    /// Root-relative paths dropped after the walk. Empty for a normal
+    /// `xerj autoindex <folder>`. `xerj corpus index` sets `corpus.json` so
+    /// the hub manifest is not indexed as a document dataset.
+    pub exclude_rels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1659,6 +1663,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 debounce: Duration::from_millis(
                     debounce_ms.unwrap_or(crate::watch::DEFAULT_DEBOUNCE_MS),
                 ),
+                exclude_rels: Vec::new(),
             })))
         }
         _ => Ok(Cmd::Help),

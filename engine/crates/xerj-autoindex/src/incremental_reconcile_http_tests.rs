@@ -971,6 +971,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         watch: false,
         label: None,
         debounce: std::time::Duration::from_millis(0),
+        exclude_rels: Vec::new(),
     }
 }
 
