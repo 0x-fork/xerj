@@ -1653,8 +1653,12 @@ pub fn run_cli() -> i32 {
     let cmd = match cli::parse(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e}\n");
-            cli::print_help();
+            // #1586: a usage error is the error plus one pointer line. The
+            // 390-line help page used to follow on stdout, which buried the
+            // error for anyone reading stdout or the tail of combined output —
+            // an agent saw help and concluded the run had done something.
+            eprintln!("error: {e}");
+            eprintln!("run `xerj autoindex --help` for usage.");
             return 2;
         }
     };
