@@ -63,7 +63,8 @@ fn skill_md() -> String {
      Use XERJ instead of grep when you need code you cannot see in the open files:\n\n\
      - `xerj def \"<symbol>\"` — where is this defined? Returns file:line + signature in one call.\n\
      - `xerj search \"<plain words>\"` — ranked passages, definitions first; cite the printed file:line.\n\
-     - `xerj autoindex <folder>` — index a repo first (once; re-index is incremental).\n\
+     - `xerj autoindex <folder> --prefix <name>` — index a repo first (once; re-index is incremental).\n\
+     - Pass the same `--prefix <name>` to `xerj search` / `xerj def`; without it they search the default `ax` prefix.\n\
      - MCP: the `xerj_search` tool accepts a plain string query and returns the same passages.\n\n\
      Trust the passage over memory: it is the actual code at that path.\n"
         .to_string()
@@ -258,7 +259,7 @@ fn self_bin() -> String {
 /// `skill_md()` or `HUB_SKILL_MD` changes, so a file an older init wrote (and
 /// the user never edited) is upgraded on the next run. A unit test pins the
 /// texts' hashes to this number, so a text change without a bump fails CI.
-const INIT_FILES_VERSION: u32 = 1;
+const INIT_FILES_VERSION: u32 = 2;
 
 /// The marker's prefix. The full line is
 /// `<!-- xerj-init-version: <N> sha256:<16 hex> -->`: the generation, and the
@@ -1114,6 +1115,20 @@ mod tests {
         );
     }
 
+    /// The skill used to teach `xerj search` / `xerj def` with no `--prefix`,
+    /// so an agent on a node whose repos sit under their own prefixes searched
+    /// the default `ax-*` and found nothing (#1580).
+    #[test]
+    fn skill_shows_prefix_on_index_and_query() {
+        let text = skill_md();
+        assert!(
+            text.contains("xerj autoindex <folder> --prefix <name>"),
+            "{text}"
+        );
+        assert!(text.contains("same `--prefix <name>`"), "{text}");
+        assert!(text.contains("default `ax` prefix"), "{text}");
+    }
+
     /// A text change without a version bump would leave every pristine older
     /// file un-upgraded. Changing either text fails here until
     /// `INIT_FILES_VERSION` is bumped and these hashes are re-pinned.
@@ -1125,7 +1140,7 @@ mod tests {
                 content_hash(&skill_md()).as_str(),
                 content_hash(HUB_SKILL_MD).as_str()
             ),
-            (1, "2431e2257fd251e5", "c2ee5047ba667c35"),
+            (2, "c59537bc1064a30f", "c2ee5047ba667c35"),
             "a teaching text changed: bump INIT_FILES_VERSION and re-pin"
         );
     }
