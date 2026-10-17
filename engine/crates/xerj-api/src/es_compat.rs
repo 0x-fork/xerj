@@ -20733,6 +20733,32 @@ fn count_shard_failure(index: &str, rendered: &Value) -> Value {
     json!({ "shard": 0, "index": index, "reason": reason })
 }
 
+/// Locator of an autoindex file-card anchor. Must stay equal to
+/// `xerj_autoindex::detect::FILE_CARD_LOCATOR` (`"file"`). The card is a real
+/// document so graph edges can resolve it, and it is not a content record.
+const FILE_CARD_LOCATOR: &str = "file";
+
+/// `stats.doc_count` minus file-card anchors. A bare `_count` is what
+/// `xerj autoindex map` and agents read as the record count; one card per
+/// file was inflating it. An explicit query is left alone, so a caller who
+/// asks for `ax_locator: file` still gets those documents, and a term query
+/// that cannot run (the field is absent) leaves the stat count unchanged.
+async fn content_doc_count(idx: &xerj_engine::index::Index) -> u64 {
+    let total = idx.stats().await.doc_count;
+    let body = json!({
+        "query": {"term": {"ax_locator": FILE_CARD_LOCATOR}},
+        "size": 0,
+        "track_total_hits": true
+    });
+    let Ok(req) = xerj_query::parse_request(&body) else {
+        return total;
+    };
+    match idx.search(&req).await {
+        Ok(result) if result.script_failure.is_none() => total.saturating_sub(result.total.value),
+        _ => total,
+    }
+}
+
 pub async fn count_docs_global(
     State(state): State<AppState>,
     Query(params): Query<CountParams>,
@@ -20904,7 +20930,7 @@ pub async fn count_docs(
                     }
                 }
             } else {
-                total += idx.stats().await.doc_count;
+                total += content_doc_count(&idx).await;
                 successful += 1;
             }
         }
@@ -20980,7 +21006,7 @@ pub async fn count_docs(
             }
         }
     } else {
-        idx.stats().await.doc_count
+        content_doc_count(&idx).await
     };
 
     let mut body_out = json!({
