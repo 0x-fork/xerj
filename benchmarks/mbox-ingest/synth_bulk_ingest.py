@@ -10,9 +10,9 @@ ingest-side memory behaviour.
   synth_bulk_ingest.py --url http://127.0.0.1:9341 --docs 20000 --body-kb 10 \
       [--index bench-docs] [--bulk-mb 8] [--key FILE] [--json]
 
-Every doc is unique (`msg-<i>`); `--seed` makes bodies reproducible. Writes
-one JSON line to stdout (--json) with docs, wall seconds, and the node's own
-count/_stats views. Memory figures are read by the caller from /proc.
+Every doc is unique (`msg-<i>`); `--seed` makes bodies reproducible. Always
+writes one JSON line to stdout (`--json` is accepted but changes nothing) with
+docs, wall seconds, and the node's own `_count`. Memory figures are read by the caller from /proc.
 """
 import argparse
 import json
