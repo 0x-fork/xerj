@@ -266,6 +266,135 @@ pub(crate) fn hit_location(hit: &Value) -> String {
     }
 }
 
+/// What the node held when a search or def returned no hits.
+///
+/// `None` means that read failed. An empty `Some` is a real answer.
+pub(crate) struct CorpusSnapshot {
+    /// Indices matching `{prefix}-*`.
+    pub under_prefix: Option<Vec<String>>,
+    /// Non-system indices other than the autoindex catalog.
+    pub all_indices: Option<Vec<String>>,
+    /// `prefix` values on catalog run documents.
+    pub catalog_prefixes: Option<Vec<String>>,
+}
+
+/// Lines to print, and the process exit code, when `xerj search` or
+/// `xerj def` has no hits.
+///
+/// A prefix that matches no index exits `1` and names the prefixes already
+/// on the node. The `xerj autoindex <folder>` hint is only for a node whose
+/// catalog and index list are both empty — a miss against a real corpus is
+/// not a reason to tell the operator to index again.
+pub(crate) fn empty_lookup_report(
+    command: &str,
+    prefix: &str,
+    query: &str,
+    identifier: bool,
+    snap: &CorpusSnapshot,
+) -> (Vec<String>, i32) {
+    let pattern = format!("{prefix}-*");
+    let prefix_absent = matches!(snap.under_prefix, Some(ref names) if names.is_empty());
+    let mut lines = Vec::new();
+    if prefix_absent {
+        lines.push(format!("no indices named {pattern}"));
+    } else if command == "def" {
+        lines.push(format!("no definition in {pattern} for: {query}"));
+        lines.push(format!(
+            "(broader ranked retrieval: xerj search \"{query}\")"
+        ));
+    } else {
+        lines.push(format!("no match in {pattern} for: {query}"));
+    }
+    if command == "search" && identifier {
+        lines.push(format!(
+            "(looks like a symbol name — try: xerj def {query})"
+        ));
+    }
+
+    // A missing catalog index (the search failed) on a node with no user
+    // indices is an empty catalog. A failed read while indices exist is not:
+    // those indices are listed below instead of the autoindex hint.
+    let no_indices = matches!(snap.all_indices, Some(ref names) if names.is_empty());
+    let no_prefixes = match &snap.catalog_prefixes {
+        Some(prefixes) => prefixes.is_empty(),
+        None => no_indices,
+    };
+    let catalog_empty = no_indices && no_prefixes;
+    if catalog_empty {
+        lines.push("(index a relevant repo first: xerj autoindex <folder>)".to_string());
+    } else if let Some(prefixes) = snap.catalog_prefixes.as_ref().filter(|p| !p.is_empty()) {
+        lines.push(format!("prefixes on this node: {}", prefixes.join(", ")));
+        if let Some(other) = prefixes.iter().find(|p| p.as_str() != prefix) {
+            lines.push(format!("try: xerj {command} --prefix {other} \"{query}\""));
+        }
+    } else if let Some(indices) = snap.all_indices.as_ref().filter(|n| !n.is_empty()) {
+        lines.push(format!(
+            "indices on this node: {}",
+            join_capped(indices, 20)
+        ));
+        lines.push(
+            "the catalog lists no prefixes; --prefix is the index name before the dataset slug"
+                .to_string(),
+        );
+    }
+    let exit = if prefix_absent { 1 } else { 0 };
+    (lines, exit)
+}
+
+fn join_capped(items: &[String], cap: usize) -> String {
+    if items.len() <= cap {
+        items.join(", ")
+    } else {
+        format!(
+            "{}, … ({} more)",
+            items[..cap].join(", "),
+            items.len() - cap
+        )
+    }
+}
+
+pub(crate) fn corpus_snapshot(es: &Es, prefix: &str) -> CorpusSnapshot {
+    let under_prefix = es.cat_indices_json(&format!("{prefix}-*")).ok();
+    let all_indices = es.cat_indices().ok().map(|rows| {
+        let catalog = xerj_common::AUTOINDEX_CATALOG_INDEX;
+        let mut names: Vec<String> = rows
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name != catalog)
+            .collect();
+        names.sort();
+        names
+    });
+    CorpusSnapshot {
+        under_prefix,
+        all_indices,
+        catalog_prefixes: catalog_run_prefixes(es),
+    }
+}
+
+/// Distinct `prefix` values on catalog run documents, sorted. `None` when
+/// the catalog cannot be read — that is not the same as an empty catalog.
+fn catalog_run_prefixes(es: &Es) -> Option<Vec<String>> {
+    let body = json!({
+        "size": 200,
+        "query": { "term": { "doc_kind": "run" } },
+        "_source": ["prefix"]
+    });
+    let v = es
+        .search(xerj_common::AUTOINDEX_CATALOG_INDEX, &body)
+        .ok()?;
+    let mut prefixes = BTreeSet::new();
+    let hits = v.pointer("/hits/hits").and_then(Value::as_array)?;
+    for hit in hits {
+        if let Some(prefix) = hit.pointer("/_source/prefix").and_then(Value::as_str) {
+            if !prefix.is_empty() {
+                prefixes.insert(prefix.to_string());
+            }
+        }
+    }
+    Some(prefixes.into_iter().collect())
+}
+
 /// Entry point for the `search` subcommand. Returns a process exit code.
 pub fn run_search_cli() -> i32 {
     let mut url = std::env::var("XERJ_URL")
@@ -379,12 +508,13 @@ pub fn run_search_cli() -> i32 {
         .cloned()
         .unwrap_or_default();
     if hits.is_empty() {
-        println!("no match in {pattern} for: {query}");
-        if is_identifier(&query) {
-            println!("(looks like a symbol name — try: xerj def {query})");
+        let snap = corpus_snapshot(&es, &prefix);
+        let (lines, exit) =
+            empty_lookup_report("search", &prefix, &query, is_identifier(&query), &snap);
+        for line in lines {
+            println!("{line}");
         }
-        println!("(index a relevant repo first: xerj autoindex <folder>)");
-        return 0;
+        return exit;
     }
 
     for h in &hits {
@@ -651,5 +781,135 @@ mod tests {
             should[0]["multi_match"]["fields"],
             json!(["body", "defs^3", "title"])
         );
+    }
+
+    fn snap(
+        under: Option<Vec<&str>>,
+        all: Option<Vec<&str>>,
+        prefixes: Option<Vec<&str>>,
+    ) -> CorpusSnapshot {
+        let owned =
+            |v: Option<Vec<&str>>| v.map(|names| names.into_iter().map(str::to_string).collect());
+        CorpusSnapshot {
+            under_prefix: owned(under),
+            all_indices: owned(all),
+            catalog_prefixes: owned(prefixes),
+        }
+    }
+
+    #[test]
+    fn a_missing_prefix_exits_nonzero_and_names_prefixes_on_the_node() {
+        let (lines, exit) = empty_lookup_report(
+            "search",
+            "typo",
+            "flush the tree",
+            false,
+            &snap(
+                Some(vec![]),
+                Some(vec!["sled-docs"]),
+                Some(vec!["eng", "sled"]),
+            ),
+        );
+        assert_eq!(exit, 1);
+        let text = lines.join("\n");
+        assert!(text.contains("no indices named typo-*"), "{text}");
+        assert!(text.contains("prefixes on this node: eng, sled"), "{text}");
+        assert!(
+            text.contains("xerj search --prefix eng \"flush the tree\""),
+            "{text}"
+        );
+        assert!(
+            !text.contains("xerj autoindex"),
+            "a node that already has a catalog must not be told to index: {text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_catalog_keeps_the_autoindex_hint() {
+        let (lines, exit) = empty_lookup_report(
+            "search",
+            "ax",
+            "Db",
+            true,
+            &snap(Some(vec![]), Some(vec![]), Some(vec![])),
+        );
+        assert_eq!(exit, 1);
+        let text = lines.join("\n");
+        assert!(text.contains("xerj autoindex <folder>"), "{text}");
+        assert!(text.contains("xerj def Db"), "{text}");
+        assert!(!text.contains("prefixes on this node"), "{text}");
+
+        let (missing_catalog, exit) = empty_lookup_report(
+            "search",
+            "ax",
+            "Db",
+            false,
+            &snap(Some(vec![]), Some(vec![]), None),
+        );
+        assert_eq!(exit, 1);
+        let text = missing_catalog.join("\n");
+        assert!(
+            text.contains("xerj autoindex <folder>"),
+            "a node with no catalog index and no user indices is empty: {text}"
+        );
+    }
+
+    #[test]
+    fn a_miss_on_a_real_prefix_stays_exit_zero_and_lists_the_others() {
+        let (lines, exit) = empty_lookup_report(
+            "search",
+            "sled",
+            "not a thing",
+            false,
+            &snap(
+                Some(vec!["sled-docs"]),
+                Some(vec!["sled-docs", "eng-docs"]),
+                Some(vec!["sled"]),
+            ),
+        );
+        assert_eq!(exit, 0, "{lines:?}");
+        let text = lines.join("\n");
+        assert!(text.contains("no match in sled-*"), "{text}");
+        assert!(text.contains("prefixes on this node: sled"), "{text}");
+        assert!(!text.contains("try: xerj search --prefix"), "{text}");
+        assert!(!text.contains("xerj autoindex"), "{text}");
+
+        let (def_lines, def_exit) = empty_lookup_report(
+            "def",
+            "nope",
+            "Db",
+            false,
+            &snap(Some(vec![]), None, Some(vec!["sled"])),
+        );
+        assert_eq!(def_exit, 1);
+        let def_text = def_lines.join("\n");
+        assert!(def_text.contains("no indices named nope-*"), "{def_text}");
+        assert!(
+            def_text.contains("xerj def --prefix sled \"Db\""),
+            "{def_text}"
+        );
+    }
+
+    #[test]
+    fn indices_are_listed_when_the_catalog_has_no_prefix() {
+        let (lines, exit) = empty_lookup_report(
+            "search",
+            "typo",
+            "q",
+            false,
+            &snap(
+                Some(vec![]),
+                Some(vec!["sled-docs", "eng-logs"]),
+                Some(vec![]),
+            ),
+        );
+        assert_eq!(exit, 1);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("indices on this node: sled-docs, eng-logs"),
+            "{text}"
+        );
+        assert!(text.contains("catalog lists no prefixes"), "{text}");
+        assert!(!text.contains("xerj autoindex"), "{text}");
     }
 }

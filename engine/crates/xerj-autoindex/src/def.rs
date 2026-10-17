@@ -15,8 +15,8 @@ use std::collections::BTreeSet;
 
 use crate::esclient::Es;
 use crate::search::{
-    field_mapped, hit_location, is_identifier, mapped_property_names, passage_text,
-    weighted_query_fields,
+    corpus_snapshot, empty_lookup_report, field_mapped, hit_location, is_identifier,
+    mapped_property_names, passage_text, weighted_query_fields,
 };
 use serde_json::{json, Value};
 
@@ -355,9 +355,12 @@ pub fn run_def_cli() -> i32 {
         .cloned()
         .unwrap_or_default();
     if hits.is_empty() {
-        println!("no definition in {pattern} for: {query}");
-        println!("(broader ranked retrieval: xerj search \"{query}\")");
-        return 0;
+        let snap = corpus_snapshot(&es, &prefix);
+        let (lines, exit) = empty_lookup_report("def", &prefix, &query, false, &snap);
+        for line in lines {
+            println!("{line}");
+        }
+        return exit;
     }
 
     for h in &hits {
