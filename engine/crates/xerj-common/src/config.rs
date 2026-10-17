@@ -1549,23 +1549,33 @@ impl LogsConfig {
 
 /// Embedding backend settings.
 ///
-/// XERJ can embed `semantic_text` fields three ways, chosen by [`mode`]:
+/// XERJ can embed `semantic_text` fields four ways, chosen by
+/// [`mode`](Self::mode):
 ///   * `"lexical"` — the zero-dependency built-in feature-hash embedder
 ///     (deterministic, 384-dim, no model, no network). This is the honest
 ///     default: lexical, *not* neural semantic understanding.
 ///   * `"neural"` — a built-in BERT sentence embedder (all-MiniLM-L6-v2 by
 ///     default) that runs in-process via `candle`. The model weights are
-///     downloaded once on first use (or read from [`local_model_dir`] for
+///     downloaded once on first use (or read from
+///     [`local_model_dir`](Self::local_model_dir) for
 ///     air-gapped deployments). The neural backend ships in the standard
 ///     binary; a `--no-default-features` slim build omits it and falls back
 ///     to lexical.
 ///   * `"proxy"` — call an external OpenAI-compatible `/v1/embeddings`
-///     endpoint ([`default_endpoint`]). Lets customers plug in ANY embedding
-///     model / provider they already run. An explicit `mode = "proxy"` with a
+///     endpoint ([`default_endpoint`](Self::default_endpoint)). Lets
+///     customers plug in ANY embedding model / provider they already run. An explicit `mode = "proxy"` with a
 ///     missing or unusable endpoint is a startup ERROR (#1189): silently
 ///     running lexical instead would write the wrong vectors into the index
 ///     while every embedding request appears to succeed.
-///   * `"auto"` (default) — use the proxy when [`default_endpoint`] is set,
+///   * `"onnx-experimental"` — a local FP32 ONNX model and tokenizer
+///     ([`onnx_model_path`](Self::onnx_model_path),
+///     [`onnx_tokenizer_path`](Self::onnx_tokenizer_path)) run through ONNX
+///     Runtime; never auto-downloaded. Needs a build with the
+///     `onnx-experimental` feature and is fail-closed: a build without it, or
+///     a missing model or tokenizer, is a startup error, never a lexical
+///     fallback.
+///   * `"auto"` (default) — use the proxy when
+///     [`default_endpoint`](Self::default_endpoint) is set,
 ///     otherwise lexical; if the endpoint fails to initialize, fall back to
 ///     lexical with a warning. The fallback exists ONLY on this path (#1189).
 ///
