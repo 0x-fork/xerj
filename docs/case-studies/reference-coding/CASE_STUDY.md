@@ -123,7 +123,9 @@ Two kinds of reference deliberately:
 
 ## How they were indexed
 
-Two commands, both shipped in [`tools/xerj-code/`](../../../tools/xerj-code/):
+Two wrapper scripts, shipped at the time in [`tools/xerj-code/`](../../../tools/xerj-code/)
+(since removed — the `xerj` subcommands that replaced them are listed under
+[How you reproduce it](#how-you-reproduce-it)):
 
 ```sh
 xc-corpus.sh <name> <git-url>…   # shallow clone (--depth 1) + record each repo's licence
