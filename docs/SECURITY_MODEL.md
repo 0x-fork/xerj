@@ -59,7 +59,7 @@ It does four things:
    (`authorize_expression`, `authz.rs:1224`).
 4. Installs the principal as the engine's visibility rule for the rest of the
    request and prunes reserved index names out of metadata responses
-   (`prune_response`, `authz.rs:1431`).
+   (`prune_response`, `authz.rs:1715`).
 
 A superuser short-circuits on the first line of the middleware
 (`authz.rs:1237`): no body buffering, no visibility guard, no response pruning.
