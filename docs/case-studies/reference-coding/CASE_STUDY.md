@@ -170,7 +170,7 @@ in [`tools/xerj-code/SKILL.md`](../../../tools/xerj-code/SKILL.md).
 
 ## How you reproduce it
 
-The **retrieval half** is shipped and runs as printed: start XERJ, then
+The **retrieval half** ran as follows at the time: start XERJ, then
 `xc-corpus.sh` (or `xc-corpus.sh --from tools/xerj-code/hub/<corpus>.json`, which
 pins the exact commits these runs used) → `xc-index.sh` → `xc.py`. It needs the
 `xerj` binary, `git` and `python3`. To point it at **your own** code, index your
