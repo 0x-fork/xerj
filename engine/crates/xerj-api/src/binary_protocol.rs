@@ -12,7 +12,7 @@
 //! ```
 //!
 //! * **length** — `u32` little-endian: byte length of the payload that follows.
-//! * **op** — one of the [`Op`] constants; determines how the server interprets
+//! * **op** — one of the [`op`] constants; determines how the server interprets
 //!   the payload.
 //! * **payload** — JSON-encoded request or response body (no trailing newline).
 //!
