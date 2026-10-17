@@ -294,7 +294,7 @@ default_analyzer = "standard"    # accepted, not wired — see the table</pre>
   <p>Vector search settings. Unfiltered kNN is served by a <strong>persisted HNSW graph with exact rescoring</strong> (measured recall@10 1.00 on the official bench query); filtered kNN and SQ8 fields run the exact scan. The <code class="inline">hnsw_*</code> keys are accepted and validated but not yet wired: the graph builds with fixed M=16 / ef_construction=200, and the query-time beam width comes from the request's <code class="inline">num_candidates</code> (floored at 800). Quantization trades recall for scoring precision, not for memory — see <code class="inline">default_quantization</code> below and <a href="https://github.com/xerj-org/xerj/issues/392">#392</a>.</p>
 <pre class="code">[vector]
 default_metric         = "cosine"    # accepted, not wired — similarity comes from the mapping
-hnsw_m                 = 16          # accepted for compat; kNN serving is exact
+hnsw_m                 = 16          # accepted, not wired — the graph builds with M=16
 hnsw_ef_construction   = 200         # accepted for compat; no effect on results
 hnsw_ef_search         = 100         # accepted for compat; no effect on results
 default_quantization   = "none"      # "scalar8" = int8 precision, 1–2% recall loss.
