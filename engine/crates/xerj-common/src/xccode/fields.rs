@@ -369,6 +369,72 @@ pub fn semantic_capable(mapping: Option<&Value>) -> (Vec<String>, usize) {
     (capable, mapping.len())
 }
 
+/// One semantic field per index, then indices grouped by that field.
+///
+/// Preference is `body`, then `text`, then the alphabetically first
+/// `semantic_text` property. Code indices often elect `code` (or prose
+/// elects `text`) while a document dataset elects `body`; a query that only
+/// names `body` never reaches the others, and posting `body` at an index
+/// that maps it as plain `text` 400s the whole request.
+///
+/// Groups are ordered `body`, `text`, then the remaining field names.
+/// Index names inside a group are sorted. An unreadable mapping is empty.
+pub fn semantic_groups(mapping: Option<&Value>) -> (Vec<(String, Vec<String>)>, usize) {
+    let Some(mapping) = mapping.and_then(Value::as_object) else {
+        return (Vec::new(), 0);
+    };
+    let mut by_field: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (name, body) in mapping {
+        let Some(chosen) = elected_semantic_field(body) else {
+            continue;
+        };
+        by_field.entry(chosen).or_default().push(name.clone());
+    }
+    let mut groups: Vec<(String, Vec<String>)> = by_field.into_iter().collect();
+    for (_, indices) in &mut groups {
+        indices.sort();
+    }
+    groups.sort_by(|left, right| {
+        semantic_field_rank(&left.0)
+            .cmp(&semantic_field_rank(&right.0))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    (groups, mapping.len())
+}
+
+fn semantic_field_rank(field: &str) -> u8 {
+    match field {
+        "body" => 0,
+        "text" => 1,
+        _ => 2,
+    }
+}
+
+fn elected_semantic_field(mapping_body: &Value) -> Option<String> {
+    let props = mapping_body
+        .pointer("/mappings/properties")
+        .and_then(Value::as_object)?;
+    let mut semantic: Vec<&str> = props
+        .iter()
+        .filter(|(_, spec)| {
+            spec.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|ty| ty == "semantic_text")
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if semantic.is_empty() {
+        return None;
+    }
+    semantic.sort_unstable();
+    let chosen = ["body", "text"]
+        .into_iter()
+        .find(|preferred| semantic.contains(preferred))
+        .unwrap_or(semantic[0]);
+    Some(chosen.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +523,48 @@ mod tests {
         assert_eq!(capable, vec!["sem-1".to_string(), "sem-2".to_string()]);
         assert_eq!(total, 3);
         assert!(semantic_capable(None) == (Vec::new(), 0));
+    }
+
+    /// A code index that elects `code` (not `body`) and a prose index that
+    /// elects `text` must both be queried, on their own field. `body` wins
+    /// when an index maps both.
+    #[test]
+    fn semantic_groups_follow_the_field_each_index_actually_embeds() {
+        let m = json!({
+            "manifest": { "mappings": { "properties": {
+                "body": { "type": "semantic_text" },
+                "text": { "type": "text" }
+            }}},
+            "code": { "mappings": { "properties": {
+                "body": { "type": "text" },
+                "code": { "type": "semantic_text" }
+            }}},
+            "prose": { "mappings": { "properties": {
+                "text": { "type": "semantic_text" },
+                "title": { "type": "text" }
+            }}},
+            "both": { "mappings": { "properties": {
+                "body": { "type": "semantic_text" },
+                "text": { "type": "semantic_text" }
+            }}},
+            "plain": { "mappings": { "properties": {
+                "body": { "type": "text" }
+            }}}
+        });
+        let (groups, total) = semantic_groups(Some(&m));
+        assert_eq!(total, 5);
+        assert_eq!(
+            groups,
+            vec![
+                (
+                    "body".to_string(),
+                    vec!["both".to_string(), "manifest".to_string()]
+                ),
+                ("text".to_string(), vec!["prose".to_string()]),
+                ("code".to_string(), vec!["code".to_string()]),
+            ]
+        );
+        assert!(semantic_groups(None).0.is_empty());
     }
 
     /// #1158: a raw-JSON corpus (ghsa-db advisories) maps none of the

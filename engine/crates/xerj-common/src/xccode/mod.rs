@@ -327,27 +327,46 @@ pub fn run_code_query(
                     )
                 }
             };
-            let (capable, total) = fields::semantic_capable(Some(&mapping));
-            if capable.is_empty() {
+            // Group by the field each index actually embeds. One request
+            // cannot name two semantic fields, and naming `body` at an index
+            // whose embedded field is `code` or `text` 400s every index in
+            // the comma-join.
+            let (groups, total) = fields::semantic_groups(Some(&mapping));
+            if groups.is_empty() {
                 // No semantic arm is possible: do NOT post the query. An
                 // empty comma-join is an empty index segment, which the
                 // server reads as `/_search` — every index on the node,
                 // corpus or not. The empty answer with its note is the
                 // honest result.
                 note = Some(format!(
-                    "no index under '{pattern}' maps `body` as semantic_text"
+                    "no index under '{pattern}' maps a field as semantic_text"
                 ));
                 (Value::Null, Vec::new())
             } else {
+                let indexed: usize = groups.iter().map(|(_, names)| names.len()).sum();
+                let described = groups
+                    .iter()
+                    .map(|(field, names)| format!("{field} ({})", names.len()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 note = Some(format!(
-                    "vector only over {} of {total} index(es)",
-                    capable.len()
+                    "vector only over {indexed} of {total} index(es): {described}"
                 ));
-                let body = semantic_body(&query, fetch, &params.lang);
-                match http.search(&capable.join(","), &body) {
-                    Ok(r) => (r.clone(), hit_list(&r)),
-                    Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
+                let mut merged: Option<Value> = None;
+                for (field, names) in &groups {
+                    let body = semantic_on_field(field, &query, fetch, &params.lang);
+                    match http.search(&names.join(","), &body) {
+                        Ok(response) => {
+                            merged = Some(match merged {
+                                Some(prev) => merge_by_score(prev, &response, fetch),
+                                None => response,
+                            });
+                        }
+                        Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
+                    }
                 }
+                let response = merged.unwrap_or(Value::Null);
+                (response.clone(), hit_list(&response))
             }
         }
         Mode::Hybrid => {
@@ -976,13 +995,20 @@ pub(crate) fn fuse_file_and_symbol_hits(
     out
 }
 
-/// The vector-only body. Aimed ONLY at indices whose `body` is semantic_text
-/// (a semantic query against plain text 400s the whole wildcard).
+/// The vector-only body aimed at `field`. A semantic query against a plain
+/// `text` field 400s the whole request, so callers pass only indices that
+/// embed this field. Hybrid still hardcodes `body`; semantic mode passes
+/// the field [`fields::semantic_groups`] elected.
 ///
 /// The clause carries `k` = the fetch window: without it the parser cuts the
 /// vector pool to 10 whatever `size` says (#1145).
-pub(crate) fn semantic_body(query: &str, k: usize, lang: &Option<String>) -> Value {
-    let q = serde_json::json!({ "semantic": { "field": "body", "query": query, "k": k } });
+pub(crate) fn semantic_on_field(
+    field: &str,
+    query: &str,
+    k: usize,
+    lang: &Option<String>,
+) -> Value {
+    let q = serde_json::json!({ "semantic": { "field": field, "query": query, "k": k } });
     // `--lang` rides in `filter`: the engine sends a bool to the vector path
     // only when the semantic clause is its sole must/should clause (#1148).
     let query = match lang {
@@ -1669,7 +1695,16 @@ mod tests {
     /// vector@10 (the #1137 overfetch widened the BM25 leg alone).
     #[test]
     fn the_vector_leg_carries_the_fetch_window_as_k() {
-        let sem = semantic_body("q", 50, &None);
+        let sem = semantic_on_field("body", "q", 50, &None);
+        assert_eq!(
+            sem.pointer("/query/semantic/field"),
+            Some(&serde_json::json!("body"))
+        );
+        let on_code = semantic_on_field("code", "q", 50, &None);
+        assert_eq!(
+            on_code.pointer("/query/semantic/field"),
+            Some(&serde_json::json!("code"))
+        );
         assert_eq!(sem.pointer("/size"), Some(&serde_json::json!(50)));
         assert_eq!(
             sem.pointer("/query/semantic/k"),
@@ -1695,7 +1730,7 @@ mod tests {
         let lang = Some("rust".to_string());
         let want_filter = serde_json::json!([{ "match": { "language": "rust" } }]);
 
-        let sem = semantic_body("q", 50, &lang);
+        let sem = semantic_on_field("body", "q", 50, &lang);
         let must = sem.pointer("/query/bool/must").and_then(Value::as_array);
         assert_eq!(must.map(Vec::len), Some(1), "{sem}");
         assert!(must.unwrap()[0].get("semantic").is_some(), "{sem}");
