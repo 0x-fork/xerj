@@ -473,11 +473,30 @@ pub fn run_code_query(
         }
     };
 
+    // #1504: a vector leg ran. The note already says how many indices it
+    // covered; it did not say which embedder produced the vectors. The
+    // default is lexical feature-hashing, and a caller who read "vector
+    // over N of M" has guessed neural before. The line states the default
+    // and the flag that changes it. It does not claim the running node is
+    // or is not on that default — the client cannot see `--embed-mode`.
+    if let Some(n) = note.as_mut() {
+        if n.contains("vector over") || n.contains("vector only") {
+            n.push_str(
+                "; vector leg uses the node's embedder (default is lexical \
+                 feature-hashing, not neural — start the node with --embed-mode neural \
+                 for the built-in BERT)",
+            );
+        }
+    }
+
     // 5. #1137: cut the overfetched window back to the page, capping records
     //    per source file (#1137) and per source index (#1238), and patch the
     //    diversified page into the response so `--json` consumers see the
     //    SAME list the prose renderer does (the G7 grader is one). A page
     //    that shrank says so in the note, naming only the caps that fired.
+    // #1504: translation catalogs and minified bundles repeat every UI phrase
+    // and win natural-language queries. They stay searchable, behind source.
+    let hits = demote_catalog_noise(hits);
     let (hits, file_dropped, index_dropped) = diversify(hits, params.k);
     if file_dropped > 0 || index_dropped > 0 {
         let mut caps = Vec::new();
@@ -597,6 +616,67 @@ pub(crate) fn diversity_fetch(k: usize) -> usize {
 /// they are: a corpus whose whole fan-out is a handful of shard indices
 /// (the blogposts pack is 4) has fewer indices than slots, the per-index
 /// cap would only shrink the page, and so it never engages.
+/// Stable partition: hits whose path is a translation catalog or a minified
+/// bundle move behind every other hit, keeping their relative order. A page
+/// that is only catalogs is unchanged. Hits with no path stay where they are.
+pub(crate) fn demote_catalog_noise(hits: Vec<Value>) -> Vec<Value> {
+    let mut primary = Vec::with_capacity(hits.len());
+    let mut catalogs = Vec::new();
+    for hit in hits {
+        if hit_path(&hit).is_some_and(is_catalog_noise) {
+            catalogs.push(hit);
+        } else {
+            primary.push(hit);
+        }
+    }
+    primary.extend(catalogs);
+    primary
+}
+
+/// Translation catalogs and minified bundles (#1504). The patterns are the
+/// ones a multilingual repo uses for key→string tables, not a general
+/// "prose file" filter: `lang/*.php`, `values*/strings.xml`, `*.lproj/*.strings`,
+/// `*.po` / `*.pot`, and `*.min.js` / `*.min.mjs` / `*.min.css`.
+pub(crate) fn is_catalog_noise(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if name.ends_with(".min.js") || name.ends_with(".min.mjs") || name.ends_with(".min.css") {
+        return true;
+    }
+    if name.ends_with(".po") || name.ends_with(".pot") {
+        return true;
+    }
+    let Some(parent) = parent_segment(path) else {
+        return false;
+    };
+    if parent == "lang" && name.ends_with(".php") {
+        return true;
+    }
+    if name == "strings.xml" && (parent == "values" || parent.starts_with("values-")) {
+        return true;
+    }
+    parent.ends_with(".lproj") && name.ends_with(".strings")
+}
+
+fn parent_segment(path: &str) -> Option<&str> {
+    let cut = path.rfind(['/', '\\'])?;
+    let head = &path[..cut];
+    let start = head.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    let parent = &head[start..];
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+fn hit_path(hit: &Value) -> Option<&str> {
+    hit.pointer("/_source/ax_path")
+        .and_then(Value::as_str)
+        .or_else(|| hit.pointer("/_source/ax_file").and_then(Value::as_str))
+        .or_else(|| hit.pointer("/_source/path").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn diversify(hits: Vec<Value>, want: usize) -> (Vec<Value>, usize, usize) {
     // Keys are owned: a borrowed &str would pin every hit it came from and
     // forbid the move into `out` below.
@@ -1335,11 +1415,125 @@ mod tests {
             "{}",
             out.text
         );
+        // #1504: the mode line names the default embedder. It must not claim
+        // the running node is neural — only what the default is and the flag
+        // that changes it.
+        assert!(
+            out.text.contains("lexical feature-hashing")
+                && out.text.contains("--embed-mode neural"),
+            "vector mode line must name the default embedder: {}",
+            out.text
+        );
         assert!(
             out.text.contains("rrf 4.20"),
             "hybrid scores render as rrf: {}",
             out.text
         );
+    }
+
+    /// #1504: standalone semantic prints the same embedder default. BM25 does
+    /// not — there is no vector leg to misread.
+    #[test]
+    fn semantic_mode_names_the_default_embedder_and_bm25_does_not() {
+        let root = root_with_state();
+        let mut http = FakeHttp::new();
+        http.mapping = serde_json::json!({
+            "xc-kv-b1-000": { "mappings": { "properties": { "body": { "type": "semantic_text" } } } },
+            "xc-kv-b1-001": { "mappings": { "properties": { "body": { "type": "text" } } } }
+        });
+        http.live = vec!["xc-kv-b1-000".into(), "xc-kv-b1-001".into()];
+        let mut p = CodeParams::new("kv", "addReplyNull");
+        p.mode = Mode::Semantic;
+        let out = run_code_query(&root, &http, "u", &p, "`--stale-ok`");
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(
+            out.text.contains("vector only over 1 of 2")
+                && out.text.contains("lexical feature-hashing")
+                && out.text.contains("--embed-mode neural"),
+            "{}",
+            out.text
+        );
+
+        let bm25 = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "addReplyNull"),
+            "`--stale-ok`",
+        );
+        assert_eq!(bm25.exit, 0, "{}", bm25.text);
+        assert!(
+            !bm25.text.contains("--embed-mode neural"),
+            "bm25 has no vector leg: {}",
+            bm25.text
+        );
+    }
+
+    /// #1504: lang catalogs, Android strings, Apple .strings, gettext, and
+    /// minified bundles sort behind an implementing source file. A page that
+    /// is only catalogs keeps its order. A PHP service file is not a catalog
+    /// just because the repo also has `lang/`.
+    #[test]
+    fn catalog_and_minified_hits_rank_behind_source() {
+        let hit = |path: &str, score: f64| {
+            serde_json::json!({
+                "_index": "xc-aipbx-000",
+                "_score": score,
+                "_source": { "ax_path": path, "ax_file": path, "body": "phrase" }
+            })
+        };
+        let hits = vec![
+            hit("web/lang/en.php", 9.0),
+            hit("assets/jssip.min.js", 8.0),
+            hit("res/values-da/strings.xml", 7.0),
+            hit("ios/en.lproj/Localizable.strings", 6.0),
+            hit("locale/app.po", 5.5),
+            hit("locale/app.pot", 5.4),
+            hit("android/service/PbxForegroundService.kt", 4.0),
+            hit("web/src/services/phones/NecTemplate.php", 3.0),
+            hit("docs/phones.md", 2.0),
+        ];
+        let demoted = demote_catalog_noise(hits);
+        let paths: Vec<&str> = demoted
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &paths[..3],
+            [
+                "android/service/PbxForegroundService.kt",
+                "web/src/services/phones/NecTemplate.php",
+                "docs/phones.md",
+            ]
+        );
+        assert!(paths[3..].iter().all(|p| is_catalog_noise(p)), "{paths:?}");
+
+        let (page, _, _) = diversify(demoted, 3);
+        let page_paths: Vec<&str> = page
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            page_paths,
+            [
+                "android/service/PbxForegroundService.kt",
+                "web/src/services/phones/NecTemplate.php",
+                "docs/phones.md",
+            ]
+        );
+
+        let only = demote_catalog_noise(vec![
+            hit("web/lang/hr.php", 9.0),
+            hit("web/lang/en.php", 8.0),
+        ]);
+        assert_eq!(only[0]["_source"]["ax_path"], "web/lang/hr.php");
+        assert_eq!(only[1]["_source"]["ax_path"], "web/lang/en.php");
+
+        assert!(!is_catalog_noise("src/main.rs"));
+        assert!(!is_catalog_noise("res/layout/activity.xml"));
+        assert!(is_catalog_noise("web/lang/en.php"));
+        assert!(is_catalog_noise("res/values/strings.xml"));
+        assert!(is_catalog_noise("assets/app.min.css"));
     }
 
     /// #1146: with a mixed mapping the fused request may only go to the
