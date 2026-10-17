@@ -11,6 +11,8 @@ allowlist is widened, on purpose), and `gh` is a stub that records its calls.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -630,6 +632,118 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout, "alpha\taaaaaaaa\tpack-alpha-aaaaaaaa-r2\n")
         self.assertIn("1 of 2 live corpora", out.stderr)
+
+
+class ReportTests(unittest.TestCase):
+    STAGES = ["start", "build", "verify", "tag", "upload", "e2e", "publish"]
+
+    def steps(self, **outcomes) -> dict:
+        return {sid: {"outcome": outcomes.get(sid, "success")} for sid in self.STAGES}
+
+    def stages(self, logs: dict) -> list:
+        return [(sid, [logs[sid]] if sid in logs else []) for sid in self.STAGES]
+
+    def test_a_published_pack_records_bytes_defs_and_its_tag(self):
+        with tempfile.TemporaryDirectory() as t:
+            out = pathlib.Path(t) / "build.txt"
+            out.write_text("cloning...\npack lz4 aaaaaaaa 1234 3 56\n")
+            r = hp.result_row("lz4", "aaaaaaaa", self.steps(), self.stages({}), out,
+                              "pack-lz4-aaaaaaaa", False, "77", "2026-10-16")
+            self.assertEqual((r["result"], r["tag"], r["bytes"], r["defs"]),
+                             ("published", "pack-lz4-aaaaaaaa", 1234, 56))
+
+    def test_a_failed_stage_names_itself_and_its_most_telling_log_line(self):
+        with tempfile.TemporaryDirectory() as t:
+            log = pathlib.Path(t) / "e2e.log"
+            log.write_text("pulling\n\x1b[31m::error::def LZ4_x not answered from the local pack\x1b[0m\ncleanup\n")
+            r = hp.result_row("lz4", "aaaaaaaa", self.steps(e2e="failure", publish="skipped"),
+                              self.stages({"e2e": log}), None, "", False, "77", "2026-10-16")
+            self.assertEqual((r["result"], r["stage"]), ("failed", "e2e"))
+            self.assertEqual(r["error"], "def LZ4_x not answered from the local pack")
+            self.assertIsNone(r["bytes"])
+
+    def test_the_first_failed_stage_wins_and_a_cancelled_one_is_not_a_success(self):
+        r = hp.result_row("x", "aaaaaaaa", self.steps(build="cancelled", verify="skipped"),
+                          self.stages({}), None, "", False, "1", "d")
+        self.assertEqual((r["result"], r["stage"]), ("cancelled", "build"))
+
+    def test_nothing_failed_but_nothing_published_is_not_reported_as_success(self):
+        r = hp.result_row("x", "aaaaaaaa", self.steps(), self.stages({}), None, "", False, "1", "d")
+        self.assertEqual(r["result"], "no result")
+        self.assertTrue(r["error"])
+
+    def test_a_job_that_died_before_its_first_stage_is_not_called_unexplained(self):
+        steps = {sid: {"outcome": "skipped"} for sid in self.STAGES}
+        r = hp.result_row("x", "aaaaaaaa", steps, self.stages({}), None, "", False, "1", "d", "failure")
+        self.assertEqual((r["result"], r["stage"]), ("failed", "before start"))
+
+    def test_the_error_line_skips_success_counts_and_redacts_secrets(self):
+        with tempfile.TemporaryDirectory() as t:
+            log = pathlib.Path(t) / "b.log"
+            log.write_text("cannot clone https://ghp_" + "A" * 36 + "@github.com/x\nsummary: 0 errors\nexit 1\n")
+            line = hp._log_tail_error([log])
+            self.assertTrue(line.startswith("cannot clone"), line)
+            self.assertNotIn("ghp_", line)
+            self.assertIn("[redacted]", line)
+
+    def test_the_report_shows_the_newest_runs_and_says_how_many_it_hides(self):
+        hist = [{"run": str(i), "date": "d", "slug": "a", "pin8": "aaaaaaaa", "result": "published"}
+                for i in range(hp.REPORT_RUNS_SHOWN + 2)]
+        md = hp.render_report(hist)
+        self.assertIn(f"The {hp.REPORT_RUNS_SHOWN} newest of {hp.REPORT_RUNS_SHOWN + 2} runs", md)
+        self.assertNotIn("### Run 0,", md)
+        self.assertIn(f"### Run {hp.REPORT_RUNS_SHOWN + 1},", md)
+
+    def test_a_dry_run_that_passed_says_so(self):
+        r = hp.result_row("x", "aaaaaaaa", self.steps(tag="skipped", upload="skipped", publish="skipped"),
+                          self.stages({}), None, "", True, "1", "d")
+        self.assertEqual(r["result"], "dry-run ok")
+
+    def test_a_planned_corpus_without_a_row_still_gets_one(self):
+        planned = [{"slug": "a", "pin8": "11111111"}, {"slug": "b", "pin8": "22222222"}]
+        rows = [{"slug": "a", "result": "published"}]
+        extra = hp.missing_rows(planned, rows, "9", "d", "build xerj: failure")
+        self.assertEqual([(r["slug"], r["result"], r["error"]) for r in extra],
+                         [("b", "no result", "build xerj: failure")])
+
+    def test_the_report_keeps_a_failure_visible_until_a_later_run_publishes_it(self):
+        def r(run, slug, result, error=""):
+            return {"run": run, "date": "d", "slug": slug, "pin8": "aaaaaaaa", "bytes": None,
+                    "defs": None, "result": result, "tag": "", "stage": "", "error": error}
+        history = [r("1", "a", "failed", "boom | pipe"), r("1", "b", "published"),
+                   r("2", "c", "failed", "later")]
+        md = hp.render_report(history)
+        self.assertIn("3 corpora attempted: 1 published at their latest attempt, 2 not.", md)
+        self.assertIn("boom \\| pipe", md, "a pipe in an error must not break the table")
+        self.assertLess(md.index("### Run 2"), md.index("### Run 1"), "newest run first")
+        md = hp.render_report(history + [r("3", "a", "published")])
+        self.assertIn("3 corpora attempted: 2 published at their latest attempt, 1 not.", md)
+        self.assertIn("boom", md, "the old failing row stays in run 1's table")
+
+    def test_report_cli_appends_this_run_and_replaces_a_rerun_of_the_same_id(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = pathlib.Path(t)
+            rows = root / "rows"; rows.mkdir()
+            (rows / "a.json").write_text(json.dumps(
+                {"slug": "a", "pin8": "11111111", "result": "published", "tag": "pack-a-11111111",
+                 "bytes": 5, "defs": 2, "stage": "", "error": "", "date": "d", "run": "x"}))
+            matrix = root / "plan.json"
+            matrix.write_text(json.dumps({"include": [{"slug": "a", "pin8": "11111111"},
+                                                      {"slug": "b", "pin8": "22222222"}]}))
+            hist, rep = root / "out" / "rows.jsonl", root / "out" / "REPORT.md"
+            args = ["report", "--rows-dir", str(rows), "--matrix", str(matrix), "--run-id", "5",
+                    "--run-url", "https://x.test/runs/5", "--history", str(hist), "--report", str(rep),
+                    "--missing-reason", "pack: cancelled", "--write"]
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(hp.main(args), 0)
+                self.assertEqual(hp.main(args), 0)  # a re-run of the report job must not duplicate rows
+            self.assertIn("1 of 2 corpora published in this run.", out.getvalue())
+            got = hp.read_rows(hist)
+            self.assertEqual([(r["slug"], r["result"], r["run"]) for r in got],
+                             [("a", "published", "5"), ("b", "no result", "5")])
+            md = rep.read_text()
+            self.assertIn("### Run [5](https://x.test/runs/5), d", md.replace(hp._today(), "d"))
+            self.assertIn("| `b` | `22222222` |  |  | no result | pack: cancelled |", md)
 
 
 class CommandLineTests(unittest.TestCase):

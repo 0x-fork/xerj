@@ -4,7 +4,7 @@
 Drives `.github/workflows/hub-packs.yml` (plan §8, docs/CORPUS_HUB_V2_IMPLEMENTATION.md).
 Stdlib only, so the workflow needs no `pip install` and the tests run anywhere.
 
-Two jobs, both pure functions over the registry first and thin I/O second:
+Three jobs, all pure functions over the registry first and thin I/O second:
 
   plan    Which live corpora need a pack built?  A corpus is DUE when no published
           release `pack-<slug>-<pin8>` exists for its current pin (pin8 = the first
@@ -17,6 +17,10 @@ Two jobs, both pure functions over the registry first and thin I/O second:
           and if the default-branch head differs from the manifest's `sha`, open a
           PULL REQUEST that moves the pin.  A human merges; the packs follow on
           merge (the `plan` above sees the new, unreleased pin).
+
+  report  One row per corpus per run (`result-row` in each pack job, `report` at the
+          end): REPORT.md + rows.jsonl under benchmarks/hub-backfill/ on corpus-hub,
+          so a corpus whose build failed is listed with its error (spec §12.1).
 
 Registry facts this relies on (tools/xerj-code/hub/):
   * `<slug>.json` is `{"corpus": slug, "cloned_at": ..., "repos": [{"repo", "url",
@@ -616,6 +620,195 @@ def check_catalogue(
     return errors
 
 
+# ── backfill report: one row per corpus per run (spec §12.1) ────────────────
+#
+# Every pack job records what happened to its corpus (`result-row`), success or
+# not; the `report` job folds those rows into benchmarks/hub-backfill/ on
+# corpus-hub. A corpus the plan scheduled but which left no row (its job never
+# started, was cancelled before recording, or the binary build failed) still gets
+# a row saying so: a failed corpus must never vanish silently.
+
+REPORT_ERROR_MAX = 240
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_ERRORISH_RE = re.compile(r"error|fail|panic|refus|cannot|denied|timed? ?out", re.I)
+# "0 errors", "failed=0", "no failures": error words that report success.
+_NOT_ERROR_RE = re.compile(r"\b(?:0|no|zero) (?:errors?|failures?)\b|\b(?:errors?|failed|failures?)[=:] ?0\b", re.I)
+# The report is committed: GitHub masks secrets in its own log, not in these lines.
+_SECRETISH_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|\b[0-9a-fA-F]{64}\b")
+REPORT_RUNS_SHOWN = 30
+
+
+def _log_tail_error(paths: Iterable[pathlib.Path]) -> str:
+    """The most telling line of a failed stage's log: the last `::error` annotation,
+    else the last line that looks like an error, else the last non-empty line."""
+    lines: list[tuple[bool, str]] = []
+    for p in paths:
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        for ln in text.splitlines():
+            ln = _ANSI_RE.sub("", ln).strip()
+            annotated = ln.startswith("::error")
+            ln = re.sub(r"^::(?:error|warning|notice)[^:]*::", "", ln).strip()
+            if ln:
+                lines.append((annotated, ln))
+    if not lines:
+        return ""
+    def errorish(ln: str) -> bool:
+        return bool(_ERRORISH_RE.search(ln)) and not _NOT_ERROR_RE.search(ln)
+
+    chosen = lines[-1][1]
+    for pick in (lambda a, ln: a, lambda a, ln: errorish(ln)):
+        hit = next((ln for a, ln in reversed(lines) if pick(a, ln)), None)
+        if hit is not None:
+            chosen = hit
+            break
+    return _SECRETISH_RE.sub("[redacted]", chosen)
+
+
+def result_row(
+    slug: str,
+    pin8: str,
+    steps: dict,
+    stages: list[tuple[str, list[pathlib.Path]]],
+    build_out: Optional[pathlib.Path],
+    published_tag: str,
+    dry_run: bool,
+    run_id: str,
+    date: str,
+    job_status: str = "",
+) -> dict:
+    """What happened to one corpus in one run.  `steps` is the job's
+    `toJSON(steps)`; `stages` names the step ids in order with the log files that
+    explain each one's failure."""
+    row = {
+        "run": str(run_id), "date": date, "slug": slug, "pin8": pin8,
+        "bytes": None, "defs": None, "result": "", "tag": "", "stage": "", "error": "",
+    }
+    if build_out is not None:
+        try:
+            for ln in reversed(build_out.read_text(errors="replace").splitlines()):
+                f = ln.split()
+                if len(f) == 6 and f[0] == "pack" and f[1] == slug:
+                    row["bytes"], row["defs"] = int(f[3]), int(f[5])
+                    break
+        except (OSError, ValueError):
+            pass
+    for sid, logs in stages:
+        outcome = (steps.get(sid) or {}).get("outcome")
+        if outcome in ("failure", "cancelled"):
+            row["result"] = "failed" if outcome == "failure" else "cancelled"
+            row["stage"] = sid
+            row["error"] = _log_tail_error(logs)[:REPORT_ERROR_MAX]
+            return row
+    ran = [sid for sid, _ in stages if (steps.get(sid) or {}).get("outcome") == "success"]
+    if not ran and job_status and job_status != "success":
+        # Nothing tracked ran: the job failed or was cancelled before the first stage.
+        row["result"] = "failed" if job_status == "failure" else "cancelled"
+        row["stage"] = "before start"
+        row["error"] = f"the job was {job_status} before its first tracked stage"
+        return row
+    if dry_run:
+        row["result"] = "dry-run ok" if ran else "no result"
+    elif published_tag:
+        row["result"], row["tag"] = "published", published_tag
+    else:
+        # Every recorded stage passed or was skipped, yet nothing was published.
+        row["result"] = "no result"
+        row["error"] = "no stage failed, but no release was published"
+    return row
+
+
+def missing_rows(planned: list[dict], rows: list[dict], run_id: str, date: str, why: str) -> list[dict]:
+    """A row for every planned corpus that recorded nothing."""
+    seen = {r.get("slug") for r in rows}
+    return [
+        {
+            "run": str(run_id), "date": date, "slug": m["slug"], "pin8": m["pin8"],
+            "bytes": None, "defs": None, "result": "no result", "tag": "", "stage": "",
+            "error": why,
+        }
+        for m in planned
+        if m["slug"] not in seen
+    ]
+
+
+def _cell(v) -> str:
+    if v is None or v == "":
+        return ""
+    s = re.sub(r"\s+", " ", str(v)).strip()
+    return s.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def _row_table(rows: list[dict]) -> list[str]:
+    out = ["| slug | pin8 | bytes | defs | result | error |", "|---|---|---:|---:|---|---|"]
+    for r in sorted(rows, key=lambda r: (r.get("result") == "published", r.get("slug", ""))):
+        result = r.get("result", "")
+        if r.get("tag"):
+            result += f" `{r['tag']}`"
+        if r.get("stage"):
+            result += f" at `{r['stage']}`"
+        out.append(
+            f"| `{_cell(r.get('slug'))}` | `{_cell(r.get('pin8'))}` | {_cell(r.get('bytes'))} "
+            f"| {_cell(r.get('defs'))} | {_cell(result)} | {_cell(r.get('error'))} |"
+        )
+    return out
+
+
+def render_report(history: list[dict], run_urls: Optional[dict] = None) -> str:
+    """REPORT.md from every row so far: the corpora whose latest attempt did not
+    publish first, then each run's rows, newest run first."""
+    run_urls = run_urls or {}
+    latest: dict[str, dict] = {}
+    runs: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for r in history:
+        latest[r["slug"]] = r
+        if r["run"] not in runs:
+            runs[r["run"]] = []
+            order.append(r["run"])
+        runs[r["run"]].append(r)
+    bad = [r for r in latest.values() if r.get("result") != "published"]
+    ok = len(latest) - len(bad)
+    out = [
+        "# Hub backfill report",
+        "",
+        "Written by `.github/workflows/hub-packs.yml` (the `backfill report` job) after every",
+        "publishing run; do not edit by hand. One row per corpus per run; the rows behind it",
+        "are in `rows.jsonl`. Spec: docs/CORPUS_HUB_V2_IMPLEMENTATION.md §12.1.",
+        "",
+        "## Current state",
+        "",
+        f"{len(latest)} corpora attempted: {ok} published at their latest attempt, {len(bad)} not.",
+        "",
+    ]
+    if bad:
+        out += ["### Latest attempt did not publish (fix or delist on purpose)", ""]
+        out += _row_table(bad)
+        out.append("")
+    shown = order[-REPORT_RUNS_SHOWN:]
+    out += ["## Runs (newest first)", ""]
+    if len(shown) < len(order):
+        out += [f"The {len(shown)} newest of {len(order)} runs; every row is in `rows.jsonl`.", ""]
+    for run in reversed(shown):
+        rows = runs[run]
+        date = rows[0].get("date", "")
+        url = run_urls.get(run) or rows[0].get("url", "")
+        title = f"### Run [{run}]({url})" if url else f"### Run {run}"
+        n_ok = sum(1 for r in rows if r.get("result") == "published")
+        out += [f"{title}, {date}: {n_ok} of {len(rows)} published", ""]
+        out += _row_table(rows)
+        out.append("")
+    return "\n".join(out)
+
+
+def read_rows(path: pathlib.Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+
+
 # ── command line ────────────────────────────────────────────────────────────
 
 
@@ -709,6 +902,53 @@ def cmd_repin(a: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def cmd_result_row(a: argparse.Namespace) -> int:
+    stages = []
+    for spec in a.stage:
+        sid, _, files = spec.partition("=")
+        stages.append((sid, [pathlib.Path(f) for f in _split(files)]))
+    steps = json.loads(a.steps or "{}")
+    row = result_row(
+        a.slug, a.pin8, steps, stages,
+        pathlib.Path(a.build_out) if a.build_out else None,
+        a.published_tag, a.dry_run, a.run_id, a.date or _today(), a.job_status,
+    )
+    print(json.dumps(row, separators=(",", ":")))
+    return 0
+
+
+def cmd_report(a: argparse.Namespace) -> int:
+    planned = json.loads(pathlib.Path(a.matrix).read_text()).get("include", []) if a.matrix else []
+    date = a.date or _today()
+    rows: list[dict] = []
+    if a.rows_dir and pathlib.Path(a.rows_dir).is_dir():
+        for f in sorted(pathlib.Path(a.rows_dir).glob("*.json")):
+            try:
+                r = json.loads(f.read_text())
+            except json.JSONDecodeError:
+                print(f"::warning::{f.name}: unreadable result row", file=sys.stderr)
+                continue
+            if isinstance(r, dict) and r.get("slug"):
+                rows.append(r)
+    rows += missing_rows(planned, rows, a.run_id, date, a.missing_reason)
+    for r in rows:
+        r["run"] = str(a.run_id)
+        r.setdefault("date", date)
+        if a.run_url:
+            r["url"] = a.run_url
+    history_path = pathlib.Path(a.history)
+    history = [r for r in read_rows(history_path) if r.get("run") != str(a.run_id)] + rows
+    if a.write:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in history))
+        pathlib.Path(a.report).write_text(render_report(history))
+    bad = [r for r in rows if r.get("result") != "published"]
+    print(f"### backfill report: run {a.run_id}\n")
+    print(f"{len(rows) - len(bad)} of {len(rows)} corpora published in this run.\n")
+    print("\n".join(_row_table(rows)))
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -752,6 +992,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     r.add_argument("--gh", default="gh")
     r.add_argument("--allow-file-urls", action="store_true", help=argparse.SUPPRESS)
     r.set_defaults(fn=cmd_repin)
+
+    rr = sub.add_parser("result-row", help="one corpus's result in this run, as a JSON row")
+    rr.add_argument("--slug", required=True)
+    rr.add_argument("--pin8", required=True)
+    rr.add_argument("--steps", default="{}", help="the job's toJSON(steps)")
+    rr.add_argument("--stage", action="append", default=[], help="step id=log,log (in order)")
+    rr.add_argument("--build-out", help="build-pack's stdout (its last line carries bytes and defs)")
+    rr.add_argument("--published-tag", default="")
+    rr.add_argument("--dry-run", action="store_true")
+    rr.add_argument("--run-id", required=True)
+    rr.add_argument("--date", default="")
+    rr.add_argument("--job-status", default="", help="the job's job.status")
+    rr.set_defaults(fn=cmd_result_row)
+
+    rp = sub.add_parser("report", help="fold this run's result rows into the backfill report")
+    rp.add_argument("--rows-dir", help="directory of result-row JSON files")
+    rp.add_argument("--matrix", help="the plan's JSON (its `include` is every scheduled corpus)")
+    rp.add_argument("--missing-reason", default="the pack job recorded no result")
+    rp.add_argument("--run-id", required=True)
+    rp.add_argument("--run-url", default="")
+    rp.add_argument("--date", default="")
+    rp.add_argument("--history", default="benchmarks/hub-backfill/rows.jsonl")
+    rp.add_argument("--report", default="benchmarks/hub-backfill/REPORT.md")
+    rp.add_argument("--write", action="store_true", help="update the history and REPORT.md (default: print only)")
+    rp.set_defaults(fn=cmd_report)
 
     a = ap.parse_args(argv)
     return a.fn(a)

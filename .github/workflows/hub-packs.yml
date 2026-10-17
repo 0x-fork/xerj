@@ -309,10 +309,12 @@ jobs:
       HUB_PUBKEY_HEX: ${{ needs.preflight.outputs.pubkey }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        id: checkout
         with:
           persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        id: fetch-bin
         with:
           name: xerj-bin
           path: bin
@@ -325,8 +327,12 @@ jobs:
       # once with "exact read-back count 0 disagrees with sealed count 1" (the
       # autoindex group already exists there).
       - name: Start a throwaway builder node
+        id: start
         run: |
           set -euo pipefail
+          # Each stage's output also goes to a log the backfill report quotes on failure.
+          mkdir -p "$RUNNER_TEMP/log"
+          exec > >(tee -a "$RUNNER_TEMP/log/start.log") 2>&1
           chmod +x bin/xerj
           NODE="$RUNNER_TEMP/node"
           mkdir -p "$NODE/data" "$RUNNER_TEMP/pack-out"
@@ -345,11 +351,13 @@ jobs:
           echo "the builder node did not become healthy"; cat "$NODE/node.log"; exit 1
 
       - name: Build and sign the pack
+        id: build
         env:
           HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
           XERJ_CODE_HOME: ${{ runner.temp }}/code-home
         run: |
           set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/log/build.log") 2>&1
           umask 077
           printf '%s' "$HUB_SIGNING_SEED" > "$RUNNER_TEMP/pack.key"
           # The builder parses untrusted source trees: keep the seed out of its environment.
@@ -373,8 +381,10 @@ jobs:
       # verifies under the key clients embed, and carries the layout `hub pull`
       # reads. (Clients re-verify sha256 and signature themselves.)
       - name: Verify the signature and the layout
+        id: verify
         run: |
           set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/log/verify.log") 2>&1
           ARCHIVE="$PACK_OUT/$SLUG-$PIN8.hubpack.tar.zst"
           test -s "$ARCHIVE"; test -s "$ARCHIVE.sig"
           bash tools/hub-packs/ed25519.sh verify "$HUB_PUBKEY_HEX" "$ARCHIVE" "$ARCHIVE.sig"
@@ -393,11 +403,13 @@ jobs:
       # release as a DRAFT, upload to the draft, publish last. Published releases
       # are never deleted by a rebuild.
       - name: Pick an unused release tag
+        id: tag
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/log/tag.log") 2>&1
           BASE="pack-$SLUG-$PIN8"
           TAG="$BASE"; N=1
           while gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
@@ -409,11 +421,13 @@ jobs:
       # --prerelease and --latest=false: a pack must never become the repository's
       # "latest" release, which the installer chain reads.
       - name: Upload the pack to a draft release
+        id: upload
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/log/upload.log") 2>&1
           ARCHIVE="$PACK_OUT/$SLUG-$PIN8.hubpack.tar.zst"
           zstd -dc "$ARCHIVE" | tar -xOf - pack.json > "$RUNNER_TEMP/pack.json"
           {
@@ -436,12 +450,14 @@ jobs:
       # catalogue, then `--def` for a symbol from the pack's own defs.jsonl and one
       # question. A failure fails the job and leaves the release a draft.
       - name: Consumer end-to-end (pull, --def, one question)
+        id: e2e
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HUB_SIGNING_SEED: ${{ secrets.HUB_SIGNING_SEED }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/log/e2e.log") 2>&1
           FILE="$SLUG-$PIN8.hubpack.tar.zst"
           SRC="$RUNNER_TEMP/e2e-src"; mkdir -p "$SRC"
           if [ "$DRY_RUN" = "true" ]; then
@@ -468,12 +484,15 @@ jobs:
       # "tag_name was used by an immutable release" retag this draft to the next
       # free -rN and publish that.
       - name: Publish the draft (retag past a burned tag if refused)
+        id: publish
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/log/publish.log") 2>&1
           if gh release edit "$PACK_TAG" --repo "$GITHUB_REPOSITORY" --draft=false; then
+            echo "PUBLISHED_TAG=$PACK_TAG" >> "$GITHUB_ENV"
             echo "published $PACK_TAG"; exit 0
           fi
           RELID=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
@@ -487,6 +506,7 @@ jobs:
             N=$((N + 1)); NEW="$PACK_TAG-r$N"
           done
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELID" -f tag_name="$NEW" -F draft=false
+          echo "PUBLISHED_TAG=$NEW" >> "$GITHUB_ENV"
           echo "published $NEW"
 
       # Keep the newest 3 pins of THIS corpus (a client holding a slightly stale
@@ -518,9 +538,106 @@ jobs:
         if: failure()
         run: tail -n 100 "$RUNNER_TEMP/node/node.log" || true
 
+      # One row for the backfill report (spec §12.1), whatever happened above: the
+      # first stage that failed and its most telling log line, or the published tag.
+      - name: Record this corpus's result for the backfill report
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+          JOB_STATUS: ${{ job.status }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          L="$RUNNER_TEMP/log"
+          args=(result-row --slug "$SLUG" --pin8 "$PIN8" --steps "$STEPS" \
+                --run-id "$GITHUB_RUN_ID" --build-out "$RUNNER_TEMP/build.txt" \
+                --published-tag "${PUBLISHED_TAG:-}" --job-status "$JOB_STATUS" \
+                --stage checkout --stage fetch-bin \
+                --stage "start=$L/start.log,$RUNNER_TEMP/node/node.log" --stage "build=$L/build.log" \
+                --stage "verify=$L/verify.log" --stage "tag=$L/tag.log" --stage "upload=$L/upload.log" \
+                --stage "e2e=$L/e2e.log" --stage "publish=$L/publish.log")
+          [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+          mkdir -p "$RUNNER_TEMP/result"
+          OUT="$RUNNER_TEMP/result/$SLUG.json"
+          if ! python3 tools/hub-packs/hub_packs.py "${args[@]}" > "$OUT"; then
+            # Never leave the report without this corpus: a minimal row naming the cause.
+            jq -cn --arg slug "$SLUG" --arg pin8 "$PIN8" --arg run "$GITHUB_RUN_ID" \
+              '{run: $run, slug: $slug, pin8: $pin8, bytes: null, defs: null, result: "failed",
+                tag: "", stage: "record", error: "result-row failed; see this job's log"}' > "$OUT"
+          fi
+          cat "$OUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: hub-result-${{ matrix.slug }}
+          path: ${{ runner.temp }}/result/
+          overwrite: true # a re-run of this job replaces its row
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Stop the builder node
         if: always()
         run: kill "${NODE_PID:-}" 2>/dev/null || true
+
+  # ── the backfill report (spec §12.1): one row per corpus per run ───────────
+  # Folds every pack job's result row into benchmarks/hub-backfill/ (REPORT.md and
+  # the rows.jsonl behind it) and commits them to corpus-hub. A corpus the plan
+  # scheduled that recorded nothing (its job never started, or was cut off) gets a
+  # row saying so, so a failure never vanishes silently. A commit, not a PR: the
+  # repository does not let GITHUB_TOKEN open PRs, and a push made with it starts
+  # no workflow. A dry run only writes the job summary.
+  report:
+    name: backfill report
+    needs: [plan, build-xerj, pack]
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # commit the report to corpus-hub
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: ${{ !inputs.dry_run }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true # no row at all is still reported (below)
+        with:
+          pattern: hub-result-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/rows
+
+      - name: Write the report (and commit it on a real run)
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          WHY: "the pack job recorded no result (pack jobs: ${{ needs.pack.result }}, build xerj: ${{ needs.build-xerj.result }})"
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$MATRIX" > "$RUNNER_TEMP/plan.json"
+          URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Scripts from this run's commit; the report itself from corpus-hub's tip.
+          cp tools/hub-packs/hub_packs.py "$RUNNER_TEMP/hub_packs.py"
+          args=(report --rows-dir "$RUNNER_TEMP/rows" --matrix "$RUNNER_TEMP/plan.json" \
+                --run-id "$GITHUB_RUN_ID" --run-url "$URL" --missing-reason "$WHY")
+          python3 "$RUNNER_TEMP/hub_packs.py" "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run: the report is in the job summary only"; exit 0
+          fi
+          git config user.name xerj-org
+          git config user.email git@xerj.org
+          for attempt in 1 2 3 4 5; do
+            git fetch -q --depth=1 origin corpus-hub || { sleep $((attempt * 5)); continue; }
+            git checkout -q -B corpus-hub origin/corpus-hub
+            python3 "$RUNNER_TEMP/hub_packs.py" "${args[@]}" --write > /dev/null
+            git add benchmarks/hub-backfill/REPORT.md benchmarks/hub-backfill/rows.jsonl
+            if git diff --cached --quiet; then echo "report unchanged"; exit 0; fi
+            git commit -q -m "hub backfill report: run $GITHUB_RUN_ID" -m "$URL"
+            if git push -q origin corpus-hub; then echo "report committed to corpus-hub"; exit 0; fi
+            sleep $((attempt * 5))
+          done
+          echo "::error title=backfill report::could not push the report to corpus-hub; the rows are in this job's summary"
+          exit 1
 
   # ── rebuild, check, sign and (opt-in) deploy the catalogue ─────────────────
   catalogue:
