@@ -594,10 +594,10 @@ pub async fn search(
                 started.elapsed(),
                 result.hits.len() as u64,
                 "",
-                &query_body
-                    .get("query")
-                    .map(|q| q.to_string())
-                    .unwrap_or_default(),
+                &xerj_engine::slow_query::logged_search_query(
+                    query_body.get("query"),
+                    query_body.get("knn"),
+                ),
             );
 
             let hits: Vec<Value> = result.hits.iter().map(native_hit_value).collect();

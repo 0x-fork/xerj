@@ -13556,11 +13556,10 @@ async fn search_impl(
         started.elapsed(),
         merged_hits.len() as u64,
         if body.aggs.is_some() { "with-aggs" } else { "" },
-        &body
-            .query
-            .as_ref()
-            .map(|q| q.to_string())
-            .unwrap_or_default(),
+        // An omitted `query` (match_all) or a top-level `knn` with no query
+        // clause used to log `query=` empty. `logged_search_query` records
+        // the clause the engine actually ran.
+        &xerj_engine::slow_query::logged_search_query(body.query.as_ref(), body.knn.as_ref()),
     );
     // v0.9 9-P4: append to the audit log. The subject was the literal
     // "anonymous" until issue #329 — the API-key operations had been passing a

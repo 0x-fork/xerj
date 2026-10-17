@@ -9900,6 +9900,104 @@ pub fn fetch_catalog_summary(url: &str, api_key: Option<String>) -> Result<Catal
 
 // ─── status subcommand ───────────────────────────────────────────────────
 
+struct JournalFacts {
+    root: String,
+    files_done: u64,
+    records: u64,
+    finished: bool,
+    generation: Option<u64>,
+    generation_files: Option<u64>,
+    generation_records: Option<u64>,
+    graph_line: Option<String>,
+    /// `url` from the `kind: run` record. Empty on a journal written before
+    /// that field existed.
+    url: String,
+}
+
+fn read_journal_facts(jp: &Path) -> JournalFacts {
+    let mut facts = JournalFacts {
+        root: String::new(),
+        files_done: 0,
+        records: 0,
+        finished: false,
+        generation: None,
+        generation_files: None,
+        generation_records: None,
+        graph_line: None,
+        url: String::new(),
+    };
+    let Ok(f) = std::fs::File::open(jp) else {
+        return facts;
+    };
+    for line in std::io::BufReader::new(f).lines().map_while(|l| l.ok()) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match v.get("kind").and_then(|k| k.as_str()) {
+            Some("run") => {
+                facts.root = v.get("root").and_then(|r| r.as_str()).unwrap_or("").into();
+                if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
+                    facts.url = url.to_string();
+                }
+            }
+            Some("file_done") => {
+                facts.files_done += 1;
+                facts.records += v.get("records").and_then(|r| r.as_u64()).unwrap_or(0);
+            }
+            Some("finish") => {
+                facts.finished = true;
+                facts.generation = v.pointer("/summary/generation").and_then(Value::as_u64);
+                facts.generation_files =
+                    v.pointer("/summary/files_indexed").and_then(Value::as_u64);
+                facts.generation_records =
+                    v.pointer("/summary/records_total").and_then(Value::as_u64);
+                // Latest finish wins — the summary embeds the run
+                // doc, whose `graph` block is the edge count of
+                // record for this journal.
+                if let Some(g) = v.pointer("/summary/graph").filter(|graph| !graph.is_null()) {
+                    facts.graph_line = Some(format!(
+                        "graph: {} edges written to {} (brain {})",
+                        g.get("edges_written").and_then(Value::as_u64).unwrap_or(0),
+                        g.get("edges_index").and_then(Value::as_str).unwrap_or("?"),
+                        g.get("brain").and_then(Value::as_str).unwrap_or("?"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    facts
+}
+
+/// Two endpoint strings name the same node when they match after trimming
+/// and stripping one trailing slash. `http://127.0.0.1:9200/` and
+/// `http://127.0.0.1:9200` are the same journal.
+fn urls_identify_same_endpoint(recorded: &str, current: &str) -> bool {
+    fn norm(s: &str) -> &str {
+        s.trim().trim_end_matches('/')
+    }
+    norm(recorded) == norm(current)
+}
+
+/// Status word for one journal line.
+///
+/// A journal whose `run` record names a different node is not this
+/// endpoint's run. Printing `in progress` or `FINISHED` there makes
+/// `autoindex status` look like another node's work is this node's.
+/// An empty recorded URL is a journal from before `url` was written;
+/// those keep the old words.
+fn journal_progress_label(finished: bool, journal_url: &str, current_url: &str) -> String {
+    let recorded = journal_url.trim().trim_end_matches('/');
+    if !recorded.is_empty() && !urls_identify_same_endpoint(recorded, current_url) {
+        return format!("other endpoint {recorded}");
+    }
+    if finished {
+        "FINISHED".to_string()
+    } else {
+        "in progress".to_string()
+    }
+}
+
 fn run_status(cfg: StatusCfg) -> Result<i32> {
     if let Some(note) = &cfg.xerj_url_note {
         eprintln!("autoindex: {note}");
@@ -9922,64 +10020,21 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
         if !jp.exists() {
             continue;
         }
-        let mut root = String::new();
-        let mut done = 0u64;
-        let mut records = 0u64;
-        let mut finished = false;
-        let mut generation: Option<u64> = None;
-        let mut generation_files: Option<u64> = None;
-        let mut generation_records: Option<u64> = None;
-        let mut graph_line: Option<String> = None;
-        if let Ok(f) = std::fs::File::open(&jp) {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(f).lines().map_while(|l| l.ok()) {
-                if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                    match v.get("kind").and_then(|k| k.as_str()) {
-                        Some("run") => {
-                            root = v.get("root").and_then(|r| r.as_str()).unwrap_or("").into()
-                        }
-                        Some("file_done") => {
-                            done += 1;
-                            records += v.get("records").and_then(|r| r.as_u64()).unwrap_or(0);
-                        }
-                        Some("finish") => {
-                            finished = true;
-                            generation = v.pointer("/summary/generation").and_then(Value::as_u64);
-                            generation_files =
-                                v.pointer("/summary/files_indexed").and_then(Value::as_u64);
-                            generation_records =
-                                v.pointer("/summary/records_total").and_then(Value::as_u64);
-                            // Latest finish wins — the summary embeds the run
-                            // doc, whose `graph` block is the edge count of
-                            // record for this journal.
-                            if let Some(g) =
-                                v.pointer("/summary/graph").filter(|graph| !graph.is_null())
-                            {
-                                graph_line = Some(format!(
-                                    "graph: {} edges written to {} (brain {})",
-                                    g.get("edges_written").and_then(Value::as_u64).unwrap_or(0),
-                                    g.get("edges_index").and_then(Value::as_str).unwrap_or("?"),
-                                    g.get("brain").and_then(Value::as_str).unwrap_or("?"),
-                                ));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        let facts = read_journal_facts(&jp);
+        let label = journal_progress_label(facts.finished, &facts.url, &cfg.url);
         println!(
             "journal {} — root {} — {} files done, {} records, {}{}",
             jp.display(),
-            root,
-            generation_files.unwrap_or(done),
-            generation_records.unwrap_or(records),
-            if finished { "FINISHED" } else { "in progress" },
-            generation
+            facts.root,
+            facts.generation_files.unwrap_or(facts.files_done),
+            facts.generation_records.unwrap_or(facts.records),
+            label,
+            facts
+                .generation
                 .map(|generation| format!(" (generation {generation})"))
                 .unwrap_or_default()
         );
-        if let Some(line) = graph_line {
+        if let Some(line) = facts.graph_line {
             println!("  {line}");
         }
     }
@@ -9996,6 +10051,77 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod journal_status_tests {
+    use super::{journal_progress_label, read_journal_facts};
+    use std::fs;
+
+    fn write_journal(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xerj-status-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.ndjson");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn another_endpoints_journal_is_not_in_progress() {
+        let path = write_journal(
+            "other-open",
+            "{\"v\":1,\"kind\":\"run\",\"root\":\"/repo\",\"url\":\"http://127.0.0.1:9201\",\"prefix\":\"ax\"}\n\
+             {\"kind\":\"file_done\",\"records\":3}\n",
+        );
+        let facts = read_journal_facts(&path);
+        assert_eq!(facts.root, "/repo");
+        assert_eq!(facts.files_done, 1);
+        assert_eq!(facts.records, 3);
+        assert!(!facts.finished);
+        let label = journal_progress_label(facts.finished, &facts.url, "http://127.0.0.1:9200");
+        assert_eq!(label, "other endpoint http://127.0.0.1:9201");
+        assert!(!label.contains("in progress"));
+        assert!(!label.contains("FINISHED"));
+
+        let finished = write_journal(
+            "other-done",
+            "{\"kind\":\"run\",\"root\":\"/other\",\"url\":\"http://10.0.0.2:9200/\"}\n\
+             {\"kind\":\"finish\",\"summary\":{\"generation\":4,\"files_indexed\":2,\"records_total\":9}}\n",
+        );
+        let facts = read_journal_facts(&finished);
+        assert!(facts.finished);
+        assert_eq!(facts.generation, Some(4));
+        assert_eq!(facts.generation_files, Some(2));
+        assert_eq!(facts.generation_records, Some(9));
+        let label = journal_progress_label(facts.finished, &facts.url, "http://127.0.0.1:9200");
+        assert_eq!(label, "other endpoint http://10.0.0.2:9200");
+        assert!(!label.contains("in progress"));
+        assert!(!label.contains("FINISHED"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let _ = fs::remove_dir_all(finished.parent().unwrap());
+    }
+
+    #[test]
+    fn this_endpoint_and_a_legacy_journal_keep_the_old_words() {
+        assert_eq!(
+            journal_progress_label(true, "http://127.0.0.1:9200/", "http://127.0.0.1:9200"),
+            "FINISHED"
+        );
+        assert_eq!(
+            journal_progress_label(false, "  http://127.0.0.1:9200  ", "http://127.0.0.1:9200/"),
+            "in progress"
+        );
+        // No `url` on the run record: a journal from before the field existed.
+        let path = write_journal("legacy", "{\"kind\":\"run\",\"root\":\"/old\"}\n");
+        let facts = read_journal_facts(&path);
+        assert!(facts.url.is_empty());
+        assert_eq!(
+            journal_progress_label(facts.finished, &facts.url, "http://127.0.0.1:9200"),
+            "in progress"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 }
 
 #[cfg(test)]
