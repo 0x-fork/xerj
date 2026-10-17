@@ -1089,6 +1089,21 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 root_raw = Some(other.to_string());
                 folder = Some(PathBuf::from(other))
             }
+            // #1586: a second positional folder is not an "unknown argument".
+            // Say what the command does (one folder per run) and show the
+            // two-run form with a distinct --prefix, so an agent that read
+            // "unknown argument: repoB" does not conclude repoA was refused.
+            other if !other.starts_with('-') && folder.is_some() && sub.is_none() => {
+                let first = folder
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(format!(
+                    "takes one folder per run, got two: `{first}` and `{other}`; index each \
+                     folder in its own run with a distinct --prefix, e.g. `xerj autoindex \
+                     {first} --prefix <name-a>` then `xerj autoindex {other} --prefix <name-b>`"
+                ));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -2580,6 +2595,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1586: a second positional folder used to fall through to
+    /// `unknown argument: repoB`, which reads as if the first folder were
+    /// refused and says nothing about how to index both. The refusal must
+    /// name both folders and show the one-run-per-folder form with `--prefix`.
+    #[test]
+    fn a_second_folder_says_one_folder_per_run_and_shows_the_two_run_form() {
+        let text = err(&["repoA", "repoB"]);
+        assert!(
+            text.contains("takes one folder per run"),
+            "the refusal must say the constraint: {text}"
+        );
+        assert!(
+            text.contains("`repoA`") && text.contains("`repoB`"),
+            "the refusal must name both folders: {text}"
+        );
+        assert!(
+            text.contains("--prefix"),
+            "the refusal must show the one-run-per-folder form: {text}"
+        );
+        assert!(
+            !text.contains("unknown argument"),
+            "a folder is not an unknown argument: {text}"
+        );
     }
 
     /// A flag that cannot change anything is refused rather than accepted and
