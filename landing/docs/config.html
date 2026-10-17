@@ -235,7 +235,7 @@
 <pre class="code">[server]
 rest_port      = 8080            # native /v1/* API
 es_compat_port = 9200            # ES wire-compatible API
-grpc_port      = 8081            # reserved
+grpc_port      = 8081            # gRPC (xerj.v1.XerjSearch), plaintext h2c
 bind_address   = "0.0.0.0"       # not a default — the default is "127.0.0.1" (loopback only)
 allow_insecure_network_bind = true   # not a default (false) — required for a non-loopback bind while TLS is off
 data_dir       = "/var/lib/xerj" # not a default ("./data") — an absolute path is strongly recommended</pre>
