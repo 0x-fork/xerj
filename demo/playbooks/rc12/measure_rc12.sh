@@ -314,4 +314,4 @@ PY
 
 echo ""
 echo "==> done. server still running on $PORT (data: $DATA)"
-echo "    stop it with: pkill -f 'xerj --data-dir $DATA'"
+echo "    stop it with: pkill -f '$DATA/xerj.toml'"
