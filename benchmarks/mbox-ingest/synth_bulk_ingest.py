@@ -72,7 +72,8 @@ def main() -> int:
     ap.add_argument("--body-type", choices=["text", "keyword"], default="text",
                     help="mapping for the body field: text (postings) or keyword (none)")
     ap.add_argument("--key", help="file with the admin API key")
-    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--json", action="store_true",
+                    help="no-op, kept for old command lines: the JSON summary is always printed")
     ap.add_argument("--auto-id", action="store_true",
                     help="omit _id from bulk actions (turbo-raw path) instead of "
                          "explicit ids (per-doc path)")
