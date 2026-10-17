@@ -1003,6 +1003,7 @@ mod tests {
             journal_records: 42,
             files_done_journaled: 7,
             dataset_indices: 2,
+            state_dir: "/tmp/xerj-state".to_string(),
         }
         .into();
         assert!(zero_live_is_journal_server_disagreement(
@@ -1040,6 +1041,7 @@ mod tests {
             journal_records: 3,
             files_done_journaled: 1,
             dataset_indices: 1,
+            state_dir: "/tmp/xerj-state".to_string(),
         }
         .to_string();
         assert!(

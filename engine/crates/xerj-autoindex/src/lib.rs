@@ -4302,6 +4302,10 @@ pub struct ZeroLiveVerificationError {
     pub files_done_journaled: usize,
     /// Dataset indices that answered with zero live documents.
     pub dataset_indices: usize,
+    /// Directory the resume journal was read from. A new `--data-dir` does
+    /// not move this directory: the default is keyed by folder, URL, and
+    /// prefix, so a journal left by an earlier node is reused as-is.
+    pub state_dir: String,
 }
 
 impl std::fmt::Display for ZeroLiveVerificationError {
@@ -4310,12 +4314,14 @@ impl std::fmt::Display for ZeroLiveVerificationError {
             formatter,
             "autoindex verification failed: the resume journal records {} \
              record(s) from {} completed file(s), but 0 documents are \
-             live across the {} dataset index(es). The indices exist and look healthy but \
+             live across the {} dataset index(es). Journal state dir: {}. \
+             This journal may belong to another data dir (a new --data-dir \
+             reuses it). The indices exist and look healthy but \
              hold nothing — a server-side write rejection (e.g. a disk flood-stage or \
-             index write block), deleted indices, or an unreadable server can all cause \
+             index write block), deleted indices, or an unreadable server can also cause \
              this. Fix the server-side condition, then rerun with --fresh to re-index \
              from scratch",
-            self.journal_records, self.files_done_journaled, self.dataset_indices
+            self.journal_records, self.files_done_journaled, self.dataset_indices, self.state_dir
         )
     }
 }
@@ -8579,6 +8585,7 @@ fn run_index_report_inner(
             journal_records,
             files_done_journaled,
             dataset_indices: plan.datasets.len(),
+            state_dir: state_dir.display().to_string(),
         }
         .into());
     }

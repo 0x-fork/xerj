@@ -3021,6 +3021,15 @@ fn zero_live_documents_after_journaled_records_fails_the_run() {
     assert!(error.contains("verification failed"), "{error}");
     assert!(error.contains("0 documents are live"), "{error}");
     assert!(error.contains("--fresh"), "{error}");
+    let state = state_dir.path().display().to_string();
+    assert!(
+        error.contains(&format!("Journal state dir: {state}")),
+        "the refusal must name the journal directory: {error}"
+    );
+    assert!(
+        error.contains("may belong to another data dir"),
+        "a reused journal must say it may belong to another data dir: {error}"
+    );
 }
 
 /// #241 regression: a run must never be silent.
