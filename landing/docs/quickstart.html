@@ -254,7 +254,7 @@ $ xerj autoindex ~/my-project        # picks up XERJ_API_KEY, or take --api-key<
      }'</pre>
 
   <h2>3 · Ingest at line rate</h2>
-  <p>Two ingest paths. <code class="inline">turbo-ingest</code> takes NDJSON and parallel-tokenizes across cores.</p>
+  <p>Two ingest paths: the Elasticsearch-compatible <code class="inline">_bulk</code> on port 9200, and the native <code class="inline">turbo-ingest</code> used here, which takes a JSON array of documents and writes each batch to the WAL in one call.</p>
 <pre class="code">$ curl -sX POST http://localhost:8080/v1/indices/logs/turbo-ingest \
      -H 'Content-Type: application/x-ndjson' \
      --data-binary @nginx.jsonl</pre>
