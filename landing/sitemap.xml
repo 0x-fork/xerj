@@ -2,7 +2,7 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://xerj.org/</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/agent-search/</loc>
@@ -334,7 +334,7 @@
   </url>
   <url>
     <loc>https://xerj.org/blog/</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/blog/cutting-the-index-28-percent</loc>
@@ -366,7 +366,7 @@
   </url>
   <url>
     <loc>https://xerj.org/blog/the-rc80-gates</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/brand</loc>
@@ -470,7 +470,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/agents/</loc>
@@ -518,7 +518,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/config</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/corpus-hub</loc>
@@ -534,7 +534,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/install</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/metrics</loc>
@@ -574,7 +574,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/quickstart</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/recipes/</loc>
@@ -582,7 +582,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/recipes/agentic-memory</loc>
-    <lastmod>2026-10-16</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/recipes/air-gapped-deployment</loc>
