@@ -17,13 +17,13 @@ use crate::esclient::Es;
 use crate::search::{
     corpus_snapshot, empty_lookup_report, field_lookup_ok, hit_location, is_identifier,
     mapped_property_names, numeric_property_names, parse_count_arg, passage_text,
-    query_failure_message,
-    weighted_query_fields,
+    query_failure_message, weighted_query_fields,
 };
 use serde_json::{json, Value};
 
 const USAGE: &str = "\
 xerj def — find where a symbol is defined (go-to-definition, no scripts)
+Default ranking is lexical: it matches the words you typed, and it is not a neural reading of the code.
 
 USAGE:
     xerj def [OPTIONS] \"<symbol or capability>\"
@@ -570,6 +570,14 @@ fn unique_locations(hits: Vec<Value>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_says_the_default_ranking_is_lexical() {
+        assert!(
+            USAGE.contains("Default ranking is lexical") && USAGE.contains("not a neural reading"),
+            "{USAGE}"
+        );
+    }
 
     #[test]
     fn declaration_preview_keeps_a_later_constant_and_caps_a_huge_line() {
