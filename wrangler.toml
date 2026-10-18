@@ -8,18 +8,15 @@
 #              Cloudflare dashboard (R2 → Create bucket → `xerj-installs`);
 #              until it exists the function serves the installer normally and
 #              simply does not count. Fail-open is deliberate.
-#   FIELD_REPORTS (Workers KV) — functions/api/field-report.js stores each
-#              accepted agent field report as a small JSON value. This is the
-#              GitHub-unavailable FALLBACK to `xerj feedback --open-pr`; the
-#              PR path stays primary. KV only — NEVER R2 (R2 is frozen by
-#              owner order). The namespace must be created ONCE and its id
-#              pasted below, replacing the placeholder; until then the
-#              function accepts requests but does not store (fail-open, like
-#              get.js). One-time setup (owner runs it; do NOT run against the
-#              live account from CI/agents):
-#                  wrangler kv namespace create FIELD_REPORTS
-#              then copy the printed id into `id = "..."` under the
-#              [[kv_namespaces]] block below and redeploy.
+#   FIELD_REPORTS — functions/api/field-report.js stores each accepted agent
+#              field report as a small JSON object under reports/<date>/. This
+#              is the GitHub-unavailable FALLBACK to `xerj feedback --open-pr`;
+#              the PR path stays primary. R2 bucket `xerj-field-reports` (the
+#              cheapest storage already granted to the Pages token; the same
+#              account's LEADS/INSTALLS Functions use R2). A per-IP rate limit
+#              and a daily cap keep writes far inside the R2 free tier. Until
+#              the bucket exists the function accepts requests but does not
+#              store (fail-open, like get.js).
 #
 # Routing: landing/_routes.json pins Function invocation to /get, /get.ps1,
 # /lead and /api/field-report. A NEW FUNCTION ADDED UNDER functions/ WILL NOT
@@ -36,19 +33,11 @@ bucket_name = "xerj-leads"
 binding = "INSTALLS"
 bucket_name = "xerj-installs"
 
-# Workers KV for agent field reports (functions/api/field-report.js).
-# PLACEHOLDER id — NOT a real namespace. Create the namespace once with
-#   wrangler kv namespace create FIELD_REPORTS
-# and replace the id below with the one it prints. Do not commit a real id
-# from the live account via an automated run; the owner wires this at deploy.
-# [[kv_namespaces]]  — COMMENTED OUT until the owner wires the real namespace.
-# A placeholder id here makes `wrangler pages deploy` fail with
-# "Error 8000022: Invalid KV namespace ID", which blocks EVERY xerj.org deploy
-# (this file is on the deploy trigger path). With no binding declared, the
-# Function fails open: /api/field-report accepts a report and returns 200 but
-# does NOT store it (see functions/api/field-report.js, the `!env.FIELD_REPORTS`
-# branch). To activate storage, create the namespace and restore this block:
-#     wrangler kv namespace create FIELD_REPORTS   # prints an id
-# [[kv_namespaces]]
-# binding = "FIELD_REPORTS"
-# id = "<the id it printed>"
+# Agent field reports filed via the HTTP fallback POST /api/field-report
+# (functions/api/field-report.js). R2 is the cheapest storage already granted
+# to the Pages deploy token. Reports land under reports/<date>/; a per-IP
+# rate limit and a daily cap keep writes far inside the R2 free tier.
+[[r2_buckets]]
+binding = "FIELD_REPORTS"
+bucket_name = "xerj-field-reports"
+
