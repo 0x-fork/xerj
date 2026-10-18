@@ -67,6 +67,23 @@ pub(crate) fn passage_text(hit: &Value) -> Option<String> {
     }
 }
 
+/// One line for the human printer when the node says this lexical query
+/// scored a `semantic_text` field and did not consult the embedding.
+///
+/// The response already carries `_xerj.hints[].reason`, which tells the
+/// caller to POST a `semantic` query. That reason is the wrong sentence for
+/// `xerj search`: this command has no semantic mode. `--json` returns the
+/// hint unchanged.
+pub(crate) fn lexical_semantic_note(resp: &Value) -> Option<&'static str> {
+    let hints = resp.pointer("/_xerj/hints")?.as_array()?;
+    let flagged = hints
+        .iter()
+        .any(|hint| hint.get("code").and_then(Value::as_str) == Some("lexical_on_semantic_text"));
+    flagged.then_some(
+        "xerj search: these hits are lexical; this command does not consult the embedding.",
+    )
+}
+
 /// Text to print for one hit.
 ///
 /// Passage first, then the symbol `code`. When the engine matched a document
@@ -828,6 +845,9 @@ pub fn run_search_cli() -> i32 {
         );
         return 0;
     }
+    if let Some(note) = lexical_semantic_note(&resp) {
+        eprintln!("{note}");
+    }
 
     let hits = resp
         .pointer("/hits/hits")
@@ -1056,6 +1076,28 @@ mod tests {
                 .any(|f| f == "heading"),
             "{source}"
         );
+    }
+
+    #[test]
+    fn a_lexical_on_semantic_text_hint_is_one_line_and_not_the_post_recipe() {
+        let flagged = json!({
+            "_xerj": { "hints": [{
+                "code": "lexical_on_semantic_text",
+                "reason": "body is semantic_text, but this query scored it with BM25. POST a semantic query.",
+                "try": { "request": "POST /smoke-nb-docs/_search" }
+            }] }
+        });
+        let note = lexical_semantic_note(&flagged).unwrap();
+        assert!(note.contains("lexical"));
+        assert!(note.contains("does not consult the embedding"));
+        assert!(!note.contains("POST"), "{note}");
+        assert!(!note.contains('\n'), "{note}");
+
+        let other = json!({
+            "_xerj": { "hints": [{ "code": "unknown_field", "reason": "no such field" }] }
+        });
+        assert!(lexical_semantic_note(&other).is_none());
+        assert!(lexical_semantic_note(&json!({"hits": []})).is_none());
     }
 
     /// #1365: whole-file hits (`ax-code-*`, `ax-docs-md-*`, `ax-text-*`) carry
