@@ -984,14 +984,29 @@ pub fn valid_slug(s: &str) -> bool {
 /// of bytes written.
 fn fetch_to(url: &str, dest: &Path, max_bytes: u64) -> Result<u64> {
     if let Some(path) = url.strip_prefix("file://") {
-        let sz = fs::metadata(path)
-            .with_context(|| format!("stat {path}"))?
-            .len();
+        // A regular file only. `/dev/zero` (or a FIFO, `/dev/stdin`, …) stats as
+        // 0 bytes, passed the size check, and was then `fs::copy`'d without end,
+        // filling the disk under `~/.xerj/hub`. The read is bounded as well, in
+        // case the file grows between the stat and the read.
+        let meta = fs::metadata(path).with_context(|| format!("stat {path}"))?;
+        if !meta.is_file() {
+            bail!("{path} is not a regular file");
+        }
+        let sz = meta.len();
         if sz > max_bytes {
             bail!("{path} is {sz} bytes, over the {max_bytes}-byte cap");
         }
-        let n = fs::copy(path, dest).with_context(|| format!("copy {path}"))?;
-        return Ok(n);
+        let mut buf = Vec::new();
+        fs::File::open(path)
+            .with_context(|| format!("open {path}"))?
+            .take(max_bytes + 1)
+            .read_to_end(&mut buf)
+            .with_context(|| format!("read {path}"))?;
+        if buf.len() as u64 > max_bytes {
+            bail!("{path} grew past the {max_bytes}-byte cap while it was read");
+        }
+        fs::write(dest, &buf).with_context(|| format!("write {}", dest.display()))?;
+        return Ok(buf.len() as u64);
     }
     let resp = reqwest::blocking::get(url).with_context(|| format!("GET {url}"))?;
     let status = resp.status();
@@ -1591,6 +1606,19 @@ mod tests {
         let err = fetch_to(&url, &dst, 1024).unwrap_err();
         assert!(err.to_string().contains("over the"), "{err}");
         assert!(!dst.exists(), "nothing is written when over the cap");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_to_refuses_a_device_that_stats_as_empty() {
+        // `/dev/zero` stats as 0 bytes. It used to pass the cap and then be copied
+        // without end (a signed catalogue `pack_url: "file:///dev/zero"` fills the
+        // disk). A non-regular file is refused before a byte is read.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dst.bin");
+        let err = fetch_to("file:///dev/zero", &dst, 1024).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(!dst.exists(), "nothing is written");
     }
 
     #[test]

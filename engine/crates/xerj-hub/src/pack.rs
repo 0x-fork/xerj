@@ -45,6 +45,18 @@ const FILES_JSONL: &str = "files.jsonl";
 const SNAPSHOT_DIR: &str = "snapshot";
 /// zstd level for the archive — 9 matches the builder recipe (§2 step 5).
 const ZSTD_LEVEL: i32 = 9;
+/// Largest decompressed tar a reader accepts. The archive itself is capped by
+/// `AUTO_PULL_MAX_BYTES` (50 MiB) before it is read, but zstd reaches ratios of
+/// several thousand to one on repetitive input (1 GiB of zeros is ~32 KiB at
+/// level 9), so a capped archive could still expand to terabytes in memory. A
+/// signature only says who made the pack, not that the maker's key was never
+/// stolen or its build never fed a bad snapshot: the reader bounds what it
+/// allocates whatever the signature says. 1 GiB is twenty times the pull cap —
+/// far above what a snapshot of already-compressed segment files expands to.
+const MAX_UNPACKED_BYTES: u64 = 1 << 30;
+/// Largest number of tar entries a reader accepts (a pack holds four fixed
+/// members plus the snapshot's files — a few hundred in practice).
+const MAX_MEMBERS: usize = 100_000;
 
 /// One line of `files.jsonl`: an indexed source file with its per-path licence.
 /// `read_and_verify_pack` does not parse this (it is extracted verbatim); it is
@@ -147,6 +159,26 @@ pub fn read_and_verify_pack(
     pubkey_hex: &str,
     dest: &Path,
 ) -> Result<PackManifest> {
+    read_and_verify_pack_bounded(
+        archive,
+        sig,
+        expected_sha256,
+        pubkey_hex,
+        dest,
+        MAX_UNPACKED_BYTES,
+    )
+}
+
+/// [`read_and_verify_pack`] with the decompressed-size bound as a parameter, so
+/// a test can prove the bound with a small archive.
+fn read_and_verify_pack_bounded(
+    archive: &Path,
+    sig: &Path,
+    expected_sha256: &str,
+    pubkey_hex: &str,
+    dest: &Path,
+    max_unpacked: u64,
+) -> Result<PackManifest> {
     // The whole archive is read into memory because the detached signature is over
     // the complete archive bytes (ed25519 verifies a contiguous message); the hub's
     // auto-pull packs are capped well below that cost (AUTO_PULL_MAX_BYTES).
@@ -164,7 +196,8 @@ pub fn read_and_verify_pack(
     verify_bytes(&archive_bytes, sig_hex.trim(), pubkey_hex).context("pack signature")?;
 
     // 3. Decompress and load the members (still nothing written to dest).
-    let tar_bytes = zstd::decode_all(archive_bytes.as_slice()).context("zstd decompress")?;
+    //    Bounded: never allocate more than `max_unpacked` however well it compresses.
+    let tar_bytes = decompress_bounded(&archive_bytes, max_unpacked)?;
     drop(archive_bytes);
     let members = read_members(&tar_bytes)?;
 
@@ -293,11 +326,30 @@ fn rel_to_forward_slash(rel: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// zstd-decompress `archive`, refusing output larger than `max` bytes. Reads at
+/// most `max + 1` bytes from the decoder, so a decompression bomb costs at most
+/// that much memory before it is refused.
+fn decompress_bounded(archive: &[u8], max: u64) -> Result<Vec<u8>> {
+    let decoder = zstd::stream::read::Decoder::new(archive).context("zstd decompress")?;
+    let mut out = Vec::new();
+    decoder
+        .take(max.saturating_add(1))
+        .read_to_end(&mut out)
+        .context("zstd decompress")?;
+    if out.len() as u64 > max {
+        bail!("pack decompresses to more than {max} bytes; refusing to extract it");
+    }
+    Ok(out)
+}
+
 /// Read every regular tar entry into a map, keyed by a sanitised archive path.
 fn read_members(tar_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
     let mut members: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for entry in archive.entries().context("read tar entries")? {
+    for (n, entry) in archive.entries().context("read tar entries")?.enumerate() {
+        if n >= MAX_MEMBERS {
+            bail!("pack holds more than {MAX_MEMBERS} entries; refusing to extract it");
+        }
         let mut entry = entry.context("read tar entry")?;
         if entry.header().entry_type().is_dir() {
             continue;
@@ -1019,5 +1071,42 @@ mod tests {
                  registry() row (a rename would silently zero out every .{ext} file's defs)"
             );
         }
+    }
+
+    #[test]
+    fn a_pack_that_decompresses_past_the_bound_is_refused_before_extraction() {
+        // A validly signed pack whose snapshot is 8 MiB of zeros: the archive is a
+        // few KiB (zstd's ratio on repetitive input is in the thousands), so the
+        // 50 MiB download cap alone does not bound what the reader allocates.
+        // Before the bound, `zstd::decode_all` inflated whatever the archive held.
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = make_snapshot(tmp.path());
+        fs::write(snap.join("idx/zeros.bin"), vec![0u8; 8 << 20]).unwrap();
+        let out = tmp.path().join("bomb.hubpack.tar.zst");
+        let (seed, public) = generate_keypair().unwrap();
+        let (sha, bytes) = write_pack(
+            &out,
+            &sample_manifest(),
+            &sample_defs(),
+            &sample_files(),
+            &snap,
+            &seed,
+        )
+        .unwrap();
+        assert!(bytes < 64 * 1024, "the archive is tiny: {bytes} bytes");
+        let sig = sig_path_for(&out);
+
+        let dest = tmp.path().join("dest");
+        let err =
+            read_and_verify_pack_bounded(&out, &sig, &sha, &public, &dest, 1 << 20).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("decompresses to more than"),
+            "{err:#}"
+        );
+        assert!(dir_is_empty_or_absent(&dest), "nothing extracted");
+
+        // The same pack under a bound it fits in still verifies and extracts.
+        read_and_verify_pack_bounded(&out, &sig, &sha, &public, &dest, 16 << 20).unwrap();
+        assert!(dest.join("snapshot/idx/zeros.bin").exists());
     }
 }

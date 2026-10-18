@@ -516,6 +516,24 @@ fn fetch_and_store(hub_url: &str, cache_file: &Path, etag_file: &Path) -> Result
 
     // Only trusted bytes get parsed and cached.
     let cat = parse_catalogue(&body)?;
+
+    // Anti-rollback. A signature proves the hub made these bytes, not that they
+    // are the hub's CURRENT catalogue: every catalogue the hub ever signed
+    // verifies for ever. Whoever answers for the hub URL (a compromised mirror or
+    // CDN, a captive proxy, an `XERJ_HUB_URL` someone else chose) could otherwise
+    // replay an older signed catalogue, and `hub sync` would then "update" every
+    // cached pack back to an older pin and delete the newer one. A catalogue
+    // generated before the copy already cached is refused and the cache kept.
+    if let Some(prev) = read_cached(cache_file) {
+        if is_rollback(&cat.generated_at, &prev.generated_at) {
+            bail!(
+                "refusing a catalogue generated {} — older than the cached one ({}); a signed \
+                 but older catalogue is a rollback, so the cache was kept",
+                cat.generated_at,
+                prev.generated_at
+            );
+        }
+    }
     if let Some(parent) = cache_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create cache dir {}", parent.display()))?;
@@ -533,6 +551,20 @@ fn fetch_and_store(hub_url: &str, cache_file: &Path, etag_file: &Path) -> Result
         }
     }
     Ok(cat)
+}
+
+/// True when `fetched` was generated before `cached` — a rollback. Both are the
+/// signed `generated_at` (RFC 3339). An unparsable cached time cannot anchor a
+/// comparison, so it never blocks; an unparsable fetched time against a
+/// parsable cached one cannot be shown to be newer, so it is refused.
+fn is_rollback(fetched: &str, cached: &str) -> bool {
+    let Ok(cached) = chrono::DateTime::parse_from_rfc3339(cached.trim()) else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(fetched.trim()) {
+        Ok(fetched) => fetched < cached,
+        Err(_) => true,
+    }
 }
 
 /// The response's `Content-Type`, or `no content type`.
@@ -1089,5 +1121,53 @@ mod tests {
         // as a 32-byte key in the very function the client verifies with.
         assert!(msg.contains("signature does not verify"), "{msg}");
         assert!(!cache.path().join(CACHE_FILE).exists(), "nothing cached");
+    }
+
+    #[test]
+    fn an_older_signed_catalogue_is_refused_as_a_rollback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fx = tempfile::tempdir().unwrap();
+        let inputs = two_inputs(fx.path());
+        let (seed, public) = keypair();
+
+        // The client already holds today's catalogue (aged, so it would refresh).
+        let (new_cat, new_sig) = build_catalogue(&inputs, "2026-10-14T00:00:00Z", &seed).unwrap();
+        let new_bytes = canonical_json(&new_cat).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        seed_cache(cache.path(), &new_bytes, &new_sig);
+        age_file(&cache.path().join(CACHE_FILE), 48 * 3600);
+
+        // The hub URL answers with an OLDER catalogue, genuinely signed by the
+        // trusted key — a replay of what the hub published two weeks earlier.
+        let (old_cat, old_sig) = build_catalogue(&inputs, "2026-10-01T00:00:00Z", &seed).unwrap();
+        let old_bytes = canonical_json(&old_cat).unwrap();
+
+        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        let (url, handle) = spawn_hub(old_bytes.clone(), old_sig.clone());
+        let err = refresh_catalogue(&url, cache.path()).expect_err("a rollback is refused");
+        handle.join().unwrap();
+        let (url, handle) = spawn_hub(old_bytes, old_sig);
+        let served = load_catalogue(&url, cache.path(), false).expect("cached copy kept");
+        std::env::remove_var("XERJ_HUB_PUBKEY");
+        handle.join().unwrap();
+
+        assert!(format!("{err:#}").contains("rollback"), "{err:#}");
+        assert_eq!(served.generated_at, "2026-10-14T00:00:00Z");
+        let on_disk = fs::read(cache.path().join(CACHE_FILE)).unwrap();
+        assert_eq!(on_disk, new_bytes, "the newer cache is untouched");
+    }
+
+    #[test]
+    fn rollback_comparison_rules() {
+        assert!(is_rollback("2026-10-01T00:00:00Z", "2026-10-14T00:00:00Z"));
+        assert!(!is_rollback("2026-10-14T00:00:00Z", "2026-10-14T00:00:00Z"));
+        assert!(!is_rollback("2026-10-15T00:00:00Z", "2026-10-14T00:00:00Z"));
+        // Same instant, different offset: not older.
+        assert!(!is_rollback(
+            "2026-10-14T02:00:00+02:00",
+            "2026-10-14T00:00:00Z"
+        ));
+        assert!(is_rollback("not a time", "2026-10-14T00:00:00Z"));
+        assert!(!is_rollback("2026-10-01T00:00:00Z", "not a time"));
     }
 }
