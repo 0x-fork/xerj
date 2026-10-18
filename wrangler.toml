@@ -41,6 +41,14 @@ bucket_name = "xerj-installs"
 #   wrangler kv namespace create FIELD_REPORTS
 # and replace the id below with the one it prints. Do not commit a real id
 # from the live account via an automated run; the owner wires this at deploy.
-[[kv_namespaces]]
-binding = "FIELD_REPORTS"
-id = "REPLACE_WITH_FIELD_REPORTS_KV_NAMESPACE_ID"
+# [[kv_namespaces]]  — COMMENTED OUT until the owner wires the real namespace.
+# A placeholder id here makes `wrangler pages deploy` fail with
+# "Error 8000022: Invalid KV namespace ID", which blocks EVERY xerj.org deploy
+# (this file is on the deploy trigger path). With no binding declared, the
+# Function fails open: /api/field-report accepts a report and returns 200 but
+# does NOT store it (see functions/api/field-report.js, the `!env.FIELD_REPORTS`
+# branch). To activate storage, create the namespace and restore this block:
+#     wrangler kv namespace create FIELD_REPORTS   # prints an id
+# [[kv_namespaces]]
+# binding = "FIELD_REPORTS"
+# id = "<the id it printed>"
