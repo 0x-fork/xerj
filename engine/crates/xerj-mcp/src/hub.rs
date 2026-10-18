@@ -269,6 +269,10 @@ async fn run(ctx: &Ctx, mut a: AskArgs) -> Value {
     }
 }
 
+/// The re-ask hint as the CLI words it, and as a tool caller needs it.
+const CLI_CORPUS_HINT: &str = "re-run with --corpus <slug>";
+const MCP_CORPUS_HINT: &str = "call xerj_hub_ask again with the `corpus` argument";
+
 /// An [`AskOutcome`] as a tool result. An answer — including one with no hits
 /// (a miss is an answer, not an error) — carries the Answer JSON as structured
 /// content. More than one candidate corpus is not an error either: the text
@@ -276,7 +280,8 @@ async fn run(ctx: &Ctx, mut a: AskArgs) -> Value {
 fn outcome_result(o: AskOutcome) -> Value {
     let mut text = String::new();
     for line in &o.stderr {
-        text.push_str(line);
+        // The flow's hints name the CLI flag; a tool caller sets an argument.
+        text.push_str(&line.replace(CLI_CORPUS_HINT, MCP_CORPUS_HINT));
         text.push('\n');
     }
     text.push_str(&o.stdout);
@@ -388,5 +393,35 @@ mod tests {
             answer: None,
         };
         assert_eq!(outcome_result(failed)["isError"], true);
+    }
+
+    /// FTX shell-less trial (2026-10-17): the "nothing matches" and "more than one
+    /// corpus" hints told a tool caller to "re-run with --corpus <slug>", a CLI
+    /// flag it has no way to pass. The tool result names the argument instead.
+    #[test]
+    fn the_reask_hint_names_the_tool_argument_not_the_cli_flag() {
+        for (exit, line) in [
+            (
+                1,
+                "closest corpora: lz4, snappy; re-run with --corpus <slug> to ask one of them",
+            ),
+            (
+                EXIT_NEEDS_DECISION,
+                "more than one corpus matches; re-run with --corpus <slug>",
+            ),
+        ] {
+            let r = outcome_result(AskOutcome {
+                exit,
+                stdout: String::new(),
+                stderr: vec![line.into()],
+                answer: None,
+            });
+            let text = r["content"][0]["text"].as_str().unwrap();
+            assert!(!text.contains("--corpus"), "{text}");
+            assert!(
+                text.contains("xerj_hub_ask again with the `corpus` argument"),
+                "{text}"
+            );
+        }
     }
 }

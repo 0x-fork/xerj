@@ -273,9 +273,10 @@ pub struct AskDeps<'a> {
 // ── step 1: mode ─────────────────────────────────────────────────────────────
 
 /// Decide the answer mode and the symbol (for `Def`). `--def` / `--how` /
-/// `--files` win; otherwise a question that is one identifier, or that matches
-/// `what is the (exact )?value of (\w+)`, is a definition lookup, and anything
-/// else is a how-does-it-work question.
+/// `--files` win; otherwise a question that is one identifier, that matches
+/// `what is the (exact )?value of (\w+)`, or that asks `what is <SYMBOL>` /
+/// `what's <SYMBOL>` about a code-shaped name ([`looks_like_code_symbol`]), is a
+/// definition lookup, and anything else is a how-does-it-work question.
 pub fn detect_mode(question: &str, requested: &ModeRequest) -> (AnswerMode, Option<String>) {
     match requested {
         ModeRequest::Def(sym) => (AnswerMode::Def, Some(sym.clone())),
@@ -307,6 +308,7 @@ fn is_identifier(s: &str) -> bool {
 /// The symbol in `what is the (exact )?value of (\w+)`, matched anywhere in the
 /// question and case-insensitively on the fixed words (a sentence starts with a
 /// capital); the symbol keeps its own case.
+/// Failing that, the code-shaped symbol in `what is <SYMBOL>` / `what's <SYMBOL>`.
 fn value_of_symbol(q: &str) -> Option<String> {
     // ASCII lowercasing keeps every byte offset, so `pos` indexes `q` too.
     let lower = q.to_ascii_lowercase();
@@ -321,7 +323,36 @@ fn value_of_symbol(q: &str) -> Option<String> {
             }
         }
     }
+    // `what is LZ4_VERSION_RELEASE in lz4?` — the plain form, but only for a
+    // name that is visibly code: `what is compression` stays a how question.
+    for lead in ["what is ", "what's "] {
+        if let Some(pos) = lower.find(lead) {
+            let sym: String = q[pos + lead.len()..]
+                .chars()
+                .skip_while(|c| *c == '`')
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if looks_like_code_symbol(&sym) {
+                return Some(sym);
+            }
+        }
+    }
     None
+}
+
+/// A word that can only be a code identifier, not prose: an identifier with an
+/// underscore (`LZ4_VERSION_RELEASE`, `max_len`), or mixed case past its first
+/// letter (`HashMap`, `readFile`). `LZ4`, `Snappy` and `compression` are not —
+/// they read as names or words, and a def lookup on them would miss.
+fn looks_like_code_symbol(s: &str) -> bool {
+    if !is_identifier(s) {
+        return false;
+    }
+    let has_word_char = s.chars().any(|c| c.is_ascii_alphanumeric());
+    let underscored = s.contains('_') && has_word_char;
+    let mixed_case = s.chars().any(|c| c.is_ascii_lowercase())
+        && s.chars().skip(1).any(|c| c.is_ascii_uppercase());
+    underscored || mixed_case
 }
 
 // ── step 4/5: the pull policy ────────────────────────────────────────────────
@@ -2050,6 +2081,36 @@ mod tests {
         }
     }
 
+    /// FTX shell-less trial (2026-10-17): an agent asked `What is
+    /// LZ4_VERSION_RELEASE in lz4?` — a definition question in the plain form —
+    /// and got a how-mode search. A code-shaped name after `what is` / `what's` is
+    /// a definition lookup; a word or a product name is not.
+    #[test]
+    fn mode_is_def_for_what_is_a_code_shaped_symbol() {
+        let auto = ModeRequest::Auto;
+        for (q, sym) in [
+            ("What is LZ4_VERSION_RELEASE in lz4?", "LZ4_VERSION_RELEASE"),
+            ("what is ZSTD_CLEVEL_DEFAULT", "ZSTD_CLEVEL_DEFAULT"),
+            ("what's `max_len` in quinn?", "max_len"),
+            ("In std, what is HashMap?", "HashMap"),
+        ] {
+            assert_eq!(
+                detect_mode(q, &auto),
+                (AnswerMode::Def, Some(sym.to_string())),
+                "{q}"
+            );
+        }
+        for q in [
+            "what is compression",
+            "What is LZ4?",
+            "what is Snappy's framing format",
+            "what is the difference between lz4 and zstd",
+            "what is _",
+        ] {
+            assert_eq!(detect_mode(q, &auto), (AnswerMode::How, None), "{q:?}");
+        }
+    }
+
     #[test]
     fn mode_is_how_for_prose_and_flags_force_the_rest() {
         let auto = ModeRequest::Auto;
@@ -2829,6 +2890,69 @@ mod tests {
             with_symbol_evidence(Routing::NoCorpus, &[]),
             Routing::NoCorpus
         );
+    }
+
+    /// FTX shell-less trial (2026-10-17): `xerj_hub_ask` with no `corpus` refused
+    /// "What is LZ4_VERSION_RELEASE in lz4?" and "How does snappy's decompressor
+    /// …?" with "no hub corpus matches" — while listing the very corpus the
+    /// question named as the closest. Neighbouring compression corpora share the
+    /// question's words (zstd's sources even mention lz4), so the sketch alone was
+    /// never decisive. The corpus the question names is.
+    #[test]
+    fn a_question_that_names_its_corpus_is_answered_from_it() {
+        let rig = Rig::new();
+        let shared = &[
+            "lz4",
+            "snappy",
+            "decompressor",
+            "literal",
+            "copy",
+            "element",
+        ];
+        let cat = catalogue(vec![
+            entry("lz4", 1024, LicenceClass::AdaptWithAttribution, shared),
+            entry("snappy", 1024, LicenceClass::AdaptWithAttribution, shared),
+            entry("zstd", 1024, LicenceClass::AdaptWithAttribution, shared),
+        ]);
+        for (q, slug, mode) in [
+            (
+                "What is LZ4_VERSION_RELEASE in lz4?",
+                "lz4",
+                AnswerMode::Def,
+            ),
+            (
+                "How does snappy's decompressor tell a literal element from a copy element?",
+                "snappy",
+                AnswerMode::How,
+            ),
+        ] {
+            let backend = FakeBackend::new(true);
+            let out = rig.run(&args(q, None), &cat, None, &backend);
+            assert_eq!(out.exit, EXIT_OK, "{q}: {:?}", out.stderr);
+            let ans = out.answer.expect("an answer");
+            assert_eq!(ans.corpus, slug, "{q}");
+            assert_eq!(ans.mode, mode, "{q}");
+            assert_eq!(
+                backend.calls(),
+                [format!("ready:{slug}"), format!("answer_local:{slug}")],
+                "{q}"
+            );
+        }
+
+        // Two corpora named: the asker picks, exactly as with two sketch matches.
+        let out = rig.run(
+            &args("is lz4 or zstd faster at decompressing?", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_eq!(out.exit, EXIT_NEEDS_DECISION, "{out:?}");
+        assert!(
+            out.stdout.contains("lz4") && out.stdout.contains("zstd"),
+            "{}",
+            out.stdout
+        );
+        assert!(!out.stdout.contains("snappy"), "{}", out.stdout);
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub enum EvidenceSource {
     Hosted,
     /// The corpus's term sketch matched some of the question's tokens.
     Sketch,
+    /// The question names this corpus by its slug (`… in lz4?`, `snappy's …`).
+    Named,
 }
 
 /// One corpus proposed for a question, with the score it earned on its source's
@@ -94,6 +96,12 @@ const CONFIDENT_MIN: f32 = 0.6;
 const DOMINANCE: f32 = 1.5;
 /// A slug must reach this to be an `Ambiguous` candidate.
 const CANDIDATE_MIN: f32 = 0.3;
+/// Score a corpus named in the question earns (it outranks everything: the
+/// asker said which corpus they mean).
+const NAMED_SCORE: f32 = 1.0;
+/// Slugs shorter than this are never matched as a name (too likely to be a
+/// stray word or abbreviation).
+const NAMED_MIN_LEN: usize = 2;
 
 /// Route a question to a corpus.
 ///
@@ -216,7 +224,54 @@ pub fn route_ranked(
         }
     }
 
-    decide(evidence, cached)
+    // 4. The corpus the question names. Asking "what is X in lz4?" names the
+    //    corpus outright; the sketch alone could not see that, because the
+    //    question's other words (and the name itself — zstd's sources mention
+    //    lz4) also hit the neighbouring corpora. One named corpus decides; several
+    //    ("lz4 or zstd?") are the candidates, in the order the evidence ranks them.
+    let named = named_slugs(question, cat);
+    for slug in &named {
+        evidence.push(Evidence {
+            slug: slug.clone(),
+            score: NAMED_SCORE,
+            source: EvidenceSource::Named,
+        });
+    }
+
+    let (routing, ranked) = decide(evidence, cached);
+    match named.len() {
+        0 => (routing, ranked),
+        1 => (Routing::Confident(named[0].clone()), ranked),
+        _ => {
+            let in_order: Vec<String> = ranked
+                .iter()
+                .filter(|(slug, _)| named.contains(slug))
+                .map(|(slug, _)| slug.clone())
+                .collect();
+            (Routing::Ambiguous(in_order), ranked)
+        }
+    }
+}
+
+/// The catalogue slugs `question` names as a whole word, case-insensitively,
+/// in catalogue order. A word is a run of slug characters (`a-z`, `0-9`, `.`,
+/// `_`, `-`) with sentence punctuation (`.`, `-`) trimmed from its ends, so
+/// `in lz4?`, `LZ4.`, `snappy's` and `c-ares` all name their corpus while
+/// `lz4frame` and `liblz4` do not.
+pub fn named_slugs(question: &str, cat: &Catalogue) -> Vec<String> {
+    let lower = question.to_ascii_lowercase();
+    let words: HashSet<&str> = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .map(|w| w.trim_matches(|c| c == '.' || c == '-'))
+        .filter(|w| w.len() >= NAMED_MIN_LEN)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for entry in &cat.corpora {
+        if words.contains(entry.slug.as_str()) && !out.contains(&entry.slug) {
+            out.push(entry.slug.clone());
+        }
+    }
+    out
 }
 
 /// Merge evidence by slug (max score), apply the cached bonus, and reach a
@@ -782,6 +837,53 @@ mod tests {
     }
 
     // --- tokenizer --------------------------------------------------------
+
+    #[test]
+    fn named_slugs_match_whole_words_only() {
+        let cat = catalogue(vec![
+            entry("lz4", &[], &[]),
+            entry("c-ares", &[], &[]),
+            entry("snappy", &[], &[]),
+            entry("h2", &[], &[]),
+        ]);
+        let names = |q: &str| named_slugs(q, &cat);
+        assert_eq!(names("What is LZ4_VERSION_RELEASE in lz4?"), ["lz4"]);
+        assert_eq!(names("Does LZ4. handle it"), ["lz4"]);
+        assert_eq!(names("how does snappy's decoder work"), ["snappy"]);
+        assert_eq!(names("c-ares resolver timeouts"), ["c-ares"]);
+        assert_eq!(names("lz4 vs snappy"), ["lz4", "snappy"]);
+        // Part of a longer word or identifier is not the name.
+        assert!(names("liblz4 and lz4frame and LZ4_compress").is_empty());
+        assert!(names("snappyish ares").is_empty());
+    }
+
+    #[test]
+    fn a_named_corpus_decides_even_against_a_dependency() {
+        let cat = catalogue(vec![
+            entry("alpha", &["widgetlib"], &["frobnicate", "wizzle"]),
+            entry("beta", &[], &["frobnicate", "wizzle"]),
+            entry("gamma", &[], &["server"]),
+        ]);
+        let proj = empty_project();
+        fs::write(
+            proj.path().join("Cargo.lock"),
+            "[[package]]\nname = \"widgetlib\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let (routing, ranked) =
+            route_ranked("how does beta frobnicate", proj.path(), &cat, None, &[]);
+        assert_eq!(routing, Routing::Confident("beta".to_string()));
+        assert!(ranked.iter().any(|(s, _)| s == "beta"), "{ranked:?}");
+        // Two named: ambiguous between exactly those two.
+        let both = route("alpha or beta?", empty_project().path(), &cat, None, &[]);
+        match both {
+            Routing::Ambiguous(mut slugs) => {
+                slugs.sort();
+                assert_eq!(slugs, ["alpha", "beta"]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
 
     #[test]
     fn tokenizer_keeps_identifiers_and_lowercases() {
