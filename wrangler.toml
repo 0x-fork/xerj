@@ -8,10 +8,22 @@
 #              Cloudflare dashboard (R2 → Create bucket → `xerj-installs`);
 #              until it exists the function serves the installer normally and
 #              simply does not count. Fail-open is deliberate.
+#   FIELD_REPORTS (Workers KV) — functions/api/field-report.js stores each
+#              accepted agent field report as a small JSON value. This is the
+#              GitHub-unavailable FALLBACK to `xerj feedback --open-pr`; the
+#              PR path stays primary. KV only — NEVER R2 (R2 is frozen by
+#              owner order). The namespace must be created ONCE and its id
+#              pasted below, replacing the placeholder; until then the
+#              function accepts requests but does not store (fail-open, like
+#              get.js). One-time setup (owner runs it; do NOT run against the
+#              live account from CI/agents):
+#                  wrangler kv namespace create FIELD_REPORTS
+#              then copy the printed id into `id = "..."` under the
+#              [[kv_namespaces]] block below and redeploy.
 #
-# Routing: landing/_routes.json pins Function invocation to /get, /get.ps1 and
-# /lead. A NEW FUNCTION ADDED UNDER functions/ WILL NOT BE ROUTED until its
-# path is added to that include list.
+# Routing: landing/_routes.json pins Function invocation to /get, /get.ps1,
+# /lead and /api/field-report. A NEW FUNCTION ADDED UNDER functions/ WILL NOT
+# BE ROUTED until its path is added to that include list.
 name = "xerj"
 pages_build_output_dir = "landing"
 compatibility_date = "2024-09-01"
@@ -23,3 +35,12 @@ bucket_name = "xerj-leads"
 [[r2_buckets]]
 binding = "INSTALLS"
 bucket_name = "xerj-installs"
+
+# Workers KV for agent field reports (functions/api/field-report.js).
+# PLACEHOLDER id — NOT a real namespace. Create the namespace once with
+#   wrangler kv namespace create FIELD_REPORTS
+# and replace the id below with the one it prints. Do not commit a real id
+# from the live account via an automated run; the owner wires this at deploy.
+[[kv_namespaces]]
+binding = "FIELD_REPORTS"
+id = "REPLACE_WITH_FIELD_REPORTS_KV_NAMESPACE_ID"
