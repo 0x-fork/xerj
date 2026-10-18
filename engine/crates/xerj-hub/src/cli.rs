@@ -1276,10 +1276,79 @@ pub fn parse_ask_args(args: &[String]) -> Result<Option<AskArgs>, String> {
 /// `xerj code …`: `--def <SYMBOL>` answers from the `-defs` index; everything
 /// else is the existing retrieval path, delegated unchanged.
 pub fn run_code(args: &[String]) -> i32 {
+    let args = match with_pulled_node_url(args) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("xerj code: {e:#}");
+            return 2;
+        }
+    };
     if !args.iter().any(|a| a == "--def") {
-        return xerj_autoindex::xc::run_code_cli(args);
+        return xerj_autoindex::xc::run_code_cli(&args);
     }
-    run_code_def(args)
+    run_code_def(&args)
+}
+
+/// The `xerj code` flags (either mode) that take a value.
+const CODE_VALUE_FLAGS: &[&str] = &[
+    "-k",
+    "--lang",
+    "--mode",
+    "--full",
+    "--url",
+    "--api-key",
+    "--def",
+];
+
+/// The `<corpus>` argument of `xerj code …`: the first positional, skipping the
+/// values of [`CODE_VALUE_FLAGS`] (both parsers take it in that position).
+fn code_corpus_arg(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if CODE_VALUE_FLAGS.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with('-') {
+            return Some(a);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// For a PULLED corpus queried with no `--url` and no `XERJ_URL`, add
+/// `--url <the node the pack lives on>` ([`node::resolve_pulled_node`]).
+///
+/// Without this, `xerj code <slug>` — the command `xerj hub pull` tells the user
+/// to run next — resolved `localhost:9200` while the pack had been restored into
+/// the automatic node on 9300+: `--def` printed "no match … answered from: local
+/// pack" and a question failed with a transport error. `xerj ask` already used
+/// the automatic node. A locally indexed corpus, an explicit `--url` or
+/// `XERJ_URL`, and anything that is not a pulled corpus pass through unchanged.
+fn with_pulled_node_url(args: &[String]) -> Result<Vec<String>> {
+    let explicit_env = std::env::var("XERJ_URL").is_ok_and(|u| !u.is_empty());
+    let help = args.iter().any(|a| a == "-h" || a == "--help");
+    if explicit_env || help || args.iter().any(|a| a == "--url") {
+        return Ok(args.to_vec());
+    }
+    let Some(corpus) = code_corpus_arg(args) else {
+        return Ok(args.to_vec());
+    };
+    let Ok(st) = state::load_state(&xerj_autoindex::xc::code_root(), corpus) else {
+        return Ok(args.to_vec()); // the code path reports "not indexed" itself
+    };
+    if st.source.as_deref() != Some(state::SOURCE_HUBPACK) {
+        return Ok(args.to_vec());
+    }
+    let launcher = NodeLauncher::current()?;
+    let resolved = node::resolve_pulled_node(&hub_home(), st.url.as_deref(), &launcher)
+        .with_context(|| format!("cannot reach the node holding the pulled corpus '{corpus}'"))?;
+    let mut out = args.to_vec();
+    out.push("--url".into());
+    out.push(resolved.url);
+    Ok(out)
 }
 
 fn run_code_def(args: &[String]) -> i32 {
@@ -1358,10 +1427,17 @@ fn run_code_def(args: &[String]) -> i32 {
         return 2;
     }
     let prefix = state::query_prefix(&st);
-    if let Ok(live) = node.cat_indices_json(&format!("{prefix}*")) {
-        if live.is_empty() {
+    match node.cat_indices_json(&format!("{prefix}*")) {
+        Ok(live) if live.is_empty() => {
             eprintln!("{}", state::not_loaded_message(&st, &prefix, &url));
             return 3;
+        }
+        Ok(_) => {}
+        // An unreachable node is a failure to answer (exit 2), not "no match"
+        // (exit 1) — and never "answered from: local pack".
+        Err(e) => {
+            eprintln!("xerj code: cannot reach {url}: {e}");
+            return 2;
         }
     }
 
@@ -1459,6 +1535,22 @@ mod tests {
         ] {
             assert_eq!(licence_class_str(c), s);
         }
+    }
+
+    #[test]
+    fn code_corpus_arg_skips_flag_values() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(code_corpus_arg(&v(&["lz4", "q"])), Some("lz4"));
+        assert_eq!(code_corpus_arg(&v(&["--def", "X", "lz4"])), Some("lz4"));
+        assert_eq!(
+            code_corpus_arg(&v(&["-k", "3", "--json", "lz4", "q"])),
+            Some("lz4")
+        );
+        assert_eq!(
+            code_corpus_arg(&v(&["--mode", "bm25", "--lang", "c"])),
+            None
+        );
+        assert_eq!(code_corpus_arg(&v(&["--def"])), None);
     }
 
     #[test]

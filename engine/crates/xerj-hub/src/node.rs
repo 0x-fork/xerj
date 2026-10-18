@@ -559,6 +559,43 @@ fn ensure_node_with(
     }
 }
 
+/// The node a PULLED corpus (a `source: "hubpack"` ledger) is queried on when
+/// the caller named none (no `--url`, no `XERJ_URL`).
+///
+/// `xerj hub pull` restores into whatever [`ensure_node`] resolved — on a
+/// machine with nothing on `localhost:9200`, the automatic node on 9300+ — and
+/// records that URL in the ledger. A bare `xerj code <slug>` used to ignore the
+/// ledger and query `localhost:9200`, so the corpus `pull` had just restored was
+/// unreachable from the command `pull` tells the user to run next.
+///
+/// The recorded URL takes the place `--url` has in [`ensure_node`]: used when it
+/// answers; refused when it is remote and silent; and when it is local and
+/// silent (the automatic node was stopped, or its port changed), the automatic
+/// node is reused or restarted on its own data directory, where the restored
+/// indices persist. `localhost:9200` is NOT probed: a node there that never held
+/// the pack would answer "not loaded" for a corpus that is one restart away.
+/// A ledger with no URL falls back to plain [`ensure_node`].
+pub fn resolve_pulled_node(
+    hub_home: &Path,
+    recorded: Option<&str>,
+    launcher: &NodeLauncher,
+) -> Result<ResolvedNode> {
+    resolve_pulled_node_with(hub_home, recorded, launcher, NODE_BOOT_TIMEOUT)
+}
+
+/// [`resolve_pulled_node`] with the boot timeout spelled out (tests shorten it).
+fn resolve_pulled_node_with(
+    hub_home: &Path,
+    recorded: Option<&str>,
+    launcher: &NodeLauncher,
+    boot_timeout: Duration,
+) -> Result<ResolvedNode> {
+    let recorded = recorded
+        .map(|u| u.trim().trim_end_matches('/'))
+        .filter(|u| !u.is_empty());
+    ensure_node_with(hub_home, recorded, launcher, boot_timeout)
+}
+
 fn unconfirmed_message(hub_home: &Path, rec: &NodeRecord) -> String {
     if rec.port.is_none() {
         format!(
@@ -1832,6 +1869,35 @@ mod tests {
         assert!(!hub.path().join("node.pid").exists());
     }
 
+    // ── resolve_pulled_node: a bare `xerj code <pulled slug>` ────────────────
+
+    #[test]
+    fn a_pulled_corpus_is_queried_on_the_node_its_ledger_recorded() {
+        // The bug: `pull` restored into the automatic node (9300+) and recorded
+        // its URL; a bare `xerj code` then queried localhost:9200 instead.
+        let hub = tempfile::tempdir().unwrap();
+        let port = fake_node("200 OK", r#"{"status":"green"}"#);
+        let recorded = format!("http://127.0.0.1:{port}/");
+        let r = resolve_pulled_node(hub.path(), Some(&recorded), &forbidden_launcher()).unwrap();
+        assert_eq!(r.url, format!("http://127.0.0.1:{port}"));
+        assert!(!r.started_now, "an answering node is never started over");
+        assert!(!hub.path().join("node.pid").exists());
+    }
+
+    #[test]
+    fn a_pulled_corpus_on_a_silent_remote_node_is_an_error_not_a_local_node() {
+        let hub = tempfile::tempdir().unwrap();
+        let err = resolve_pulled_node(
+            hub.path(),
+            Some("http://nonexistent.invalid:9200"),
+            &forbidden_launcher(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a local address"), "{err}");
+        assert!(!hub.path().join("node.pid").exists());
+    }
+
     #[test]
     fn free_port_search_skips_a_busy_triple() {
         let held = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2395,6 +2461,24 @@ mod tests {
             // The default-ish URL is silent (a closed loopback port), so the
             // recorded node is the one used.
             let r = ensure_node(hub.path(), Some(&silent_url()), &forbidden_launcher()).unwrap();
+            assert_eq!(r.url, format!("http://127.0.0.1:{port}"));
+            assert!(r.managed && !r.started_now);
+            live.kill().unwrap();
+            live.wait().unwrap();
+        }
+
+        #[test]
+        fn a_pulled_corpus_whose_recorded_node_moved_finds_the_automatic_node() {
+            // `xerj hub stop` + a later restart put the automatic node on another
+            // port than the one `pull` recorded. The ledger URL is silent and
+            // local, so the automatic node is the answer — and localhost:9200 is
+            // never consulted (a node there never held the pack).
+            let hub = tempfile::tempdir().unwrap();
+            let mut live = spawn_node_like(&node_data_dir(hub.path()));
+            let port = fake_node_with_pid(live.id());
+            record(hub.path(), live.id(), Some(port));
+            let r = resolve_pulled_node(hub.path(), Some(&silent_url()), &forbidden_launcher())
+                .unwrap();
             assert_eq!(r.url, format!("http://127.0.0.1:{port}"));
             assert!(r.managed && !r.started_now);
             live.kill().unwrap();

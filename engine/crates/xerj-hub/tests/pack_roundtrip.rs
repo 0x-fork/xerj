@@ -491,6 +491,35 @@ async fn pack_build_pull_def_roundtrip() {
     assert_eq!(answer.hits[0].file, "limits.h");
     assert_eq!(answer.hits[0].line, 5);
 
+    // A BARE `xerj code` (no --url, no XERJ_URL) finds the node the pack was
+    // restored into, from the ledger — not localhost:9200. `pull` names exactly
+    // this command as the next step; it used to query localhost:9200, where
+    // `--def` printed "no match … answered from: local pack" (exit 1) and a
+    // question failed to connect (exit 2).
+    let (rc_def, rc_how) = {
+        let (ch, hh) = (code_home.clone(), hub_home.clone());
+        tokio::task::spawn_blocking(move || {
+            std::env::set_var("XERJ_CODE_HOME", &ch);
+            std::env::set_var("XERJ_HUB_HOME", &hh);
+            std::env::remove_var("XERJ_URL");
+            let def = xerj_hub::cli::run_code(&[
+                "mini-c".into(),
+                "--def".into(),
+                "MINI_LIMIT".into(),
+                "--json".into(),
+            ]);
+            let how = xerj_hub::cli::run_code(&["mini-c".into(), "mini c reference".into()]);
+            (def, how)
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        rc_def, 0,
+        "bare `xerj code mini-c --def MINI_LIMIT` answers"
+    );
+    assert_eq!(rc_how, 0, "bare `xerj code mini-c \"<question>\"` answers");
+
     // Second pull of the same pin → already present, restores nothing.
     let rc2 = {
         let (url_b, ch, hh, pk) = (
