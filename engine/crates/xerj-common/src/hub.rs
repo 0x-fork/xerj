@@ -29,6 +29,33 @@ pub const PACK_FORMAT_VERSION: u32 = 1;
 /// Where the catalogue and the hosted query API live.
 pub const DEFAULT_HUB_URL: &str = "https://hub.xerj.org";
 
+/// The hub's local root: `XERJ_HUB_HOME` when set and non-empty, else
+/// `<home>/.xerj/hub` ([`crate::home::home_dir_from`]: `HOME`, else
+/// `USERPROFILE`). `None` when neither is set.
+///
+/// This is THE rule. The CLI (`xerj hub pull`, which extracts packs under
+/// `<root>/packs`) and the server (which, by default, lets a snapshot restore
+/// read from that same `<root>/packs` — `limits.hub_pack_restore`) both resolve
+/// it here, so a server started by the same user agrees with the CLI on where a
+/// pulled pack lives.
+pub fn hub_root_from(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let Some(h) = env("XERJ_HUB_HOME").filter(|h| !h.is_empty()) {
+        return Some(std::path::PathBuf::from(h));
+    }
+    crate::home::home_dir_from(env).map(|home| home.join(".xerj").join("hub"))
+}
+
+/// The directory `xerj hub pull` extracts verified packs into:
+/// [`hub_root_from`]`/packs`, over the process environment.
+pub fn hub_packs_dir() -> Option<std::path::PathBuf> {
+    hub_root_from(&|key| std::env::var_os(key)).map(|root| root.join(HUB_PACKS_DIR))
+}
+
+/// The pack-cache directory name under the hub root.
+pub const HUB_PACKS_DIR: &str = "packs";
+
 /// Packs at or below this size are pulled automatically; larger ones are
 /// answered through the hosted route until the user runs `xerj hub pull`.
 pub const AUTO_PULL_MAX_BYTES: u64 = 50 * 1024 * 1024;
@@ -338,6 +365,38 @@ pub fn render(answer: &Answer) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn hub_env<'a>(
+        vars: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn the_hub_root_rule_is_xerj_hub_home_then_home_then_nothing() {
+        use std::path::PathBuf;
+        assert_eq!(
+            hub_root_from(&hub_env(&[
+                ("XERJ_HUB_HOME", "/srv/hub"),
+                ("HOME", "/home/u")
+            ])),
+            Some(PathBuf::from("/srv/hub"))
+        );
+        assert_eq!(
+            hub_root_from(&hub_env(&[("XERJ_HUB_HOME", ""), ("HOME", "/home/u")])),
+            Some(PathBuf::from("/home/u/.xerj/hub"))
+        );
+        assert_eq!(
+            hub_root_from(&hub_env(&[("USERPROFILE", "/Users/u")])),
+            Some(PathBuf::from("/Users/u/.xerj/hub"))
+        );
+        // No home at all: the server grants nothing (never `./.xerj/hub`).
+        assert_eq!(hub_root_from(&hub_env(&[])), None);
+    }
+
     use super::*;
     use serde_json::json;
 

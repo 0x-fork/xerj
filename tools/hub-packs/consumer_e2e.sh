@@ -65,17 +65,16 @@ python3 -m http.server "$HUB_PORT" --bind 127.0.0.1 --directory "$WORK/site" \
   > "$WORK/http.log" 2>&1 &
 PIDS+=("$!")
 
-# 2. A fresh node and an empty HOME. The node allows snapshot repositories only
-#    under the hub's pack cache, as the automatic node does (node.rs).
+# 2. A fresh node and an empty HOME. The node is started the way a user starts
+#    one — no config file, no snapshot allowlist: a server restores from the pack
+#    cache of the user it runs as by default (limits.hub_pack_restore), and this
+#    gate is what proves `xerj hub pull` works against such a node.
 export HOME="$WORK/home"
 # XERJ_HUB_PUBKEY is deliberately NOT unset: CI never sets it, so the key compiled
 # into <xerj> governs there; a local rehearsal with a throwaway key sets it.
 unset XERJ_CODE_HOME XERJ_HUB_HOME XERJ_API_KEY
-mkdir -p "$HOME/.xerj/hub/packs"
-printf '[limits]\nsnapshot_repo_allowlist = ["%s"]\n' "$(realpath "$HOME/.xerj/hub/packs")" \
-  > "$WORK/node/config.toml"
 "$BIN" --insecure --bind 127.0.0.1 --port "$NODE_PORT" --data-dir "$WORK/node/data" \
-  --config "$WORK/node/config.toml" > "$WORK/node/node.log" 2>&1 &
+  > "$WORK/node/node.log" 2>&1 &
 PIDS+=("$!")
 export XERJ_URL="http://127.0.0.1:$NODE_PORT"
 export XERJ_HUB_URL="http://127.0.0.1:$HUB_PORT"

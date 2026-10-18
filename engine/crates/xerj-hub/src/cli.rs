@@ -909,7 +909,12 @@ pub(crate) fn pull_with(
             ),
             Some(&json!({ "indices": format!("{prefix}-*") })),
         )
-        .map_err(|e| PullError::new(E_INFRA, format!("restore snapshot: {e:#}")))?;
+        .map_err(|e| {
+            PullError::new(
+                E_INFRA,
+                restore_error_message(&format!("{e:#}"), url, &hub_home.join("packs")),
+            )
+        })?;
     }
 
     // Only now — with the full set provably present — stamp the ledger.
@@ -933,6 +938,33 @@ pub(crate) fn pull_with(
         "pulled {slug} {pin8} {bytes} → {n_indices} indices, {} definitions",
         manifest.defs_count
     )))
+}
+
+/// The message for a failed restore. A server that refuses the pack's location
+/// (`... not in limits.snapshot_repo_allowlist`) gets the fix spelled out: by
+/// default a server restores from the pack cache of the user it runs as
+/// (`limits.hub_pack_restore`), so this only happens when the server does not
+/// share this cache — another user, a container, another machine — or has the
+/// grant switched off. The exact config line names THIS client's cache.
+fn restore_error_message(err: &str, url: &str, packs: &Path) -> String {
+    if !err.contains("snapshot_repo_allowlist") {
+        return format!("restore snapshot: {err}");
+    }
+    let dir = packs.canonicalize().unwrap_or_else(|_| packs.to_path_buf());
+    let dir_toml = serde_json::to_string(&dir.to_string_lossy()).unwrap_or_default();
+    format!(
+        "restore snapshot: the XERJ server at {url} refused to read the pack from {dir}.\n\
+         A server restores pulled packs from the hub pack cache of the user it runs as \
+         (limits.hub_pack_restore, on by default); this server does not share yours — it runs \
+         as another user, in a container or on another machine, or has hub_pack_restore = false.\n\
+         Fix, either:\n  \
+         - add this line under [limits] in the server's config TOML and restart it (a container \
+         must also mount the directory at the same path):\n      \
+         snapshot_repo_allowlist = [{dir_toml}]\n  \
+         - or let xerj start its own node: unset XERJ_URL (or point it at a free port).\n\
+         server said: {err}",
+        dir = dir.display()
+    )
 }
 
 /// Put the verified, fully extracted `staging` directory at `dest` by renaming it —
@@ -1530,6 +1562,44 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_restore_names_the_exact_config_line_that_fixes_it() {
+        let hub = tempfile::tempdir().unwrap();
+        let packs = hub.path().join("packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        let canon = packs.canonicalize().unwrap();
+        let server = "invalid_mapping: snapshot repository location [/x] is outside data_dir \
+                      and not in limits.snapshot_repo_allowlist; refusing";
+        let msg = restore_error_message(server, "http://127.0.0.1:9200", &packs);
+        let line = format!(
+            "snapshot_repo_allowlist = [{}]",
+            serde_json::to_string(&canon.to_string_lossy()).unwrap()
+        );
+        assert!(msg.contains(&line), "{msg}");
+        assert!(msg.contains("[limits]"), "{msg}");
+        assert!(msg.contains("http://127.0.0.1:9200"), "{msg}");
+        assert!(msg.contains("XERJ_URL"), "{msg}");
+        assert!(
+            msg.contains(server),
+            "the server's own words are kept: {msg}"
+        );
+        // The line it prints is one the real config loader accepts, and it
+        // allowlists exactly the cache.
+        let cfg_path = hub.path().join("fix.toml");
+        std::fs::write(&cfg_path, format!("[limits]\n{line}\n")).unwrap();
+        let cfg = xerj_common::config::Config::load(&cfg_path).expect("the printed fix loads");
+        assert_eq!(
+            cfg.limits.snapshot_repo_allowlist,
+            [canon.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn any_other_restore_failure_is_reported_as_it_was() {
+        let msg = restore_error_message("boom", "http://h:1", Path::new("/p"));
+        assert_eq!(msg, "restore snapshot: boom");
+    }
 
     #[test]
     fn pin8_takes_eight_lowercase_hex() {

@@ -425,6 +425,12 @@ health check fails, start `current_exe() --insecure --port <free port ≥ 9300> 
 detached, PID to `~/.xerj/hub/node.pid`, wait for green (max 60 s), remember the port
 in `~/.xerj/hub/node.port`. Never start a node on a port that answers. `xerj hub status`
 shows it; `xerj hub stop` stops only that PID.
+A node the user started themselves needs no config for `xerj hub pull` to restore
+into it: by default a server allows snapshot **restores** (never creates) from the
+pack cache of the user it runs as (`limits.hub_pack_restore`, `xerj_common::hub::hub_packs_dir`,
+refused if that directory is a symlink or owned by another user). A server that does
+not share the cache (other user, container, other machine) refuses, and the pull
+error prints the exact `snapshot_repo_allowlist` line to add.
 
 **Tests** (`xerj-hub/tests/routing.rs`, `xerj-hub/tests/ask_flow.rs`):
 

@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 56 of XERJ's 134 user-facing settings to their
+# This file sets 57 of XERJ's 135 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -470,7 +470,7 @@ timeout_ms = 5000
 # Range: 1 – 64.
 # neural_window_concurrency = 1
 
-# ── Resource Limits (6 of 14 settings) ────────────────────────────────────────
+# ── Resource Limits (7 of 15 settings) ────────────────────────────────────────
 
 [limits]
 
@@ -512,6 +512,17 @@ max_actions_per_bulk = 50000
 # Add absolute base paths here only to allow snapshots on external/backup roots.
 # Example: snapshot_repo_allowlist = ["/mnt/backups"]
 snapshot_repo_allowlist = []
+
+# Let a snapshot RESTORE (never a create) read from the Corpus Hub pack cache of
+# the user this server runs as: $XERJ_HUB_HOME/packs, else ~/.xerj/hub/packs.
+# That is where `xerj hub pull` / `xerj ask` extract a verified, signed pack
+# before asking the server to restore it, so this is what lets a pull work
+# against a server you started yourself. Honoured only while that directory is
+# a real directory (not a symlink) owned by this server's user; symlinks inside
+# it that point elsewhere are refused. false = only data_dir and the allowlist.
+# A server running as another user, in a container or on another machine does
+# not share your cache: add the directory to snapshot_repo_allowlist there.
+hub_pack_restore = true
 
 # Process-wide retained-payload budget for the seven immutable segment
 # hydration caches (MiB). 0 derives 20% of the effective cgroup/system memory

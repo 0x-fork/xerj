@@ -4418,12 +4418,15 @@ impl Engine {
     ) -> Result<Value> {
         self.ensure_cluster_state_writable()?;
         let snap_dir = std::path::Path::new(repo_path).join(name);
+        // No hub-pack root here: the pack cache is a restore-only source, so a
+        // client can never write a snapshot into the user's home directory.
         let snap_dir = validate_snapshot_path(
             repo_path,
             name,
             &snap_dir,
             &self.data_dir,
             &self.config.limits.snapshot_repo_allowlist,
+            None,
         )?;
         std::fs::create_dir_all(&snap_dir).map_err(EngineError::Io)?;
 
@@ -4517,12 +4520,22 @@ impl Engine {
     ) -> Result<Vec<String>> {
         self.ensure_cluster_state_writable()?;
         let snap_dir = std::path::Path::new(repo_path).join(name);
+        // `limits.hub_pack_restore`: the Corpus Hub pack cache of the user this
+        // server runs as is a restore source by default, so `xerj hub pull`
+        // works against a server the user started by hand (not only against the
+        // node `xerj ask` starts, which allowlists it in its own config).
+        let hub_packs = if self.config.limits.hub_pack_restore {
+            xerj_common::hub::hub_packs_dir()
+        } else {
+            None
+        };
         let snap_dir = validate_snapshot_path(
             repo_path,
             name,
             &snap_dir,
             &self.data_dir,
             &self.config.limits.snapshot_repo_allowlist,
+            hub_packs.as_deref(),
         )?;
         let manifest_path = snap_dir.join("manifest.json");
 
@@ -4740,6 +4753,7 @@ fn validate_snapshot_path(
     snap_dir: &std::path::Path,
     data_dir: &std::path::Path,
     allowlist: &[String],
+    hub_packs: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf> {
     if repo_path.is_empty() {
         return Err(EngineError::Common(
@@ -4780,6 +4794,10 @@ fn validate_snapshot_path(
             .iter()
             .map(|b| base_canon(std::path::Path::new(b))),
     );
+    // The hub pack cache (restore only — create passes `None`). Unlike an
+    // operator's allowlist entry it is implicit, so it is trusted only in the
+    // shape `xerj hub pull` makes it; see `trusted_hub_pack_root`.
+    allowed_bases.extend(hub_packs.and_then(trusted_hub_pack_root));
     if !allowed_bases.iter().any(|base| repo_base.starts_with(base)) {
         return Err(EngineError::Common(
             xerj_common::XerjError::invalid_mapping(format!(
@@ -4831,6 +4849,50 @@ fn validate_snapshot_path(
         }
         Ok(snap_lex)
     }
+}
+
+/// The canonical hub pack-cache root a restore may read from, or `None` when
+/// `packs` is not safe to trust implicitly.
+///
+/// `limits.snapshot_repo_allowlist` entries are canonicalized as given: an
+/// operator who allowlists a symlink means its target. The hub root is NOT an
+/// operator's choice — it is derived from the environment — so it is held to
+/// the shape `xerj hub pull` creates (`create_dir_all`, by the same user):
+///
+///   - it exists and is a real directory, not a symlink (`symlink_metadata`),
+///     so `~/.xerj/hub/packs -> /` cannot widen the grant to the whole disk;
+///   - canonicalizing it changes nothing but its parent's resolution (its own
+///     last component is not a link);
+///   - it is not a filesystem root;
+///   - on Unix it is owned by the server's effective user, so a shared or
+///     pre-created directory (a `HOME` under a world-writable dir) is not
+///     honoured.
+///
+/// What is inside it is still checked per request: the caller canonicalizes the
+/// repo location, so `packs/x -> /etc` resolves outside this root and is
+/// refused, and `..` components are rejected before this is consulted.
+fn trusted_hub_pack_root(packs: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !packs.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(packs).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return None;
+        }
+    }
+    let canon = packs.canonicalize().ok()?;
+    let parent = packs.parent()?.canonicalize().ok()?;
+    if canon != parent.join(packs.file_name()?) || canon.parent().is_none() {
+        return None;
+    }
+    Some(canon)
 }
 
 /// Recursively copy all files from `src` to `dst`, recording relative paths in `files`.
@@ -4911,7 +4973,7 @@ mod snapshot_path_security_tests {
         let outside = tempfile::TempDir::new().unwrap();
         let repo = outside.path().to_str().unwrap();
         let snap = std::path::Path::new(repo).join("s1");
-        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[], None)
             .expect_err("external repo location must be rejected");
         assert!(err.to_string().contains("outside data_dir"), "{err}");
     }
@@ -4923,7 +4985,7 @@ mod snapshot_path_security_tests {
         std::fs::create_dir_all(&repo_dir).unwrap();
         let repo = repo_dir.to_str().unwrap();
         let snap = repo_dir.join("s1");
-        validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+        validate_snapshot_path(repo, "s1", &snap, data.path(), &[], None)
             .expect("a repo under data_dir must be allowed");
     }
 
@@ -4933,8 +4995,15 @@ mod snapshot_path_security_tests {
         let ext = tempfile::TempDir::new().unwrap();
         let repo = ext.path().to_str().unwrap().to_string();
         let snap = std::path::Path::new(&repo).join("s1");
-        validate_snapshot_path(&repo, "s1", &snap, data.path(), std::slice::from_ref(&repo))
-            .expect("an allowlisted external root must be permitted");
+        validate_snapshot_path(
+            &repo,
+            "s1",
+            &snap,
+            data.path(),
+            std::slice::from_ref(&repo),
+            None,
+        )
+        .expect("an allowlisted external root must be permitted");
     }
 
     #[test]
@@ -4942,7 +5011,7 @@ mod snapshot_path_security_tests {
         let data = tempfile::TempDir::new().unwrap();
         let snap = data.path().join("..");
         let repo = data.path().to_str().unwrap();
-        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[]).is_err());
+        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[], None).is_err());
     }
 
     #[test]
@@ -4955,15 +5024,146 @@ mod snapshot_path_security_tests {
         let data = tempfile::TempDir::new().unwrap();
         let repo = format!("{}/../../xerj-escape", data.path().display());
         let snap = std::path::Path::new(&repo).join("s1");
-        let err = validate_snapshot_path(&repo, "s1", &snap, data.path(), &[])
+        let err = validate_snapshot_path(&repo, "s1", &snap, data.path(), &[], None)
             .expect_err("a location containing `..` must be rejected");
         assert!(err.to_string().contains(".."), "unexpected error: {err}");
         // And it stays rejected even if the operator allowlists a broad root:
         // the `..` guard runs before containment, so a parent-ref cannot be
         // laundered through the allowlist either.
-        let err2 = validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()])
-            .expect_err("`..` must be rejected even with a permissive allowlist");
+        let err2 =
+            validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()], None)
+                .expect_err("`..` must be rejected even with a permissive allowlist");
         assert!(err2.to_string().contains(".."), "unexpected error: {err2}");
+    }
+}
+
+#[cfg(test)]
+mod hub_pack_restore_root_tests {
+    //! `limits.hub_pack_restore`: the Corpus Hub pack cache is a restore-only
+    //! snapshot root, trusted only in the shape `xerj hub pull` creates it.
+    use super::{trusted_hub_pack_root, validate_snapshot_path};
+    use std::path::{Path, PathBuf};
+
+    /// `<tmp>/hub/packs/lz4/0774d055/snapshot/<snap>` as `xerj hub pull`
+    /// extracts it, plus a data_dir elsewhere. Returns (tmp, data, packs, repo).
+    fn layout() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        let packs = root.join("hub").join("packs");
+        let repo = packs.join("lz4").join("0774d055").join("snapshot");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(repo.join("snap-1")).unwrap();
+        (tmp, data, packs, repo)
+    }
+
+    fn check(repo: &Path, data: &Path, hub: Option<&Path>) -> Result<PathBuf, String> {
+        let repo_s = repo.to_str().unwrap();
+        validate_snapshot_path(repo_s, "snap-1", &repo.join("snap-1"), data, &[], hub)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_pulled_pack_is_restorable_from_the_hub_cache_without_an_allowlist() {
+        let (_t, data, packs, repo) = layout();
+        let snap = check(&repo, &data, Some(&packs)).expect("restore from the pack cache");
+        assert!(snap.starts_with(&packs), "{}", snap.display());
+    }
+
+    #[test]
+    fn without_the_hub_root_the_same_location_is_refused_as_before() {
+        // Create passes `None`, and so does `hub_pack_restore = false`: the
+        // pack cache is then exactly as foreign as any other path.
+        let (_t, data, _packs, repo) = layout();
+        let err = check(&repo, &data, None).expect_err("no hub root, no grant");
+        assert!(err.contains("snapshot_repo_allowlist"), "{err}");
+    }
+
+    #[test]
+    fn the_grant_covers_the_pack_cache_only_not_its_parent_or_a_sibling() {
+        let (_t, data, packs, _repo) = layout();
+        let hub = packs.parent().unwrap();
+        // The hub root itself (catalogue, node data, config) is not a restore source.
+        std::fs::create_dir_all(hub.join("node").join("snap-1")).unwrap();
+        assert!(check(&hub.join("node"), &data, Some(&packs)).is_err());
+        // A sibling sharing the name as a string prefix is not inside it.
+        let sibling = hub.join("packs-evil");
+        std::fs::create_dir_all(sibling.join("snap-1")).unwrap();
+        assert!(check(&sibling, &data, Some(&packs)).is_err());
+        // Nor is an unrelated absolute path.
+        assert!(check(Path::new("/etc"), &data, Some(&packs)).is_err());
+    }
+
+    #[test]
+    fn traversal_out_of_the_pack_cache_is_refused() {
+        let (_t, data, packs, _repo) = layout();
+        let outside = packs.parent().unwrap().parent().unwrap().join("outside");
+        std::fs::create_dir_all(outside.join("snap-1")).unwrap();
+        let escape = packs
+            .join("lz4")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("outside");
+        let err = check(&escape, &data, Some(&packs)).expect_err("`..` refused");
+        assert!(err.contains(".."), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_pack_cache_cannot_point_the_restore_elsewhere() {
+        let (_t, data, packs, _repo) = layout();
+        let outside = packs.parent().unwrap().parent().unwrap().join("outside");
+        std::fs::create_dir_all(outside.join("snap-1")).unwrap();
+        let link = packs.join("evil");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = check(&link, &data, Some(&packs)).expect_err("escaping link refused");
+        assert!(err.contains("snapshot_repo_allowlist"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pack_cache_that_is_itself_a_symlink_is_not_trusted() {
+        // `~/.xerj/hub/packs -> /` would otherwise turn the grant into the
+        // whole disk; `-> <elsewhere>` would move it somewhere nobody chose.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let hub = root.join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        let packs = hub.join("packs");
+        std::os::unix::fs::symlink("/", &packs).unwrap();
+        assert_eq!(trusted_hub_pack_root(&packs), None);
+        assert!(check(Path::new("/etc"), &data, Some(&packs)).is_err());
+
+        let real = root.join("elsewhere");
+        std::fs::create_dir_all(real.join("snap-1")).unwrap();
+        std::fs::remove_file(&packs).unwrap();
+        std::os::unix::fs::symlink(&real, &packs).unwrap();
+        assert_eq!(trusted_hub_pack_root(&packs), None);
+        assert!(check(&packs, &data, Some(&packs)).is_err());
+        assert!(check(&real, &data, Some(&packs)).is_err());
+    }
+
+    #[test]
+    fn a_missing_relative_or_non_directory_pack_cache_is_not_trusted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert_eq!(trusted_hub_pack_root(&root.join("absent")), None);
+        assert_eq!(trusted_hub_pack_root(Path::new("relative/packs")), None);
+        let file = root.join("packs");
+        std::fs::write(&file, b"not a dir").unwrap();
+        assert_eq!(trusted_hub_pack_root(&file), None);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        assert_eq!(trusted_hub_pack_root(&file), Some(file.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_filesystem_root_is_never_a_pack_cache() {
+        assert_eq!(trusted_hub_pack_root(Path::new("/")), None);
     }
 }
 
