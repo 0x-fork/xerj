@@ -333,9 +333,9 @@ pub fn work_order_line(bands: &[BandSummary], workers: usize) -> String {
         .iter()
         .map(|band| {
             format!(
-                "{} ({} files, {})",
+                "{} ({}, {})",
                 band.band,
-                band.files,
+                crate::estimate::count_phrase(band.files, "file", "files"),
                 crate::estimate::human_bytes(band.bytes)
             )
         })
