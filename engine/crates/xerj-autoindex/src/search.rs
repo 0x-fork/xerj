@@ -67,6 +67,23 @@ pub(crate) fn passage_text(hit: &Value) -> Option<String> {
     }
 }
 
+/// `xerj search` has no mode flag. `--mode semantic` and `--mode hybrid`
+/// belong to `xerj code`. Saying "unexpected argument" and dumping USAGE
+/// hides that, and it hides that those modes still use lexical feature
+/// hashing unless the node was started with `--embed-mode neural`.
+pub(crate) fn search_mode_refusal(asked: &str) -> String {
+    let which = if asked.is_empty() {
+        String::new()
+    } else {
+        format!(" ({asked})")
+    };
+    format!(
+        "xerj search: no --mode{which}. This command always sends a lexical query. \
+         xerj code --mode semantic and xerj code --mode hybrid are the commands that take a mode; \
+         unless the node was started with --embed-mode neural they still embed with lexical feature hashing."
+    )
+}
+
 /// One line for the human printer when the node says this lexical query
 /// scored a `semantic_text` field and did not consult the embedding.
 ///
@@ -696,6 +713,11 @@ fn parse_search_cli(
             "-k" => k = parse_count_arg("-k", it.next())?,
             "--full" => full = parse_count_arg("--full", it.next())?,
             "--json" => as_json = true,
+            "--mode" => {
+                let asked = it.next().unwrap_or_default();
+                eprintln!("{}", search_mode_refusal(&asked));
+                return 2;
+            }
             other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
             other => return Err(format!("unexpected argument '{other}'")),
         }
@@ -902,6 +924,22 @@ pub fn run_search_cli() -> i32 {
 mod tests {
     use super::*;
     use xerj_common::code_query::normalize_code_search_query;
+
+    #[test]
+    fn search_refuses_a_mode_flag_and_names_the_embedder() {
+        for asked in ["semantic", "hybrid", "bm25"] {
+            let line = search_mode_refusal(asked);
+            assert!(line.contains(&format!("({asked})")), "{line}");
+            assert!(line.contains("always sends a lexical query"), "{line}");
+            assert!(line.contains("xerj code --mode semantic"), "{line}");
+            assert!(line.contains("--embed-mode neural"), "{line}");
+            assert!(line.contains("lexical feature hashing"), "{line}");
+            assert!(!line.contains("POST"), "{line}");
+        }
+        let bare = search_mode_refusal("");
+        assert!(bare.contains("no --mode."));
+        assert!(!bare.contains("()"), "{bare}");
+    }
 
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_string()).collect()
