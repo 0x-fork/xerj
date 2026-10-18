@@ -364,7 +364,11 @@ pub fn pr_commands(d: &Draft) -> String {
         format!(" \\\n --agent {:?}", d.agent)
     };
     format!(
-        "# Ready-to-run — files ONLY the field report, nothing else:\n\
+        "# Ready-to-run — files ONLY the field report, nothing else.\n\
+         # Run these in a clone of xerj-org/xerj, not in the project you are working in.\n\
+         git clone https://github.com/xerj-org/xerj.git\n\
+         cd xerj\n\
+         gh repo fork xerj-org/xerj --remote --remote-name xerj-fork\n\
          xerj feedback{agent_line} \\\n\
          \x20 --used-for {used_for:?} --pointed-at {pointed_at:?} \\\n\
          \x20 --verdict {verdict:?} --numbers {numbers:?} \\\n\
@@ -372,10 +376,10 @@ pub fn pr_commands(d: &Draft) -> String {
          git checkout -b {branch}\n\
          git add {relpath}\n\
          git commit --only {relpath} -m \"docs(field-report): {slug}\"\n\
-         git push -u origin {branch}\n\
-         gh pr create --repo xerj-org/xerj --base main --head {branch} \\\n\
+         git push -u xerj-fork {branch}\n\
+         gh pr create --repo xerj-org/xerj --base main --head YOUR_LOGIN:{branch} \\\n\
          \x20 --title \"Agent field report: {title}\" \\\n\
-         \x20 --body \"Written by an AI agent on behalf of a human. Field report only; see {relpath}.\"",
+         \x20 --body \"Field report only; see {relpath}.\"",
         used_for = d.used_for,
         pointed_at = d.pointed_at,
         verdict = d.verdict,
@@ -433,12 +437,38 @@ const XERJ_ORIGIN_URLS: &[&str] = &[
 /// same-prefix repository (`xerj-org/xerj-fork`) or someone else's project
 /// never passes. #960.
 fn origin_url_is_xerj(url: &str) -> bool {
+    let normalized = normalize_origin_url(url);
+    XERJ_ORIGIN_URLS.contains(&normalized.as_str())
+}
+
+/// Lower-case, drop a trailing `.git` and slash, and drop `user:secret@` from
+/// an `https://` or `ssh://` URL. An authenticated clone of xerj-org/xerj is
+/// still that repository; the credential must not change the answer, and it
+/// must not be printed.
+fn normalize_origin_url(url: &str) -> String {
     let normalized = url.trim().to_ascii_lowercase();
     let normalized = normalized
         .strip_suffix(".git")
         .unwrap_or(normalized.as_str());
     let normalized = normalized.trim_end_matches('/');
-    XERJ_ORIGIN_URLS.contains(&normalized)
+    strip_credential_userinfo(normalized)
+}
+
+fn strip_credential_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after = &url[scheme_end + 3..];
+    let Some(slash) = after.find('/') else {
+        return url.to_string();
+    };
+    let authority = &after[..slash];
+    if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        if userinfo.contains(':') {
+            return format!("{}://{host}{}", &url[..scheme_end], &after[slash..]);
+        }
+    }
+    url.to_string()
 }
 
 /// `git remote get-url origin` run in `dir` (the process working directory
@@ -494,7 +524,7 @@ fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -
     // xerj-org/xerj itself.
     if !origin_is_xerj_checkout(dir) {
         let found = match origin_remote_url(dir) {
-            Some(url) => format!("{url:?}"),
+            Some(url) => format!("{:?}", normalize_origin_url(&url)),
             None => "none — this directory is not a git repository, or it has no \
                      `origin` remote"
                 .to_string(),
@@ -510,15 +540,16 @@ fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -
         eprintln!(
             "To file the report: run this command again from a clone of xerj-org/xerj, or \
              fork it, push `{branch}` to your fork and open the PR with \
-             `gh pr create --repo xerj-org/xerj --head <your-login>:{branch}`."
+             `gh pr create --repo xerj-org/xerj --head YOUR_LOGIN:{branch}`."
         );
         eprintln!("The report and the exact commands to run there:\n");
         println!("{report}");
         println!("\n{commands}");
         return 1;
     }
-    // A `gh` that cannot open the PR turns a committed branch into a dead end.
-    // Say so and hand over the commands instead.
+    // A `gh` that cannot open the PR, or a git that cannot commit, must fail
+    // before any branch exists. The fresh-agent failure mode was a dirty
+    // `field-report/*` branch left behind when identity was missing.
     if let Err(reason) = gh_ready() {
         eprintln!("error: cannot open the pull request automatically: {reason}");
         eprintln!(
@@ -527,48 +558,110 @@ fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -
         println!("{commands}");
         return 1;
     }
+    if let Err(reason) = git_identity_ready(dir) {
+        eprintln!("error: cannot commit the field report: {reason}");
+        eprintln!("Nothing was branched. The report and the commands:\n");
+        println!("{report}");
+        println!("\n{commands}");
+        return 1;
+    }
 
-    let steps: [(&str, Vec<String>); 5] = [
-        (
-            "git checkout -b",
-            vec!["checkout".into(), "-b".into(), branch.clone()],
-        ),
-        ("write report", vec![]), // handled specially below
-        ("git add", vec!["add".into(), relpath.clone()]),
-        (
-            "git commit",
-            field_report_commit_argv(&relpath, &draft.slug),
-        ),
-        (
-            "git push",
-            vec!["push".into(), "-u".into(), "origin".into(), branch.clone()],
-        ),
-    ];
+    let login = match gh_login() {
+        Ok(login) => login,
+        Err(reason) => {
+            eprintln!("error: could not read the gh login: {reason}");
+            eprintln!("Nothing was branched.\n");
+            println!("{commands}");
+            return 1;
+        }
+    };
+    let can_push = match has_push_rights() {
+        Ok(can) => can,
+        Err(reason) => {
+            eprintln!(
+                "error: could not tell whether this account can push to xerj-org/xerj: {reason}"
+            );
+            eprintln!("Nothing was branched.\n");
+            println!("{commands}");
+            return 1;
+        }
+    };
+    let (remote, head) = if can_push {
+        ("origin".to_string(), branch.clone())
+    } else if let Err(reason) = ensure_fork(dir) {
+        eprintln!("error: this account cannot push to xerj-org/xerj, and forking failed: {reason}");
+        eprintln!("Nothing was branched.\n");
+        println!("{commands}");
+        return 1;
+    } else {
+        ("xerj-fork".to_string(), format!("{login}:{branch}"))
+    };
 
+    let original = match current_branch(dir) {
+        Ok(name) => name,
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            eprintln!("Nothing was branched.\n");
+            println!("{commands}");
+            return 1;
+        }
+    };
     let report_path = match dir {
         Some(d) => d.join(&relpath),
         None => PathBuf::from(&relpath),
     };
-    for (label, argv) in steps {
-        if label == "write report" {
-            if let Err(e) = write_report_file(&report_path, report) {
-                eprintln!("error: could not write {}: {e}", report_path.display());
-                eprintln!("Falling back to the exact commands:\n");
-                println!("{commands}");
-                return 1;
-            }
-            continue;
-        }
-        if !run_cmd(dir, "git", &argv) {
-            eprintln!("error: `git {}` failed.", argv.join(" "));
-            eprintln!("Falling back to the exact commands:\n");
-            println!("{commands}");
-            return 1;
-        }
+    // Armed only after `checkout -b` succeeds. Drop rolls the branch back
+    // unless the pull request was created.
+    let mut local = LocalBranch {
+        dir,
+        original,
+        branch: branch.clone(),
+        report_path: report_path.clone(),
+        armed: false,
+    };
+
+    if !run_cmd(
+        dir,
+        "git",
+        &["checkout".into(), "-b".into(), branch.clone()],
+    ) {
+        eprintln!("error: `git checkout -b {branch}` failed. Nothing else was changed.");
+        println!("{commands}");
+        return 1;
+    }
+    local.armed = true;
+
+    if let Err(err) = write_report_file(&report_path, report) {
+        eprintln!("error: could not write {}: {err}", report_path.display());
+        eprintln!("The local branch was removed.\n");
+        println!("{commands}");
+        return 1;
+    }
+    if !run_cmd(dir, "git", &["add".into(), relpath.clone()]) {
+        eprintln!("error: `git add {relpath}` failed. The local branch was removed.\n");
+        println!("{commands}");
+        return 1;
+    }
+    let commit = field_report_commit_argv(&relpath, &draft.slug);
+    if !run_cmd(dir, "git", &commit) {
+        eprintln!(
+            "error: `git {}` failed. The local branch was removed.",
+            commit.join(" ")
+        );
+        println!("{commands}");
+        return 1;
+    }
+    if !run_cmd(
+        dir,
+        "git",
+        &["push".into(), "-u".into(), remote.clone(), branch.clone()],
+    ) {
+        eprintln!("error: `git push -u {remote} {branch}` failed. The local branch was removed.\n");
+        println!("{commands}");
+        return 1;
     }
 
-    let pr_body =
-        format!("Written by an AI agent on behalf of a human. Field report only; see {relpath}.");
+    let pr_body = format!("Field report only; see {relpath}.");
     let pr_args = vec![
         "pr".to_string(),
         "create".to_string(),
@@ -579,19 +672,57 @@ fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -
         "--base".to_string(),
         "main".to_string(),
         "--head".to_string(),
-        branch.clone(),
+        head,
         "--title".to_string(),
         format!("Agent field report: {}", draft.title),
         "--body".to_string(),
         pr_body,
     ];
     if !run_cmd(dir, "gh", &pr_args) {
-        eprintln!("error: `gh pr create` failed — the branch and commit are in place.");
-        eprintln!("Finish it yourself with:\n");
+        eprintln!(
+            "error: `gh pr create` failed. The local branch was removed. \
+             If the push succeeded, the remote branch is still there; finish it with:\n"
+        );
         println!("{commands}");
         return 1;
     }
+    local.armed = false;
     0
+}
+
+/// Rolls back a `field-report/*` branch when a later step fails. Disarm it
+/// only after `gh pr create` succeeds.
+struct LocalBranch<'a> {
+    dir: Option<&'a Path>,
+    original: String,
+    branch: String,
+    report_path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for LocalBranch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = run_cmd(self.dir, "git", &["checkout".into(), self.original.clone()]);
+        let _ = run_cmd(
+            self.dir,
+            "git",
+            &["branch".into(), "-D".into(), self.branch.clone()],
+        );
+        if self.report_path.exists() {
+            let _ = std::fs::remove_file(&self.report_path);
+        }
+        // checkout leaves the directories `git commit` does not track.
+        // remove_dir refuses a non-empty directory, so an unrelated file stays.
+        if let Some(parent) = self.report_path.parent() {
+            let _ = std::fs::remove_dir(parent);
+            if let Some(grand) = parent.parent() {
+                let _ = std::fs::remove_dir(grand);
+            }
+        }
+    }
 }
 
 /// Whether `gh` is on PATH and authenticated. Both are required to open a PR;
@@ -608,12 +739,146 @@ fn gh_ready() -> Result<(), String> {
 }
 
 fn run_cmd(dir: Option<&Path>, bin: &str, args: &[String]) -> bool {
+    command(dir, bin, args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn command(dir: Option<&Path>, bin: &str, args: &[String]) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args(args);
+    // A missing credential must fail the push, not sit on a prompt.
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    cmd
+}
+
+fn command_stdout(dir: Option<&Path>, bin: &str, args: &[String]) -> Result<String, String> {
+    let out = command(dir, bin, args)
+        .output()
+        .map_err(|err| format!("could not run `{bin}`: {err}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "`{bin} {}` failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `user.name` and `user.email`, or `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL`.
+/// Empty counts as unset. Checked before any branch is created.
+fn git_identity_ready(dir: Option<&Path>) -> Result<(), String> {
+    let name = non_empty_env("GIT_AUTHOR_NAME").or_else(|| git_config(dir, "user.name"));
+    let email = non_empty_env("GIT_AUTHOR_EMAIL").or_else(|| git_config(dir, "user.email"));
+    if name.is_some() && email.is_some() {
+        return Ok(());
+    }
+    Err(
+        "git has no identity yet. Set user.name and user.email, or GIT_AUTHOR_NAME and \
+         GIT_AUTHOR_EMAIL, then re-run"
+            .into(),
+    )
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn git_config(dir: Option<&Path>, key: &str) -> Option<String> {
+    let value = command_stdout(dir, "git", &["config".into(), "--get".into(), key.into()]).ok()?;
+    (!value.is_empty()).then_some(value)
+}
+
+fn gh_login() -> Result<String, String> {
+    let login = command_stdout(
+        None,
+        "gh",
+        &["api".into(), "user".into(), "--jq".into(), ".login".into()],
+    )?;
+    if login.is_empty() {
+        Err("`gh api user` returned no login".into())
+    } else {
+        Ok(login)
+    }
+}
+
+/// `true` when this gh account can push to xerj-org/xerj. A fork is the path
+/// when it cannot. An unreadable answer is a failure, not a guess.
+fn has_push_rights() -> Result<bool, String> {
+    let value = command_stdout(
+        None,
+        "gh",
+        &[
+            "api".into(),
+            "repos/xerj-org/xerj".into(),
+            "--jq".into(),
+            ".permissions.push".into(),
+        ],
+    )?;
+    match value.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "`gh api repos/xerj-org/xerj` returned {other:?}, not true or false"
+        )),
+    }
+}
+
+/// `gh repo fork` adds the `xerj-fork` remote. A remote that is already there
+/// is enough — forking twice would fail on the second run.
+fn ensure_fork(dir: Option<&Path>) -> Result<(), String> {
+    if git_config_remote_exists(dir) {
+        return Ok(());
+    }
+    if run_cmd(
+        dir,
+        "gh",
+        &[
+            "repo".into(),
+            "fork".into(),
+            "xerj-org/xerj".into(),
+            "--remote".into(),
+            "--remote-name".into(),
+            "xerj-fork".into(),
+        ],
+    ) {
+        Ok(())
+    } else {
+        Err("`gh repo fork xerj-org/xerj --remote --remote-name xerj-fork` failed".into())
+    }
+}
+
+fn git_config_remote_exists(dir: Option<&Path>) -> bool {
+    command_stdout(
+        dir,
+        "git",
+        &["remote".into(), "get-url".into(), "xerj-fork".into()],
+    )
+    .is_ok()
+}
+
+fn current_branch(dir: Option<&Path>) -> Result<String, String> {
+    let name = command_stdout(
+        dir,
+        "git",
+        &["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()],
+    )?;
+    if name.is_empty() {
+        return Err("could not read the current branch".into());
+    }
+    if name == "HEAD" {
+        return command_stdout(dir, "git", &["rev-parse".into(), "HEAD".into()]);
+    }
+    Ok(name)
 }
 
 pub fn print_help() {
@@ -656,9 +921,12 @@ pub fn help_text(feedback: bool) -> String {
                                   and run `gh pr create --repo xerj-org/xerj`. Requires a\n\
                                   checkout whose `origin` IS xerj-org/xerj; in any other\n\
                                   repository it refuses loudly — nothing written, committed\n\
-                                  or pushed — and prints the report + commands. If gh is\n\
-                                  missing/unauth it FAILS LOUDLY and prints the exact\n\
-                                  commands to run by hand\n\
+                                  or pushed — and prints the report + commands. Checks `gh`\n\
+                                  auth and git identity BEFORE creating the branch. Forks\n\
+                                  xerj-org/xerj when this account cannot push, and pushes\n\
+                                  that fork. If a later step fails, the local branch is\n\
+                                  removed. If gh is missing/unauth it FAILS LOUDLY and\n\
+                                  prints the exact commands to run by hand\n\
              --dry-run            print the report AND the exact commands, and do nothing\n\
                                   (opens no PR, writes no file)\n\
          \n\
@@ -1143,6 +1411,10 @@ mod tests {
             "git@github.com:xerj-org/xerj.git",
             "ssh://git@github.com/xerj-org/xerj",
             "ssh://git@github.com/xerj-org/xerj.git",
+            // An authenticated https clone is still this repository. The
+            // credential is not part of the identity and must not be required
+            // to match.
+            "https://x-access-token:example@github.com/xerj-org/xerj.git",
             // Tolerate the forms a copy button or `git remote set-url` leaves
             // behind: trailing slash, mixed case, surrounding whitespace.
             "https://github.com/xerj-org/xerj/",
@@ -1158,6 +1430,7 @@ mod tests {
             // Same prefix, different repository: must NOT pass.
             "git@github.com:xerj-org/xerj-fork.git",
             "https://github.com/xerj-org/xerj-fork",
+            "https://user:secret@github.com/someone/else.git",
             // A path under the repository is a different URL.
             "https://github.com/xerj-org/xerj/issues",
             // Same owner/name on a different host: must NOT pass.
@@ -1215,6 +1488,53 @@ mod tests {
         );
     }
 
+    /// Serialises tests that prepend a stub `gh` to PATH. PATH is process-global.
+    static GH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PathGuard(std::ffi::OsString);
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.0);
+        }
+    }
+
+    fn prepend_path(dir: &Path) -> PathGuard {
+        let previous = std::env::var_os("PATH").expect("PATH is set");
+        std::env::set_var(
+            "PATH",
+            std::ffi::OsString::from(format!("{}:{}", dir.display(), previous.to_string_lossy())),
+        );
+        PathGuard(previous)
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn xerj_origin(root: &Path) {
+        git_run(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/xerj-org/xerj.git",
+            ],
+        );
+        git_run(
+            root,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "/nonexistent/open-pr",
+            ],
+        );
+    }
+
     /// #960: in a repository whose `origin` is NOT xerj-org/xerj, `--open-pr`
     /// must refuse BEFORE any step runs — no branch, no report file, no
     /// commit, no push — and hand over the report + commands instead.
@@ -1223,16 +1543,10 @@ mod tests {
     /// test (the same stub-gh construction the issue was reproduced with), so
     /// the ONLY precondition that can refuse is the origin one. Prepending a
     /// directory to PATH is process-global but harmless here: it is restored on
-    /// drop (panic included), and no other test in this binary spawns `gh`.
+    /// drop (panic included). Tests that also stub `gh` take [`GH_LOCK`].
     #[test]
     fn open_pr_refuses_in_a_foreign_repository_before_touching_the_tree() {
-        struct PathGuard(std::ffi::OsString);
-        impl Drop for PathGuard {
-            fn drop(&mut self) {
-                std::env::set_var("PATH", &self.0);
-            }
-        }
-
+        let _lock = GH_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let dir = seeded_repo();
         let root = dir.path();
         git_run(
@@ -1252,22 +1566,8 @@ mod tests {
         );
 
         let stub_dir = tempfile::tempdir().unwrap();
-        let stub = stub_dir.path().join("gh");
-        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let previous_path = std::env::var_os("PATH").expect("PATH is set");
-        std::env::set_var(
-            "PATH",
-            std::ffi::OsString::from(format!(
-                "{}:{}",
-                stub_dir.path().display(),
-                previous_path.to_string_lossy()
-            )),
-        );
-        let _restore_path = PathGuard(previous_path);
+        write_executable(&stub_dir.path().join("gh"), "#!/bin/sh\nexit 0\n");
+        let _restore_path = prepend_path(stub_dir.path());
 
         let head_before = git_stdout(root, &["rev-parse", "HEAD"]);
         let d = resolve_draft(&base_cfg(), None, "2026-09-20");
@@ -1290,5 +1590,165 @@ mod tests {
             head_before.trim(),
             "#960: HEAD must not move in a foreign repository"
         );
+    }
+
+    #[test]
+    fn dry_run_commands_are_fork_correct_and_keep_agent() {
+        let filled = resolve_draft(
+            &Cfg {
+                agent: Some("Claude Code".into()),
+                ..base_cfg()
+            },
+            None,
+            "2026-08-18",
+        );
+        let commands = pr_commands(&filled);
+        for needle in [
+            "git clone https://github.com/xerj-org/xerj.git",
+            "gh repo fork xerj-org/xerj --remote --remote-name xerj-fork",
+            "--agent \"Claude Code\"",
+            "git push -u xerj-fork field-report/",
+            "--head YOUR_LOGIN:field-report/",
+        ] {
+            assert!(commands.contains(needle), "missing {needle}:\n{commands}");
+        }
+        assert!(
+            !commands.contains("git push -u origin field-report/"),
+            "a no-push account must not be told to push origin:\n{commands}"
+        );
+        assert!(!commands.contains("<your-login>"), "{commands}");
+        assert!(!commands.contains("<login>"), "{commands}");
+    }
+
+    #[test]
+    fn open_pr_refuses_a_missing_git_identity_before_creating_a_branch() {
+        let _lock = GH_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = seeded_repo();
+        let root = dir.path();
+        git_run(root, &["config", "user.name", ""]);
+        git_run(root, &["config", "user.email", ""]);
+        xerj_origin(root);
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_executable(
+            &stub_dir.path().join("gh"),
+            "#!/bin/sh\necho should-not-run >&2\nexit 0\n",
+        );
+        let _restore_path = prepend_path(stub_dir.path());
+        let head_before = git_stdout(root, &["rev-parse", "HEAD"]);
+        let d = resolve_draft(&base_cfg(), None, "2026-09-20");
+        let code = open_pr_at(Some(root), &d, &render_report(&d), &pr_commands(&d));
+        assert_eq!(code, 1);
+        assert!(
+            git_stdout(root, &["branch", "--list", "field-report/*"])
+                .trim()
+                .is_empty(),
+            "identity is checked before checkout -b"
+        );
+        assert!(!root.join(FIELD_REPORT_DIR).exists());
+        assert_eq!(
+            git_stdout(root, &["rev-parse", "HEAD"]).trim(),
+            head_before.trim()
+        );
+    }
+
+    /// No push rights: fork, then a failed push must delete the local branch
+    /// and the report file and return to the original HEAD.
+    #[test]
+    fn open_pr_forks_without_push_rights_and_rolls_back_when_push_fails() {
+        let _lock = GH_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = seeded_repo();
+        let root = dir.path();
+        xerj_origin(root);
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log = stub_dir.path().join("gh.log");
+        write_executable(
+            &stub_dir.path().join("gh"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n\
+                 case \"$1 $2\" in\n\
+                 \"auth status\") exit 0 ;;\n\
+                 \"api user\") echo testlogin; exit 0 ;;\n\
+                 \"api repos/xerj-org/xerj\") echo false; exit 0 ;;\n\
+                 \"repo fork\") git remote add xerj-fork /nonexistent/fork-target; exit 0 ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n",
+                shell_single(&log.display().to_string())
+            ),
+        );
+        let _restore_path = prepend_path(stub_dir.path());
+        let head_before = git_stdout(root, &["rev-parse", "HEAD"]);
+        let branch_before = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let d = resolve_draft(&base_cfg(), None, "2026-09-20");
+        let code = open_pr_at(Some(root), &d, &render_report(&d), &pr_commands(&d));
+        assert_eq!(code, 1);
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            log_text.contains("repo fork xerj-org/xerj"),
+            "a no-push account must fork:\n{log_text}"
+        );
+        assert!(
+            git_stdout(root, &["branch", "--list", "field-report/*"])
+                .trim()
+                .is_empty(),
+            "the field-report branch must be deleted after a failed push"
+        );
+        assert!(
+            !root.join(FIELD_REPORT_DIR).exists(),
+            "the report file must not remain after rollback"
+        );
+        assert_eq!(
+            git_stdout(root, &["rev-parse", "HEAD"]).trim(),
+            head_before.trim()
+        );
+        assert_eq!(
+            git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            branch_before.trim()
+        );
+        assert!(
+            git_stdout(root, &["remote"]).contains("xerj-fork"),
+            "the fork remote is added before the push that fails"
+        );
+    }
+
+    #[test]
+    fn open_pr_with_push_rights_does_not_fork_and_rolls_back_when_push_fails() {
+        let _lock = GH_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = seeded_repo();
+        let root = dir.path();
+        xerj_origin(root);
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log = stub_dir.path().join("gh.log");
+        write_executable(
+            &stub_dir.path().join("gh"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n\
+                 case \"$1 $2\" in\n\
+                 \"auth status\") exit 0 ;;\n\
+                 \"api user\") echo testlogin; exit 0 ;;\n\
+                 \"api repos/xerj-org/xerj\") echo true; exit 0 ;;\n\
+                 \"repo fork\") echo forked-unexpectedly; exit 0 ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n",
+                shell_single(&log.display().to_string())
+            ),
+        );
+        let _restore_path = prepend_path(stub_dir.path());
+        let d = resolve_draft(&base_cfg(), None, "2026-09-20");
+        let code = open_pr_at(Some(root), &d, &render_report(&d), &pr_commands(&d));
+        assert_eq!(code, 1);
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !log_text.contains("repo fork"),
+            "push rights must not fork:\n{log_text}"
+        );
+        assert!(git_stdout(root, &["branch", "--list", "field-report/*"])
+            .trim()
+            .is_empty());
+        assert!(!root.join(FIELD_REPORT_DIR).exists());
+        assert!(!git_stdout(root, &["remote"]).contains("xerj-fork"));
+    }
+
+    fn shell_single(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
