@@ -456,6 +456,21 @@ The 1.0 bar: **every public claim verified against the release binary, and every
 - **Ship-or-descope every entry in *Known partials* below.** GA does not ship with a "partial" section that reads like a feature list.
 - **Close the CHANGELOG gap — closed 2026-09-26.** rc.19–rc.70 shipped without entries; the 52 sections are now backfilled from `git log` and the release records, with an in-file provenance banner and every link checked to sit inside its release window (PR [#1035](https://github.com/xerj-org/xerj/pull/1035), shipped in rc.78). A project whose pitch is verified numbers cannot ask users to reconstruct releases from `git log` — and now it does not.
 
+### 1.0 feature shortlist (filed 2026-10-18)
+
+These are ten feature requests the team ranked for 1.0, each filed as an issue on the v1.0.0 milestone, listed in rank order; they are planned work, not shipped, and each ships under the same measured-or-not-claimed rule as the gates above.
+
+1. MCP server for the corpus hub: [#1785](https://github.com/xerj-org/xerj/issues/1785)
+2. Calibrated confidence plus abstain and escalate flags on MCP answers (builds on #1063; re-measures #1108): [#1786](https://github.com/xerj-org/xerj/issues/1786)
+3. Built-in agent A/B benchmark against grep (AgentQuery-Bench): [#1787](https://github.com/xerj-org/xerj/issues/1787)
+4. Field-aware BM25 plus exact ID matching in `xerj code` (prototype +0.065 nDCG@10 on 18 corpora, not yet measured on a release binary): [#1788](https://github.com/xerj-org/xerj/issues/1788)
+5. Version-pinned answers with file:line citations and a trace-to-evidence report: [#1789](https://github.com/xerj-org/xerj/issues/1789)
+6. Schema-valid JSON output behind an OpenAI-compatible endpoint: [#1790](https://github.com/xerj-org/xerj/issues/1790)
+7. Symbol and call-graph queries over MCP: [#1791](https://github.com/xerj-org/xerj/issues/1791)
+8. Temporal as-of queries with validity windows (relates to #1100): [#1792](https://github.com/xerj-org/xerj/issues/1792)
+9. Index past agent sessions as searchable memory: [#1793](https://github.com/xerj-org/xerj/issues/1793)
+10. Signed release binaries (SignPath or Sigstore): [#1794](https://github.com/xerj-org/xerj/issues/1794)
+
 ## The zero-token direction
 
 **Zero-token** is the name for work XERJ does locally, inside the engine, so that a person or an agent spends no model tokens *finding*, *judging*, *watching for* or *handing over* an answer. Search already works that way — no model runs to answer a query. This section is the rest of that idea, as product work (long form: [docs/ZERO_TOKEN_DIRECTION.md](./docs/ZERO_TOKEN_DIRECTION.md)), with each item's status checked against `main` on 2026-09-18 (`4d8dadbf`, 32 commits after `v1.0.0-rc.74`) by reading the code named beside it. "In flight" means a pushed branch exists and nothing of it is on `main`; "planned" means no code exists. Tracking issue: [#941](https://github.com/xerj-org/xerj/issues/941).
