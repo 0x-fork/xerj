@@ -405,6 +405,7 @@ pub fn run_def_cli() -> i32 {
             "--kind" => kind = it.next(),
             "--lang" => lang = it.next(),
             "--json" => as_json = true,
+            "--disable-feedback" => {}
             other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
             other => {
                 eprintln!("xerj def: unexpected argument '{other}'\n\n{USAGE}");

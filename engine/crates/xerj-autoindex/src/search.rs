@@ -760,6 +760,9 @@ fn parse_search_cli(
             "-k" => k = parse_count_arg("-k", it.next())?,
             "--full" => full = parse_count_arg("--full", it.next())?,
             "--json" => as_json = true,
+            // Read by feedback::enabled from the raw argv. Accepted so
+            // `xerj search --disable-feedback` is not an unexpected argument.
+            "--disable-feedback" => {}
             "--mode" => {
                 let asked = it.next().unwrap_or_default();
                 eprintln!("{}", search_mode_refusal(&asked));
@@ -1042,6 +1045,23 @@ mod tests {
 
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn disable_feedback_is_not_an_unexpected_argument() {
+        for args in [
+            vec!["--disable-feedback", "needle"],
+            vec!["needle", "--disable-feedback"],
+            vec!["--disable-feedback", "--json", "needle"],
+        ] {
+            let parsed = parse_search_cli(words(&args).into_iter(), String::new(), None)
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match parsed {
+                SearchCli::Query(q) => assert_eq!(q.query.as_deref(), Some("needle")),
+                SearchCli::Help => panic!("help from {args:?}"),
+                SearchCli::Refuse => panic!("refusal from {args:?}"),
+            }
+        }
     }
 
     #[test]

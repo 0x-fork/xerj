@@ -63,6 +63,9 @@ OPTIONS:
     --url <U>       node endpoint baked into the MCP config
                     (default $XERJ_URL or http://localhost:9200)
     --dry-run       print what would be written, write nothing
+    --disable-feedback
+                    accepted; turns off the feedback invitation on help
+                    screens. Honoured in any position (env XERJ_DISABLE_FEEDBACK)
     -h, --help      this help
 
 After init: restart the agent session so it picks up the new tools, then
@@ -553,31 +556,59 @@ fn register_mcp(path: &Path, url: &str, dry: bool) -> Result<String, String> {
     Ok(report(if had { "merged" } else { "wrote" }, path, dry))
 }
 
-/// Entry point for the `init` subcommand. Returns a process exit code.
-pub fn run_init_cli() -> i32 {
+struct InitFlags {
+    url: String,
+    dry: bool,
+    help: bool,
+}
+
+/// `Err` is the unexpected-argument line, without the help page.
+fn read_init_flags(args: impl IntoIterator<Item = String>) -> Result<InitFlags, String> {
     let mut url = std::env::var("XERJ_URL")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_URL.to_string());
     let mut dry = false;
-    let mut it = xerj_common::argv::args_after_subcommand().into_iter();
+    let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                print!("{}", usage(xerj_common::hub::hub_key_configured()));
-                return 0;
+                return Ok(InitFlags {
+                    url,
+                    dry,
+                    help: true,
+                });
             }
             "--url" => url = it.next().unwrap_or(url),
             "--dry-run" => dry = true,
-            other => {
-                eprintln!(
-                    "xerj init: unexpected argument '{other}'\n\n{}",
-                    usage(xerj_common::hub::hub_key_configured())
-                );
-                return 2;
-            }
+            // Also stripped by args_after_subcommand. Accepted here so a
+            // caller that passes the raw list still does not exit 2.
+            "--disable-feedback" => {}
+            other => return Err(format!("xerj init: unexpected argument '{other}'")),
         }
     }
+    Ok(InitFlags {
+        url,
+        dry,
+        help: false,
+    })
+}
+
+/// Entry point for the `init` subcommand. Returns a process exit code.
+pub fn run_init_cli() -> i32 {
+    let flags = match read_init_flags(xerj_common::argv::args_after_subcommand()) {
+        Ok(flags) => flags,
+        Err(e) => {
+            eprintln!("{e}\n\n{}", usage(xerj_common::hub::hub_key_configured()));
+            return 2;
+        }
+    };
+    if flags.help {
+        print!("{}", usage(xerj_common::hub::hub_key_configured()));
+        return 0;
+    }
+    let url = flags.url;
+    let dry = flags.dry;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let hub = xerj_common::hub::hub_key_configured();
     match run_init_with(&cwd, &url, dry, hub) {
@@ -1236,6 +1267,29 @@ mod tests {
         assert!(!HUB_SKILL_MD.contains("has no hub tool"));
         let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
         assert!(printed.contains("xerj_search"));
+    }
+
+    #[test]
+    fn disable_feedback_is_accepted_in_any_position() {
+        let help = usage(false);
+        assert!(
+            help.contains("--disable-feedback"),
+            "xerj init --help must document the off-switch:\n{help}"
+        );
+        for args in [
+            vec!["--disable-feedback"],
+            vec!["--dry-run", "--disable-feedback"],
+            vec!["--disable-feedback", "--url", "http://127.0.0.1:9"],
+            vec!["--url", "http://127.0.0.1:9", "--disable-feedback"],
+        ] {
+            let flags = read_init_flags(args.iter().map(|s| (*s).to_string()))
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(!flags.help, "{args:?}");
+        }
+        match read_init_flags(["--nope".to_string()]) {
+            Err(err) => assert!(err.contains("unexpected argument"), "{err}"),
+            Ok(_) => panic!("--nope must be rejected"),
+        }
     }
 
     /// `--help` lists every file init can write. The hub pair is listed only
