@@ -257,9 +257,9 @@ fn mcp_registration(bin: &str, url: &str) -> String {
     format!(
         "MCP registration for other clients (restart the session after; success: `{MCP_SUCCESS_TOOL}` is in the tool list):\n\
          \x20 Claude Code, every project:  claude mcp add --scope user xerj{env} -- {} mcp\n\
-         \x20 Cursor:  `.cursor/mcp.json` when that directory exists (init writes it; root key \"mcpServers\")\n\\
-         \x20 Windsurf, Claude Desktop, Cline:  copy the \"xerj\" entry from .mcp.json; the root key is \"mcpServers\"\n\\
-         \x20 VS Code (.vscode/mcp.json):  root key \"servers\", not \"mcpServers\"; the entry needs \"type\": \"stdio\"\n\\
+         \x20 Cursor:  `.cursor/mcp.json` when that directory exists (init writes it; root key \"mcpServers\")\n\
+         \x20 Windsurf, Claude Desktop, Cline:  copy the \"xerj\" entry from .mcp.json; the root key is \"mcpServers\"\n\
+         \x20 VS Code (.vscode/mcp.json):  root key \"servers\", not \"mcpServers\"; the entry needs \"type\": \"stdio\"\n\
          \x20 Codex (.codex/config.toml, trusted projects only; xerj init writes it when .codex/ exists): [mcp_servers.xerj]",
         shell_quote(bin)
     )
@@ -1174,6 +1174,24 @@ mod tests {
                 assert!(n <= 300, "{name} line {} is {n} characters", i + 1);
             }
         }
+    }
+
+    /// #1838: a `\n\\` typo in the format string printed a lone `\\` between
+    /// the Cursor / Windsurf / VS Code registration lines.
+    #[test]
+    fn mcp_registration_has_no_lone_backslash_line() {
+        let printed = mcp_registration("/usr/local/bin/xerj", DEFAULT_URL);
+        for (i, line) in printed.lines().enumerate() {
+            assert!(
+                line.trim() != "\\",
+                "line {} is a stray backslash:\n{printed}",
+                i + 1
+            );
+        }
+        assert!(
+            printed.contains("Windsurf, Claude Desktop, Cline"),
+            "{printed}"
+        );
     }
 
     /// What init prints and what the skill teaches are one registration, not
