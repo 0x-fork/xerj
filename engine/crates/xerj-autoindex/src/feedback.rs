@@ -243,7 +243,10 @@ pub fn run(cfg: &Cfg) -> i32 {
             Err(_) => None,
         }
     };
-    let draft = resolve_draft(cfg, indexed, &date);
+    let mut draft = resolve_draft(cfg, indexed, &date);
+    if cfg.submit {
+        fill_optional_placeholders_for_submit(&mut draft);
+    }
     let report = render_report(&draft);
     let commands = pr_commands(&draft);
 
@@ -313,6 +316,21 @@ pub fn resolve_draft(cfg: &Cfg, indexed: Option<String>, date: &str) -> Draft {
         numbers: non_empty(&cfg.numbers).unwrap_or_else(|| PH_NUMBERS.to_string()),
         filed_alongside: non_empty(&cfg.filed_alongside).unwrap_or_else(|| PH_FILED.to_string()),
         slug,
+    }
+}
+
+/// On `--submit`, optional opinion slots that are still template placeholders
+/// must not be filed. Replace them with short defaults so R2 / GitHub never
+/// store angle-bracket template text (field-report #1835).
+pub fn fill_optional_placeholders_for_submit(d: &mut Draft) {
+    if d.pointed_at == PH_POINTED_AT {
+        d.pointed_at.clear();
+    }
+    if d.numbers == PH_NUMBERS {
+        d.numbers = "not measured".to_string();
+    }
+    if d.filed_alongside == PH_FILED {
+        d.filed_alongside = "nothing broke".to_string();
     }
 }
 
@@ -1279,6 +1297,30 @@ mod tests {
         }
         // The version line is this binary's real version, not a guess.
         assert!(report.contains(&format!("xerj v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn submit_replaces_optional_placeholders_with_defaults() {
+        let mut cfg = base_cfg();
+        cfg.agent = Some("Test Agent".into());
+        cfg.used_for = Some("indexing a tiny corpus".into());
+        cfg.verdict = Some("worked".into());
+        let mut d = resolve_draft(&cfg, None, "2026-08-18");
+        assert_eq!(d.pointed_at, PH_POINTED_AT);
+        assert_eq!(d.numbers, PH_NUMBERS);
+        assert_eq!(d.filed_alongside, PH_FILED);
+        fill_optional_placeholders_for_submit(&mut d);
+        assert!(d.pointed_at.is_empty(), "pointed_at should be dropped");
+        assert_eq!(d.numbers, "not measured");
+        assert_eq!(d.filed_alongside, "nothing broke");
+        let report = render_report(&d);
+        assert!(!report.contains(PH_POINTED_AT), "{report}");
+        assert!(!report.contains(PH_NUMBERS), "{report}");
+        assert!(!report.contains(PH_FILED), "{report}");
+        assert!(
+            !report.contains('<'),
+            "no angle-bracket template left:\n{report}"
+        );
     }
 
     #[test]
