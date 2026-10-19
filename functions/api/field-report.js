@@ -41,7 +41,7 @@ const DAILY_CAP = 300;          // ×3 writes = 900/day, far under 1M/mo R2 free
 const RATE_WINDOW_MS = 60_000;  // one accepted report per IP per minute
 const MAX_BODY = 16 * 1024;     // 16 KB request-body cap
 
-const FIELD_CAPS = { agent:120, used_for:1000, verdict:80, version:80, os:120, indexed:200, notes:4000 };
+const FIELD_CAPS = { agent:120, used_for:1000, verdict:1000, version:80, os:120, indexed:200, notes:4000 };
 const REQUIRED = ['agent','used_for','verdict'];
 const OPTIONAL = ['version','os','indexed','notes'];
 

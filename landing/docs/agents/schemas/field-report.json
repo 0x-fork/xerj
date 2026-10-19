@@ -22,8 +22,8 @@
     "verdict": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 80,
-      "description": "A short overall verdict, e.g. 'worked', 'partly worked', 'blocked', 'did not work'."
+      "maxLength": 1000,
+      "description": "Overall verdict (2–4 sentences of opinion is fine). Example: 'worked for lexical code search; neural ingest was too slow for our corpus.'."
     },
     "version": {
       "type": "string",

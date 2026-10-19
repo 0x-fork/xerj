@@ -19,8 +19,8 @@ pub const URL_ENV: &str = "XERJ_FIELD_REPORT_URL";
 
 const CAP_AGENT: usize = 120;
 const CAP_USED_FOR: usize = 1000;
-/// The published schema caps `verdict` at 80. The long text goes in `notes`.
-const CAP_VERDICT: usize = 80;
+/// The published schema caps `verdict` at 1000 (aligned with `used_for`).
+const CAP_VERDICT: usize = 1000;
 const CAP_VERSION: usize = 80;
 const CAP_OS: usize = 120;
 const CAP_INDEXED: usize = 200;
@@ -134,7 +134,7 @@ mod tests {
         let payload = Payload::from_input(&Input {
             agent: "  Agent\nName  ",
             used_for: "used",
-            verdict: &"v".repeat(200),
+            verdict: &"v".repeat(CAP_VERDICT + 50),
             version: "xerj v1",
             os: "linux x86_64",
             indexed: &"i".repeat(500),

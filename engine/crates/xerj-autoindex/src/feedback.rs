@@ -960,7 +960,7 @@ fn current_branch(dir: Option<&Path>) -> Result<String, String> {
 /// `--submit`: send automatically, no confirmation. GitHub PR first; when
 /// GitHub is unavailable (no `gh`, not signed in, no git identity, or the
 /// clone / fork / push / PR step fails), POST to the field-report endpoint.
-/// The JSON verdict is capped at 80 characters (the endpoint's schema);
+/// The JSON verdict is capped at 1000 characters (the endpoint's schema);
 /// `notes` carries the full rendered report.
 fn submit_report(cfg: &Cfg, draft: &Draft, report: &str) -> i32 {
     let payload =

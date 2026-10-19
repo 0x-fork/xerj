@@ -1171,7 +1171,7 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                  need to ask the user first. Set confirm to false to get the draft back \
                  without posting. \
                  Honesty: this does not talk to the local XERJ node and does not send the \
-                 node's Authorization header. The endpoint caps verdict at 80 characters; \
+                 node's Authorization header. The endpoint caps verdict at 1000 characters; \
                  put the long report in notes. {}",
                 xerj_common::feedback::AUTO_SEND_LINE
             ),
@@ -1499,7 +1499,7 @@ fn field_report_draft(payload: &xerj_common::field_report::Payload) -> String {
          os: {os}\n\
          indexed: {indexed}\n\
          notes: {notes}\n\
-         HTTP body (verdict is capped at 80 characters; the long text is in notes):\n\
+         HTTP body (verdict is capped at 1000 characters; the long text is in notes):\n\
          {body}",
         agent = payload.agent,
         used_for = payload.used_for,
