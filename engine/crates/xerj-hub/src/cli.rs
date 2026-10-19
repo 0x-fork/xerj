@@ -645,10 +645,12 @@ fn run_pull(args: &[String]) -> i32 {
         return 2;
     };
     // Everything that can refuse this pull — a malformed or unknown slug, an
-    // excluded licence, a pack over the size cap, no key to verify it with — is
-    // decided BEFORE a node is looked for or started. A doomed pull used to boot a
-    // whole node first, and only then say "no".
-    let plan = match plan_pull(&slug) {
+    // excluded licence, a pack larger than the whole disk budget, no key to verify
+    // it with — is decided BEFORE a node is looked for or started. A doomed pull
+    // used to boot a whole node first, and only then say "no". This is the explicit
+    // command, so the ceiling is the disk budget, not the 50 MiB auto-pull cap: the
+    // person typing it has named exactly this pack.
+    let plan = match plan_pull(&slug, DISK_BUDGET_BYTES) {
         Ok(p) => p,
         Err(PullError { code, message }) => {
             eprintln!("xerj hub pull: {message}");
@@ -736,9 +738,10 @@ const E_NOKEY: i32 = ask::EXIT_NO_KEY;
 /// so this caps a hostile hub's "signature" far below the pack cap.
 const SIG_MAX_BYTES: u64 = 4096;
 /// How long a pull waits for another pull of the same pin to finish before it
-/// gives up. A pull is a download of at most [`AUTO_PULL_MAX_BYTES`] plus a
-/// restore, so this is generous; it exists so a wedged holder cannot hang a
-/// caller (an agent's tool call) for ever.
+/// gives up. A pull is a download of at most the planned ceiling
+/// ([`AUTO_PULL_MAX_BYTES`] for an automatic pull, [`DISK_BUDGET_BYTES`] for an
+/// explicit one) plus a restore, so this is generous; it exists so a wedged holder
+/// cannot hang a caller (an agent's tool call) for ever.
 const PULL_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// Cross-process exclusion for one `(slug, pin)`: an OS lock on `<pin8>.lock`
@@ -808,16 +811,25 @@ impl PullLock {
 }
 
 /// What a pull has decided before it touches a node or the disk: the catalogue
-/// entry, the pin its files are named by, and the key it will verify with.
+/// entry, the pin its files are named by, the key it will verify with, and the
+/// byte ceiling this pull may download under (see [`plan_pull_entry`]).
 pub(crate) struct PullPlan {
     entry: CatalogueEntry,
     pin8: String,
     pubkey: String,
+    /// The largest pack this pull will accept and download. An *explicit*
+    /// `xerj hub pull <slug>` passes [`DISK_BUDGET_BYTES`]; an *automatic* pull
+    /// (the `ask` flow) passes [`AUTO_PULL_MAX_BYTES`]. The transfer in
+    /// [`pull_with`] is bounded again by this value, so a hub that lies in
+    /// `pack_bytes` still cannot write more than the ceiling the caller chose.
+    max_bytes: u64,
 }
 
 /// Look `slug` up in the catalogue and decide whether it may be pulled at all
-/// ([`plan_pull_entry`]).
-pub(crate) fn plan_pull(slug: &str) -> Result<PullPlan, PullError> {
+/// ([`plan_pull_entry`]). `max_bytes` is the largest pack this caller accepts —
+/// [`DISK_BUDGET_BYTES`] for an explicit pull, [`AUTO_PULL_MAX_BYTES`] for an
+/// automatic one.
+pub(crate) fn plan_pull(slug: &str, max_bytes: u64) -> Result<PullPlan, PullError> {
     // 0. Validate the slug BEFORE it is ever joined into a filesystem path. The
     //    catalogue is accepted UNVERIFIED when no hub pubkey is configured, so a
     //    hostile `slug` ("../../etc") must be rejected here, ahead of every fs op.
@@ -857,7 +869,7 @@ pub(crate) fn plan_pull(slug: &str) -> Result<PullPlan, PullError> {
             ),
         )
     })?;
-    plan_pull_entry(entry)
+    plan_pull_entry(entry, max_bytes)
 }
 
 /// Everything that can refuse to pull `entry`, checked in the order that costs
@@ -875,12 +887,22 @@ pub(crate) fn plan_pull(slug: &str) -> Result<PullPlan, PullError> {
 ///    a licence class, and a flag an agent can read in `--help` is not a human
 ///    decision. If an override is ever wanted it needs its own decision and its own
 ///    confirmation, not a switch here;
-/// 4. its advertised size is within [`AUTO_PULL_MAX_BYTES`] — a malicious hub must
-///    not OOM the client by advertising a huge pack (decision 2). The transfer is
-///    bounded again in [`fetch_to`] in case the field lies;
+/// 4. its advertised size is within `max_bytes` — a malicious hub must not OOM the
+///    client by advertising a huge pack (decision 2). The ceiling depends on who is
+///    pulling: an *automatic* pull (the `ask` flow) passes [`AUTO_PULL_MAX_BYTES`],
+///    so a question never silently drags down a large pack; an *explicit*
+///    `xerj hub pull <slug>` passes the larger [`DISK_BUDGET_BYTES`], because the
+///    person (or agent) naming the slug has asked for exactly this pack and the hub
+///    cannot keep a pack bigger than the whole cache anyway. The 50 MiB cap is on
+///    the implicit case, not on the command — the notice a build prints over the
+///    cap ("run `xerj hub pull <slug>`") now resolves to a command that works. The
+///    transfer is bounded again in [`fetch_to`] in case the field lies;
 /// 5. there is a key to verify it with (exit [`E_NOKEY`]). Resolved before any temp
 ///    dir exists, so a pull with no key leaves nothing to re-fetch.
-pub(crate) fn plan_pull_entry(entry: &CatalogueEntry) -> Result<PullPlan, PullError> {
+pub(crate) fn plan_pull_entry(
+    entry: &CatalogueEntry,
+    max_bytes: u64,
+) -> Result<PullPlan, PullError> {
     let slug = entry.slug.as_str();
     if !valid_slug(slug) {
         return Err(PullError::new(
@@ -903,12 +925,18 @@ pub(crate) fn plan_pull_entry(entry: &CatalogueEntry) -> Result<PullPlan, PullEr
             ),
         ));
     }
-    if entry.pack_bytes > AUTO_PULL_MAX_BYTES {
+    if entry.pack_bytes > max_bytes {
+        let hint = if max_bytes <= AUTO_PULL_MAX_BYTES {
+            "over the auto-pull cap; run `xerj hub pull` to fetch it explicitly"
+        } else {
+            "larger than the disk budget"
+        };
         return Err(PullError::new(
             E_INFRA,
             format!(
-                "pack '{slug}' is {} bytes, over the {}-byte auto-pull cap; not downloaded",
-                entry.pack_bytes, AUTO_PULL_MAX_BYTES
+                "pack '{slug}' is {} bytes, over the {max_bytes}-byte limit for this pull \
+                 ({hint}); not downloaded",
+                entry.pack_bytes
             ),
         ));
     }
@@ -917,6 +945,7 @@ pub(crate) fn plan_pull_entry(entry: &CatalogueEntry) -> Result<PullPlan, PullEr
         entry: entry.clone(),
         pin8,
         pubkey,
+        max_bytes,
     })
 }
 
@@ -965,7 +994,8 @@ pub(crate) fn pull_with(
     let pack_dir = hub_home.join("packs").join(slug);
     let _lock = PullLock::acquire(&pack_dir, slug, pin8, PULL_LOCK_WAIT, quiet)?;
 
-    // Download pack + sig into a temp dir (size-capped). NOTHING is extracted.
+    // Download pack + sig into a temp dir (size-capped at the ceiling this pull was
+    // planned under — see `PullPlan::max_bytes`). NOTHING is extracted.
     let tmp = pack_dir.join(format!("{pin8}.tmp"));
     let extract = pack_dir.join(pin8);
     let _ = fs::remove_dir_all(&tmp); // a stale temp from a crash must not poison this
@@ -974,7 +1004,7 @@ pub(crate) fn pull_with(
     let archive = tmp.join(format!("{slug}-{pin8}.hubpack.tar.zst"));
     let sig = tmp.join(format!("{slug}-{pin8}.hubpack.tar.zst.sig"));
     let dl = (|| -> Result<u64> {
-        let n = fetch_to(&entry.pack_url, &archive, AUTO_PULL_MAX_BYTES)
+        let n = fetch_to(&entry.pack_url, &archive, plan.max_bytes)
             .with_context(|| format!("download pack {}", entry.pack_url))?;
         fetch_to(&entry.sig_url, &sig, SIG_MAX_BYTES)
             .with_context(|| format!("download sig {}", entry.sig_url))?;
@@ -2202,9 +2232,12 @@ mod tests {
         // `xerj hub pull <slug>` is a command anyone can type — including from a
         // hint an earlier run printed. Plan §11: an excluded licence class is never
         // pulled. The refusal is the pull's, before any node, download or temp dir.
-        let err = plan_pull_entry(&entry("gpl-thing", LicenceClass::Excluded, 1024))
-            .err()
-            .expect("refused");
+        let err = plan_pull_entry(
+            &entry("gpl-thing", LicenceClass::Excluded, 1024),
+            DISK_BUDGET_BYTES,
+        )
+        .err()
+        .expect("refused");
         assert_eq!(err.code, 1, "a policy refusal, exit 1");
         assert!(
             err.message.contains("excluded licence class"),
@@ -2217,10 +2250,14 @@ mod tests {
             "names the licence: {}",
             err.message
         );
-        // Excluded wins over the size cap: the licence is the first thing said.
-        let err = plan_pull_entry(&entry("gpl-thing", LicenceClass::Excluded, u64::MAX / 2))
-            .err()
-            .expect("refused");
+        // Excluded wins over the size cap: the licence is the first thing said,
+        // even for a pack far over any ceiling.
+        let err = plan_pull_entry(
+            &entry("gpl-thing", LicenceClass::Excluded, u64::MAX / 2),
+            DISK_BUDGET_BYTES,
+        )
+        .err()
+        .expect("refused");
         assert!(
             err.message.contains("excluded licence class"),
             "{}",
@@ -2229,25 +2266,77 @@ mod tests {
     }
 
     #[test]
-    fn pull_refuses_a_pack_over_the_cap_and_a_bad_slug_before_anything_else() {
-        let err = plan_pull_entry(&entry(
+    fn the_size_ceiling_is_the_callers_not_a_fixed_cap() {
+        // A pack just over the 50 MiB auto-pull cap. Under the AUTOMATIC ceiling it
+        // is refused — a question must never silently drag it down — and the refusal
+        // points at the command that CAN fetch it.
+        let big = entry(
             "big",
             LicenceClass::AdaptWithAttribution,
             AUTO_PULL_MAX_BYTES + 1,
-        ))
-        .err()
-        .expect("refused");
+        );
+        let err = plan_pull_entry(&big, AUTO_PULL_MAX_BYTES)
+            .err()
+            .expect("auto-pull refuses an over-cap pack");
         assert_eq!(err.code, 1);
         assert!(err.message.contains("over the"), "{}", err.message);
+        assert!(
+            err.message.contains("xerj hub pull"),
+            "the refusal names the explicit escape hatch: {}",
+            err.message
+        );
 
-        let err = plan_pull_entry(&entry("../../etc", LicenceClass::AdaptWithAttribution, 1))
+        // The SAME pack under the EXPLICIT ceiling (the disk budget) is NOT refused
+        // for its size: the person typing `xerj hub pull big` asked for exactly it.
+        // The only thing that may still stop it here is the key lookup (no hub key
+        // in a unit test) — never a size refusal. This is the fix: over-50-MiB
+        // corpora were previously unpullable by any route.
+        match plan_pull_entry(&big, DISK_BUDGET_BYTES) {
+            Ok(plan) => assert_eq!(plan.max_bytes, DISK_BUDGET_BYTES),
+            Err(e) => {
+                assert_eq!(
+                    e.code, E_NOKEY,
+                    "only a missing key may stop it: {}",
+                    e.message
+                );
+                assert!(
+                    !e.message.contains("not downloaded"),
+                    "an explicit pull must not refuse on size: {}",
+                    e.message
+                );
+            }
+        }
+
+        // A pack larger than the whole disk budget is refused even explicitly —
+        // it could not be stored — and says so.
+        let huge = entry(
+            "huge",
+            LicenceClass::AdaptWithAttribution,
+            DISK_BUDGET_BYTES + 1,
+        );
+        let err = plan_pull_entry(&huge, DISK_BUDGET_BYTES)
             .err()
-            .expect("refused");
+            .expect("over the disk budget is refused");
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("disk budget"), "{}", err.message);
+
+        let err = plan_pull_entry(
+            &entry("../../etc", LicenceClass::AdaptWithAttribution, 1),
+            DISK_BUDGET_BYTES,
+        )
+        .err()
+        .expect("refused");
         assert_eq!(err.code, 2, "a malformed slug is exit 2");
 
         let mut bad_pin = entry("ok", LicenceClass::AdaptWithAttribution, 1);
         bad_pin.pin_sha = "not-a-commit".to_string();
-        assert_eq!(plan_pull_entry(&bad_pin).err().expect("refused").code, 1);
+        assert_eq!(
+            plan_pull_entry(&bad_pin, DISK_BUDGET_BYTES)
+                .err()
+                .expect("refused")
+                .code,
+            1
+        );
     }
 
     #[test]
@@ -2258,7 +2347,7 @@ mod tests {
             LicenceClass::AdaptWithAttribution,
             LicenceClass::ApproachOnly,
         ] {
-            match plan_pull_entry(&entry("fine", class, 1024)) {
+            match plan_pull_entry(&entry("fine", class, 1024), DISK_BUDGET_BYTES) {
                 Ok(plan) => assert_eq!(plan.pin8, "0774d055"),
                 Err(e) => assert_eq!(
                     e.code, E_NOKEY,

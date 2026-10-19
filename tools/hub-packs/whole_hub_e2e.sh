@@ -30,6 +30,10 @@
 #                        engine/crates/xerj-common/src/hub.rs in this checkout).
 #   --questions <file>   the lz4 benchmark questions (default: e2e/lz4-questions.json).
 #   --only <slugs>       restrict the per-corpus checks (a partial run never passes).
+#   --strict             the final gate: a catalogued corpus with no published pack
+#                        is a FAIL, not pending, and the catalogue count must equal
+#                        the published-pack count. Default (backfill climbing): a
+#                        not-yet-published corpus is pending, not a fail.
 #   --batch <n>          corpora per fresh HOME + node (default 20).
 #   --no-sandbox         run without bubblewrap (still an empty HOME and a cleared
 #                        environment per phase). Default: every client phase runs in
@@ -46,12 +50,32 @@
 # against). The tampered-CATALOGUE check uses the hub's own catalogue and
 # signature, so in production mode it is a real-key check.
 #
+# GREEN CRITERIA (what has to hold for exit 0 — the release gate)
+#   The gate is GREEN when ALL of these hold:
+#     1. the catalogue loads, verifies against the client's embedded key, and
+#        verifies independently with openssl;
+#     2. every corpus with a PUBLISHED pack is in the catalogue (a published pack
+#        that is not catalogued is a hard fail — users could not discover it);
+#     3. every catalogued corpus that HAS a published pack passes pull + one --def
+#        + one question (§12.3). A catalogued corpus whose pack is NOT published
+#        yet is PENDING (skipped, reported, never a fail) — the backfill is still
+#        climbing to 100% coverage; `--strict` turns pending into a fail;
+#     4. the lz4 benchmark questions route and answer with no corpus named;
+#     5. every documented failure path (hosted off/unreachable, offline,
+#        over-the-auto-pull-cap, over-the-disk-budget) and both tamper checks give
+#        their exact message and leave nothing extracted.
+#   --strict additionally requires: 0 pending corpora, and the catalogue count to
+#   equal the published-pack count (the spec §12.4 gate once the backfill is done).
+#
 # OUTPUT (in --out)
 #   checks.jsonl   one {check, result, signatures, detail} line per gate check
 #   rows/*.json    one backfill-report row per catalogued corpus (hub_packs.py
-#                  `report --rows-dir` folds them into benchmarks/hub-backfill/)
-#   GATE.md        the human summary; homes/<phase>/ every phase's HOME and logs
-# Exit 0 only when every check passed and every catalogued corpus passed.
+#                  `report --rows-dir` folds them into benchmarks/hub-backfill/).
+#                  result is "e2e passed", "pending" (no published pack yet), or
+#                  "failed" (a published corpus that did not answer).
+#   GATE.md        the human summary (with the GREEN/RED verdict and these
+#                  criteria); homes/<phase>/ every phase's HOME and logs
+# Exit 0 only when the gate is GREEN by the criteria above.
 #
 # Never point --hub, XERJ_URL or anything else here at a node you care about: each
 # client phase starts its own node (the automatic node, port >= 9300) in its own
@@ -70,12 +94,13 @@ MSG_KEEP_CACHE="keeping the cached copy"                                        
 MSG_HTML="not a signed catalogue; no catalogue is served at this address"               # catalogue.rs fetch_and_store
 MSG_OFFLINE_NOCAT="offline and no usable cached catalogue"                               # catalogue.rs load_catalogue
 MSG_OFFLINE_NOPACK="--offline forbids downloading it"                                    # ask.rs ask() step 5
-MSG_OVERCAP_ASK="MB limit for pulling a pack, so it is not downloaded"                  # ask.rs ask() pull policy
-MSG_OVERCAP_PULL="over the 52428800-byte auto-pull cap; not downloaded"                 # cli.rs plan_pull_entry
+MSG_OVERCAP_ASK="auto-pull cap, so a question does not download it automatically"       # ask.rs ask() pull policy (#1784)
+MSG_OVERBUDGET_PULL="larger than the disk budget); not downloaded"                       # cli.rs plan_pull_entry (#1784)
 MSG_TAMPER_SHA="pack sha256 mismatch"                                                    # pack.rs read_and_verify_pack
 MSG_TAMPER_SIG="pack signature"                                                          # pack.rs read_and_verify_pack
 MSG_TAMPER_CAT="catalogue signature did not verify"                                      # catalogue.rs fetch_and_store
 AUTO_PULL_MAX_BYTES=52428800                                                             # xerj-common hub.rs
+DISK_BUDGET_BYTES=4294967296                                                             # xerj-common hub.rs (explicit-pull ceiling, #1784)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # INNER: one client phase, run inside the sandbox with a fresh HOME. Everything it
@@ -115,7 +140,38 @@ if [ "${1:-}" = "--inner" ]; then
               -o -name '*.tmp' -o -name snapshot \) 2>/dev/null | head -n 3 || true)
     [ -z "$found" ] && [ ! -e "$HOME/.xerj-code/state/$slug.json" ]
   }
+  # <slug>'s pack WAS extracted (an explicit `hub pull` over the auto-pull cap now
+  # fetches it, #1784): the restored pack files are present under its packs dir.
+  extracted() {
+    local slug=$1
+    find "$HOME/.xerj/hub/packs/$slug" \( -name pack.json -o -name defs.jsonl \) 2>/dev/null | grep -q .
+  }
+  # Is <slug> one of the published packs this run was told about? When
+  # E2E_PUBLISHED is empty every catalogued corpus is treated as published
+  # (rehearsal builds its catalogue from exactly the packs it was given).
+  is_published() {
+    [ -z "${E2E_PUBLISHED:-}" ] && return 0
+    local s; for s in $E2E_PUBLISHED; do [ "$s" = "$1" ] && return 0; done; return 1
+  }
   last_err() { tr '\n' ' ' < "$ERRF" | tr -s ' ' | cut -c1-200; }
+  # The automatic node's FIRST cold boot creates its console/system indices one by
+  # one; on a loaded machine that can exceed the client's hard-wired 60s boot wait
+  # (xerj-hub node.rs NODE_BOOT_TIMEOUT, not env-configurable), so the first
+  # node-starting command times out. The indices persist on disk, so the next boot
+  # just opens them and is fast. Retry a command that failed ONLY because the node
+  # was not healthy yet — never a verification, licence or match failure.
+  run_boot_retry() { # label cmd...
+    local label=$1; shift
+    local tries=${E2E_BOOT_TRIES:-5} n
+    for ((n = 1; n <= tries; n++)); do
+      run "$label" "$@"
+      [ "$RC" = 0 ] && return 0
+      grep -qE 'did not report a healthy cluster|has not answered on port|not answering on port' "$ERRF" 2>/dev/null || return "$RC"
+      echo "    ($label: node still cold-booting, attempt $n/$tries)" >&2
+      sleep 3
+    done
+    return "$RC"
+  }
 
   case "$PHASE" in
     sync)
@@ -144,7 +200,14 @@ if [ "${1:-}" = "--inner" ]; then
             "$cat" > "$R/rows/$slug.json" 2>/dev/null || echo "$base" > "$R/rows/$slug.json"
           echo "  $slug: $1${2:+ at $2}${3:+ ($3)}${4:+ $4}"
         }
-        run "pull-$slug" "$BIN" hub pull "$slug"
+        # A catalogued corpus whose pack is not published yet is PENDING, not a
+        # fail: skip it (no pull), record it, move on. The gate is 100% of the
+        # PUBLISHED corpora; full coverage follows the backfill (--strict fails it).
+        if ! is_published "$slug"; then
+          row pending "" "" "no published pack yet (backfill in progress); skipped"
+          continue
+        fi
+        run_boot_retry "pull-$slug" "$BIN" hub pull "$slug"
         if [ "$RC" != 0 ]; then row failed pull "exit $RC: $(last_err)"; continue; fi
         pin8=$(jq -r --arg s "$slug" '.corpora[] | select(.slug == $s) | .pin_sha[0:8]' "$HOME/.xerj/hub/catalogue.json")
         defs="$HOME/.xerj/hub/packs/$slug/$pin8/defs.jsonl"
@@ -153,17 +216,17 @@ if [ "${1:-}" = "--inner" ]; then
         SYM=$(jq -r .symbol <<<"$DEF")
         def_ok() { [ "$RC" = 0 ] && jq -e --argjson d "$DEF" '.answered_from == "local_pack"
               and ([.hits[]? | select(.file == $d.file and .line == $d.line)] | length) > 0' "$OUTF" >/dev/null 2>&1; }
-        run "def-$slug" "$BIN" code "$slug" --def "$SYM" --json
+        # `xerj code <slug>` with no XERJ_URL finds the node `hub pull` restored
+        # into, through the hub ledger (#1729: node::resolve_pulled_node, never
+        # localhost:9200 for a pulled pack). The outer base env points XERJ_URL at a
+        # dead port so `hub pull` cannot restore into a node on :9200 — but that
+        # same var makes `code` skip the ledger and query the dead port, so it is
+        # cleared HERE with `env -u`, which is exactly a clean machine's state.
+        run "def-$slug" env -u XERJ_URL "$BIN" code "$slug" --def "$SYM" --json
         if ! def_ok; then
           why="--def $SYM did not return $(jq -r '"\(.file):\(.line)"' <<<"$DEF") from the local pack (exit $RC: $(last_err))"
-          # Tell a broken pack from a client that cannot find the node the pull started
-          # (`xerj code` resolves --url / XERJ_URL / localhost:9200 only): ask the
-          # automatic node directly. The row still fails: a clean machine has no XERJ_URL.
           port=$(cat "$HOME/.xerj/hub/node.port" 2>/dev/null || true)
-          if [ -n "$port" ]; then
-            run "def-$slug-autonode" env XERJ_URL="http://127.0.0.1:$port" "$BIN" code "$slug" --def "$SYM" --json
-            def_ok && why="$why; the same call answers with XERJ_URL=<the automatic node, port $port>: xerj code does not find the node xerj hub pull started"
-          fi
+          [ -n "$port" ] && why="$why; the automatic node the pull started is on port $port"
           row failed def "$why"; continue
         fi
         ASK=$(jq -r --arg s "$slug" '.corpora[] | select(.slug == $s) | .ask_for' "$HOME/.xerj/hub/catalogue.json")
@@ -173,7 +236,7 @@ if [ "${1:-}" = "--inner" ]; then
         [ -n "$WORDS" ] || WORDS=$slug
         hit=""
         for w in $WORDS; do
-          run "q-$slug" "$BIN" code "$slug" "$w" --json
+          run "q-$slug" env -u XERJ_URL "$BIN" code "$slug" "$w" --json
           if [ "$RC" = 0 ] && jq -e '[.. | objects | select((.file? // .path? // "") != "" and (.line? // .start_line? // null) != null)] | length > 0' "$OUTF" >/dev/null 2>&1; then
             hit=$w; break
           fi
@@ -187,6 +250,9 @@ if [ "${1:-}" = "--inner" ]; then
     questions)
       # Spec step 2 "done when", asked the step-5 way: `xerj "<question>"`, no corpus
       # named, on a machine with no pack yet (the first question pulls it).
+      # Warm the node first so a slow cold boot does not fail the FIRST question
+      # (the counted questions then reuse the ready node, as a real session would).
+      run_boot_retry warmup "$BIN" hub pull "$E2E_QCORPUS" || true
       total=$(jq '.tasks | length' "$E2E_QFILE"); ok=0; bad=""
       for i in $(seq 0 $((total - 1))); do
         q=$(jq -r ".tasks[$i].q" "$E2E_QFILE"); id=$(jq -r ".tasks[$i].id" "$E2E_QFILE")
@@ -298,14 +364,31 @@ if [ "${1:-}" = "--inner" ]; then
       ;;
 
     overcap)
+      # #1784: a question does NOT auto-pull an over-cap pack — it refuses with the
+      # auto-pull-cap message and now NAMES `xerj hub pull` — but an explicit
+      # `xerj hub pull` DOES fetch it (its ceiling is the 4 GiB disk budget, not the
+      # 50 MiB auto-pull cap), so the pack is downloaded and extracted.
       run sync "$BIN" hub sync
       run ask "$BIN" ask --corpus "$E2E_TARGET" "$E2E_TARGET"; a=$RC; ae=$ERRF
-      run pull "$BIN" hub pull "$E2E_TARGET"
-      if [ "$a" = 1 ] && has "$MSG_OVERCAP_ASK" "$ae" && [ "$RC" != 0 ] && has "$MSG_OVERCAP_PULL" "$ERRF" \
-         && nothing_extracted "$E2E_TARGET"; then
-        check over-the-cap 0 "pack_bytes $((AUTO_PULL_MAX_BYTES + 1)): ask exit 1 '$(head -c 160 "$ae")', pull exit $RC '…$MSG_OVERCAP_PULL'; nothing downloaded"
+      run_boot_retry pull "$BIN" hub pull "$E2E_TARGET"
+      if [ "$a" = 1 ] && has "$MSG_OVERCAP_ASK" "$ae" && has "xerj hub pull" "$ae" \
+         && [ "$RC" = 0 ] && extracted "$E2E_TARGET"; then
+        check over-the-cap 0 "pack_bytes $((AUTO_PULL_MAX_BYTES + 1)): ask exit 1 '…$MSG_OVERCAP_ASK…' and names the explicit pull; hub pull exit 0 and the pack is extracted (#1784)"
       else
-        check over-the-cap 1 "sync/ask/pull: ask exit $a, pull exit $RC: $(last_err)"
+        check over-the-cap 1 "ask exit $a (cap msg: $(has "$MSG_OVERCAP_ASK" "$ae" && echo yes || echo no)), pull exit $RC: $(last_err)"
+      fi
+      ;;
+
+    overbudget)
+      # #1784: even an explicit `xerj hub pull` refuses a pack advertised LARGER
+      # than the whole disk budget (4 GiB) — and refuses before any node is started
+      # or any byte is downloaded (the check is on the advertised pack_bytes).
+      run sync "$BIN" hub sync
+      run pull "$BIN" hub pull "$E2E_TARGET"
+      if [ "$RC" != 0 ] && has "$MSG_OVERBUDGET_PULL" "$ERRF" && nothing_extracted "$E2E_TARGET"; then
+        check over-the-budget 0 "pack_bytes $((DISK_BUDGET_BYTES + 1)): hub pull exit $RC '…$MSG_OVERBUDGET_PULL'; nothing downloaded or extracted"
+      else
+        check over-the-budget 1 "pull exit $RC: $(last_err)"
       fi
       ;;
 
@@ -342,7 +425,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 usage() { sed -n '2,60p' "$SELF" >&2; exit 2; }
 BIN="" OUT="" HUB="https://hub.xerj.org" REPO="xerj-org/xerj" EXPECT="" REHEARSE="" REGISTRY="" BACKLOG=""
-ASSETS="" PUBKEY="" QFILE="$HERE/e2e/lz4-questions.json" ONLY="" BATCH=20 SANDBOX=1 RUN_ID="" PORT=19530
+ASSETS="" PUBKEY="" QFILE="$HERE/e2e/lz4-questions.json" ONLY="" BATCH=20 SANDBOX=1 RUN_ID="" PORT=19530 STRICT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin) BIN=$2; shift 2 ;;
@@ -357,6 +440,7 @@ while [ $# -gt 0 ]; do
     --pubkey) PUBKEY=$2; shift 2 ;;
     --questions) QFILE=$2; shift 2 ;;
     --only) ONLY=$2; shift 2 ;;
+    --strict) STRICT=1; shift ;;
     --batch) BATCH=$2; shift 2 ;;
     --no-sandbox) SANDBOX=0; shift ;;
     --run-id) RUN_ID=$2; shift 2 ;;
@@ -493,8 +577,9 @@ phase() { # phase-name home-name [env...] -- [args...]
     MSG_HOSTED_OFF="$MSG_HOSTED_OFF" MSG_NO_HOSTED_CLIENT="$MSG_NO_HOSTED_CLIENT" MSG_NO_CACHE="$MSG_NO_CACHE"
     MSG_KEEP_CACHE="$MSG_KEEP_CACHE" MSG_HTML="$MSG_HTML" MSG_OFFLINE_NOCAT="$MSG_OFFLINE_NOCAT"
     MSG_OFFLINE_NOPACK="$MSG_OFFLINE_NOPACK" MSG_OVERCAP_ASK="$MSG_OVERCAP_ASK"
-    MSG_OVERCAP_PULL="$MSG_OVERCAP_PULL" MSG_TAMPER_SHA="$MSG_TAMPER_SHA" MSG_TAMPER_SIG="$MSG_TAMPER_SIG"
-    MSG_TAMPER_CAT="$MSG_TAMPER_CAT" AUTO_PULL_MAX_BYTES="$AUTO_PULL_MAX_BYTES")
+    MSG_OVERBUDGET_PULL="$MSG_OVERBUDGET_PULL" MSG_TAMPER_SHA="$MSG_TAMPER_SHA" MSG_TAMPER_SIG="$MSG_TAMPER_SIG"
+    MSG_TAMPER_CAT="$MSG_TAMPER_CAT" AUTO_PULL_MAX_BYTES="$AUTO_PULL_MAX_BYTES" DISK_BUDGET_BYTES="$DISK_BUDGET_BYTES"
+    E2E_PUBLISHED="${PUBLISHED:-}")
   [ -n "$CLIENT_KEY" ] && base+=(XERJ_HUB_PUBKEY="$CLIENT_KEY")
   base+=("${envs[@]}")
   echo "-- phase $name (HOME $home)"
@@ -531,16 +616,29 @@ else
   fi
   got=$(jq '.corpora | length' "$OUT/catalogue.json")
   CAT_SLUGS=$(jq -r '.corpora[].slug' "$OUT/catalogue.json" | sort -u)
-  detail="catalogue lists $got corpora; $EXPECT corpora have a published pack"
+  # A PUBLISHED pack that is not catalogued is always a hard fail (users could not
+  # discover it). A CATALOGUED corpus with no published pack yet is PENDING: fine
+  # by default (the backfill is still climbing to full coverage), a fail only under
+  # --strict, which is the spec §12.4 gate for the final, fully-backfilled release.
+  miss=""; extra=""; n_pending=0
   if [ -n "${EXPECT_SLUGS:-}" ]; then
     miss=$(comm -13 <(echo "$CAT_SLUGS") <(tr ' ' '\n' <<<"$EXPECT_SLUGS" | grep . | sort -u) | tr '\n' ' ')
     extra=$(comm -23 <(echo "$CAT_SLUGS") <(tr ' ' '\n' <<<"$EXPECT_SLUGS" | grep . | sort -u) | tr '\n' ' ')
-    [ -n "$miss" ] && detail="$detail; published but not catalogued: $miss"
-    [ -n "$extra" ] && detail="$detail; catalogued without a published pack: $extra"
+    n_pending=$(echo $extra | wc -w)
   fi
-  check catalogue-count-equals-published "$([ "$got" = "$EXPECT" ] && [ -z "${miss:-}${extra:-}" ] && echo 0 || echo 1)" "$detail"
+  detail="catalogue lists $got corpora; $EXPECT have a published pack; $n_pending catalogued without a published pack yet (pending)"
+  [ -n "$miss" ] && detail="$detail; PUBLISHED BUT NOT CATALOGUED: $miss"
+  if [ "$STRICT" = 1 ]; then
+    detail="$detail [--strict: count must equal published, 0 pending]"
+    ccok=$([ -z "$miss" ] && [ -z "$extra" ] && [ "$got" = "$EXPECT" ] && echo 0 || echo 1)
+  else
+    ccok=$([ -z "$miss" ] && echo 0 || echo 1)
+  fi
+  check catalogue-count-equals-published "$ccok" "$detail"
 
-  # 2. Every catalogued corpus: pull + one --def + one question (§12.3 again).
+  # 2. Every catalogued corpus: pull + one --def + one question (§12.3 again). The
+  # PUBLISHED set is passed to the phase so a not-yet-published corpus is pending.
+  PUBLISHED="${EXPECT_SLUGS:-}"
   SLUGS=$CAT_SLUGS
   if [ -n "$ONLY" ]; then SLUGS=$(tr ',' '\n' <<<"$ONLY" | grep -xF -f <(echo "$CAT_SLUGS") || true); fi
   mapfile -t ALL <<<"$SLUGS"
@@ -559,9 +657,19 @@ else
   done
   n_rows=$(ls "$OUT/rows" | wc -l)
   n_pass=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result == "e2e passed")] | length')
-  partial=""; [ -n "$ONLY" ] && partial=" (PARTIAL: --only $ONLY; the gate is every catalogued corpus)"
-  check every-corpus-pull-def-question "$([ "$n_pass" = "$got" ] && [ -z "$ONLY" ] && echo 0 || echo 1)" \
-    "$n_pass of $got catalogued corpora passed pull + --def + one question$partial"
+  n_pend=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result == "pending")] | length')
+  n_cfail=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result != "e2e passed" and .result != "pending")] | length')
+  partial=""; [ -n "$ONLY" ] && partial=" (PARTIAL: --only $ONLY; the gate is every PUBLISHED corpus)"
+  # GREEN when no PUBLISHED corpus failed. Pending (not-yet-published) is allowed
+  # by default; --strict requires 0 pending too (every catalogued corpus passed).
+  if [ "$STRICT" = 1 ]; then
+    ecok=$([ "$n_cfail" = 0 ] && [ "$n_pend" = 0 ] && [ -z "$ONLY" ] && echo 0 || echo 1)
+    partial="$partial [--strict: pending is a fail]"
+  else
+    ecok=$([ "$n_cfail" = 0 ] && [ -z "$ONLY" ] && echo 0 || echo 1)
+  fi
+  check every-corpus-pull-def-question "$ecok" \
+    "$n_pass passed, $n_pend pending (no published pack yet), $n_cfail failed of $got catalogued corpora$partial"
 
   # 3. `xerj "<question>"`, no corpus named: the lz4 benchmark questions.
   QCORPUS=$(jq -r .corpus "$QFILE")
@@ -590,6 +698,7 @@ else
   }
   T="file://$OUT/lab/target"
   lab_catalogue overcap "(.corpora[] | select(.slug == \$s) | .pack_bytes) = $((AUTO_PULL_MAX_BYTES + 1))"
+  lab_catalogue overbudget "(.corpora[] | select(.slug == \$s) | .pack_bytes) = $((DISK_BUDGET_BYTES + 1))"
   lab_catalogue tamper-sha "(.corpora[] | select(.slug == \$s)) |= (.pack_url = \"$T/tampered-$file\" | .sig_url = \"$T/$file.sig\")"
   lab_catalogue tamper-sig "(.corpora[] | select(.slug == \$s)) |= (.pack_url = \"$T/tampered-$file\" | .sig_url = \"$T/$file.sig\" | .pack_sha256 = \"$bad_sha\")"
   mkdir -p "$OUT/site/tampered/api/v1"
@@ -600,6 +709,7 @@ else
   phase html html
   phase offline offline
   SIG=lab phase overcap overcap XERJ_HUB_URL="$LOCAL/overcap" XERJ_HUB_PUBKEY="$LAB_PUB"
+  SIG=lab phase overbudget overbudget XERJ_HUB_URL="$LOCAL/overbudget" XERJ_HUB_PUBKEY="$LAB_PUB"
   SIG=lab phase tamper-sha tamper-sha XERJ_HUB_URL="$LOCAL/tamper-sha" XERJ_HUB_PUBKEY="$LAB_PUB"
   SIG=lab phase tamper-sig tamper-sig XERJ_HUB_URL="$LOCAL/tamper-sig" XERJ_HUB_PUBKEY="$LAB_PUB"
   phase tamper-catalogue tamper-catalogue XERJ_HUB_URL="$LOCAL/tampered"
@@ -608,21 +718,31 @@ fi
 # ── fold ────────────────────────────────────────────────────────────────────
 n_fail=$(jq -s '[.[] | select(.result != "pass")] | length' "$CHECKS")
 n_all=$(jq -s length "$CHECKS")
+rp_pass=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result == "e2e passed")] | length' 2>/dev/null || echo 0)
+rp_pend=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result == "pending")] | length' 2>/dev/null || echo 0)
+rp_fail=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result != "e2e passed" and .result != "pending")] | length' 2>/dev/null || echo 0)
+verdict=$([ "$n_fail" = 0 ] && echo "GREEN" || echo "RED")
 {
   echo "# Hub v2 whole-hub end-to-end (spec §12.4)"
   echo
-  echo "- run: \`$RUN_ID\` ($DATE), mode: **$MODE**, hub: \`$HUB_UNDER_TEST\`"
+  echo "## GATE: $verdict"
+  echo
+  echo "- run: \`$RUN_ID\` ($DATE), mode: **$MODE**, hub: \`$HUB_UNDER_TEST\`$([ "$STRICT" = 1 ] && echo ', **--strict**')"
   echo "- binary: \`$("$BIN" --version 2>/dev/null | head -n 1 || echo "$BIN")\`, embedded key \`$PUBKEY\`"
   [ "$MODE" = rehearsal ] && echo "- rehearsal: the client verified a throwaway key \`$LAB_PUB\` (packs re-signed); \`signatures: real\` rows used the real key"
   echo "- sandbox: $([ "$SANDBOX" = 1 ] && echo "benchmarks/hub-pov/sandbox.sh, a fresh HOME per phase" || echo "none (--no-sandbox); a fresh HOME and cleared env per phase")"
   echo
-  echo "**$((n_all - n_fail)) of $n_all checks passed.**"
+  echo "**$((n_all - n_fail)) of $n_all gate checks passed.** Per corpus: **$rp_pass passed, $rp_pend pending, $rp_fail failed.**"
+  echo
+  echo "Green criteria (exit 0): every gate check below passes. A corpus with a"
+  echo "published pack must pass pull + \`--def\` + one question; a catalogued corpus"
+  echo "with no published pack yet is *pending*, not a fail$([ "$STRICT" = 1 ] && echo ", EXCEPT under --strict (pending is a fail and the catalogue count must equal the published-pack count)" || echo " (the backfill is still climbing to 100% coverage; --strict is the final gate)")."
   echo
   echo "| check | result | signatures | detail |"
   echo "|---|---|---|---|"
   jq -r '"| `\(.check)` | \(.result) | \(.signatures) | \(.detail | gsub("\\|"; "\\\\|")) |"' "$CHECKS"
   echo
-  echo "## Per corpus"
+  echo "## Per corpus (result: \`e2e passed\` / \`pending\` = no published pack yet / \`failed\`)"
   echo
   echo "| slug | pin8 | bytes | result | detail |"
   echo "|---|---|---:|---|---|"

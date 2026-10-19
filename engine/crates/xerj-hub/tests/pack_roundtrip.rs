@@ -32,7 +32,7 @@ use xerj_hub::node::HubNode;
 use xerj_hub::pack::{self, PackFileEntry};
 use xerj_hub::{
     Catalogue, CatalogueEntry, DefRecord, LicenceClass, PackIndex, PackManifest, PackSource,
-    Sketch, AUTO_PULL_MAX_BYTES, CATALOGUE_FORMAT_VERSION, PACK_FORMAT_VERSION,
+    Sketch, AUTO_PULL_MAX_BYTES, CATALOGUE_FORMAT_VERSION, DISK_BUDGET_BYTES, PACK_FORMAT_VERSION,
 };
 
 const PIN_SHA: &str = "0774d05537f9762f838f7ab541b7765f1a729cb5";
@@ -587,19 +587,40 @@ async fn pack_build_pull_def_roundtrip() {
         assert_eq!(after.hits[0].value.as_deref(), Some("128"));
     }
 
-    // ── A too-large advertised pack is refused BEFORE any download (DoS cap) ──
+    // ── Advertised over the AUTO-pull cap but under the disk budget: the EXPLICIT
+    //    `xerj hub pull` fetches it. The 50 MiB cap is on the implicit auto-pull a
+    //    question would trigger, not on the command a person (or an agent that was
+    //    handed the hint) types — otherwise a corpus whose pack is over the cap
+    //    would be unreachable by any route (hosted search is plan step 6/7). ──
+    {
+        let hh = work.join("hub-overcap");
+        write_catalogue_bytes(&hh, &archive, &good_sha, AUTO_PULL_MAX_BYTES + 1);
+        let rc = run_pull(&work.join("code-overcap"), &hh, Some(&public), &url_b).await;
+        assert_eq!(
+            rc, 0,
+            "an explicit pull fetches a pack over the auto-pull cap"
+        );
+        assert!(
+            hh.join("packs/mini-c").join(PIN8).exists(),
+            "the over-cap pack was extracted by the explicit pull"
+        );
+    }
+
+    // ── Advertised larger than the whole disk budget: refused BEFORE any download,
+    //    even on an explicit pull (the DoS cap — a malicious hub must not OOM the
+    //    client; the transfer is bounded again by `fetch_to` if the field lies). ──
     {
         let hh = work.join("hub-cap");
-        write_catalogue_bytes(&hh, &archive, &good_sha, AUTO_PULL_MAX_BYTES + 1);
+        write_catalogue_bytes(&hh, &archive, &good_sha, DISK_BUDGET_BYTES + 1);
         let rc = run_pull(&work.join("code-cap"), &hh, Some(&public), &url_b).await;
-        assert_eq!(rc, 1, "over-cap pack → policy/infra exit 1");
+        assert_eq!(rc, 1, "over-budget pack → policy/infra exit 1");
         assert!(
             !hh.join("packs/mini-c").join(format!("{PIN8}.tmp")).exists(),
-            "nothing downloaded over the cap"
+            "nothing downloaded over the budget"
         );
         assert!(
             !hh.join("packs/mini-c").join(PIN8).exists(),
-            "nothing extracted over the cap"
+            "nothing extracted over the budget"
         );
     }
 
