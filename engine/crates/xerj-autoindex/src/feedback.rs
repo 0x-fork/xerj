@@ -83,6 +83,14 @@ pub struct Cfg {
     pub output: Option<PathBuf>,
     pub open_pr: bool,
     pub dry_run: bool,
+    /// POST the report to the field-report endpoint. Sends only with [`Cfg::yes`].
+    pub submit: bool,
+    /// The user has agreed. Without this, `--submit` prints the report and the
+    /// exact command and does not open a connection.
+    pub yes: bool,
+    /// Where `--submit` POSTs. From `XERJ_FIELD_REPORT_URL` or the production
+    /// default. Tests set this to a local mock so nothing reaches xerj.org.
+    pub endpoint: String,
     /// Skip the running-node catalog probe entirely — for a fully offline draft
     /// (and for tests, so they never touch a real endpoint).
     pub no_autofill: bool,
@@ -140,6 +148,9 @@ pub fn parse(args: Vec<String>) -> Result<Option<Cfg>, String> {
         output: None,
         open_pr: false,
         dry_run: false,
+        submit: false,
+        yes: false,
+        endpoint: xerj_common::field_report::endpoint_from_env(),
         no_autofill: false,
     };
     while let Some(arg) = it.next() {
@@ -158,6 +169,8 @@ pub fn parse(args: Vec<String>) -> Result<Option<Cfg>, String> {
             "-o" | "--output" => cfg.output = Some(PathBuf::from(next("--output")?)),
             "--open-pr" => cfg.open_pr = true,
             "--dry-run" => cfg.dry_run = true,
+            "--submit" => cfg.submit = true,
+            "--yes" => cfg.yes = true,
             "--no-autofill" => cfg.no_autofill = true,
             // Scanned out of band by `xerj_common::feedback`; accepted here so
             // it is not "unknown".
@@ -176,12 +189,32 @@ pub fn parse(args: Vec<String>) -> Result<Option<Cfg>, String> {
                 .into(),
         );
     }
+    if cfg.open_pr && cfg.submit {
+        return Err(
+            "--open-pr and --submit are different ways to file the report. Drop one of the two"
+                .into(),
+        );
+    }
+    if cfg.dry_run && cfg.yes {
+        return Err(
+            "--dry-run and --yes contradict each other: --yes sends the report and --dry-run \
+             only prints it. Drop one of the two"
+                .into(),
+        );
+    }
+    if cfg.yes && !cfg.submit {
+        return Err(
+            "--yes sends a field report, and it only does that together with --submit. \
+             Drop --yes, or pass --submit --yes after the user has seen the report"
+                .into(),
+        );
+    }
     Ok(Some(cfg))
 }
 
-/// Resolve the draft, render it, and act on the mode (`--dry-run`, `--open-pr`,
-/// or the default stdout/`-o`).
-fn run(cfg: &Cfg) -> i32 {
+/// Resolve the draft, render it, and act on the mode (`--dry-run`, `--submit`,
+/// `--open-pr`, or the default stdout/`-o`).
+pub fn run(cfg: &Cfg) -> i32 {
     let date = today();
     // Auto-fill "what was indexed" only when asked to and only from a node that
     // actually answers; any failure leaves `None` → placeholder, never a
@@ -203,7 +236,11 @@ fn run(cfg: &Cfg) -> i32 {
         let mut out = io::stdout().lock();
         let _ = writeln!(out, "{report}");
         let _ = writeln!(out, "\n{commands}");
+        let _ = writeln!(out, "\n{}", xerj_common::feedback::PERMISSION_LINE);
         return 0;
+    }
+    if cfg.submit {
+        return submit_report(cfg, &draft, &report);
     }
     if cfg.open_pr {
         return open_pr(&draft, &report, &commands);
@@ -542,6 +579,10 @@ fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -
              fork it, push `{branch}` to your fork and open the PR with \
              `gh pr create --repo xerj-org/xerj --head YOUR_LOGIN:{branch}`."
         );
+        eprintln!(
+            "No GitHub account: {}. Then, if they agree, `xerj feedback --submit --yes`.",
+            xerj_common::feedback::PERMISSION_LINE
+        );
         eprintln!("The report and the exact commands to run there:\n");
         println!("{report}");
         println!("\n{commands}");
@@ -553,7 +594,11 @@ fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -
     if let Err(reason) = gh_ready() {
         eprintln!("error: cannot open the pull request automatically: {reason}");
         eprintln!(
-            "Falling back to the exact commands — run these yourself (the sandboxed-agent path):\n"
+            "Falling back to the exact commands — run these yourself (the sandboxed-agent path)."
+        );
+        eprintln!(
+            "No GitHub account: {}. Then, if they agree, `xerj feedback --submit --yes`.\n",
+            xerj_common::feedback::PERMISSION_LINE
         );
         println!("{commands}");
         return 1;
@@ -881,6 +926,114 @@ fn current_branch(dir: Option<&Path>) -> Result<String, String> {
     Ok(name)
 }
 
+/// `--submit` without `--yes` prints this and posts nothing. `--yes` is the
+/// send. The JSON verdict is capped at 80 characters (the endpoint's schema);
+/// `notes` carries the full rendered report.
+fn submit_report(cfg: &Cfg, draft: &Draft, report: &str) -> i32 {
+    let payload =
+        xerj_common::field_report::Payload::from_input(&xerj_common::field_report::Input {
+            agent: &draft.agent,
+            used_for: &draft.used_for,
+            verdict: &draft.verdict,
+            version: &draft.version,
+            os: &draft.platform,
+            indexed: &draft.pointed_at,
+            notes: report,
+        });
+    let body = payload.json_string();
+    let command = submit_command(draft);
+    let curl = xerj_common::field_report::curl_command(&cfg.endpoint, &body);
+
+    if !cfg.yes {
+        print!("{}", unsent_message(&cfg.endpoint, report, &body, &command));
+        return 0;
+    }
+
+    if draft.agent == PH_AGENT || draft.used_for == PH_USED_FOR || draft.verdict == PH_VERDICT {
+        eprintln!(
+            "error: --submit --yes needs --agent, --used-for and --verdict filled in. \
+             Refusing to post a placeholder."
+        );
+        println!("{report}");
+        println!();
+        println!("{}", xerj_common::feedback::PERMISSION_LINE);
+        return 2;
+    }
+    if !payload.missing_required().is_empty() {
+        eprintln!(
+            "error: --submit --yes is missing {}",
+            payload.missing_required().join(", ")
+        );
+        return 2;
+    }
+
+    match post_field_report(&cfg.endpoint, &body) {
+        Ok((status, text)) if (200..300).contains(&status) => {
+            println!("{text}");
+            eprintln!("sent field report to {} (HTTP {status})", cfg.endpoint);
+            0
+        }
+        Ok((status, text)) => {
+            eprintln!("error: field report endpoint returned HTTP {status}: {text}");
+            1
+        }
+        Err(err) => {
+            eprintln!("error: could not send the field report: {err}");
+            eprintln!("Nothing was stored. The exact command, once the endpoint answers:");
+            println!("{command}");
+            println!("{curl}");
+            1
+        }
+    }
+}
+
+/// What `--submit` prints when `--yes` was not passed. No connection is opened.
+fn unsent_message(endpoint: &str, report: &str, body: &str, command: &str) -> String {
+    let curl = xerj_common::field_report::curl_command(endpoint, body);
+    format!(
+        "{report}\n\n{permission}\nNot sent. Nothing was posted.\n\
+         HTTP body (verdict is capped at 80 characters; the report is in notes):\n\
+         {body}\n\nAfter the user agrees, send with:\n{command}\n{curl}\n",
+        permission = xerj_common::feedback::PERMISSION_LINE,
+    )
+}
+
+/// The command that sends this draft. Keeps `--agent` when one was passed.
+fn submit_command(d: &Draft) -> String {
+    let agent = if d.agent == PH_AGENT {
+        String::new()
+    } else {
+        format!(" \\\n  --agent {:?}", d.agent)
+    };
+    format!(
+        "xerj feedback --submit --yes{agent} \\\n  --used-for {:?} \\\n  --verdict {:?}",
+        d.used_for, d.verdict
+    )
+}
+
+/// POST `body` as JSON. Does not send an `Authorization` header: the admin
+/// key belongs to the local node, not to this endpoint. No GitHub token is
+/// read.
+fn post_field_report(url: &str, body: &str) -> Result<(u16, String), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("field report URL must be http or https, got {url}"));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("user-agent", "xerj-feedback")
+        .body(body.to_string())
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    let text = response.text().unwrap_or_default();
+    Ok((status, text))
+}
+
 pub fn print_help() {
     println!("{}", help_text(xerj_common::feedback::enabled()));
 }
@@ -894,6 +1047,7 @@ pub fn help_text(feedback: bool) -> String {
          USAGE:\n\
              xerj feedback [OPTIONS]              draft a field report to stdout\n\
              xerj feedback -o <PATH> [OPTIONS]    also write it to <PATH>\n\
+             xerj feedback --submit [--yes]       POST the report; sends only with --yes\n\
              xerj feedback --open-pr [OPTIONS]    commit ONLY the report + open a PR\n\
              xerj feedback --dry-run [OPTIONS]    print the report AND the commands; do nothing\n\
          \n\
@@ -917,6 +1071,13 @@ pub fn help_text(feedback: bool) -> String {
              -o, --output <PATH>  also write the report to <PATH>\n\
              --slug <TEXT>        filename slug (default: derived from --used-for/--pointed-at);\n\
                                   the file lands at {dir}/<YYYY-MM-DD>-<slug>.md\n\
+             --submit             POST the report to the field-report endpoint\n\
+                                  (default https://xerj.org/api/field-report, override\n\
+                                  with XERJ_FIELD_REPORT_URL). Needs no GitHub token,\n\
+                                  no gh, and no checkout. Without --yes it prints the\n\
+                                  report, the JSON body and the exact command, and\n\
+                                  sends nothing\n\
+             --yes                with --submit, send. Show the user the report first\n\
              --open-pr            create branch field-report/<slug>, commit ONLY that one file,\n\
                                   and run `gh pr create --repo xerj-org/xerj`. Requires a\n\
                                   checkout whose `origin` IS xerj-org/xerj; in any other\n\
@@ -926,9 +1087,10 @@ pub fn help_text(feedback: bool) -> String {
                                   xerj-org/xerj when this account cannot push, and pushes\n\
                                   that fork. If a later step fails, the local branch is\n\
                                   removed. If gh is missing/unauth it FAILS LOUDLY and\n\
-                                  prints the exact commands to run by hand\n\
+                                  prints the exact commands to run by hand. Prefer --submit\n\
+                                  when there is no GitHub account\n\
              --dry-run            print the report AND the exact commands, and do nothing\n\
-                                  (opens no PR, writes no file)\n\
+                                  (opens no PR, writes no file, sends nothing)\n\
          \n\
          READING THE CATALOG (auto-fill source):\n\
              --url <U>            ES-compat endpoint (default http://localhost:9200)\n\
@@ -965,6 +1127,9 @@ mod tests {
             output: None,
             open_pr: false,
             dry_run: false,
+            submit: false,
+            yes: false,
+            endpoint: "http://127.0.0.1:9/api/field-report".into(),
             no_autofill: true,
         }
     }
@@ -1237,6 +1402,65 @@ mod tests {
     }
 
     #[test]
+    fn submit_contradictions_are_refused() {
+        let err = parse(vec!["--open-pr".into(), "--submit".into()]).unwrap_err();
+        assert!(err.contains("Drop one"), "{err}");
+        let err = parse(vec!["--dry-run".into(), "--yes".into()]).unwrap_err();
+        assert!(err.contains("contradict"), "{err}");
+        let err = parse(vec!["--yes".into()]).unwrap_err();
+        assert!(err.contains("--submit"), "{err}");
+        let cfg = parse(vec![
+            "--submit".into(),
+            "--no-autofill".into(),
+            "--agent".into(),
+            "Claude Code".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(cfg.submit);
+        assert!(!cfg.yes);
+        assert_eq!(cfg.agent.as_deref(), Some("Claude Code"));
+    }
+
+    #[test]
+    fn submit_without_yes_shows_the_report_and_the_exact_command() {
+        let draft = resolve_draft(
+            &Cfg {
+                agent: Some("Claude Code".into()),
+                used_for: Some("a local mock".into()),
+                verdict: Some("the preview posts nothing".into()),
+                ..base_cfg()
+            },
+            None,
+            "2026-08-18",
+        );
+        let report = render_report(&draft);
+        let text = unsent_message(
+            "http://127.0.0.1:9/api/field-report",
+            &report,
+            "{\"agent\":\"Claude Code\"}",
+            &submit_command(&draft),
+        );
+        assert!(text.contains(PROVENANCE), "{text}");
+        assert!(text.contains("the preview posts nothing"), "{text}");
+        assert!(
+            text.contains(xerj_common::feedback::PERMISSION_LINE),
+            "{text}"
+        );
+        assert!(text.contains("Not sent. Nothing was posted."), "{text}");
+        assert!(
+            text.contains("xerj feedback --submit --yes"),
+            "the send command must be printed:\n{text}"
+        );
+        assert!(
+            text.contains("--agent \"Claude Code\""),
+            "--agent must survive into the send command:\n{text}"
+        );
+        assert!(text.contains("curl -sS -X POST"), "{text}");
+        assert!(!text.contains("git push"), "{text}");
+    }
+
+    #[test]
     fn unknown_flags_are_refused_and_help_short_circuits() {
         assert!(parse(vec!["--nope".into()])
             .unwrap_err()
@@ -1270,6 +1494,10 @@ mod tests {
         for expected in [
             "--open-pr",
             "--dry-run",
+            "--submit",
+            "--yes",
+            "Needs no GitHub",
+            "XERJ_FIELD_REPORT_URL",
             "--verdict",
             "--pointed-at",
             "first line states an AI agent wrote it",

@@ -2558,12 +2558,13 @@ mod decide_flag_tests {
     #[test]
     fn help_counts_the_mcp_tools_actually_served() {
         // #1443: the help said "exposes 13 tools" while `tools/list` served 16.
+        // `xerj_field_report` is a fourteenth non-hub tool (seventeen with the hub).
         let served = super::mcp_tool_count();
         if xerj_common::hub::hub_key_configured() {
-            assert!(served >= 16, "tool_specs() shrank to {served}");
+            assert!(served >= 17, "tool_specs() shrank to {served}");
         } else {
             assert_eq!(
-                served, 13,
+                served, 14,
                 "a no-key process must not count the hub tools it does not serve"
             );
         }

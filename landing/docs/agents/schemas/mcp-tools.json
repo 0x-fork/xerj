@@ -621,6 +621,56 @@
       }
     },
     {
+      "name": "xerj_field_report",
+      "description": "File an agent field report. POSTs JSON to the field-report endpoint (default https://xerj.org/api/field-report, override with the endpoint argument or XERJ_FIELD_REPORT_URL). Needs no GitHub account, no gh, and no checkout. Show the returned draft to the user. Nothing is posted unless you call again with the same arguments and confirm set to true. Honesty: this does not talk to the local XERJ node and does not send the node's Authorization header. The endpoint caps verdict at 80 characters; put the long report in notes. Show your user the report (`xerj feedback --dry-run`) and ask before sending.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "type": "string",
+            "description": "The model or tool writing the report. A placeholder such as '<model / tool>' is refused when confirm is true."
+          },
+          "used_for": {
+            "type": "string",
+            "description": "What XERJ was used for, in one sentence."
+          },
+          "verdict": {
+            "type": "string",
+            "description": "What worked and what did not. Capped at 80 characters on the wire; put the long text in notes."
+          },
+          "version": {
+            "type": "string",
+            "description": "xerj version, if known. Optional."
+          },
+          "os": {
+            "type": "string",
+            "description": "OS and architecture. Optional."
+          },
+          "indexed": {
+            "type": "string",
+            "description": "What was indexed. Optional."
+          },
+          "notes": {
+            "type": "string",
+            "description": "The full report. Optional, capped at 4000 characters."
+          },
+          "confirm": {
+            "type": "boolean",
+            "description": "Send the report. Omit or false to get the draft back with nothing posted. Set true only after the user has seen the draft and agreed."
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Override the POST URL. Default https://xerj.org/api/field-report, or XERJ_FIELD_REPORT_URL when that is set. Must be http or https."
+          }
+        },
+        "required": [
+          "agent",
+          "used_for",
+          "verdict"
+        ]
+      }
+    },
+    {
       "name": "xerj_hub_find",
       "description": "Discover which hub corpora can answer a question. Returns candidate corpora with their pin, licence and whether the pack is already on this machine — not passages; ask one with xerj_hub_ask. Routed exactly as `xerj ask` routes: your project's dependencies, the signed catalogue's term sketches, and the exact symbol a definition question names (offline: reads the catalogue `xerj hub sync` cached and never fetches it; this build has no hosted search). Excluded-licence corpora are never listed.",
       "inputSchema": {

@@ -14,6 +14,11 @@
 //! Turning it off: [`DISABLE_FLAG`] anywhere in the argument list, or
 //! [`DISABLE_ENV`] in the environment.
 
+/// The one sentence every field-report surface uses. An agent shows the draft
+/// and waits. Nothing is posted, pushed, or opened until the user agrees.
+pub const PERMISSION_LINE: &str =
+    "Show your user the report (`xerj feedback --dry-run`) and ask before sending.";
+
 /// Where a defect goes. Verified against the README badges and clone URL.
 pub const ISSUES_URL: &str = "https://github.com/xerj-org/xerj/issues";
 

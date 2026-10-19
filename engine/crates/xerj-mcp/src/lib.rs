@@ -9,11 +9,13 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as sixteen
-//! tools: thirteen that map 1:1 onto XERJ's real, verified REST surface, and
-//! three Corpus Hub tools (`xerj_hub_*`) that run the `xerj ask` flow itself. Every tool is
-//! a *thin proxy*: it constructs exactly the request the running engine
-//! already accepts and forwards it to a configurable base URL.
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as seventeen
+//! tools: fourteen without a hub key, and three Corpus Hub tools
+//! (`xerj_hub_*`) that run the `xerj ask` flow itself. Thirteen of those
+//! fourteen construct exactly the request the running engine already accepts
+//! and forward it to a configurable base URL. `xerj_field_report` does not:
+//! it posts a field report to the web endpoint, not to the node, and it sends
+//! nothing until `confirm` is true.
 //!
 //! ## The thirteen canonical agent operations
 //!
@@ -30,6 +32,7 @@
 //! | `xerj_brain_unlink`    | `DELETE /_graph/{brain}/link/{id}`    | retire a link (soft-invalidate; never deletes) |
 //! | `xerj_brain_overview`  | `GET /_graph/{brain}/overview`        | whole-brain orientation: counts, hubs, detectors, timeline |
 //! | `xerj_plan`            | `POST /_ask`                          | natural-language prompt in, VALIDATED query DSL out (deterministic planner, not an LLM) |
+//! | `xerj_field_report`    | `POST /api/field-report` (xerj.org)   | file an agent field report; posts only when `confirm` is true |
 //! | `xerj_map`             | `POST /autoindex-catalog/_search`     | per-index field map from the autoindex catalog (#1055) |
 //! | `xerj_hub_find` / `xerj_hub_def` / `xerj_hub_ask` | the `xerj ask` flow (`src/hub.rs`) | which hub corpus answers; one definition; one question — from local packs, never downloading |
 //!
@@ -493,7 +496,12 @@ fn initialize_result(msg: &Value) -> Value {
              evidence-carrying link index built by `xerj brain <folder>`): \
              xerj_brain_overview to orient, then xerj_brain_ego for one node's \
              neighborhood, then xerj_brain_link / xerj_brain_unlink to assert \
-             or retire links — retired links stay replayable via as_of.",
+             or retire links — retired links stay replayable via as_of. \
+             xerj_field_report posts an agent field report to the web \
+             endpoint (not to this node) and does not send the node's \
+             Authorization header. Show your user the report (`xerj feedback \
+             --dry-run`) and ask before sending. Without confirm it returns \
+             the draft and posts nothing; confirm: true sends.",
     })
 }
 
@@ -1147,6 +1155,62 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                 },
                 "required": ["prompt"]
             }
+        },
+        {
+            "name": "xerj_field_report",
+            "description": format!(
+                "File an agent field report. POSTs JSON to the field-report endpoint \
+                 (default https://xerj.org/api/field-report, override with the endpoint \
+                 argument or XERJ_FIELD_REPORT_URL). Needs no GitHub account, no gh, and \
+                 no checkout. Show the returned draft to the user. Nothing is posted unless \
+                 you call again with the same arguments and confirm set to true. \
+                 Honesty: this does not talk to the local XERJ node and does not send the \
+                 node's Authorization header. The endpoint caps verdict at 80 characters; \
+                 put the long report in notes. {}",
+                xerj_common::feedback::PERMISSION_LINE
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "The model or tool writing the report. A placeholder such as '<model / tool>' is refused when confirm is true."
+                    },
+                    "used_for": {
+                        "type": "string",
+                        "description": "What XERJ was used for, in one sentence."
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "description": "What worked and what did not. Capped at 80 characters on the wire; put the long text in notes."
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "xerj version, if known. Optional."
+                    },
+                    "os": {
+                        "type": "string",
+                        "description": "OS and architecture. Optional."
+                    },
+                    "indexed": {
+                        "type": "string",
+                        "description": "What was indexed. Optional."
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "The full report. Optional, capped at 4000 characters."
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Send the report. Omit or false to get the draft back with nothing posted. Set true only after the user has seen the draft and agreed."
+                    },
+                    "endpoint": {
+                        "type": "string",
+                        "description": "Override the POST URL. Default https://xerj.org/api/field-report, or XERJ_FIELD_REPORT_URL when that is set. Must be http or https."
+                    }
+                },
+                "required": ["agent", "used_for", "verdict"]
+            }
         }
     ]);
     if include_hub {
@@ -1155,6 +1219,182 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
         }
     }
     specs
+}
+
+/// `xerj_field_report`. Without `confirm: true` this returns the draft and
+/// posts nothing. With it, it POSTs to the field-report endpoint on a fresh
+/// client that has no `Authorization` header — `Ctx::auth` is the local node's
+/// key and must not be sent to xerj.org.
+async fn call_field_report(args: &Value) -> Value {
+    let agent = match req_str(args, "agent") {
+        Ok(v) => v.to_string(),
+        Err(msg) => return tool_text(msg, true),
+    };
+    let used_for = match req_str(args, "used_for") {
+        Ok(v) => v.to_string(),
+        Err(msg) => return tool_text(msg, true),
+    };
+    let verdict = match req_str(args, "verdict") {
+        Ok(v) => v.to_string(),
+        Err(msg) => return tool_text(msg, true),
+    };
+    let version = match opt_text(args, "version") {
+        Ok(v) => v,
+        Err(msg) => return tool_text(msg, true),
+    };
+    let os = match opt_text(args, "os") {
+        Ok(v) => v,
+        Err(msg) => return tool_text(msg, true),
+    };
+    let indexed = match opt_text(args, "indexed") {
+        Ok(v) => v,
+        Err(msg) => return tool_text(msg, true),
+    };
+    let notes = match opt_text(args, "notes") {
+        Ok(v) => v,
+        Err(msg) => return tool_text(msg, true),
+    };
+    let confirm = match args.get("confirm") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return tool_text(
+            "`confirm` must be a boolean. Omit it to preview; set true only after the user agrees.",
+            true,
+        ),
+    };
+    let endpoint = match args.get("endpoint") {
+        None | Some(Value::Null) => xerj_common::field_report::endpoint_from_env(),
+        Some(Value::String(s)) if s.trim().is_empty() => {
+            xerj_common::field_report::endpoint_from_env()
+        }
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(_) => return tool_text("`endpoint` must be a string", true),
+    };
+
+    let payload =
+        xerj_common::field_report::Payload::from_input(&xerj_common::field_report::Input {
+            agent: &agent,
+            used_for: &used_for,
+            verdict: &verdict,
+            version: &version,
+            os: &os,
+            indexed: &indexed,
+            notes: &notes,
+        });
+    let body = payload.json_string();
+    let curl = xerj_common::field_report::curl_command(&endpoint, &body);
+    let draft = field_report_draft(&payload);
+
+    if !confirm {
+        return tool_text(
+            format!(
+                "{draft}\n\n{}\nNot sent. Nothing was posted.\n\
+                 After the user agrees, call xerj_field_report again with the same \
+                 arguments and confirm set to true.\n{curl}",
+                xerj_common::feedback::PERMISSION_LINE
+            ),
+            false,
+        );
+    }
+
+    if let Some(slot) = [&agent, &used_for, &verdict]
+        .into_iter()
+        .find(|s| is_placeholder(s))
+    {
+        return tool_text(
+            format!(
+                "refusing to post a placeholder value: {slot}\n{draft}\n\n{}",
+                xerj_common::feedback::PERMISSION_LINE
+            ),
+            true,
+        );
+    }
+    if !payload.missing_required().is_empty() {
+        return tool_text(
+            format!("missing {}", payload.missing_required().join(", ")),
+            true,
+        );
+    }
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+        return tool_text(
+            format!("field report URL must be http or https, got {endpoint}"),
+            true,
+        );
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return tool_text(format!("could not build HTTP client: {err}"), true),
+    };
+    match client
+        .post(&endpoint)
+        .header("content-type", "application/json")
+        .header("user-agent", "xerj-feedback")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            if (200..300).contains(&status) {
+                tool_text(
+                    format!("sent field report to {endpoint} (HTTP {status})\n{text}"),
+                    false,
+                )
+            } else {
+                tool_text(
+                    format!("field report endpoint returned HTTP {status}: {text}"),
+                    true,
+                )
+            }
+        }
+        Err(err) => tool_text(
+            format!("could not send the field report: {err}\nNothing was stored.\n{curl}"),
+            true,
+        ),
+    }
+}
+
+fn opt_text(args: &Value, key: &str) -> Result<String, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+/// Template slots copied from the field-report README. Posting one would file
+/// an unfilled report.
+fn is_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with('<') && trimmed.ends_with('>')
+}
+
+fn field_report_draft(payload: &xerj_common::field_report::Payload) -> String {
+    format!(
+        "Field report draft\n\
+         agent: {agent}\n\
+         used_for: {used_for}\n\
+         verdict: {verdict}\n\
+         version: {version}\n\
+         os: {os}\n\
+         indexed: {indexed}\n\
+         notes: {notes}\n\
+         HTTP body (verdict is capped at 80 characters; the long text is in notes):\n\
+         {body}",
+        agent = payload.agent,
+        used_for = payload.used_for,
+        verdict = payload.verdict,
+        version = payload.version,
+        os = payload.os,
+        indexed = payload.indexed,
+        notes = payload.notes,
+        body = payload.json_string(),
+    )
 }
 
 /// Dispatch a `tools/call` to the matching proxy. Any bad-argument or transport
@@ -1204,6 +1444,9 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         "xerj_brain_overview" => build_brain_overview(&args),
         // #1056: prompt in, validated DSL out — a plain engine proxy.
         "xerj_plan" => build_plan(&args),
+        // Posts to the web endpoint, not the node. `ctx` is unused on purpose:
+        // the node's Authorization header must not leave the machine.
+        "xerj_field_report" => return call_field_report(&args).await,
         // #1055: the catalog read is a proxy-with-post-processing, like
         // code_search — it renders the per-index field map itself, so it
         // returns a tool result directly instead of a BuiltRequest.
@@ -3040,10 +3283,175 @@ mod tests {
         let res = initialize_result(&msg);
         assert_eq!(res["protocolVersion"], "2024-11-05");
         assert_eq!(res["serverInfo"]["name"], "xerj-mcp");
+        let instructions = res["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains(xerj_common::feedback::PERMISSION_LINE),
+            "{instructions}"
+        );
+        assert!(instructions.contains("xerj_field_report"), "{instructions}");
+    }
+
+    fn tool_body(result: &Value) -> String {
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// One HTTP/1.1 request, then a tiny JSON 200. Reads Content-Length so the
+    /// client is not left waiting on a half-consumed body.
+    fn read_one_http(listener: std::net::TcpListener) -> String {
+        use std::io::{Read, Write};
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match sock.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        let length = headers.lines().find_map(|line| {
+                            let rest = line
+                                .split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))?
+                                .1;
+                            rest.trim().parse::<usize>().ok()
+                        });
+                        let body_at = header_end + 4;
+                        if let Some(length) = length {
+                            while buf.len() < body_at + length {
+                                match sock.read(&mut tmp) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let response_body = r#"{"ok":true,"stored":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        let _ = sock.write_all(response.as_bytes());
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
     }
 
     #[test]
-    fn tools_list_has_all_sixteen() {
+    fn field_report_without_confirm_posts_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = block_on(call_field_report(&json!({
+            "agent": "Test Agent",
+            "used_for": "mock",
+            "verdict": "works offline",
+            "endpoint": format!("http://127.0.0.1:{port}/api/field-report"),
+        })));
+        assert_eq!(result["isError"], false, "{result}");
+        let text = tool_body(&result);
+        assert!(
+            text.contains(xerj_common::feedback::PERMISSION_LINE),
+            "{text}"
+        );
+        assert!(text.contains("Not sent. Nothing was posted."), "{text}");
+        assert!(text.contains("Test Agent"), "{text}");
+        assert!(text.contains("confirm"), "{text}");
+        match listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("preview must not connect: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_report_confirm_posts_without_node_auth_or_a_github_token() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "ghp_should_not_appear";
+        let prev_gh = std::env::var_os("GH_TOKEN");
+        let prev_github = std::env::var_os("GITHUB_TOKEN");
+        std::env::set_var("GH_TOKEN", token);
+        std::env::set_var("GITHUB_TOKEN", token);
+        let server = std::thread::spawn(move || read_one_http(listener));
+        let result = block_on(call_field_report(&json!({
+            "agent": "Test Agent",
+            "used_for": "mock",
+            "verdict": "works offline",
+            "notes": "full report",
+            "confirm": true,
+            "endpoint": format!("http://127.0.0.1:{port}/api/field-report"),
+        })));
+        let request = server.join().expect("server thread");
+        match prev_gh {
+            Some(value) => std::env::set_var("GH_TOKEN", value),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+        match prev_github {
+            Some(value) => std::env::set_var("GITHUB_TOKEN", value),
+            None => std::env::remove_var("GITHUB_TOKEN"),
+        }
+        assert_eq!(result["isError"], false, "{result}");
+        let text = tool_body(&result);
+        assert!(text.contains("HTTP 200"), "{text}");
+        let header = request
+            .split("\r\n\r\n")
+            .next()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            header.starts_with("post /api/field-report http/1.1"),
+            "{header}"
+        );
+        assert!(
+            header.contains("content-type: application/json"),
+            "{header}"
+        );
+        assert!(header.contains("user-agent: xerj-feedback"), "{header}");
+        assert!(!header.contains("authorization"), "{header}");
+        assert!(!request.contains(token), "{request}");
+        assert!(request.contains("\"agent\":\"Test Agent\""), "{request}");
+        assert!(request.contains("\"notes\":\"full report\""), "{request}");
+    }
+
+    #[test]
+    fn field_report_confirm_refuses_a_placeholder_without_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = block_on(call_field_report(&json!({
+            "agent": "<model / tool>",
+            "used_for": "mock",
+            "verdict": "works",
+            "confirm": true,
+            "endpoint": format!("http://127.0.0.1:{port}/api/field-report"),
+        })));
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(tool_body(&result).contains("placeholder"), "{result}");
+        match listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("a placeholder must not be posted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tools_list_has_all_seventeen() {
         let specs = tool_specs_with(true);
         let names: Vec<&str> = specs
             .as_array()
@@ -3051,7 +3459,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
         for n in [
             "xerj_search",
             "xerj_semantic_search",
@@ -3070,13 +3478,40 @@ mod tests {
             "xerj_code_search",
             // #1056: prompt in, validated DSL out.
             "xerj_plan",
-            // Corpus Hub v2 (plan §7), appended after the thirteen.
+            // Field report: posts to xerj.org, not the node. Before the hub tools.
+            "xerj_field_report",
+            // Corpus Hub v2 (plan §7), appended after the fourteen.
             "xerj_hub_find",
             "xerj_hub_def",
             "xerj_hub_ask",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
+        let at = |name: &str| names.iter().position(|n| *n == name).unwrap();
+        assert!(at("xerj_plan") < at("xerj_field_report"));
+        assert!(at("xerj_field_report") < at("xerj_hub_find"));
+        let field = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "xerj_field_report")
+            .unwrap();
+        assert!(
+            field["description"]
+                .as_str()
+                .unwrap()
+                .contains(xerj_common::feedback::PERMISSION_LINE),
+            "the tool description must carry the permission line"
+        );
+        assert_eq!(
+            field["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["agent", "used_for", "verdict"]
+        );
         // Deliberately NOT exposed: raw traversal, bulk dumps, operator actions.
         for forbidden in ["graph_expand", "autoindex", "dump"] {
             assert!(
@@ -3100,23 +3535,23 @@ mod tests {
                 .collect()
         };
         let without = names(false);
-        assert_eq!(without.len(), 13, "{without:?}");
+        assert_eq!(without.len(), 14, "{without:?}");
         assert!(
             without.iter().all(|n| !n.starts_with("xerj_hub_")),
             "{without:?}"
         );
         let with = names(true);
-        assert_eq!(with.len(), 16, "{with:?}");
+        assert_eq!(with.len(), 17, "{with:?}");
         for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
             assert!(with.iter().any(|name| name == n), "missing {n}");
         }
 
         let help = tools_paragraph(false);
-        assert!(help.contains("proxies 13 tools"), "{help}");
+        assert!(help.contains("proxies 14 tools"), "{help}");
         assert!(!help.contains("xerj_hub_"), "{help}");
         assert!(help.contains("~/xerj-data"), "{help}");
         let help = tools_paragraph(true);
-        assert!(help.contains("proxies 16 tools"), "{help}");
+        assert!(help.contains("proxies 17 tools"), "{help}");
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }
