@@ -36,7 +36,7 @@ use xerj_vector::distance::DistanceMetric;
 use xerj_vector::hnsw::{HnswIndex, HnswParams};
 use xerj_vector::{Sq8CodeStore, Sq8Params};
 
-use crate::aggs::run_aggs_with_all;
+use crate::aggs::run_aggs_with_schema;
 use crate::segment_cache_budget::{
     CacheResident, SegmentCacheCategory, SegmentHydrationBudget, CATEGORY_COUNT,
 };
@@ -15402,9 +15402,15 @@ impl Index {
             candidates = scored.len(),
             "knn served via HNSW (coverage gate passed)"
         );
-        let generated_companion_fields = {
+        let (generated_companion_fields, knn_schema) = {
             let schema = self.schema.read().await;
-            generated_embedding_companion_fields(&schema.schema)
+            (
+                generated_embedding_companion_fields(&schema.schema),
+                // #1745: filter/filters aggs evaluate their clauses with the
+                // query matcher; only clone the mapping when this request
+                // actually carries aggregations.
+                request.aggs.as_ref().map(|_| schema.schema.clone()),
+            )
         };
         Some(knn_result_from_scored(
             self,
@@ -15414,6 +15420,7 @@ impl Index {
             k,
             started,
             &generated_companion_fields,
+            knn_schema.as_ref(),
         ))
     }
 
@@ -15692,9 +15699,15 @@ impl Index {
             return None;
         }
 
-        let generated_companion_fields = {
+        let (generated_companion_fields, knn_schema) = {
             let schema = self.schema.read().await;
-            generated_embedding_companion_fields(&schema.schema)
+            (
+                generated_embedding_companion_fields(&schema.schema),
+                // #1745: filter/filters aggs evaluate their clauses with the
+                // query matcher; only clone the mapping when this request
+                // actually carries aggregations.
+                request.aggs.as_ref().map(|_| schema.schema.clone()),
+            )
         };
         Some(knn_result_from_scored(
             self,
@@ -15704,6 +15717,7 @@ impl Index {
             k,
             started,
             &generated_companion_fields,
+            knn_schema.as_ref(),
         ))
     }
 
@@ -16577,9 +16591,15 @@ impl Index {
                 }
             }
         }
-        let generated_companion_fields = {
+        let (generated_companion_fields, knn_schema) = {
             let schema = self.schema.read().await;
-            generated_embedding_companion_fields(&schema.schema)
+            (
+                generated_embedding_companion_fields(&schema.schema),
+                // #1745: filter/filters aggs evaluate their clauses with the
+                // query matcher; only clone the mapping when this request
+                // actually carries aggregations.
+                request.aggs.as_ref().map(|_| schema.schema.clone()),
+            )
         };
         // The default `_source` drops the generated embedding companions from
         // every hit without reporting it (`apply_source_filter_measured`), and
@@ -16670,6 +16690,7 @@ impl Index {
             ranked,
             started,
             &generated_companion_fields,
+            knn_schema.as_ref(),
         );
         result.timed_out = timed_out;
         if timed_out {
@@ -16753,9 +16774,15 @@ impl Index {
         // passage metadata. Child clauses retain ordinary ranking semantics;
         // provenance is intentionally omitted until per-clause ownership is
         // represented in the merged winner.
-        let generated_companion_fields = {
+        let (generated_companion_fields, knn_schema) = {
             let schema = self.schema.read().await;
-            generated_embedding_companion_fields(&schema.schema)
+            (
+                generated_embedding_companion_fields(&schema.schema),
+                // #1745: filter/filters aggs evaluate their clauses with the
+                // query matcher; only clone the mapping when this request
+                // actually carries aggregations.
+                request.aggs.as_ref().map(|_| schema.schema.clone()),
+            )
         };
         let mut result = knn_result_from_scored(
             self,
@@ -16765,6 +16792,7 @@ impl Index {
             k_sum,
             started,
             &generated_companion_fields,
+            knn_schema.as_ref(),
         );
         result.timed_out = any_timed_out;
         if any_timed_out {
@@ -25159,7 +25187,7 @@ impl Index {
                         } else {
                             &all_docs[..]
                         };
-                        run_aggs_with_all(aggs_def, fg, bg)
+                        run_aggs_with_schema(aggs_def, fg, bg, &dmq_schema)
                     } else {
                         // Safety net: corpus not built — aggregate the hit window.
                         let sources: Vec<Value> = final_hits
@@ -25197,7 +25225,7 @@ impl Index {
                         } else {
                             &all_docs[..]
                         };
-                        run_aggs_with_all(aggs_def, &sources, bg)
+                        run_aggs_with_schema(aggs_def, &sources, bg, &dmq_schema)
                     }
                 };
                 Some(agg_result)
@@ -40402,6 +40430,9 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
 /// rank by score desc, cap the candidate pool at `k`, window with
 /// `from`/`size`, and shape the response. Centralised so the exact and
 /// approximate paths cannot drift on hits format or total semantics.
+// `schema` is the one parameter the aggregation tail needs beyond the kNN
+// executor's own tuple; a struct for it would exist only here.
+#[allow(clippy::too_many_arguments)]
 fn knn_result_from_scored(
     index: &Index,
     request: &SearchRequest,
@@ -40410,6 +40441,7 @@ fn knn_result_from_scored(
     k: usize,
     started: std::time::Instant,
     generated_companion_fields: &HashSet<String>,
+    schema: Option<&Schema>,
 ) -> SearchResult {
     rank_knn_pool(&mut scored, k, |entry| entry.1);
     knn_result_from_ranked(
@@ -40419,6 +40451,7 @@ fn knn_result_from_scored(
         scored,
         started,
         generated_companion_fields,
+        schema,
     )
 }
 
@@ -40446,6 +40479,8 @@ fn rank_knn_pool<T>(pool: &mut Vec<T>, k: usize, score: impl Fn(&T) -> f32) {
 
 /// Shape an already ranked, already `k`-capped pool (see [`rank_knn_pool`])
 /// into the response.
+// Same parameter set as `knn_result_from_scored`, minus the ranking pool.
+#[allow(clippy::too_many_arguments)]
 fn knn_result_from_ranked(
     index: &Index,
     request: &SearchRequest,
@@ -40453,6 +40488,7 @@ fn knn_result_from_ranked(
     scored: Vec<(String, f32, Value, Option<u32>)>,
     started: std::time::Instant,
     generated_companion_fields: &HashSet<String>,
+    schema: Option<&Schema>,
 ) -> SearchResult {
     // ES reports `hits.total.value` for a knn/semantic query as the size
     // of the retrieved neighbor pool (min(k, matches)), NOT the number of
@@ -40475,7 +40511,13 @@ fn knn_result_from_ranked(
             .iter()
             .map(|(_, _, source, _)| source.clone())
             .collect();
-        crate::aggs::run_aggs(aggs_def, &sources)
+        // #1745: filter/filters aggs see the real mapping, so their clauses
+        // are evaluated by the query matcher instead of the `_source`
+        // approximation (`doc_matches_filter`).
+        match schema {
+            Some(s) => crate::aggs::run_aggs_with_schema(aggs_def, &sources, &sources, s),
+            None => crate::aggs::run_aggs(aggs_def, &sources),
+        }
     });
 
     let hits: Vec<Hit> = if request.size == 0 {
@@ -41600,7 +41642,7 @@ fn lookup_vector_quantization(schema: &Schema, field: &str) -> Option<String> {
 /// `FieldConfig::fields` (object sub-paths and multi-fields). Returns `None`
 /// for anything the schema does not declare — dynamic fields have no declared
 /// mapping options to honour.
-fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig> {
+pub(crate) fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig> {
     fn find<'a>(fields: &'a [FieldConfig], path: &[&str]) -> Option<&'a FieldConfig> {
         let head = *path.first()?;
         let tail = &path[1..];
@@ -45863,7 +45905,7 @@ pub(crate) fn value_present(v: &Value) -> bool {
     }
 }
 
-fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Schema) -> bool {
+pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Schema) -> bool {
     match q {
         QueryNode::MatchAll => true,
         QueryNode::MatchNone => false,

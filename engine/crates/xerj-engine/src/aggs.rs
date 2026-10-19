@@ -30,6 +30,8 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
+use xerj_common::types::{FieldType, Schema};
+use xerj_query::ast::QueryNode;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Capability manifest — the single source of truth for "what aggregations exist"
@@ -176,6 +178,106 @@ impl<'d> FieldCache<'d> {
 /// ```
 pub fn run_aggs(aggs_def: &Value, docs: &[Value]) -> Value {
     run_aggs_with_all(aggs_def, docs, docs)
+}
+
+thread_local! {
+    /// Mapping/analyzer context for the `filter` and `filters` aggregations
+    /// (#1745), installed by [`run_aggs_with_schema`] for one synchronous
+    /// aggregation. `None` means no schema was supplied and those aggs fall
+    /// back to the legacy `_source`-only matcher.
+    ///
+    /// Scoped to the calling thread for the same reason as
+    /// `BUCKET_CAP_OVERRIDE`: the whole agg evaluator is synchronous and runs
+    /// on the caller's thread, so the value covers exactly the call it was
+    /// installed for and is invisible to a concurrent aggregation elsewhere.
+    static FILTER_SCHEMA: std::cell::RefCell<Option<Schema>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous value on drop, so nested calls compose.
+struct FilterSchemaScope(Option<Schema>);
+
+impl FilterSchemaScope {
+    fn install(schema: Option<&Schema>) -> Self {
+        let previous =
+            FILTER_SCHEMA.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), schema.cloned()));
+        Self(previous)
+    }
+}
+
+impl Drop for FilterSchemaScope {
+    fn drop(&mut self) {
+        FILTER_SCHEMA.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
+
+/// [`run_aggs_with_all`] with the index's mapping available to `filter` and
+/// `filters` aggregations (#1745).
+///
+/// Those two aggs evaluate their clauses per document. Without a schema they
+/// used `doc_matches_filter`'s `_source` approximation — `match` was a
+/// substring test, `match: "a b"` was AND rather than ES's default OR, and
+/// `match_phrase` ignored adjacency — so the same clause counted differently
+/// as an aggregation than as a query. With the schema in scope the clause is
+/// evaluated by `doc_matches_query_typed`, the matcher `_search`/`_count`
+/// use, so the two surfaces agree.
+pub fn run_aggs_with_schema(
+    aggs_def: &Value,
+    docs: &[Value],
+    all_docs: &[Value],
+    schema: &Schema,
+) -> Value {
+    let _scope = FilterSchemaScope::install(Some(schema));
+    run_aggs_with_all(aggs_def, docs, all_docs)
+}
+
+/// True when every field the clause targets is a declared `text` field.
+///
+/// Only then does `filter`/`filters` evaluate the clause with the query
+/// matcher; every other clause keeps `doc_matches_filter`. Two boundaries are
+/// deliberate:
+///
+/// * Keyword / numeric / boolean / date / ip clauses are already rewritten by
+///   the API layer's mapping-aware `match` → exact `term`/`terms` rewrite
+///   (`es_compat`), which is the form the legacy matcher answers correctly.
+///   Sending them through the query matcher tokenizes keyword values — the
+///   `filters_bucket.yml` `split_queries_on_whitespace` case counts 5 instead
+///   of ES's 4 that way.
+/// * Aggregation targets resolve field names with the agg-side rule
+///   (`get_nested_field` strips one suffix segment), while
+///   `doc_matches_query_typed` uses the recursive query-side rule. A suffix
+///   alias is not a declared field, so it stays on the agg-side matcher —
+///   `fast_aggs_multifield_suffix` pins that split.
+///
+/// `Bool` and the score wrappers recurse, so a clause that mixes a text leaf
+/// with an exact leaf stays on the legacy matcher rather than evaluating half
+/// of itself with each rule.
+fn clause_targets_only_text(node: &QueryNode, schema: &Schema) -> bool {
+    match node {
+        QueryNode::Match { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::MatchPhrasePrefix { field, .. }
+        | QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. } => crate::index::declared_field(schema, field)
+            .is_some_and(|f| matches!(f.field_type, FieldType::Text)),
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .all(|q| clause_targets_only_text(q, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. } => clause_targets_only_text(query, schema),
+        QueryNode::Boosting { positive, .. } => clause_targets_only_text(positive, schema),
+        _ => false,
+    }
 }
 
 // ── Aggregation bucket cap ────────────────────────────────────────────────────
@@ -6766,14 +6868,33 @@ fn run_filter(
     // terms lookups are already resolved to concrete arrays before the
     // aggs run (es_compat `resolve_terms_lookups` walks the aggs subtree),
     // so an unresolved lookup object is also correctly caught here.
-    if let Err(e) = xerj_query::parser::parse_query(filter_query) {
-        return json!({"error": format!("failed to parse `filter` aggregation query: {e}")});
-    }
-    let filtered_docs: Vec<Value> = docs
-        .iter()
-        .filter(|doc| doc_matches_filter(doc, filter_query))
-        .cloned()
-        .collect();
+    //
+    // #1745: the parsed AST is reused as the matcher when the index schema
+    // is in scope, so the bucket count and `_search`/`_count` for the same
+    // clause cannot disagree.
+    let parsed = match xerj_query::parser::parse_query(filter_query) {
+        Ok(node) => node,
+        Err(e) => {
+            return json!({"error": format!("failed to parse `filter` aggregation query: {e}")})
+        }
+    };
+    // #1745: only a clause whose targets are all declared text fields uses
+    // the query matcher (see `clause_targets_only_text`).
+    let use_schema = FILTER_SCHEMA.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|s| clause_targets_only_text(&parsed, s))
+    });
+    let filtered_docs: Vec<Value> = FILTER_SCHEMA.with(|cell| {
+        let schema = cell.borrow();
+        docs.iter()
+            .filter(|doc| match (use_schema, schema.as_ref()) {
+                (true, Some(s)) => crate::index::doc_matches_query_typed(&parsed, doc, s),
+                _ => doc_matches_filter(doc, filter_query),
+            })
+            .cloned()
+            .collect()
+    });
 
     let doc_count = sum_doc_count(&filtered_docs);
     let mut result = serde_json::Map::new();
@@ -6818,20 +6939,61 @@ fn run_filters(
         None => return json!({"buckets": {}}),
     };
 
-    // #959: same entry validation as `run_filter` — a clause the query
-    // parser rejects must surface as an error, never as a bucket that
-    // counts every document (the old catch-all behaviour). Applies to both
-    // the named map and the anonymous array form.
-    let clauses: Vec<&Value> = match filters_val {
-        Value::Object(map) => map.values().collect(),
-        Value::Array(arr) => arr.iter().collect(),
-        _ => Vec::new(),
-    };
-    for q in clauses {
-        if let Err(e) = xerj_query::parser::parse_query(q) {
-            return json!({"error": format!("failed to parse `filters` aggregation query: {e}")});
+    // #959 (entry validation) and #1745 (one parse serves the rejection and
+    // the schema-aware matcher): reject a clause the query parser rejects
+    // instead of counting it, and keep the AST for the match below.
+    let mut named: Vec<(&String, &Value, QueryNode, bool)> = Vec::new();
+    let mut anonymous: Vec<(&Value, QueryNode, bool)> = Vec::new();
+    match filters_val {
+        Value::Object(map) => {
+            for (name, query) in map {
+                match xerj_query::parser::parse_query(query) {
+                    Ok(node) => named.push((name, query, node, false)),
+                    Err(e) => {
+                        return json!({"error": format!("failed to parse `filters` aggregation query: {e}")})
+                    }
+                }
+            }
         }
+        Value::Array(arr) => {
+            for query in arr {
+                match xerj_query::parser::parse_query(query) {
+                    Ok(node) => anonymous.push((query, node, false)),
+                    Err(e) => {
+                        return json!({"error": format!("failed to parse `filters` aggregation query: {e}")})
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+
+    // Decide once per clause whether the query matcher applies.
+    FILTER_SCHEMA.with(|cell| {
+        if let Some(s) = cell.borrow().as_ref() {
+            for (_, _, node, flag) in named.iter_mut() {
+                *flag = clause_targets_only_text(node, s);
+            }
+            for (_, node, flag) in anonymous.iter_mut() {
+                *flag = clause_targets_only_text(node, s);
+            }
+        }
+    });
+
+    // #1745: with the index schema in scope, a text clause is evaluated by the
+    // same matcher `_search`/`_count` use, so a bucket's doc_count equals the
+    // count of the same clause as a query. Exact-field clauses keep the legacy
+    // `_source` matcher (see `clause_targets_only_text`), and without a schema
+    // (unit tests, the public `run_aggs*` entry points) everything does.
+    let clause_matches = |doc: &Value, raw: &Value, node: &QueryNode, use_schema: bool| -> bool {
+        if !use_schema {
+            return doc_matches_filter(doc, raw);
+        }
+        FILTER_SCHEMA.with(|cell| match cell.borrow().as_ref() {
+            Some(s) => crate::index::doc_matches_query_typed(node, doc, s),
+            None => doc_matches_filter(doc, raw),
+        })
+    };
 
     // ES `keyed` defaults to true for a named `filters` map and false for
     // an anonymous array. `keyed:false` on a named map rewrites to an
@@ -6867,14 +7029,14 @@ fn run_filters(
 
     match filters_val {
         // Named filters: { "name1": { query }, "name2": { query } }
-        Value::Object(map) => {
+        Value::Object(_) => {
             let keyed = keyed_override.unwrap_or(true);
             if keyed {
                 let mut buckets = serde_json::Map::new();
-                for (name, query) in map {
+                for (name, query, node, use_schema) in &named {
                     let filtered: Vec<Value> = docs
                         .iter()
-                        .filter(|doc| doc_matches_filter(doc, query))
+                        .filter(|doc| clause_matches(doc, query, node, *use_schema))
                         .cloned()
                         .collect();
                     let mut bucket = serde_json::Map::new();
@@ -6888,12 +7050,12 @@ fn run_filters(
                             }
                         }
                     }
-                    buckets.insert(name.clone(), Value::Object(bucket));
+                    buckets.insert(name.to_string(), Value::Object(bucket));
                 }
                 if let Some(ok) = &other_key {
                     let other: Vec<Value> = docs
                         .iter()
-                        .filter(|d| !map.values().any(|q| doc_matches_filter(d, q)))
+                        .filter(|d| !named.iter().any(|(_, q, n, u)| clause_matches(d, q, n, *u)))
                         .cloned()
                         .collect();
                     buckets.insert(ok.clone(), Value::Object(other_body(&other)));
@@ -6901,14 +7063,14 @@ fn run_filters(
                 json!({"buckets": buckets})
             } else {
                 let mut buckets: Vec<Value> = Vec::new();
-                for (name, query) in map {
+                for (name, query, node, use_schema) in &named {
                     let filtered: Vec<Value> = docs
                         .iter()
-                        .filter(|doc| doc_matches_filter(doc, query))
+                        .filter(|doc| clause_matches(doc, query, node, *use_schema))
                         .cloned()
                         .collect();
                     let mut bucket = serde_json::Map::new();
-                    bucket.insert("key".to_string(), Value::String(name.clone()));
+                    bucket.insert("key".to_string(), Value::String(name.to_string()));
                     bucket.insert("doc_count".to_string(), json!(sum_doc_count(&filtered)));
                     if let Some(sub) = sub_aggs {
                         let sr =
@@ -6924,7 +7086,7 @@ fn run_filters(
                 if let Some(ok) = &other_key {
                     let other: Vec<Value> = docs
                         .iter()
-                        .filter(|d| !map.values().any(|q| doc_matches_filter(d, q)))
+                        .filter(|d| !named.iter().any(|(_, q, n, u)| clause_matches(d, q, n, *u)))
                         .cloned()
                         .collect();
                     let mut bucket = serde_json::Map::new();
@@ -6938,12 +7100,12 @@ fn run_filters(
             }
         }
         // Anonymous filters: [ { query1 }, { query2 } ]
-        Value::Array(arr) => {
+        Value::Array(_) => {
             let mut buckets: Vec<Value> = Vec::new();
-            for query in arr {
+            for (query, node, use_schema) in &anonymous {
                 let filtered: Vec<Value> = docs
                     .iter()
-                    .filter(|doc| doc_matches_filter(doc, query))
+                    .filter(|doc| clause_matches(doc, query, node, *use_schema))
                     .cloned()
                     .collect();
                 let mut bucket = serde_json::Map::new();
@@ -6961,7 +7123,11 @@ fn run_filters(
             if let Some(ok) = &other_key {
                 let other: Vec<Value> = docs
                     .iter()
-                    .filter(|d| !arr.iter().any(|q| doc_matches_filter(d, q)))
+                    .filter(|d| {
+                        !anonymous
+                            .iter()
+                            .any(|(q, n, u)| clause_matches(d, q, n, *u))
+                    })
                     .cloned()
                     .collect();
                 let mut bucket = serde_json::Map::new();
