@@ -9,10 +9,14 @@ an optional, separately staged path.
 
 - The default embedding mode is **lexical feature hashing**. It needs no model,
   no embedding service, and no network connection.
-- Neural mode is optional. Without `embedding.local_model_dir`, the first
-  operation that needs an embedding downloads `config.json`, `tokenizer.json`,
-  and `model.safetensors` for `sentence-transformers/all-MiniLM-L6-v2` from the
-  Hugging Face Hub. With that directory set, XERJ reads those files locally.
+- Neural mode is optional. The model is loaded when the process starts, not
+  on the first embed. Without `embedding.local_model_dir`, startup downloads
+  `config.json`, `tokenizer.json`, and `model.safetensors` for
+  `sentence-transformers/all-MiniLM-L6-v2` from the Hugging Face Hub
+  (`HF_ENDPOINT` selects a mirror). If that download fails, the process
+  refuses to start rather than indexing with the lexical embedder. With
+  `local_model_dir` set, XERJ reads those files locally and does not contact
+  the Hub.
 - `proxy` calls only the configured OpenAI-compatible
   `embedding.default_endpoint`. The experimental `onnx-experimental` backend
   needs an ONNX-enabled build and explicit local assets; neither is the base

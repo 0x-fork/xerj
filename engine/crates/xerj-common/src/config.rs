@@ -1556,11 +1556,15 @@ impl LogsConfig {
 ///     default: lexical, *not* neural semantic understanding.
 ///   * `"neural"` — a built-in BERT sentence embedder (all-MiniLM-L6-v2 by
 ///     default) that runs in-process via `candle`. The model weights are
-///     downloaded once on first use (or read from
+///     downloaded and loaded at startup (or read from
 ///     [`local_model_dir`](Self::local_model_dir) for
-///     air-gapped deployments). The neural backend ships in the standard
-///     binary; a `--no-default-features` slim build omits it and falls back
-///     to lexical.
+///     air-gapped deployments; `HF_ENDPOINT` selects a Hub mirror). If that
+///     load fails, the process refuses to start (#1840) instead of accepting
+///     traffic and failing every ingest. It does not substitute the lexical
+///     embedder: those vectors are not comparable with neural vectors, the
+///     same fail-closed rule as explicit `"proxy"` (#1189). The neural
+///     backend ships in the standard binary; a `--no-default-features` slim
+///     build omits it and falls back to lexical, and identity reports lexical.
 ///   * `"proxy"` — call an external OpenAI-compatible `/v1/embeddings`
 ///     endpoint ([`default_endpoint`](Self::default_endpoint)). Lets
 ///     customers plug in ANY embedding model / provider they already run. An explicit `mode = "proxy"` with a

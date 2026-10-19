@@ -12,8 +12,10 @@
 //!     service ([`crate::embed::EmbeddingProxy`]). Bring any model/provider.
 //!   * [`Embedder::Neural`] — the built-in BERT sentence encoder
 //!     ([`crate::neural`]), running in-process via `candle`. Compiled only
-//!     under the `neural` cargo feature; the model is loaded lazily on first
-//!     use (download-on-first-run) so startup stays instant.
+//!     under the `neural` cargo feature. The server loads it at startup
+//!     (`Embedder::preload_neural`); a blocked download refuses the process
+//!     rather than failing every ingest. The handle still shares one
+//!     process-wide model.
 //!   * [`Embedder::Onnx`] — the experimental in-process ONNX Runtime backend.
 //!     It is compiled only under `onnx-experimental`, requires explicit model
 //!     and tokenizer paths, and loads the model lazily on first use.
@@ -215,7 +217,8 @@ pub enum Embedder {
     Lexical,
     /// External OpenAI-compatible embedding service.
     Proxy(EmbeddingProxy),
-    /// Built-in neural BERT embedder (candle). Lazily loaded on first use.
+    /// Built-in neural BERT embedder (candle). The server preloads it at
+    /// startup; a handle built without that preload still loads on first embed.
     #[cfg(feature = "neural")]
     Neural(NeuralHandle),
     /// Experimental local ONNX Runtime sentence encoder.
@@ -234,10 +237,34 @@ impl Embedder {
         Embedder::Proxy(proxy)
     }
 
-    /// A lazily-loaded built-in neural embedder.
+    /// A built-in neural embedder. Call [`preload_neural`] first when a
+    /// failed download must surface before the first embed.
     #[cfg(feature = "neural")]
     pub fn neural(cfg: crate::neural::NeuralConfig) -> Self {
         Embedder::Neural(NeuralHandle::new(cfg))
+    }
+
+    /// Load the neural model into the process-wide cache.
+    ///
+    /// The server calls this at startup (#1840). On success, every later
+    /// [`Self::neural`] handle with the same config reuses the loaded model
+    /// instead of downloading again. On failure the cell stays empty — this
+    /// never installs the lexical embedder.
+    #[cfg(feature = "neural")]
+    pub fn preload_neural(
+        cfg: &crate::neural::NeuralConfig,
+    ) -> Result<std::sync::Arc<crate::neural::NeuralEmbedder>> {
+        let cell = shared_neural_cell(cfg);
+        if let Some(ready) = cell.get() {
+            return Ok(std::sync::Arc::clone(ready));
+        }
+        let loaded = std::sync::Arc::new(crate::neural::NeuralEmbedder::load(cfg)?);
+        // A concurrent preload may win `set`. Keep whichever model landed in
+        // the cell so every handle shares one copy.
+        match cell.set(std::sync::Arc::clone(&loaded)) {
+            Ok(()) => Ok(loaded),
+            Err(_) => Ok(cell.get().cloned().unwrap_or(loaded)),
+        }
     }
 
     #[cfg(feature = "onnx-experimental")]
@@ -870,6 +897,7 @@ mod neural_handle_tests {
             model_id: "test/model-shared".into(),
             cache_dir: Some(PathBuf::from("/tmp/xerj-neural-shared-cache")),
             local_dir: None,
+            hub_endpoint: None,
         };
         let first = NeuralHandle::new(cfg.clone());
         let second = NeuralHandle::new(cfg);
@@ -884,11 +912,13 @@ mod neural_handle_tests {
             model_id: "test/model-a".into(),
             cache_dir: None,
             local_dir: None,
+            hub_endpoint: None,
         });
         let second = NeuralHandle::new(NeuralConfig {
             model_id: "test/model-b".into(),
             cache_dir: None,
             local_dir: None,
+            hub_endpoint: None,
         });
 
         assert!(!Arc::ptr_eq(&first.cell, &second.cell));
@@ -900,6 +930,7 @@ mod neural_handle_tests {
             model_id: "test/model-reclaimable".into(),
             cache_dir: None,
             local_dir: None,
+            hub_endpoint: None,
         };
         let weak = {
             let handle = NeuralHandle::new(cfg.clone());

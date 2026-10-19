@@ -330,8 +330,13 @@ fn help_text(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20onnx-experimental\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20lexical  built-in feature-hash (default; offline, not neural)\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20neural   built-in BERT (all-MiniLM-L6-v2) — real semantics,\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20in-process; auto-downloads the model (~90 MB) on\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20first use, then runs from cache. Just add the flag.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20in-process. The model (~90 MB) loads at startup:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20downloaded from the HuggingFace Hub, or read from\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20embedding.local_model_dir, then cached. If that load\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20fails, the process refuses to start. It does not keep\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20running and fail every ingest, and it does not write\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20lexical vectors. Restart with: xerj --embed-mode lexical\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Or set HF_ENDPOINT to a Hub mirror and start again.\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20proxy    external OpenAI-compatible /v1/embeddings endpoint\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20auto     proxy if embedding.default_endpoint is set, else lexical\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20onnx-experimental  local all-MiniLM-L6-v2-compatible FP32\n\
@@ -2297,9 +2302,140 @@ fn build_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime> {
         .context("build tokio runtime")
 }
 
+/// #1840: a neural startup whose Hub cannot be reached fails once, here,
+/// before any listener exists. This lives in `xerj-server` because that
+/// crate's default features include `neural`, which is what
+/// `cargo test --workspace` actually runs. `xerj-ai`'s own tests do not
+/// enable the feature unless asked.
+#[cfg(all(test, feature = "neural"))]
+mod neural_startup_tests {
+    use xerj_ai::neural::{startup_failure_message, NeuralConfig};
+    use xerj_ai::Embedder;
+
+    /// Closed port on loopback. Connection refused is local and immediate;
+    /// nothing is sent off the machine.
+    const UNREACHABLE_HUB: &str = "http://127.0.0.1:1";
+
+    #[test]
+    fn unreachable_hub_refuses_once_and_does_not_install_lexical() {
+        let cache = tempfile::tempdir().unwrap();
+        let cfg = NeuralConfig {
+            model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+            cache_dir: Some(cache.path().to_path_buf()),
+            local_dir: None,
+            hub_endpoint: Some(UNREACHABLE_HUB.into()),
+        };
+        // `NeuralEmbedder` is not `Debug`, so `expect_err` cannot name the Ok side.
+        let error = match Embedder::preload_neural(&cfg) {
+            Ok(_) => panic!("a closed hub must not load a model"),
+            Err(error) => error,
+        };
+        let message = startup_failure_message(&cfg.model_id, &error);
+        assert!(
+            message.contains("127.0.0.1") || message.contains("Connection refused"),
+            "the cause must be the closed local hub, not a real download: {message}"
+        );
+        assert!(
+            message.contains("xerj --embed-mode lexical"),
+            "the error must give the lexical command: {message}"
+        );
+        assert!(
+            message.contains("embedding.local_model_dir"),
+            "the error must name the offline model directory: {message}"
+        );
+        assert!(
+            message.contains("HF_ENDPOINT"),
+            "the error must name the mirror variable: {message}"
+        );
+        assert!(
+            message.contains("Refusing to start"),
+            "the error must say the process will not start: {message}"
+        );
+        assert!(
+            !message
+                .to_ascii_lowercase()
+                .contains("falling back to lexical"),
+            "must not describe a lexical swap: {message}"
+        );
+        // The shared cell stays empty, so a later embed cannot pretend the
+        // model loaded. Preload's return type is the neural model itself:
+        // failure cannot hand back a lexical embedder.
+        assert!(
+            Embedder::preload_neural(&cfg).is_err(),
+            "a second attempt must still fail rather than reuse a lexical stand-in"
+        );
+    }
+
+    #[test]
+    fn missing_local_model_refuses_with_the_same_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = xerj_common::config::EmbeddingConfig {
+            mode: "neural".into(),
+            local_model_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let error = xerj_engine::index::ensure_neural_ready(&cfg)
+            .expect_err("an empty local model directory must refuse startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("embedding.mode=neural"),
+            "must name the setting: {message}"
+        );
+        assert!(
+            message.contains("xerj --embed-mode lexical"),
+            "must give the lexical command: {message}"
+        );
+        assert!(
+            message.contains("model.safetensors") || message.contains("missing"),
+            "must name the missing local asset: {message}"
+        );
+        assert!(
+            !message.contains("127.0.0.1"),
+            "a local directory must not contact the hub: {message}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod help_text_tests {
     use super::{auth_disabled_line, help_text};
+
+    /// #1840: `--embed-mode neural` must say the model loads at startup and
+    /// that a failed download refuses to start, with the lexical command.
+    #[test]
+    fn neural_help_says_a_failed_download_refuses_to_start() {
+        let help = help_text(true);
+        let neural = help
+            .lines()
+            .position(|line| line.contains("neural   built-in BERT"))
+            .expect("neural mode must be documented");
+        let window: String = help
+            .lines()
+            .skip(neural)
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            window.contains("loads at startup"),
+            "neural help must say the model loads at startup:\n{window}"
+        );
+        assert!(
+            window.contains("refuses to start"),
+            "neural help must say a failed load refuses to start:\n{window}"
+        );
+        assert!(
+            window.contains("xerj --embed-mode lexical"),
+            "neural help must give the lexical command:\n{window}"
+        );
+        assert!(
+            window.contains("embedding.local_model_dir"),
+            "neural help must name the offline model directory:\n{window}"
+        );
+        assert!(
+            window.contains("HF_ENDPOINT"),
+            "neural help must name the Hub mirror variable:\n{window}"
+        );
+    }
 
     /// A loopback `--insecure` boot says nothing off this host can connect,
     /// then used to say anyone on the network can write. Those two lines
@@ -3037,6 +3173,35 @@ async fn async_main() -> Result<()> {
             cfg.server.es_compat_port,
             cfg.server.grpc_port,
         );
+    }
+
+    // 3d. Explicit mode=neural loads the model before the data directory, the
+    //     admin key, or any listener (#1840). A blocked Hub used to boot a
+    //     node that then failed every ingest. Explicit proxy already refuses
+    //     to start rather than substitute lexical vectors (#1189); neural does
+    //     the same, because those vectors are not comparable. A slim build
+    //     without the neural feature keeps its documented lexical fallback
+    //     (identity reports lexical) — there is no model to load.
+    if cfg.embedding.mode.trim().eq_ignore_ascii_case("neural") {
+        #[cfg(feature = "neural")]
+        {
+            let embedding = cfg.embedding.clone();
+            info!(
+                model = %embedding.neural_model,
+                "embedding.mode=neural: loading the model before opening the data directory"
+            );
+            tokio::task::spawn_blocking(move || {
+                xerj_engine::index::ensure_neural_ready(&embedding)
+            })
+            .await
+            .context("neural embedder load task panicked")??;
+            info!("embedding.mode=neural: model loaded");
+        }
+        #[cfg(not(feature = "neural"))]
+        {
+            // Slim binary. `make_neural_embedder` warns and uses lexical when
+            // an index actually embeds. Do not refuse to start.
+        }
     }
 
     // 4. Data directory

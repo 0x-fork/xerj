@@ -37185,6 +37185,9 @@ fn configured_neural_config(
         model_id,
         cache_dir: (!cfg.model_cache_dir.is_empty()).then(|| cfg.model_cache_dir.clone().into()),
         local_dir: (!cfg.local_model_dir.is_empty()).then(|| cfg.local_model_dir.clone().into()),
+        // The mirror URL is `HF_ENDPOINT`, read inside the hub client. There
+        // is no config field for it; tests inject one on `NeuralConfig` directly.
+        hub_endpoint: None,
     }
 }
 
@@ -38599,7 +38602,7 @@ fn make_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj_ai::
         || (mode != "neural" && mode != "lexical" && !cfg.default_endpoint.is_empty());
 
     if mode == "neural" {
-        return Ok(make_neural_embedder(cfg));
+        return make_neural_embedder(cfg);
     }
 
     if mode == "onnx-experimental" {
@@ -38735,27 +38738,66 @@ fn make_onnx_embedder(_cfg: &xerj_common::config::EmbeddingConfig) -> Result<xer
     )))
 }
 
-/// Construct the built-in neural embedder when compiled in; otherwise warn
-/// and fall back to lexical so a `mode=neural` config never bricks startup.
+/// Load the neural model when this binary can, before any ingest.
+///
+/// Explicit `mode=neural` fails closed (#1840), the same shape as explicit
+/// `mode=proxy` (#1189): a download or file error is returned, and the lexical
+/// embedder is not installed in its place. Those vectors are not comparable.
+/// The server calls this at startup so the failure happens once, before it
+/// listens. A slim build without the `neural` feature still returns `Ok` —
+/// `make_neural_embedder` warns and substitutes lexical, and identity reports
+/// lexical, because there is no model to load.
+pub fn ensure_neural_ready(cfg: &xerj_common::config::EmbeddingConfig) -> Result<()> {
+    if !cfg.mode.trim().eq_ignore_ascii_case("neural") {
+        return Ok(());
+    }
+    #[cfg(feature = "neural")]
+    {
+        let neural_cfg = configured_neural_config(cfg);
+        if let Err(error) = xerj_ai::Embedder::preload_neural(&neural_cfg) {
+            return Err(EngineError::Common(xerj_common::XerjError::embedding(
+                xerj_ai::neural::startup_failure_message(&neural_cfg.model_id, &error),
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "neural"))]
+    {
+        Ok(())
+    }
+}
+
+/// Construct the built-in neural embedder when compiled in.
+///
+/// The model is loaded here (and at server startup via [`ensure_neural_ready`]).
+/// A failure is an error, not a lexical embedder. A slim build without the
+/// feature warns and returns lexical so a `mode=neural` config on that binary
+/// still starts; identity reports lexical for that case.
 #[cfg(feature = "neural")]
-fn make_neural_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> xerj_ai::Embedder {
+fn make_neural_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj_ai::Embedder> {
     // Exactly the resolution the execution identity content-addresses — see
     // `configured_neural_config`. Duplicating it here once let the reported
     // identity describe a different model than the one that loads.
+    ensure_neural_ready(cfg)?;
     let neural_cfg = configured_neural_config(cfg);
-    info!(model = %neural_cfg.model_id, "embedding backend: built-in neural BERT (loads on first use)");
-    xerj_ai::Embedder::neural(neural_cfg)
+    info!(
+        model = %neural_cfg.model_id,
+        "embedding backend: built-in neural BERT (loaded)"
+    );
+    Ok(xerj_ai::Embedder::neural(neural_cfg))
 }
 
 #[cfg(not(feature = "neural"))]
-fn make_neural_embedder(_cfg: &xerj_common::config::EmbeddingConfig) -> xerj_ai::Embedder {
+fn make_neural_embedder(_cfg: &xerj_common::config::EmbeddingConfig) -> Result<xerj_ai::Embedder> {
+    // Identity reports lexical for this build. The warning is the whole
+    // signal: there is no model download that can fail later.
     warn!(
         "embedding.mode=neural requested but this is a slim build (compiled with \
          `--no-default-features`, no neural backend) — falling back to the built-in lexical \
          embedder. The standard release binary ships the neural embedder; use it, or rebuild \
          xerj-server with default features."
     );
-    xerj_ai::Embedder::lexical()
+    Ok(xerj_ai::Embedder::lexical())
 }
 
 // ── HNSW persistence helpers (module-level, called from sync `Index::open`)

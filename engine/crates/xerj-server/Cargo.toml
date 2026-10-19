@@ -64,8 +64,9 @@ prost.workspace = true
 [features]
 # The shipped binary is batteries-included: the built-in neural BERT
 # embedder (candle + MiniLM) is ON by default, so end users just add
-# `--embed-mode neural` at runtime and the model downloads itself on first
-# use — no special build, no separate binary. Build with
+# `--embed-mode neural` at runtime and the model downloads and loads at
+# startup — a blocked Hub refuses to start, it does not fail every ingest.
+# No special build, no separate binary. Build with
 # `--no-default-features` for a slimmer binary without the neural backend
 # (the lexical + proxy backends still work).
 default = ["neural", "decide-local"]

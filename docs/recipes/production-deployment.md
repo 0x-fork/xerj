@@ -467,9 +467,14 @@ in-process BERT sentence encoder (default `all-MiniLM-L6-v2`, 384-dim, ~90 MB),
 no Python, no external service. Select it per node with `[embedding] mode =
 "neural"` (or `--embed-mode neural`, or `XERJ_EMBED_MODE=neural`).
 
-On a connected host the model downloads itself **once, on first use**, from the
-HuggingFace Hub and is cached for every later start. On an **air-gapped** host
-there is no Hub to reach, so stage the model files yourself.
+On a connected host the model is downloaded from the HuggingFace Hub and loaded
+**at startup**, then cached for every later start. If that load fails the
+process **refuses to start** with one error that names the cause, the command
+`xerj --embed-mode lexical`, `embedding.local_model_dir`, and `HF_ENDPOINT`
+(a Hub mirror). It does not stay up and fail every ingest, and it does not
+substitute lexical vectors — those are not comparable with neural vectors.
+Explicit `proxy` already fails closed the same way. On an **air-gapped** host
+there is no Hub to reach, so stage the model files yourself before starting.
 
 ### Step 1 — download the three files on a connected machine
 
@@ -505,26 +510,21 @@ local_model_dir = "/opt/xerj/models/all-MiniLM-L6-v2"   # holds the 3 files abov
 ```
 
 When `local_model_dir` is set it takes precedence over the Hub — XERJ makes
-**no outbound network call** for the model. Selecting the neural backend logs a
-line when the semantic index is built:
+**no outbound network call** for the model. The weights load at startup, before
+the data directory is opened. A correct staging just works and makes no network
+call. A **missing or wrong file refuses startup** with the offending path:
 
 ```
-INFO  embedding backend: built-in neural BERT (loads on first use)
+embedding.mode=neural failed to load model sentence-transformers/all-MiniLM-L6-v2: local model dir /opt/xerj/models/... is missing tokenizer.json
+… has no model.safetensors (candle requires safetensors, not pytorch_model.bin).
+Refusing to start. …
+To index without a model, restart with: xerj --embed-mode lexical
 ```
 
-The weights themselves load lazily, from your staged directory, on the first
-`semantic_text` ingest (not at boot). A correct staging just works — the local
-path is silent on success and makes no network call. A **missing or wrong file
-fails loud** with the offending path, which is your signal to fix the staging:
-
-```
-local model dir /opt/xerj/models/... is missing tokenizer.json
-… has no model.safetensors (candle requires safetensors, not pytorch_model.bin)
-```
-
-(The `neural embedder: model ready` log line you may have seen elsewhere is the
-*Hub-download* path's completion message; the offline `local_model_dir` path
-does not print it.)
+(The `neural embedder: model ready` log line is the *Hub-download* path's
+completion message; the offline `local_model_dir` path does not print it.
+After a successful load, opening a semantic index logs
+`embedding backend: built-in neural BERT (loaded)`.)
 
 > **Slim builds.** A `--no-default-features` build omits the neural backend;
 > `mode = "neural"` on such a binary logs a warning and falls back to the
