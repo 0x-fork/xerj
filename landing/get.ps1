@@ -59,11 +59,24 @@
     if ($tag -notmatch '^v') { $tag = "v$tag" }  # release tags are v-prefixed
   } else {
     Write-Step "resolving latest release of $Repo..."
+    # Prefer github.com /releases/latest redirect (no api.github.com rate limit).
     try {
-      $rel = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest"
-      $tag = $rel.tag_name
+      $resp = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri "https://github.com/$Repo/releases/latest" -ErrorAction SilentlyContinue
     } catch {
-      Fail "could not resolve the latest release ($($_.Exception.Message)) - set `$env:XERJ_VERSION='vX.Y.Z' (see https://github.com/$Repo/releases)"
+      # 302 is expected; PowerShell surfaces it as an error when MaxRedirection=0.
+      $resp = $_.Exception.Response
+    }
+    if ($resp -and $resp.Headers -and $resp.Headers.Location) {
+      $loc = [string]$resp.Headers.Location
+      if ($loc -match '/tag/([^/\s]+)$') { $tag = $Matches[1] }
+    }
+    if (-not $tag) {
+      try {
+        $rel = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest"
+        $tag = $rel.tag_name
+      } catch {
+        Fail "could not resolve the latest release ($($_.Exception.Message)) - set `$env:XERJ_VERSION='vX.Y.Z' (see https://github.com/$Repo/releases)"
+      }
     }
     if (-not $tag) { Fail "could not resolve the latest release - set `$env:XERJ_VERSION='vX.Y.Z'" }
   }

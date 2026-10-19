@@ -88,9 +88,19 @@ target="${cpu}-${plat}"
 # --- resolve version --------------------------------------------------------
 if [ "${XERJ_VERSION:-}" = "" ]; then
   info "resolving latest release of ${REPO}…"
-  # Follow the /releases/latest redirect to read the tag without jq.
-  tag=$(DLS "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+  # Prefer github.com /releases/latest redirect (no api.github.com rate limit).
+  # curl -w '%{url_effective}' follows redirects and prints the final .../tag/vX.Y.Z URL.
+  tag=""
+  if command -v curl >/dev/null 2>&1; then
+    tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+      "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+      | sed -n 's|.*/tag/\([^/]*\)$|\1|p' | head -n1)
+  fi
+  # Fall back to the REST endpoint when the redirect path yields nothing.
+  if [ -z "$tag" ]; then
+    tag=$(DLS "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+          | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+  fi
   [ -n "$tag" ] || die "could not resolve latest release — set XERJ_VERSION=vX.Y.Z (see https://github.com/${REPO}/releases)"
 else
   tag="$XERJ_VERSION"
