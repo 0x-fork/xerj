@@ -187,6 +187,8 @@ fn slide_order<R: Read + Seek>(z: &mut zip::ZipArchive<R>, budget: &mut Budget) 
     let mut numbered: Vec<(u32, String)> = z
         .file_names()
         .filter_map(|n| {
+            // zip 9: entry names are fallible (non-UTF-8 names); skip those.
+            let n = n.ok()?;
             let num = n.strip_prefix("ppt/slides/slide")?.strip_suffix(".xml")?;
             Some((num.parse().ok()?, n.to_string()))
         })

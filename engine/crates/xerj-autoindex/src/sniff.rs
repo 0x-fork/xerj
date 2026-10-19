@@ -1245,7 +1245,7 @@ fn zip_container_kind<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>) -> &'
         }
     }
     // numpy.savez: a zip of `.npy` members.
-    if !z.is_empty() && z.file_names().all(|n| n.ends_with(".npy")) {
+    if !z.is_empty() && z.file_names().all(|n| n.is_ok_and(|n| n.ends_with(".npy"))) {
         return "npz";
     }
     let mut mime = Vec::with_capacity(64);

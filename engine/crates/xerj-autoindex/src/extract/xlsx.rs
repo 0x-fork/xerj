@@ -223,6 +223,8 @@ fn sheet_parts<R: Read + Seek>(
     let mut numbered: Vec<(u32, String)> = z
         .file_names()
         .filter_map(|n| {
+            // zip 9: entry names are fallible (non-UTF-8 names); skip those.
+            let n = n.ok()?;
             let num = n
                 .strip_prefix("xl/worksheets/sheet")?
                 .strip_suffix(".xml")?;

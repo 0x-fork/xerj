@@ -195,7 +195,11 @@ pub fn extract_zip(zip: &Path, dest: &Path) -> Result<usize> {
             skipped += 1;
             continue;
         }
-        let raw = entry.name().to_string();
+        // zip 9: an entry name that cannot be decoded is skipped like an unsafe one.
+        let Ok(raw) = entry.name().map(|n| n.to_string()) else {
+            skipped += 1;
+            continue;
+        };
         let Some(safe) = sanitize_entry_path(&raw) else {
             skipped += 1;
             continue;
