@@ -732,6 +732,10 @@ struct ParsedSearch {
 #[derive(Debug)]
 enum SearchCli {
     Help,
+    /// A flag the command refuses (e.g. `--mode`): the one-line reason is
+    /// already printed to stderr, and the caller exits 2 without the USAGE
+    /// dump the generic `Err` path adds.
+    Refuse,
     Query(ParsedSearch),
 }
 
@@ -759,7 +763,7 @@ fn parse_search_cli(
             "--mode" => {
                 let asked = it.next().unwrap_or_default();
                 eprintln!("{}", search_mode_refusal(&asked));
-                return 2;
+                return Ok(SearchCli::Refuse);
             }
             other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
             other => return Err(format!("unexpected argument '{other}'")),
@@ -794,6 +798,8 @@ pub fn run_search_cli() -> i32 {
             print!("{USAGE}");
             return 0;
         }
+        // The refusal line is already on stderr; exit 2 without a USAGE dump.
+        Ok(SearchCli::Refuse) => return 2,
         Ok(SearchCli::Query(parsed)) => parsed,
         Err(e) => {
             eprintln!("xerj search: {e}\n\n{USAGE}");

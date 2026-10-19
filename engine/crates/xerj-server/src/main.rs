@@ -1333,7 +1333,12 @@ fn bind_listener(addr: SocketAddr, name: &str) -> Result<std::net::TcpListener> 
     let listener = match std::net::TcpListener::bind(addr) {
         Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            anyhow::bail!("{}", addr_in_use_message(name, addr));
+            // The hint first, then the OS reason and the `bind {addr}` wording
+            // the #465 process test (`taken_port_fails_startup`) relies on.
+            anyhow::bail!(
+                "{} ({name}: bind {addr}: {e})",
+                addr_in_use_message(name, addr)
+            );
         }
         Err(e) => return Err(e).with_context(|| format!("{name}: bind {addr}")),
     };
@@ -1360,7 +1365,11 @@ mod bind_listener_tests {
         assert!(msg.contains("--auto-port"), "{msg}");
         assert!(msg.contains("xerj --help"), "{msg}");
         assert!(msg.contains(&addr.to_string()), "{msg}");
-        assert_eq!(msg, addr_in_use_message("ES-compat", addr));
+        assert!(
+            msg.starts_with(&addr_in_use_message("ES-compat", addr)),
+            "{msg}"
+        );
+        assert!(msg.contains(&format!("bind {addr}")), "{msg}");
     }
 }
 
@@ -2167,6 +2176,14 @@ fn main() -> Result<()> {
     #[cfg(unix)]
     raise_nofile_limit();
 
+    // Dispatch before creating Tokio's pool so each PDF worker stays small.
+    // Before the flag hoist below, too: the hoist reads `std::env::args()`,
+    // which panics on a non-UTF-8 argument, and a worker's PDF path may be
+    // one. Only `args_os` is read here.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__extract-pdf")) {
+        std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
+    }
+
     // `xerj --url URL corpus index name` used to die here as an unknown
     // server flag. Move those flags behind the subcommand before any
     // dispatch reads argv.
@@ -2174,14 +2191,6 @@ fn main() -> Result<()> {
         &std::env::args().skip(1).collect::<Vec<_>>(),
         is_top_level_command,
     ));
-
-    // Dispatch before creating Tokio's pool so each PDF worker stays small.
-    if matches!(
-        xerj_common::argv::subcommand().as_deref(),
-        Some("__extract-pdf")
-    ) {
-        std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
-    }
 
     // The isolated legacy-`.xls` BIFF reader. calamine 0.26.1 panics on crafted
     // records (short `Lbl`/`ExternSheet`) and the release profile is

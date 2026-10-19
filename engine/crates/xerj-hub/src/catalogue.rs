@@ -1125,7 +1125,7 @@ mod tests {
 
     #[test]
     fn an_older_signed_catalogue_is_refused_as_a_rollback() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let inputs = two_inputs(fx.path());
         let (seed, public) = keypair();
@@ -1142,13 +1142,13 @@ mod tests {
         let (old_cat, old_sig) = build_catalogue(&inputs, "2026-10-01T00:00:00Z", &seed).unwrap();
         let old_bytes = canonical_json(&old_cat).unwrap();
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        env.set(&public);
         let (url, handle) = spawn_hub(old_bytes.clone(), old_sig.clone());
         let err = refresh_catalogue(&url, cache.path()).expect_err("a rollback is refused");
         handle.join().unwrap();
         let (url, handle) = spawn_hub(old_bytes, old_sig);
         let served = load_catalogue(&url, cache.path(), false).expect("cached copy kept");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         handle.join().unwrap();
 
         assert!(format!("{err:#}").contains("rollback"), "{err:#}");

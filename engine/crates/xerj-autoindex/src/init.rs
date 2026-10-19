@@ -494,7 +494,7 @@ fn write_codex_config(path: &Path, url: &str, dry: bool) -> Result<String, Strin
         }
     };
     if existing.as_deref().is_some_and(codex_has_xerj) {
-        return Ok(report("kept", path));
+        return Ok(report("kept", path, dry));
     }
     let block = codex_mcp_block(url);
     let merged = match existing {
@@ -513,7 +513,7 @@ fn write_codex_config(path: &Path, url: &str, dry: bool) -> Result<String, Strin
     };
     let had = backup(path, dry)?;
     write_file(path, &merged, dry).map_err(|e| e.to_string())?;
-    Ok(report(if had { "appended" } else { "wrote" }, path))
+    Ok(report(if had { "appended" } else { "wrote" }, path, dry))
 }
 
 /// One detected surface, written. Returns the human line to print.

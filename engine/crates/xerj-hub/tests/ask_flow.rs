@@ -988,8 +988,6 @@ async fn ask_end_to_end() {
     // for half an hour, with no owner recorded. It is an OS lock now.
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
-
         let hub = work.join("hub-f");
         let code = work.join("code-f");
         publish(&archive, &sig, &work.join("net-f"), &hub);
@@ -997,15 +995,19 @@ async fn ask_end_to_end() {
         set_env(&hub, &code, &scratch_home, &public);
         let url = spawn_node(&work.join("data-f"), allowlist.clone()).await;
 
-        // A pack URL that never delivers a byte: a FIFO with no writer. The pull takes
-        // its lock, starts "downloading" and blocks in open(2).
-        let fifo = work.join("net-f").join("never.fifo");
-        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
+        // A pack URL that never delivers a byte: a listener that is never
+        // accepted. The kernel completes the handshake, the request is sent, and
+        // no response comes, so the pull takes its lock, starts "downloading" and
+        // blocks reading the reply. (A FIFO no longer works: since #1733 a
+        // file:// pack must be a regular file, so the pull fails before it blocks.)
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         set_catalogue_field(
             &hub,
             "pack_url",
-            json!(format!("file://{}", fifo.display())),
+            json!(format!(
+                "http://{}/never.hubpack.tar.zst",
+                silent.local_addr().unwrap()
+            )),
         );
 
         // The victim is a separate process running `xerj hub pull` (this binary).
@@ -1084,7 +1086,7 @@ async fn ask_end_to_end() {
             .join(PIN8)
             .join("pack.json")
             .is_file());
-        let _ = std::fs::remove_file(&fifo);
+        drop(silent);
     }
 }
 
