@@ -7424,23 +7424,31 @@ fn run_range(
             let bucket_docs: Vec<Value> = docs
                 .iter()
                 .filter(|doc| {
-                    let num = if is_date_range {
+                    // A multi-valued field contributes the document to a bucket
+                    // when ANY of its values falls in range (ES value-source
+                    // semantics). This used to read the first value only
+                    // (`extract_numeric`/`.first()`), so [22, 8080] counted in
+                    // `[.., 100)` and vanished from `[8000, 9000)`.
+                    let mut values: Vec<f64> = if is_date_range {
                         extract_date_ms_values(doc, field)
-                            .first()
-                            .copied()
+                            .into_iter()
                             .map(|ms| ms as f64)
+                            .collect()
                     } else {
-                        extract_numeric(doc, field)
+                        extract_numeric_values(doc, field)
                     };
-                    // Fall back to `missing` for docs without a value.
-                    let num = num.or(missing_val);
-                    match (num, from, to) {
-                        (Some(n), Some(f), Some(t)) => n >= f && n < t,
-                        (Some(n), Some(f), None) => n >= f,
-                        (Some(n), None, Some(t)) => n < t,
-                        (Some(_), None, None) => true,
-                        _ => false,
+                    // `missing` applies only to a document with NO value.
+                    if values.is_empty() {
+                        if let Some(m) = missing_val {
+                            values.push(m);
+                        }
                     }
+                    values.iter().any(|n| match (from, to) {
+                        (Some(f), Some(t)) => *n >= f && *n < t,
+                        (Some(f), None) => *n >= f,
+                        (None, Some(t)) => *n < t,
+                        (None, None) => true,
+                    })
                 })
                 .cloned()
                 .collect();
@@ -12338,13 +12346,27 @@ fn run_date_range(
                 // Doc values honor the field-declared format too: a doc
                 // stored as `{date: 1000}` under `format: epoch_second`
                 // means 1000 seconds = 1 000 000 ms.
-                let doc_ms = match v.and_then(&parse_with_fmt).or(missing_ms) {
-                    Some(m) => m,
-                    None => return false,
+                //
+                // A multi-valued field contributes the document when ANY of
+                // its values falls in range (ES value-source semantics); the
+                // array used to be handed to `parse_with_fmt` whole, which
+                // could not parse it, so every array-valued document was
+                // silently missed.
+                let mut values: Vec<i64> = match v {
+                    Some(Value::Array(arr)) => arr.iter().filter_map(&parse_with_fmt).collect(),
+                    Some(single) => parse_with_fmt(single).into_iter().collect(),
+                    None => Vec::new(),
                 };
-                let passes_from = from_ms.map(|f| doc_ms >= f).unwrap_or(true);
-                let passes_to = to_ms.map(|t| doc_ms < t).unwrap_or(true);
-                passes_from && passes_to
+                if values.is_empty() {
+                    if let Some(m) = missing_ms {
+                        values.push(m);
+                    }
+                }
+                values.iter().any(|ms| {
+                    let passes_from = from_ms.map(|f| *ms >= f).unwrap_or(true);
+                    let passes_to = to_ms.map(|t| *ms < t).unwrap_or(true);
+                    passes_from && passes_to
+                })
             })
             .cloned()
             .collect();
@@ -13985,21 +14007,27 @@ fn run_ip_range(
                 let val = doc
                     .get(field)
                     .or_else(|| doc.get("_source").and_then(|s| s.get(field)));
-                let ip_str = match val.and_then(Value::as_str) {
-                    Some(s) => s,
-                    None => return false,
+                // A multi-valued ip field contributes the document when ANY
+                // of its addresses falls in range (ES value-source
+                // semantics); the previous `Value::as_str` read returned None
+                // for an array, so array-valued documents were missed.
+                let addrs: Vec<&str> = match val {
+                    Some(Value::Array(arr)) => arr.iter().filter_map(Value::as_str).collect(),
+                    Some(Value::String(s)) => vec![s.as_str()],
+                    _ => Vec::new(),
                 };
-                if let Some(m) = mask {
-                    cidr_matches(ip_str, m)
-                } else {
-                    let ip_u = match ip_as_u128(ip_str) {
-                        Some(v) => v,
-                        None => return false,
-                    };
-                    let passes_from = from_u.map(|f| ip_u >= f).unwrap_or(true);
-                    let passes_to = to_u.map(|t| ip_u < t).unwrap_or(true);
-                    passes_from && passes_to
-                }
+                addrs.iter().any(|ip_str| {
+                    if let Some(m) = mask {
+                        cidr_matches(ip_str, m)
+                    } else {
+                        let Some(ip_u) = ip_as_u128(ip_str) else {
+                            return false;
+                        };
+                        let passes_from = from_u.map(|f| ip_u >= f).unwrap_or(true);
+                        let passes_to = to_u.map(|t| ip_u < t).unwrap_or(true);
+                        passes_from && passes_to
+                    }
+                })
             })
             .cloned()
             .collect();
