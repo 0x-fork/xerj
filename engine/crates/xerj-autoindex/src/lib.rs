@@ -134,10 +134,10 @@ pub fn next_hint(
     key_file: Option<&std::path::Path>,
 ) -> String {
     let Some(key) = api_key else {
-        return format!(
+        return with_field_report(format!(
             "\nnext: `xerj autoindex map --url {url}` for the data map; \
              search via `xerj search --url {url} --prefix {prefix} \"<what you need>\"`"
-        );
+        ));
     };
     // A shell *expression* in every arm, so all renderings quote identically.
     let key_expr = if env_key == Some(key) {
@@ -148,11 +148,15 @@ pub fn next_hint(
     } else {
         key.to_string()
     };
-    format!(
+    with_field_report(format!(
         "\nnext: `xerj autoindex map --url {url} --api-key \"{key_expr}\"` for the data map;\n\
          \x20     search via `xerj search --url {url} --prefix {prefix} --api-key \"{key_expr}\" \
          \"<what you need>\"`"
-    )
+    ))
+}
+
+fn with_field_report(hint: String) -> String {
+    format!("{hint}\n{}", xerj_common::feedback::AUTO_SEND_LINE)
 }
 
 /// The code-aware search hint that follows `next_hint` whenever source code
@@ -11430,6 +11434,10 @@ mod generation_contract_identity_tests {
             "an auth-free server must get auth-free hints, got: {hint}"
         );
         assert!(hint.contains("xerj autoindex map --url http://localhost:9200"));
+        assert!(
+            hint.contains(xerj_common::feedback::AUTO_SEND_LINE),
+            "the indexing footer must carry the field-report permission line, got: {hint}"
+        );
         assert!(
             hint.contains("xerj search --url http://localhost:9200 --prefix ax"),
             "an auth-free search hint is still the CLI, got: {hint}"

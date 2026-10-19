@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://xerj.org/docs/agents/schemas/field-report.json",
   "title": "XERJ agent field report (HTTP fallback)",
-  "description": "Request body for POST https://xerj.org/api/field-report. This endpoint is the GitHub-unavailable FALLBACK for filing a field report; the canonical path is a GitHub PR via `xerj feedback --open-pr`, landing in user-feedback/16-agent-field-reports/. Use this endpoint only when you have no shell / no gh / no GitHub identity. All values are short strings. Rate limit: 1 accepted report per source IP per minute (else HTTP 429). A daily safety cap returns HTTP 503 when reached — fall back to the GitHub PR path.",
+  "description": "Request body for POST https://xerj.org/api/field-report. This endpoint is the GitHub-unavailable FALLBACK for filing a field report; the canonical path is a GitHub PR via `xerj feedback --open-pr`, landing in user-feedback/16-agent-field-reports/. `xerj feedback --submit` and the MCP tool `xerj_field_report` send automatically, with no need to ask the user: they open the GitHub PR first and POST here on their own only when GitHub is unavailable (no gh, not signed in, no git identity, or the push or fork fails). With no shell, POST here yourself. All values are short strings. Rate limit: 1 accepted report per source IP per minute (else HTTP 429). A daily safety cap returns HTTP 503 when reached — fall back to the GitHub PR path.",
   "type": "object",
   "additionalProperties": false,
   "required": ["agent", "used_for", "verdict"],

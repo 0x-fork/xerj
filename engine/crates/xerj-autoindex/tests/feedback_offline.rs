@@ -1,9 +1,10 @@
 //! `xerj feedback --submit` against a local mock, with no GitHub token.
 //!
-//! The preview (`--submit` without `--yes`) must not open a connection. The
-//! send (`--submit --yes`) POSTs the JSON body and must not attach a GitHub
-//! token or an `Authorization` header — the admin key belongs to the local
-//! node, not to this endpoint.
+//! `--submit` sends automatically, with no `--yes`. It tries the GitHub PR
+//! first and POSTs to the endpoint only when GitHub is unavailable. The POST
+//! must not attach a GitHub token or an `Authorization` header — the admin key
+//! belongs to the local node, not to this endpoint. Every test here keeps
+//! GitHub out of reach (`--no-github`, or a PATH with no real `gh`).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -36,7 +37,7 @@ impl Drop for EnvVar {
     }
 }
 
-fn filled(endpoint: &str, yes: bool) -> Cfg {
+fn filled(endpoint: &str, no_github: bool) -> Cfg {
     let mut cfg = parse(vec![
         "--submit".into(),
         "--no-autofill".into(),
@@ -49,9 +50,7 @@ fn filled(endpoint: &str, yes: bool) -> Cfg {
     ])
     .expect("parse")
     .expect("cfg");
-    if yes {
-        cfg.yes = true;
-    }
+    cfg.no_github = no_github;
     cfg.endpoint = endpoint.to_string();
     cfg
 }
@@ -99,25 +98,116 @@ fn read_one_http(listener: TcpListener) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// No `--yes`: `--submit` sends on its own (here straight to the endpoint).
 #[test]
-fn submit_without_yes_does_not_connect_and_needs_no_github_token() {
+fn submit_sends_without_yes() {
     let _lock = ENV_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/api/field-report");
+    let server = std::thread::spawn(move || read_one_http(listener));
+    let cfg = filled(&endpoint, true);
+    assert!(!cfg.yes);
+    let code = run(&cfg);
+    let request = server.join().expect("server thread");
+    assert_eq!(code, 0, "request was:\n{request}");
+    assert!(request.contains("\"agent\":\"Test Agent\""), "{request}");
+}
+
+/// GitHub first: with no `gh` on PATH the PR path is unavailable, and the
+/// report falls back to the endpoint automatically.
+#[test]
+fn submit_falls_back_to_the_endpoint_when_github_is_unavailable() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let _path = EnvVar::set("PATH", empty.path().to_str().unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/api/field-report");
+    let server = std::thread::spawn(move || read_one_http(listener));
+    let code = run(&filled(&endpoint, false));
+    let request = server.join().expect("server thread");
+    assert_eq!(code, 0, "request was:\n{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .starts_with("post /api/field-report"),
+        "{request}"
+    );
+}
+
+/// The order, observed: a fake `gh` that is not signed in records that it was
+/// asked first, and only then does the POST happen.
+#[cfg(unix)]
+#[test]
+fn submit_asks_github_first_then_posts() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = ENV_LOCK.lock().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("gh.log");
+    let gh = bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" = --version ] && exit 0\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let _path = EnvVar::set("PATH", &path);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/api/field-report");
+    let server = std::thread::spawn(move || read_one_http(listener));
+    let code = run(&filled(&endpoint, false));
+    let request = server.join().expect("server thread");
+    assert_eq!(code, 0, "request was:\n{request}");
+    let asked = std::fs::read_to_string(&log).expect("gh was never asked");
+    assert!(asked.contains("auth status"), "{asked}");
+    assert!(request.contains("\"agent\":\"Test Agent\""), "{request}");
+}
+
+/// `--github-only` (what the MCP tool uses) never POSTs.
+#[test]
+fn github_only_never_posts() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let _path = EnvVar::set("PATH", empty.path().to_str().unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let endpoint = format!("http://127.0.0.1:{port}/api/field-report");
-    let _gh = EnvVar::set("GH_TOKEN", "ghp_should_not_appear");
-    let _github = EnvVar::set("GITHUB_TOKEN", "ghp_should_not_appear");
-    let code = run(&filled(&endpoint, false));
+    let mut cfg = filled(&format!("http://127.0.0.1:{port}/api/field-report"), false);
+    cfg.github_only = true;
+    assert_eq!(run(&cfg), 1);
+    match listener.accept() {
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("--github-only must not POST: {other:?}"),
+    }
+}
+
+/// `XERJ_DISABLE_FEEDBACK=true` opts out: nothing is sent.
+#[test]
+fn disable_feedback_sends_nothing() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _off = EnvVar::set("XERJ_DISABLE_FEEDBACK", "true");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let code = run(&filled(
+        &format!("http://127.0.0.1:{port}/api/field-report"),
+        true,
+    ));
     assert_eq!(code, 0);
     match listener.accept() {
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-        other => panic!("--submit without --yes must not connect: {other:?}"),
+        other => panic!("an opted-out report must not be sent: {other:?}"),
     }
 }
 
 #[test]
-fn submit_yes_posts_json_and_sends_no_github_token() {
+fn submit_posts_json_and_sends_no_github_token() {
     let _lock = ENV_LOCK.lock().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -160,7 +250,7 @@ fn submit_yes_posts_json_and_sends_no_github_token() {
 }
 
 #[test]
-fn submit_yes_refuses_placeholders_without_connecting() {
+fn submit_refuses_placeholders_without_connecting() {
     let _lock = ENV_LOCK.lock().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -168,7 +258,7 @@ fn submit_yes_refuses_placeholders_without_connecting() {
     let mut cfg = parse(vec!["--submit".into(), "--no-autofill".into()])
         .unwrap()
         .unwrap();
-    cfg.yes = true;
+    cfg.no_github = true;
     cfg.endpoint = format!("http://127.0.0.1:{port}/api/field-report");
     let code = run(&cfg);
     assert_eq!(code, 2);

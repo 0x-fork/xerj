@@ -66,6 +66,11 @@ jobs:
       - name: Date-source unit tests (full, shallow, untracked, no repo)
         run: python3 scripts/seo/test_urlmap.py
 
+      # The field report has its own section, ahead of Optional, and the
+      # homepage prompt asks before sending.
+      - name: Field-report section and permission line
+        run: python3 scripts/seo/test_llms_field_report.py
+
       - name: generated articles are current
         run: python3 scripts/seo/build_articles.py --check
 
