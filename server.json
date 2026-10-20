@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.xerj-org/xerj",
+  "title": "XERJ",
+  "description": "Local-first BM25, vector and hybrid search, code search and agent memory over your indexed files.",
+  "version": "1.0.0-rc.97",
+  "websiteUrl": "https://xerj.org",
+  "repository": {
+    "url": "https://github.com/xerj-org/xerj",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/xerj-org/xerj/releases/download/v1.0.0-rc.97/xerj-mcp-1.0.0-rc.97.mcpb",
+      "fileSha256": "45731b9b0bb53fc471a15d3c5720f222a8a5c2de6f939fab870c95de4cede32a",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "XERJ_URL",
+          "description": "ES-compatible listener of a running XERJ node (start one with `xerj --insecure --data-dir ~/xerj-data`).",
+          "default": "http://localhost:9200",
+          "isRequired": false
+        },
+        {
+          "name": "XERJ_AUTH",
+          "description": "Authorization header for a node with auth on, e.g. 'ApiKey <key>'. Optional for a loopback node: the key is read from <data-dir>/admin.key.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
