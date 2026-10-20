@@ -7217,13 +7217,27 @@ pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
                 if let Some(field_map) = query_body.as_object() {
                     for (field, expected) in field_map {
                         let actual_values = extract_field_values(doc, field);
-                        let prefix = match expected {
-                            Value::Object(o) => {
-                                o.get("value").map(value_to_string).unwrap_or_default()
-                            }
-                            other => value_to_string(other),
+                        let (prefix, case_insensitive) = match expected {
+                            Value::Object(o) => (
+                                o.get("value").map(value_to_string).unwrap_or_default(),
+                                o.get("case_insensitive")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                            ),
+                            other => (value_to_string(other), false),
                         };
-                        if !actual_values.iter().any(|v| v.starts_with(&prefix)) {
+                        // #1812: fold both sides when `case_insensitive` is
+                        // set, mirroring the `wildcard` arm above and the
+                        // keyword branch of `QueryNode::Prefix` (index.rs).
+                        let matched = if case_insensitive {
+                            let prefix_lc = prefix.to_lowercase();
+                            actual_values
+                                .iter()
+                                .any(|v| v.to_lowercase().starts_with(&prefix_lc))
+                        } else {
+                            actual_values.iter().any(|v| v.starts_with(&prefix))
+                        };
+                        if !matched {
                             return false;
                         }
                     }
@@ -7273,11 +7287,14 @@ pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
                 if let Some(field_map) = query_body.as_object() {
                     for (field, expected) in field_map {
                         let actual_values = extract_field_values(doc, field);
-                        let pattern = match expected {
-                            Value::Object(o) => {
-                                o.get("value").map(value_to_string).unwrap_or_default()
-                            }
-                            other => value_to_string(other),
+                        let (pattern, case_insensitive) = match expected {
+                            Value::Object(o) => (
+                                o.get("value").map(value_to_string).unwrap_or_default(),
+                                o.get("case_insensitive")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                            ),
+                            other => (value_to_string(other), false),
                         };
                         // #959: `regexp` had no arm at all and fell through
                         // the catch-all ("unknown filter type — pass
@@ -7289,6 +7306,15 @@ pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
                         // multi-valued field — mirroring `QueryNode::Regexp`
                         // (index.rs). An invalid pattern matches nothing,
                         // same as the doc-scan arm.
+                        // #1812: `case_insensitive` prepends the inline
+                        // `(?i)` flag inside the same anchored compile —
+                        // still a full-string match, mirroring the query
+                        // path's keyword branch.
+                        let pattern = if case_insensitive {
+                            format!("(?i){}", pattern)
+                        } else {
+                            pattern
+                        };
                         let matched = crate::index::compiled_anchored_regex(&pattern)
                             .map(|re| actual_values.iter().any(|v| re.is_match(v)))
                             .unwrap_or(false);

@@ -490,6 +490,12 @@ pub enum QueryNode {
         /// match_bool_prefix) that keep BM25 scoring.
         #[serde(default, skip_serializing_if = "is_false")]
         constant_score: bool,
+        /// #1812: fold case on both sides when matching a KEYWORD field.
+        /// `false` (default) = ES-correct case-sensitive keyword prefix.
+        /// `true` is set for `prefix{case_insensitive:true}`.
+        /// Ignored for `text` fields.
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
     },
 
     /// Wildcard pattern match (`?` = any char, `*` = zero-or-more chars).
@@ -714,7 +720,15 @@ pub enum QueryNode {
     },
 
     /// Regular expression match against a field value.
-    Regexp { field: String, pattern: String },
+    Regexp {
+        field: String,
+        pattern: String,
+        /// #1812: fold case on both sides when matching a KEYWORD field.
+        /// `false` (default) = ES-correct case-sensitive keyword regexp.
+        /// Ignored for `text` fields.
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
+    },
 
     /// Position-aware text match (ES `intervals` query). The `rule` is the
     /// raw rule JSON (one of match/all_of/any_of/prefix/wildcard/fuzzy,

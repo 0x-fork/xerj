@@ -924,6 +924,7 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
                     value: tokens[0].clone(),
                     boost: fb,
                     constant_score: false,
+                    case_insensitive: false,
                 };
                 should.push(prefix);
                 continue;
@@ -957,6 +958,7 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
                 value: tokens[last].clone(),
                 boost: None,
                 constant_score: false,
+                case_insensitive: false,
             });
             let (im, is, imm) = if operator_and {
                 (inner_clauses, vec![], None)
@@ -1301,6 +1303,7 @@ fn parse_prefix(params: &Value) -> Result<QueryNode> {
             value: value.to_string(),
             boost: None,
             constant_score: true,
+            case_insensitive: false,
         });
     }
 
@@ -1326,6 +1329,10 @@ fn parse_prefix(params: &Value) -> Result<QueryNode> {
             value,
             boost,
             constant_score: true,
+            case_insensitive: inner
+                .get("case_insensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
         name,
     ))
@@ -2413,6 +2420,7 @@ fn parse_regexp(params: &Value) -> Result<QueryNode> {
         return Ok(QueryNode::Regexp {
             field,
             pattern: pattern.to_string(),
+            case_insensitive: false,
         });
     }
 
@@ -2421,7 +2429,15 @@ fn parse_regexp(params: &Value) -> Result<QueryNode> {
         .ok_or_else(|| qerr("`regexp` field value must be a string or object"))?;
 
     let pattern = string_field(inner, "value")?;
-    Ok(QueryNode::Regexp { field, pattern })
+    let case_insensitive = inner
+        .get("case_insensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(QueryNode::Regexp {
+        field,
+        pattern,
+        case_insensitive,
+    })
 }
 
 fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
@@ -4728,6 +4744,7 @@ fn parse_match_bool_prefix(params: &Value) -> Result<QueryNode> {
             value: fold(&raw_tokens[0]),
             boost: None,
             constant_score: true,
+            case_insensitive: false,
         });
     }
 
@@ -4764,6 +4781,9 @@ fn parse_match_bool_prefix(params: &Value) -> Result<QueryNode> {
         value: fold(&raw_tokens[last_idx]),
         boost: None,
         constant_score: false,
+        // `match_bool_prefix` lowers to an internal prefix over ANALYZED
+        // tokens — no user-facing `case_insensitive` option to thread.
+        case_insensitive: false,
     });
 
     // operator:and → every clause must match; otherwise should + mm.

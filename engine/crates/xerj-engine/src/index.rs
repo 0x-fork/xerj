@@ -23961,7 +23961,12 @@ impl Index {
                         sort_cand
                             .as_ref()
                             .map(|sc| Arc::new(PrefilterSet::from_set(sc.set.clone())))
-                    } else if let QueryNode::Regexp { field, pattern } = query {
+                    } else if let QueryNode::Regexp {
+                        field,
+                        pattern,
+                        case_insensitive,
+                    } = query
+                    {
                         // Dictionary-expansion pre-filter (mirrors the
                         // `try_shortcut_count` Regexp arm).  When the
                         // exact total comes from the shortcut
@@ -23991,15 +23996,37 @@ impl Index {
                         } else {
                             None
                         };
-                        self.build_regexp_prefilter_cached(
-                            &segments_dir,
-                            &seg_id,
-                            field,
-                            pattern,
-                            cap,
-                            regexp_field_is_keyword,
-                        )
-                        .map(|s| Arc::new(PrefilterSet::from_set(s)))
+                        // #1812: the dictionary expansion compiles this same
+                        // pattern, so it must carry the inline `(?i)` flag too
+                        // — a case-sensitive expansion would pre-filter away
+                        // exactly the hits the (case-insensitive) doc-scan arm
+                        // would have matched.  This arm is a CANDIDATE filter:
+                        // the scan re-checks every position against
+                        // `doc_matches_query`, so a folded (wider) candidate
+                        // set is safe for any field type, and required for
+                        // keyword (where the doc-scan folds too).
+                        if *case_insensitive {
+                            let folded = format!("(?i){}", pattern);
+                            self.build_regexp_prefilter_cached(
+                                &segments_dir,
+                                &seg_id,
+                                field,
+                                &folded,
+                                cap,
+                                regexp_field_is_keyword,
+                            )
+                            .map(|s| Arc::new(PrefilterSet::from_set(s)))
+                        } else {
+                            self.build_regexp_prefilter_cached(
+                                &segments_dir,
+                                &seg_id,
+                                field,
+                                pattern,
+                                cap,
+                                regexp_field_is_keyword,
+                            )
+                            .map(|s| Arc::new(PrefilterSet::from_set(s)))
+                        }
                     } else {
                         None
                     };
@@ -28151,7 +28178,12 @@ impl Index {
         // segment has neither source (dotted / nested fields, pre-FTS
         // segments) or when deletes are present (both dictionaries tally
         // physical docs, not live ones).
-        if let QueryNode::Regexp { field, pattern } = query {
+        if let QueryNode::Regexp {
+            field,
+            pattern,
+            case_insensitive,
+        } = query
+        {
             // Delete-blind guard — same conservative signal as the F1
             // `deletes_present` gate in `search_inner`.
             let seg_physical: u64 = snap.segments.iter().map(|m| m.doc_count).sum();
@@ -28181,6 +28213,20 @@ impl Index {
                 // per query after that.  `None` (no usable dictionary /
                 // non-keyword field / pathological pattern) abandons to
                 // the stored-doc scan.
+                //
+                // #1812: this shortcut's segment total is used VERBATIM (no
+                // doc-scan re-check), so a `case_insensitive` pattern must
+                // also fold inside the dictionary expansion — otherwise the
+                // count would silently drop the case-variant matches the
+                // doc-scan arm would return.  Gated on `field_is_keyword`,
+                // the same gate the doc-scan arm applies.
+                let folded;
+                let pattern: &str = if *case_insensitive && field_is_keyword {
+                    folded = format!("(?i){}", pattern);
+                    &folded
+                } else {
+                    pattern
+                };
                 let exp = self.regexp_segment_expansion(
                     &segments_dir,
                     &meta.id,
@@ -42813,6 +42859,7 @@ mod lexically_typeless_lowering_tests {
                 value: "0".into(),
                 boost: None,
                 constant_score: true,
+                case_insensitive: false,
             },
             QueryNode::Wildcard {
                 field: "emb".into(),
@@ -44158,11 +44205,13 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             value,
             boost,
             constant_score,
+            case_insensitive,
         } => QueryNode::Prefix {
             field: strip(field),
             value: value.clone(),
             boost: *boost,
             constant_score: *constant_score,
+            case_insensitive: *case_insensitive,
         },
         QueryNode::Wildcard {
             field,
@@ -44236,9 +44285,14 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             case_insensitive: *case_insensitive,
             prefix_length: *prefix_length,
         },
-        QueryNode::Regexp { field, pattern } => QueryNode::Regexp {
+        QueryNode::Regexp {
+            field,
+            pattern,
+            case_insensitive,
+        } => QueryNode::Regexp {
             field: strip(field),
             pattern: pattern.clone(),
+            case_insensitive: *case_insensitive,
         },
         QueryNode::MultiMatch {
             fields,
@@ -46153,11 +46207,16 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
             _ => get_field_value(source, field).is_some_and(|v| value_present(&v)),
         },
 
-        QueryNode::Prefix { field, value, .. } => {
+        QueryNode::Prefix {
+            field,
+            value,
+            case_insensitive,
+            ..
+        } => {
             // #396: prefix semantics depend on the field's mapping, and ES never
             // analyses the prefix VALUE itself.
-            //  - keyword: match the RAW stored value, case-SENSITIVE ("Hello"
-            //    does not start with "hel").
+            //  - keyword: match the RAW stored value, case-SENSITIVE by default
+            //    ("Hello" does not start with "hel") unless `case_insensitive` true.
             //  - analysed text: match the analysed (lower-cased) token stream
             //    against the RAW query ("hel" prefixes "hello"; "Hel" does not).
             //  - unknown field (schemaless shim caller — no `Schema` in scope):
@@ -46169,7 +46228,11 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
             let value_lc = value.to_lowercase();
             let matches_str = |s: &str| -> bool {
                 if is_keyword {
-                    s.starts_with(value.as_str())
+                    if *case_insensitive {
+                        s.to_lowercase().starts_with(&value_lc)
+                    } else {
+                        s.starts_with(value.as_str())
+                    }
                 } else if is_text {
                     s.split(|c: char| !c.is_alphanumeric()).any(|tok| {
                         !tok.is_empty() && tok.to_lowercase().starts_with(value.as_str())
@@ -47031,13 +47094,28 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
                 .unwrap_or(false)
         }
 
-        QueryNode::Regexp { field, pattern } => {
+        QueryNode::Regexp {
+            field,
+            pattern,
+            case_insensitive,
+        } => {
             get_field_value(source, field)
                 .and_then(|v| match v {
                     Value::String(s) => {
                         // Compile-once (thread-local cache) — this arm runs
                         // per candidate doc and used to recompile every time.
-                        compiled_anchored_regex(pattern).map(|re| re.is_match(&s))
+                        // #1812: `case_insensitive` on a KEYWORD field compiles
+                        // the same anchored pattern with the inline `(?i)` flag
+                        // (still full-string match — the anchored wrapper is
+                        // unchanged, so complex patterns keep ES semantics).
+                        let ft = declared_field(schema, field).map(|f| &f.field_type);
+                        let is_keyword = matches!(ft, Some(FieldType::Keyword));
+                        if is_keyword && *case_insensitive {
+                            compiled_anchored_regex(&format!("(?i){}", pattern))
+                                .map(|re| re.is_match(&s))
+                        } else {
+                            compiled_anchored_regex(pattern).map(|re| re.is_match(&s))
+                        }
                     }
                     _ => None,
                 })
@@ -52290,6 +52368,7 @@ fn query_node_to_fts_projected(
             value,
             boost,
             constant_score,
+            case_insensitive,
         } => {
             // `prefix` on a KEYWORD field: whole-value, case-sensitive prefix
             // match over the keyword FST term dictionary — byte-identical to ES
@@ -52306,7 +52385,17 @@ fn query_node_to_fts_projected(
             // exact.  TEXT fields keep the doc-scan (None): their prefix runs
             // against analyzed tokens, which the FST-whole-value route can't
             // reproduce.
+            //
+            // #1812: `case_insensitive: true` makes the KEYWORD FST route
+            // bail to the brute scan — that route expands CASE-SENSITIVELY
+            // and can't fold, while the doc-scan arm folds both sides for
+            // keyword fields.  TEXT keeps its route: analyzed terms are
+            // already lowercased and the pattern is matched raw (flag
+            // irrelevant on text, per ES).
             if exact_fields.contains(field.as_str()) {
+                if *case_insensitive {
+                    return None;
+                }
                 return Some(FtsQuery::Prefix(xerj_fts::search::PrefixQuery {
                     field: field.clone(),
                     prefix: value.clone(),
@@ -53828,14 +53917,25 @@ fn scored_fast_plan(
             value,
             boost,
             constant_score: true,
-        } if fs.kw.contains(field) => Some(ScoredPlan::Filtered {
-            filter: vec![ScoredFilterLeaf::KeywordPrefix {
-                field: field.clone(),
-                prefix: value.clone(),
-            }],
-            must_not: Vec::new(),
-            score: scoring_boost(boost)?,
-        }),
+            case_insensitive,
+        } if fs.kw.contains(field) => {
+            // #1812: the keyword-ordinal prefix filter is case-SENSITIVE —
+            // a `case_insensitive` prefix must fall through to the brute
+            // scan (which folds both sides), like the `Wildcard` arm below
+            // threads the flag into its filter instead.
+            if *case_insensitive {
+                None
+            } else {
+                Some(ScoredPlan::Filtered {
+                    filter: vec![ScoredFilterLeaf::KeywordPrefix {
+                        field: field.clone(),
+                        prefix: value.clone(),
+                    }],
+                    must_not: Vec::new(),
+                    score: scoring_boost(boost)?,
+                })
+            }
+        }
         QueryNode::Wildcard {
             field,
             value,
@@ -56101,6 +56201,7 @@ mod fts_projection_tests {
             value: "run".into(),
             boost: None,
             constant_score: true,
+            case_insensitive: false,
         };
         match query_node_to_fts(&q, &tf, &kw(&[])).expect("text prefix projects") {
             FtsQuery::Prefix(p) => {
@@ -60725,6 +60826,7 @@ mod exact_scan_hydration_tests {
                 value: "t".into(),
                 boost: None,
                 constant_score: false,
+                case_insensitive: false,
             },
             QueryNode::Bool {
                 must: vec![exists("tag")],
