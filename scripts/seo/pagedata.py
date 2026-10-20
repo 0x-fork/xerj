@@ -24,7 +24,10 @@ Fields
     og_image     optional per-page Open Graph card, as a landing-relative PNG
                  path under og/ (e.g. "og/does-xerj-beat-jev.png").  Omit to
                  keep the site-wide card.  og_image_alt accompanies it; both
-                 width and height stay the site-wide 1200x630.
+                 width and height stay the site-wide 1200x630.  Blog posts use
+                 og/blog-<slug>.png, rendered with the in-post hero and the
+                 index thumbnail by scripts/seo/blog_covers/covers.py; keep
+                 og_image_alt equal to that post's `og_alt` in covers.POSTS.
     published /  optional pinned dates for article-kind pages (the blog).
     updated      When set they feed datePublished/dateModified verbatim, so
                  the generated head does not drift with git history.
@@ -88,6 +91,9 @@ PAGES: dict[str, dict[str, str]] = {
         description="XERJ v1.0.0-rc.6 against Elasticsearch 8.13.4 across 88 measured cells — 55 win, 26 tie, 4 lose, 3 n/a — plus the four commands that reproduce every one.",
     ),
     # ── blog ────────────────────────────────────────────────────────────────
+    # Every post's og_image is its cover from the field-log series
+    # (scripts/seo/blog_covers/, README there); og_image_alt describes only
+    # what that card draws.
     # The Jev write-up lives under /blog since 2026-09-21; it was git-mv'd
     # from benchmarks/decisions.html (which 301s to it via landing/_redirects).
     # published/updated are pinned so datePublished/dateModified do not drift
@@ -100,12 +106,8 @@ PAGES: dict[str, dict[str, str]] = {
         # 2026-09-27: added the closing 05 section (verdict + try-it); measurement
         # content unchanged. updated follows the edit, published stays pinned.
         updated="2026-09-27",
-        og_image="og/does-xerj-beat-jev.png",
-        # alt text must describe only what the committed 1200x630 card
-        # renders — the token count is NOT on the image (strip: queries,
-        # $0.6375 vs $0, URL); scripts/seo/assets/og-blog-*.html is the
-        # source of record for what is on it.
-        og_image_alt="XERJ vs JEV, measured: SciFact, NFCorpus and FiQA nDCG@10 over 1,271 judged queries, and the FiQA judge bill — $0.6375 against $0 local",
+        og_image="og/blog-does-xerj-beat-jev.png",
+        og_image_alt="Cover: “Does XERJ beat JEV?” in display type beside the post’s square-matrix art, labelled with its figures. The art: three pairs of square-matrix bars, ink for XERJ and blue for BM25+Jev, over one long blue bar and a single yellow square for the zero-cost local run",
     ),
     # Decisions study, 2026-09-22. published/updated pinned so the schema dates
     # do not drift with git (same reason as the post above). Prose written to the
@@ -118,6 +120,8 @@ PAGES: dict[str, dict[str, str]] = {
         # 2026-09-27: added the closing 08 section (takeaway + try-it); measurement
         # content unchanged. updated follows the edit, published stays pinned.
         updated="2026-09-27",
+        og_image="og/blog-jev-vs-a-bm25-vote.png",
+        og_image_alt="Cover: “A BM25 vote ties Jev on spam and beats it on intent” in display type beside the post’s square-matrix art, labelled with its figures. The art: two grids of 500 squares, filled for correct answers; the ink grid has a band of yellow squares where it beats the blue grid",
     ),
     # Size-epic stage-1 write-up, 2026-09-27. published/updated pinned like the
     # two posts above; in-body run dates stay 2026-09-26/27.
@@ -126,6 +130,8 @@ PAGES: dict[str, dict[str, str]] = {
         title="Cutting the index 28%: dissect first, write Rust second",
         description="Four file-format changes took our 100k-doc index from 5.52 MB to 3.99 MB (−28%), each gated on dissecting real segments first. The losing rows are in the post.",
         published="2026-09-27", updated="2026-09-27",
+        og_image="og/blog-cutting-the-index-28-percent.png",
+        og_image_alt="Cover: “Cutting the index 28%” in display type beside the post’s square-matrix art, labelled with its figures. The art: a large ink block of squares wrapped in a yellow L-shaped band that marks the 28% cut, beside two pairs of thin before-and-after bars",
     ),
     # Corpus-pack GTM post, 2026-09-27. Every count traces to tools/packs/
     # rust-vulns/pack-stats.json (provenance "measured", pinned by test); the
@@ -135,6 +141,8 @@ PAGES: dict[str, dict[str, str]] = {
         title="One vulnerability, three names — and a pack we sign",
         description="The same Rust vulnerability arrives as RUSTSEC, GHSA and CVE. We collapsed 4,107 advisories to 1,950 identity-resolved records, packed them, and signed the pack — because no vulnerability database we surveyed does.",
         published="2026-09-27", updated="2026-09-27",
+        og_image="og/blog-one-vulnerability-three-names.png",
+        og_image_alt="Cover: “One vulnerability, three names” in display type beside the post’s square-matrix art, labelled with its figures. The art: three outlined boxes trailing lines of small squares that converge on one square-matrix disc with a yellow seal at its centre",
     ),
     # The rc.80 gates write-up, 2026-09-30 — the blog half of the packaging
     # rule for the ten-item program (#1055-#1064): every gate verdict, wins
@@ -145,6 +153,8 @@ PAGES: dict[str, dict[str, str]] = {
         title="The rc.80 gates: three passed outright, three failed, one split",
         description="Ten features, eight measured gates: /_ask macro-F1 0.9975, xerj_map 20/30 to 0/30, calibration ECE 0.0088 pass; the judge, the flywheel and the decide head fail their bars, numbers published.",
         published="2026-09-30", updated="2026-09-30",
+        og_image="og/blog-the-rc80-gates.png",
+        og_image_alt="Cover: “The rc.80 gates” in display type beside the post’s square-matrix art, labelled with its figures. The art: ten gates built from squares in two rows: three yellow with check marks, three ink with crosses, one half yellow and three faint",
     ),
     # Corpus Hub launch post, 2026-10-01. Numbers trace to: docs/case-studies/
     # reference-coding/SUMMARY.md (16/16, 9,982 vs 26,477, $1.58 vs $3.27),
@@ -156,6 +166,8 @@ PAGES: dict[str, dict[str, str]] = {
         title="The Corpus Hub: pinned, licenced, signed, contributed by PR",
         description="A public registry of corpora for AI agents: reference code pinned to SHAs, record packs ed25519-signed, every source licence-reviewed by a human. The measured use case (2.7× fewer output tokens), the tie we published anyway, and how to contribute yours by PR.",
         published="2026-10-01", updated="2026-10-01",
+        og_image="og/blog-the-corpus-hub.png",
+        og_image_alt="Cover: “The Corpus Hub” in display type beside the post’s square-matrix art, labelled with its figures. The art: a 10 by 10 wall of square-matrix pack tiles in shades of ink, the first four solid yellow and the fifth framed",
     ),
     # Guest post, 2026-10-07: Chunxiao Wang (Assay / nautilus-compass)
     # answered our practitioner invitation in #1118 + #1138. Every measurement
@@ -172,6 +184,8 @@ PAGES: dict[str, dict[str, str]] = {
         title="Six eval scars from a production agent-memory system",
         description="Guest recipes from Chunxiao Wang (Assay): topic slicing beat token windows on recall@1 by double digits, a 0.87 classifier nearly matched by a 0.78 always-yes baseline, and the mask bug that scored every query zero. Plus the corpus gap we checked and confirmed.",
         published="2026-10-07", updated="2026-10-11",
+        og_image="og/blog-eval-scars-from-agent-memory.png",
+        og_image_alt="Cover: “Six eval scars from production agent memory” in display type beside the post’s square-matrix art, labelled with its figures. The art: six clusters of diagonal scratch marks made of small squares, five in ink and one in yellow",
     ),
     # Exploit-hub A/B post, 2026-10-08. Every number traces to the
     # sealed-truth eval (/root/eval-holdout/EVAL-REPORT.md): 23744 route/
@@ -183,6 +197,8 @@ PAGES: dict[str, dict[str, str]] = {
         title="The exploit hub, tested on three fresh CVEs",
         description="We ran the exploit corpus against three CVEs it had never seen: one query named the exact route and field for one, an in-corpus 2026 exploit named the exact denylist segments the vendor shipped for another, and the third proved the corpus adds nothing when its stratum is empty. Losses included.",
         published="2026-10-08", updated="2026-10-08",
+        og_image="og/blog-the-exploit-hub.png",
+        og_image_alt="Cover: “The exploit hub, tested on three fresh CVEs” in display type beside the post’s square-matrix art, labelled with its figures. The art: a network of small square nodes; a yellow hub linked to 36 yellow nodes, an ink node with one link, and an empty square frame with none",
     ),
     "blog/index.html": dict(
         label="Blog", kind="collection",
