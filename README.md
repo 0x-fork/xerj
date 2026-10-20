@@ -1,5 +1,9 @@
 # XERJ
 
+**Local-first search engine and MCP server for AI agents.** One Rust binary indexes code, docs,
+logs, JSONL/CSV and PDFs for BM25 full-text, vector and hybrid search, code search and agent
+memory, behind an Elasticsearch-compatible API. Works with Claude Code, Cursor and any MCP client.
+
 <a href="https://trendshift.io/repositories/116361?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-116361" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/116361" alt="xerj-org%2Fxerj | Trendshift" width="250" height="55"/></a>
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [日本語](./README.ja-JP.md) | [العربية](./README.ar.md) | [Español](./README.es.md)
@@ -327,7 +331,7 @@ Use an absolute path. The installer puts `xerj` in `~/.local/bin` by default
 shell's `PATH`. If the node is running with auth (anything but `--insecure`), add
 `"XERJ_AUTH": "ApiKey <key>"` alongside `XERJ_URL`; the key is in `<data-dir>/admin.key`.
 
-Thirteen tools are exposed. Eleven are thin proxies over an endpoint XERJ already serves:
+Seventeen tools are exposed. Eleven are thin proxies over an endpoint XERJ already serves:
 
 | Tool | What it does |
 |---|---|
@@ -342,6 +346,8 @@ Thirteen tools are exposed. Eleven are thin proxies over an endpoint XERJ alread
 Two more are not plain proxies: `xerj_map` returns the per-index field map from the autoindex
 catalog (trimmed to a byte cap, otherwise verbatim), and `xerj_code_search` runs the `xerj code`
 reference-coding pipeline ([`tools/xerj-code/`](tools/xerj-code/)) and returns its rendered text.
+`xerj_field_report` files a field report, and `xerj_hub_find`, `xerj_hub_def` and `xerj_hub_ask`
+answer from Corpus Hub packs already on the machine (the `xerj ask` flow).
 
 `xerj mcp --help` prints the same config block and the full option list. The machine-readable
 tool schemas are published at
