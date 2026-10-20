@@ -7323,97 +7323,108 @@ pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
                         if values.is_empty() {
                             return false;
                         }
-                        // Try numeric range check.
-                        let num_val: Option<f64> = values.first().and_then(|s| s.parse().ok());
-                        if let Some(n) = num_val {
-                            if let Some(gte) = bounds.get("gte").and_then(Value::as_f64) {
-                                if n < gte {
-                                    return false;
-                                }
-                            }
-                            if let Some(gt) = bounds.get("gt").and_then(Value::as_f64) {
-                                if n <= gt {
-                                    return false;
-                                }
-                            }
-                            if let Some(lte) = bounds.get("lte").and_then(Value::as_f64) {
-                                if n > lte {
-                                    return false;
-                                }
-                            }
-                            if let Some(lt) = bounds.get("lt").and_then(Value::as_f64) {
-                                if n >= lt {
-                                    return false;
-                                }
-                            }
-                        } else {
-                            // Non-numeric value — a date or a keyword.  Before
-                            // this branch existed the `if let Some(n)` above
-                            // simply fell through, so a range over a DATE field
-                            // matched **every** document unconditionally: no
-                            // bound was ever compared. That silently inflated
-                            // any date-filtered agg served over memtable-
-                            // resident docs (measured: a one-day window on a
-                            // 1.12 M-doc index reported 135,972 hits instead of
-                            // 40,000 — the whole 95,972-doc memtable admitted
-                            // wholesale).
-                            //
-                            // Dates compare as instants (so `2026-06-17` and
-                            // `2026-06-17T00:00:00.000Z` are the same point);
-                            // anything that is not a date on both sides falls
-                            // back to lexicographic comparison, which is ES's
-                            // keyword-range semantics.
-                            let raw = Value::String(values[0].clone());
-                            let doc_ms = parse_date_ms(&raw);
-                            let bound_ms =
-                                |k: &str| -> Option<i64> { bounds.get(k).and_then(parse_date_ms) };
-                            if let Some(v) = doc_ms {
-                                if let Some(b) = bound_ms("gte") {
-                                    if v < b {
+                        // #1750 — a multi-valued field matches when ANY one
+                        // of its values satisfies EVERY bound (Lucene's
+                        // per-value semantics). Checking only `values[0]`
+                        // dropped a doc whose in-range value was not first.
+                        let in_range = |value: &str| -> bool {
+                            // Try numeric range check.
+                            let num_val: Option<f64> = value.parse().ok();
+                            if let Some(n) = num_val {
+                                if let Some(gte) = bounds.get("gte").and_then(Value::as_f64) {
+                                    if n < gte {
                                         return false;
                                     }
                                 }
-                                if let Some(b) = bound_ms("gt") {
-                                    if v <= b {
+                                if let Some(gt) = bounds.get("gt").and_then(Value::as_f64) {
+                                    if n <= gt {
                                         return false;
                                     }
                                 }
-                                if let Some(b) = bound_ms("lte") {
-                                    if v > b {
+                                if let Some(lte) = bounds.get("lte").and_then(Value::as_f64) {
+                                    if n > lte {
                                         return false;
                                     }
                                 }
-                                if let Some(b) = bound_ms("lt") {
-                                    if v >= b {
+                                if let Some(lt) = bounds.get("lt").and_then(Value::as_f64) {
+                                    if n >= lt {
                                         return false;
                                     }
                                 }
                             } else {
-                                let s = values[0].as_str();
-                                let bound_str = |k: &str| -> Option<&str> {
-                                    bounds.get(k).and_then(Value::as_str)
+                                // Non-numeric value — a date or a keyword.  Before
+                                // this branch existed the `if let Some(n)` above
+                                // simply fell through, so a range over a DATE field
+                                // matched **every** document unconditionally: no
+                                // bound was ever compared. That silently inflated
+                                // any date-filtered agg served over memtable-
+                                // resident docs (measured: a one-day window on a
+                                // 1.12 M-doc index reported 135,972 hits instead of
+                                // 40,000 — the whole 95,972-doc memtable admitted
+                                // wholesale).
+                                //
+                                // Dates compare as instants (so `2026-06-17` and
+                                // `2026-06-17T00:00:00.000Z` are the same point);
+                                // anything that is not a date on both sides falls
+                                // back to lexicographic comparison, which is ES's
+                                // keyword-range semantics.
+                                let raw = Value::String(value.to_string());
+                                let doc_ms = parse_date_ms(&raw);
+                                let bound_ms = |k: &str| -> Option<i64> {
+                                    bounds.get(k).and_then(parse_date_ms)
                                 };
-                                if let Some(b) = bound_str("gte") {
-                                    if s < b {
-                                        return false;
+                                if let Some(v) = doc_ms {
+                                    if let Some(b) = bound_ms("gte") {
+                                        if v < b {
+                                            return false;
+                                        }
                                     }
-                                }
-                                if let Some(b) = bound_str("gt") {
-                                    if s <= b {
-                                        return false;
+                                    if let Some(b) = bound_ms("gt") {
+                                        if v <= b {
+                                            return false;
+                                        }
                                     }
-                                }
-                                if let Some(b) = bound_str("lte") {
-                                    if s > b {
-                                        return false;
+                                    if let Some(b) = bound_ms("lte") {
+                                        if v > b {
+                                            return false;
+                                        }
                                     }
-                                }
-                                if let Some(b) = bound_str("lt") {
-                                    if s >= b {
-                                        return false;
+                                    if let Some(b) = bound_ms("lt") {
+                                        if v >= b {
+                                            return false;
+                                        }
+                                    }
+                                } else {
+                                    let s = value;
+                                    let bound_str = |k: &str| -> Option<&str> {
+                                        bounds.get(k).and_then(Value::as_str)
+                                    };
+                                    if let Some(b) = bound_str("gte") {
+                                        if s < b {
+                                            return false;
+                                        }
+                                    }
+                                    if let Some(b) = bound_str("gt") {
+                                        if s <= b {
+                                            return false;
+                                        }
+                                    }
+                                    if let Some(b) = bound_str("lte") {
+                                        if s > b {
+                                            return false;
+                                        }
+                                    }
+                                    if let Some(b) = bound_str("lt") {
+                                        if s >= b {
+                                            return false;
+                                        }
                                     }
                                 }
                             }
+                            true
+                        };
+                        if !values.iter().any(|v| in_range(v)) {
+                            return false;
                         }
                     }
                 }

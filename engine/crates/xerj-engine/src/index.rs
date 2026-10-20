@@ -28033,6 +28033,15 @@ impl Index {
                 (None, None) => (f64::INFINITY, true),
             };
             let field_str = field.as_str();
+            // #1750 — the memtable numeric column keeps only an array's
+            // first element, so `for_each_numeric_value` below would count a
+            // multi-valued doc by that element alone. Abandon to the counting
+            // scan, whose matcher checks every element. (Segments already
+            // abandon: a field that is an array anywhere in a segment gets no
+            // dv column, which is the `None` arm below.)
+            if self.memtable.range_column_unusable(field_str) {
+                return None;
+            }
 
             let segments_dir = self.data_dir.join("segments");
             let mut seg_matches: u64 = 0;
@@ -46126,69 +46135,12 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
             lte,
             lt,
             ..
-        } => {
-            let doc_val = get_field_value(source, field);
-            match doc_val {
-                Some(dv) => {
-                    // Check if we're comparing IP addresses.
-                    let doc_is_ip = dv
-                        .as_str()
-                        .map(|s| parse_ip_to_u128(s).is_some())
-                        .unwrap_or(false);
-                    let bound_is_ip = gte
-                        .as_ref()
-                        .or(gt.as_ref())
-                        .or(lte.as_ref())
-                        .or(lt.as_ref())
-                        .and_then(|b| b.as_str())
-                        .map(|s| parse_ip_to_u128(s).is_some())
-                        .unwrap_or(false);
-
-                    if doc_is_ip && bound_is_ip {
-                        // IP address comparison using numeric ordering.
-                        let doc_ip = parse_ip_to_u128(dv.as_str().unwrap_or("")).unwrap_or(0);
-                        let passes_lower = match (gte, gt) {
-                            (Some(b), _) => {
-                                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
-                                doc_ip >= bound
-                            }
-                            (None, Some(b)) => {
-                                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
-                                doc_ip > bound
-                            }
-                            (None, None) => true,
-                        };
-                        let passes_upper = match (lte, lt) {
-                            (Some(b), _) => {
-                                let bound =
-                                    b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
-                                doc_ip <= bound
-                            }
-                            (None, Some(b)) => {
-                                let bound =
-                                    b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
-                                doc_ip < bound
-                            }
-                            (None, None) => true,
-                        };
-                        passes_lower && passes_upper
-                    } else {
-                        let passes_lower = match (gte, gt) {
-                            (Some(b), _) => json_compare(&dv, b) >= 0,
-                            (None, Some(b)) => json_compare(&dv, b) > 0,
-                            (None, None) => true,
-                        };
-                        let passes_upper = match (lte, lt) {
-                            (Some(b), _) => json_compare(&dv, b) <= 0,
-                            (None, Some(b)) => json_compare(&dv, b) < 0,
-                            (None, None) => true,
-                        };
-                        passes_lower && passes_upper
-                    }
-                }
-                None => false,
+        } => match get_field_value(source, field) {
+            Some(dv) => {
+                range_value_matches(&dv, gte.as_ref(), gt.as_ref(), lte.as_ref(), lt.as_ref())
             }
-        }
+            None => false,
+        },
 
         QueryNode::Exists { field } => match field.as_str() {
             "_id" | "_index" | "_seq_no" | "_version" | "_primary_term" => true,
@@ -50516,6 +50468,85 @@ fn compute_sort_values(
         sort_vals.push(v);
     }
     sort_vals
+}
+
+/// `_source` matcher for one `range` clause against a field value.
+///
+/// #1750 — a multi-valued field matches when ANY single element satisfies
+/// EVERY bound, which is Lucene's per-value point semantics and what ES 8.13
+/// returns. Comparing the array itself sent `json_compare` to its serialized
+/// text (`["alpha","mid"]`, `[22,8080]`), and because `'['` sorts after every
+/// digit and before every lowercase letter, an array passed any numeric/date
+/// lower bound, failed any upper bound, and failed a keyword `gte "m"` —
+/// whatever its elements were. The bounds are deliberately NOT split across
+/// elements: `["2020-01-01","2024-06-01"]` is outside
+/// `[2021-01-01, 2023-01-01)` even though one element clears each bound.
+/// Nested arrays flatten (ES indexes `[[1,2],3]` as three values) and `null`
+/// elements are skipped, as ES does not index them.
+fn range_value_matches(
+    dv: &Value,
+    gte: Option<&Value>,
+    gt: Option<&Value>,
+    lte: Option<&Value>,
+    lt: Option<&Value>,
+) -> bool {
+    if let Value::Array(arr) = dv {
+        return arr
+            .iter()
+            .any(|elem| !elem.is_null() && range_value_matches(elem, gte, gt, lte, lt));
+    }
+    // Check if we're comparing IP addresses.
+    let doc_is_ip = dv
+        .as_str()
+        .map(|s| parse_ip_to_u128(s).is_some())
+        .unwrap_or(false);
+    let bound_is_ip = gte
+        .or(gt)
+        .or(lte)
+        .or(lt)
+        .and_then(|b| b.as_str())
+        .map(|s| parse_ip_to_u128(s).is_some())
+        .unwrap_or(false);
+
+    if doc_is_ip && bound_is_ip {
+        // IP address comparison using numeric ordering.
+        let doc_ip = parse_ip_to_u128(dv.as_str().unwrap_or("")).unwrap_or(0);
+        let passes_lower = match (gte, gt) {
+            (Some(b), _) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
+                doc_ip >= bound
+            }
+            (None, Some(b)) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
+                doc_ip > bound
+            }
+            (None, None) => true,
+        };
+        let passes_upper = match (lte, lt) {
+            (Some(b), _) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
+                doc_ip <= bound
+            }
+            (None, Some(b)) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
+                doc_ip < bound
+            }
+            (None, None) => true,
+        };
+        passes_lower && passes_upper
+    } else {
+        let passes_lower = match (gte, gt) {
+            (Some(b), _) => json_compare(dv, b) >= 0,
+            (None, Some(b)) => json_compare(dv, b) > 0,
+            (None, None) => true,
+        };
+        let passes_upper = match (lte, lt) {
+            (Some(b), _) => json_compare(dv, b) <= 0,
+            (None, Some(b)) => json_compare(dv, b) < 0,
+            (None, None) => true,
+        };
+        passes_lower && passes_upper
+    }
 }
 
 pub(crate) fn get_field_value(source: &Value, field: &str) -> Option<Value> {

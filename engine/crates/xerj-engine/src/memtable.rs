@@ -2379,6 +2379,23 @@ impl ShardedFtsMemtable {
         self.dv_column_unusable(field)
     }
 
+    /// True when ANY generation's single-valued numeric column for `field`
+    /// cannot answer a `range`: the field has carried an array, and
+    /// `push_field` keeps only the array's first element, so a document
+    /// whose later element is in range would be missed (#1750). Callers
+    /// must fall back to the stored-source scan, whose range matcher checks
+    /// every element. Narrower than [`Self::dv_column_unusable`]: whitespace
+    /// keyword values do not affect the numeric column.
+    pub fn range_column_unusable(&self, field: &str) -> bool {
+        self.shards.iter().any(|s| {
+            let g = s.read();
+            g.active.doc_values.array_fields.contains(field)
+                || g.frozen
+                    .iter()
+                    .any(|fz| fz.gen.read().doc_values.array_fields.contains(field))
+        })
+    }
+
     /// DocValues term query — aggregates hits across all shards.
     /// Returns `Some(Vec<(doc_id, local_idx)>)` if any shard matched.
     /// The `local_idx` is shard-local; callers use the doc_id to
@@ -2536,6 +2553,12 @@ impl ShardedFtsMemtable {
         lt: Option<f64>,
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
+        // #1750 — refuse globally, before any shard answers: a shard whose
+        // column holds only an array's first element must not be folded into
+        // a confident partial total (the #332 shape, for range).
+        if self.range_column_unusable(field) {
+            return None;
+        }
         // #191 — per-shard bound + global `(seq_no, _id)` narrowing, as in
         // `doc_values_term_query`.
         let mut cands: Vec<(u64, String, usize)> = Vec::new();
@@ -4394,6 +4417,10 @@ impl FtsMemtable {
         lte: Option<f64>,
         lt: Option<f64>,
     ) -> Option<Vec<usize>> {
+        // #1750 — the column holds only an array's first element.
+        if self.doc_values.array_fields.contains(field) {
+            return None;
+        }
         let col = self.doc_values.numeric.get(field)?;
         let results: Vec<usize> = col
             .iter()
@@ -4494,7 +4521,8 @@ impl FtsMemtable {
     ///
     /// Parameters mirror the ES range query: `gte` / `gt` / `lte` / `lt`.
     ///
-    /// Returns `None` when the field has no numeric column (fall back to JSON scan).
+    /// Returns `None` when the field has no numeric column, or has carried an
+    /// array (fall back to JSON scan).
     pub fn doc_values_range_query(
         &self,
         field: &str,
@@ -4504,6 +4532,12 @@ impl FtsMemtable {
         lt: Option<f64>,
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
+        // #1750 — an array-valued field keeps only its first element in the
+        // numeric column; bail to the array-aware source scan, as
+        // `doc_values_bool_hits` already does for the same predicate.
+        if self.doc_values.array_fields.contains(field) {
+            return None;
+        }
         let col = self.doc_values.numeric.get(field)?;
         // Step 1: exact total, bounded doc_id materialisation — the
         // unbounded id clone was the biggest read-under-write term for
