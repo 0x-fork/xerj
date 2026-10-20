@@ -32,6 +32,11 @@ pub struct RenderOpts<'a> {
     /// caller that knows the hit came from a lexical query may turn the
     /// ordinal into a file line.
     pub lexical_lines: bool,
+    /// The corpus checkout (`<root>/corpora/<corpus>`), when it is on this
+    /// machine. Prose records (Markdown, text, HTML sections) store no file
+    /// line, and their passage ordinal counts lines of the re-flowed SECTION,
+    /// not of the file; with the checkout the line is found in the file itself.
+    pub checkout: Option<&'a std::path::Path>,
 }
 
 /// The longest non-empty string field of a source object (excluding `ax_*`
@@ -122,21 +127,83 @@ fn note_line(note: &str, meatl: bool) -> String {
 /// `file:line` when the record or a lexical `_passage` carries one.
 /// Otherwise `file (line unknown)` — a bare path reads as a finished
 /// citation, and a semantic chunk ordinal is not a line.
+#[cfg(test)]
 fn citation(hit: &Value, lexical_lines: bool) -> String {
+    citation_in(hit, lexical_lines, None)
+}
+
+/// [`citation`] with the corpus checkout. A prose section record (it has a
+/// `section` field, or an `s<N>` locator) never turns its passage ordinal into a
+/// file line: that ordinal counts lines of the re-flowed section, so every
+/// Markdown hit used to read `file:1` or `file (line unknown)` (issue #1892).
+/// With the checkout, the passage's first distinctive line is looked up in the
+/// file and its real line number is cited.
+fn citation_in(hit: &Value, lexical_lines: bool, checkout: Option<&std::path::Path>) -> String {
     let src = hit.get("_source").unwrap_or(&Value::Null);
     let path = ["ax_path", "ax_file", "path", "file"]
         .iter()
         .find_map(|k| src.get(*k).and_then(Value::as_str))
         .unwrap_or("?");
-    let line = ["line", "start_line", "lineno"]
+    let stored = ["line", "start_line", "lineno"]
         .iter()
         .find_map(|k| src.get(*k).and_then(Value::as_u64))
-        .filter(|n| *n != 0)
-        .or_else(|| lexical_passage_line(hit, lexical_lines));
+        .filter(|n| *n != 0);
+    let line = stored.or_else(|| {
+        if is_prose_section(src) {
+            checkout.and_then(|dir| line_in_checkout(hit, src, dir, path))
+        } else {
+            lexical_passage_line(hit, lexical_lines)
+        }
+    });
     match line {
         Some(n) => format!("{path}:{n}"),
         None => format!("{path} (line unknown)"),
     }
+}
+
+/// A record cut from prose by the document extractor: `section` is stamped on
+/// multi-section documents, and the locator is `s<N>` (or `<prefix>-s<N>`).
+fn is_prose_section(src: &Value) -> bool {
+    if src.get("section").is_some() {
+        return true;
+    }
+    let loc = src.get("ax_locator").and_then(Value::as_str).unwrap_or("");
+    let tail = loc.rsplit('-').next().unwrap_or(loc);
+    tail.len() > 1 && tail.starts_with('s') && tail[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A line distinctive enough to look up: at least 12 non-space characters.
+fn distinctive_line(text: &str) -> Option<&str> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.chars().filter(|c| !c.is_whitespace()).count() >= 12)
+}
+
+/// 1-based line of the passage (or, without one, of the section start) in the
+/// checked-out file. `None` when the file is not there, the path would leave
+/// the checkout, or the text is not found verbatim.
+fn line_in_checkout(hit: &Value, src: &Value, dir: &std::path::Path, rel: &str) -> Option<u64> {
+    let rel_path = std::path::Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let passage = hit
+        .pointer("/fields/_passage/0/text")
+        .and_then(Value::as_str)
+        .and_then(distinctive_line);
+    let section = src
+        .get("body")
+        .and_then(Value::as_str)
+        .and_then(distinctive_line);
+    let needle = passage.or(section)?;
+    let file = std::fs::read_to_string(dir.join(rel_path)).ok()?;
+    file.lines()
+        .position(|l| l.contains(needle))
+        .map(|i| i as u64 + 1)
 }
 
 /// 1-based file line from a lexical passage. `ordinal` is a chunk index
@@ -160,7 +227,7 @@ fn lexical_passage_line(hit: &Value, lexical_lines: bool) -> Option<u64> {
 
 fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) -> String {
     let src = h.get("_source").cloned().unwrap_or(Value::Null);
-    let loc = citation(h, opts.lexical_lines);
+    let loc = citation_in(h, opts.lexical_lines, opts.checkout);
     let score = h.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
     let lic = licences
         .get(locator_repo(&loc))
@@ -329,6 +396,7 @@ mod tests {
                 age_days: Some(3),
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -361,6 +429,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -401,6 +470,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -435,6 +505,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -475,6 +546,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -514,6 +586,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -555,6 +628,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -580,6 +654,7 @@ mod tests {
                 age_days: None,
                 strict_licence: true,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -606,6 +681,7 @@ mod tests {
                 age_days: None,
                 strict_licence: true,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -627,6 +703,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -656,6 +733,7 @@ mod tests {
                 age_days: Some(2),
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             Some("hybrid RRF(k=60) — BM25 over 9 index(es), vector over 3 of 9"),
         );
@@ -694,6 +772,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: false,
+                checkout: None,
             },
             None,
         );
@@ -745,6 +824,7 @@ mod tests {
                 age_days: None,
                 strict_licence: false,
                 lexical_lines: true,
+                checkout: None,
             },
             None,
         );
@@ -778,5 +858,53 @@ mod tests {
             }]}
         });
         assert_eq!(citation(&defs, true), "a.rs (line unknown)");
+    }
+
+    #[test]
+    fn prose_section_cites_the_file_line_from_the_checkout() {
+        // issue #1892: Markdown sections printed `(line unknown)`, or `:1` from a
+        // section-relative passage ordinal, while the footer asked for file:line.
+        let dir = std::env::temp_dir().join(format!("xc-prose-lines-{}", std::process::id()));
+        let doc = dir.join("book/Concurrency.md");
+        std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
+        std::fs::write(
+            &doc,
+            "# Concurrency\n\nIntro paragraph.\n\n```swift\nasync let firstPhoto = downloadPhoto(named: photoNames[0])\n```\n",
+        )
+        .unwrap();
+        let hit = json!({
+            "_source": { "ax_path": "book/Concurrency.md", "ax_locator": "s3", "section": 3,
+                         "body": "Intro paragraph.\n\nasync let firstPhoto = downloadPhoto(named: photoNames[0])" },
+            "fields": { "_passage": [{ "field": "body", "ordinal": 0, "start_offset": 18,
+                         "text": "async let firstPhoto = downloadPhoto(named: photoNames[0])" }]}
+        });
+        assert_eq!(citation_in(&hit, true, Some(&dir)), "book/Concurrency.md:6");
+        // without the checkout a section-relative ordinal is never passed off as a line
+        assert_eq!(
+            citation_in(&hit, true, None),
+            "book/Concurrency.md (line unknown)"
+        );
+        // a single-section file (locator s0, no `section` field) is prose too
+        let single = json!({
+            "_source": { "ax_path": "book/Concurrency.md", "ax_locator": "s0", "body": "Intro paragraph that is long." },
+            "fields": { "_passage": [{ "field": "body", "ordinal": 0, "start_offset": 0, "text": "Intro paragraph." }]}
+        });
+        assert_eq!(
+            citation_in(&single, true, Some(&dir)),
+            "book/Concurrency.md:3"
+        );
+        // a path that would leave the checkout is not opened
+        let escape = json!({ "_source": { "ax_path": "../etc/passwd", "ax_locator": "s0", "body": "root:x:0:0:root:/root" } });
+        assert_eq!(
+            citation_in(&escape, true, Some(&dir)),
+            "../etc/passwd (line unknown)"
+        );
+        // code records keep the lexical ordinal line
+        let code = json!({
+            "_source": { "ax_path": "a.rs", "ax_locator": "code" },
+            "fields": { "_passage": [{ "field": "body", "ordinal": 41, "start_offset": 9, "text": "fn x()" }]}
+        });
+        assert_eq!(citation_in(&code, true, Some(&dir)), "a.rs:42");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -607,6 +607,7 @@ pub fn run_code_query(
     // 6. Licence map: ALWAYS from the corpus's own corpus.json — never
     //    re-derived at query time, never from prose.
     let licences = manifest::licence_map(root, &corpus);
+    let checkout = root.join("corpora").join(&corpus);
 
     let text = render::render(
         &hits,
@@ -622,6 +623,7 @@ pub fn run_code_query(
             strict_licence: params.strict_licence,
             lexical_lines: params.mode == Mode::Bm25
                 || note.as_deref().is_some_and(|n| n.starts_with("BM25 only")),
+            checkout: Some(&checkout),
         },
         note.as_deref(),
     );
