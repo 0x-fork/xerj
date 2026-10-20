@@ -1902,9 +1902,58 @@ fn skip_ws_back(win: &[u8], mut end: usize) -> usize {
 }
 
 fn looks_like_json_start(t: &str) -> bool {
-    // starts with { or [ and the first ~200 chars look like JSON tokens
-    let head: String = t.chars().take(200).collect();
-    head.contains(':') || head.contains('[') || head.contains('{')
+    // Pretty-printed JSON, and a JSON value cut off by the 8 KiB sniff
+    // prefix, parse as one value or fail because the input ran out. Either
+    // one is JSON. A `{`/`[` opener that is prose fails with a syntax error
+    // instead and must not take this family.
+    //
+    // The previous test ("the first ~200 chars contain `:`, `[` or `{`") was
+    // true for every opener — the opener itself is one of those bytes — so a
+    // README whose first line is a badge or link row
+    // (`[![CI](badge.svg)](https://…/actions)`, `[Docs](https://x) | [Discord](https://y)`)
+    // sniffed as JSON and the extractor junked it (#1983). `](` outside a
+    // JSON string is a markdown link, including the link texts that happen
+    // to be JSON values (`[true](https://…)`, `[1](https://…)`). Valid JSON
+    // can contain that byte pair only inside a string.
+    if first_line_has_markdown_link(t) {
+        return false;
+    }
+    use serde::Deserialize as _;
+    let mut de = serde_json::Deserializer::from_str(t);
+    match serde_json::Value::deserialize(&mut de) {
+        Ok(_) => true,
+        Err(e) => e.is_eof(),
+    }
+}
+
+/// `](` outside a JSON string on the first line: a markdown link or badge.
+fn first_line_has_markdown_link(t: &str) -> bool {
+    let line = t.lines().next().unwrap_or("").trim();
+    if !line.starts_with('[') {
+        return false;
+    }
+    let b = line.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else if c == b'"' {
+            in_string = true;
+        } else if c == b']' && b.get(i + 1) == Some(&b'(') {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn yaml_line_ratio(nonblank: &[&str]) -> f64 {
@@ -4267,6 +4316,118 @@ mod tests {
         assert_eq!(
             classify("[\n  {\"a\": 1},\n  {\"a\": 2}\n]\n"),
             Family::Json
+        );
+    }
+
+    /// #1983: a README that opens with a badge or link row starts with `[`
+    /// and contains `:`, so the old JSON-start test sniffed it as JSON and
+    /// the extractor junked the file. The name is irrelevant — sniffing
+    /// never trusts the extension — so the same shape must be prose with
+    /// and without `.md`. A pretty-printed JSON array, a JSON value cut off
+    /// by the sniff prefix, and a JSON string that merely *contains* a
+    /// badge stay JSON.
+    #[test]
+    fn readme_opening_with_a_badge_or_link_row_is_prose_not_json() {
+        let badge = "[![CI](https://example.com/badge.svg)](https://example.com/actions)\n\n\
+                     # Widget\n\n\
+                     Widget is a reference implementation of the widget protocol.\n\
+                     Agents should be able to quote this sentence from the index.\n";
+        let links = "[Docs](https://x) | [Discord](https://y)\n\n\
+                     # Widget\n\n\
+                     Widget is a reference implementation of the widget protocol.\n\
+                     Agents should be able to quote this sentence from the index.\n";
+        // `{` opener that is a note, not an object. Same failure mode.
+        let brace = "{this is a note, not a JSON object\n\n\
+                     # Widget\n\n\
+                     The opening brace is prose punctuation, not a document.\n";
+        // Same badge text under both names: the extension is not what decides.
+        for (name, text) in [
+            ("README.md", badge),
+            ("README", badge),
+            ("LINKS", links),
+            ("NOTE", brace),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let sn = sniff(&path).unwrap();
+            assert!(
+                matches!(sn.family, Family::TxtProse | Family::TxtLines),
+                "{name} classified as {:?}, want prose",
+                sn.family
+            );
+            let mut recs = Vec::new();
+            let stats = crate::extract::extract(&path, &sn, None, &mut |r| {
+                recs.push(r);
+                true
+            })
+            .unwrap();
+            assert_eq!(stats.junk, 0, "{name} was junked");
+            assert!(!recs.is_empty(), "{name} produced no records");
+            let indexed = recs
+                .iter()
+                .filter_map(|r| {
+                    r.fields
+                        .get("body")
+                        .or_else(|| r.fields.get("text"))
+                        .and_then(|v| v.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                indexed.contains("Widget"),
+                "{name} records lost the document text: {indexed}"
+            );
+        }
+
+        let pretty =
+            "[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("array.txt");
+        std::fs::write(&path, pretty).unwrap();
+        let sn = sniff(&path).unwrap();
+        assert_eq!(sn.family, Family::Json, "pretty-printed JSON array");
+        let mut n = 0usize;
+        let stats = crate::extract::extract(&path, &sn, None, &mut |_r| {
+            n += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(stats.junk, 0);
+        assert_eq!(n, 2, "one record per array element");
+
+        // A badge stored *inside* a JSON string is still a JSON array.
+        assert_eq!(
+            classify(
+                "[\n  \"[![CI](https://example.com/badge.svg)](https://example.com/actions)\"\n]\n"
+            ),
+            Family::Json
+        );
+        // Sniff prefix cut mid-value (the long-first-line JSONL shape).
+        assert_eq!(
+            classify("{\"id\":1,\"name\":\"alpha\",\"bio\":\"this value is cut off mid-string"),
+            Family::Json
+        );
+        // Under the JSONL line-ratio, but the file still opens with a JSON
+        // value, so it stays Json and the extractor's line fallback runs.
+        assert_eq!(
+            classify("{\"a\":1}\n{\"a\":2}\nnot json\nnot json\nnot json\n"),
+            Family::Json
+        );
+        // Link text that is itself a JSON value (`true`, `1`) is still a link.
+        assert!(
+            matches!(
+                classify("[true](https://example.com)\n\n# Widget\n\nA link, not an array.\n"),
+                Family::TxtProse | Family::TxtLines
+            ),
+            "keyword link text"
+        );
+        assert!(
+            matches!(
+                classify("[1](https://example.com)\n\n# Widget\n\nA link, not an array.\n"),
+                Family::TxtProse | Family::TxtLines
+            ),
+            "numeric link text"
         );
     }
 
