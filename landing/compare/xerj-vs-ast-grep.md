@@ -193,5 +193,5 @@ No. No head-to-head was run. Every ast-grep fact here comes from its own documen
 - [How do I stop my agent from reading the whole repo into context?](/answers/index-monorepo-for-agent)
 - [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents)
 - [How do I audit a PHP codebase with an index instead of grepping 1,400 files?](/answers/audit-php-codebase-with-an-index) (same intent: code search for agents)
+- [The best grep and ripgrep alternatives for AI coding agents in 2026](/compare/best-grep-alternative-for-ai-coding-agents-2026) (same intent: code search for agents)
 - [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete) (same intent: code search for agents)
-- [How do I set up reference coding so the agent retrieves a mechanism before writing code?](/answers/index-reference-library-for-coding-agent) (same intent: code search for agents)

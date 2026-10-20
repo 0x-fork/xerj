@@ -149,6 +149,6 @@ Read the hits, not only the buckets. A captured matrix shows `match_phrase` matc
 - [How do I find every place a config key is set across YAML and XML in a repo?](/answers/search-yaml-xml-config-repository)
 - [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
+- [The best grep and ripgrep alternatives for AI coding agents in 2026](/compare/best-grep-alternative-for-ai-coding-agents-2026) (same intent: code search for agents)
 - [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep) (same intent: code search for agents)
 - [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents) (same intent: code search for agents)
-- [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete) (same intent: code search for agents)

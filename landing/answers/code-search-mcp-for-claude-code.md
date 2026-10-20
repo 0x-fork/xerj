@@ -183,5 +183,5 @@ No. Both list 6 tools while the binary serves 17 (checked 2026-10-19). Read `too
 - [Local code search MCP for Claude Code that uses fewer tokens than grep](/answers/local-code-search-mcp-fewer-tokens-than-grep)
 - [Ask questions about a GitHub repo without cloning it](/answers/ask-questions-about-a-github-repo-without-cloning)
 - [How do I audit a PHP codebase with an index instead of grepping 1,400 files?](/answers/audit-php-codebase-with-an-index) (same intent: code search for agents)
+- [The best MCP servers for searching a local codebase in 2026](/compare/best-mcp-server-local-code-search-2026) (same intent: code search for agents)
 - [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents) (same intent: code search for agents)
-- [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete) (same intent: code search for agents)

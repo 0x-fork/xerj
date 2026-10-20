@@ -179,5 +179,5 @@ Run `PRAGMA wal_checkpoint(TRUNCATE)` on the database before you index it, or in
 - [Is there a way to full-text search my browser history file itself?](/answers/full-text-search-browser-history)
 - [How do I grep PDFs and Word docs from the command line?](/compare/xerj-vs-ripgrep-all)
 - [How do I search a .csv.gz or .json.gz without unzipping it first?](/answers/search-gzipped-csv-or-json) (same intent: JSONL and data files)
+- [The best local full-text search for JSONL and CSV files in 2026, with a published benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) (same intent: JSONL and data files)
 - [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)
-- [I have a directory of CSV exports. How do I query them without opening each one in Excel?](/answers/index-multiple-csv-files) (same intent: JSONL and data files)

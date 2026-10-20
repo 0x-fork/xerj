@@ -150,4 +150,4 @@ Every run prints what it dropped and by which ignore rule, and files it opened b
 - [How do I let an agent search a folder on my laptop instead of crawling the web?](/compare/xerj-vs-web-agent-search)
 - [I have a directory of CSV exports. How do I query them without opening each one in Excel?](/answers/index-multiple-csv-files) (same intent: JSONL and data files)
 - [What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?](/answers/search-json-and-jsonl-logs) (same intent: JSONL and data files)
-- [How do I index a CSV with many columns?](/answers/index-csv-with-many-columns) (same intent: JSONL and data files)
+- [The best local full-text search for JSONL and CSV files in 2026, with a published benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) (same intent: JSONL and data files)

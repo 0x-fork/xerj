@@ -227,6 +227,6 @@ Order of magnitude, several hundred on this tree. The derived figure was about 7
 - [How do I run syntax-aware code search?](/answers/syntax-aware-code-search-refactoring)
 - [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code)
 - [Local code search MCP for Claude Code that uses fewer tokens than grep](/answers/local-code-search-mcp-fewer-tokens-than-grep)
+- [The best grep and ripgrep alternatives for AI coding agents in 2026](/compare/best-grep-alternative-for-ai-coding-agents-2026) (same intent: code search for agents)
+- [The best MCP servers for searching a local codebase in 2026](/compare/best-mcp-server-local-code-search-2026) (same intent: code search for agents)
 - [How do I audit a PHP codebase with an index instead of grepping 1,400 files?](/answers/audit-php-codebase-with-an-index) (same intent: code search for agents)
-- [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep) (same intent: code search for agents)
-- [How do I set up reference coding so the agent retrieves a mechanism before writing code?](/answers/index-reference-library-for-coding-agent) (same intent: code search for agents)

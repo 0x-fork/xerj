@@ -195,6 +195,6 @@ On recall. Grep's literal recall is perfect and the model's is not: a source at 
 - [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code)
 - [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete)
 - [WordPress security audit](/case-studies/wordpress-security-audit)
+- [The best MCP servers for searching a local codebase in 2026](/compare/best-mcp-server-local-code-search-2026) (same intent: code search for agents)
 - [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents) (same intent: code search for agents)
 - [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep) (same intent: code search for agents)
-- [How do I set up reference coding so the agent retrieves a mechanism before writing code?](/answers/index-reference-library-for-coding-agent) (same intent: code search for agents)

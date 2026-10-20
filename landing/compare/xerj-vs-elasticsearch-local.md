@@ -199,5 +199,5 @@ When you read while a heavy writer runs, when you need more than one host, or wh
 - [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)
 - [Batch lookup CVE IDs and GHSA IDs offline, without GitHub API rate limits](/answers/batch-lookup-cve-ghsa-ids-offline)
 - [Does XERJ support S3 storage, alerting or custom plugins yet?](/answers/does-xerj-support-s3-alerting-plugins) (same intent: search engine alternatives)
+- [The best lightweight Elasticsearch-compatible search servers in 2026](/compare/best-lightweight-elasticsearch-compatible-server-2026) (same intent: search engine alternatives)
 - [What's a local alternative to Meilisearch that indexes a folder by itself?](/compare/xerj-vs-meilisearch) (same intent: search engine alternatives)
-- [Do I need Typesense for an agent to search my docs?](/compare/xerj-vs-typesense) (same intent: search engine alternatives)

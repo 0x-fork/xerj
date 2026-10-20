@@ -152,6 +152,6 @@ XERJ typed `url` as `keyword`, so it matches whole values only. An exact `term` 
 - [How do I full-text search a SQLite database I just copied onto disk?](/answers/full-text-search-sqlite-database)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
 - [Why would a folder search miss files that I can see on disk?](/answers/why-autoindex-skipped-files)
+- [The best local full-text search for JSONL and CSV files in 2026, with a published benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) (same intent: JSONL and data files)
 - [How do I index a CSV with many columns?](/answers/index-csv-with-many-columns) (same intent: JSONL and data files)
 - [What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?](/answers/search-json-and-jsonl-logs) (same intent: JSONL and data files)
-- [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)

@@ -167,4 +167,4 @@ Record packs, yes, since v1.0.0-rc.78: `xerj corpus build` turns a recipe into a
 - [I want local search that works offline, no cloud embeddings. What are my options?](/answers/local-embeddings-without-openai-api)
 - [Is there an Elasticsearch-compatible engine that isn't Elasticsearch?](/compare/xerj-vs-elasticsearch-local) (same intent: search engine alternatives)
 - [Is there a single-binary local search engine I can just run?](/answers/search-engine-without-docker) (same intent: search engine alternatives)
-- [What's a local alternative to Meilisearch that indexes a folder by itself?](/compare/xerj-vs-meilisearch) (same intent: search engine alternatives)
+- [The best lightweight Elasticsearch-compatible search servers in 2026](/compare/best-lightweight-elasticsearch-compatible-server-2026) (same intent: search engine alternatives)

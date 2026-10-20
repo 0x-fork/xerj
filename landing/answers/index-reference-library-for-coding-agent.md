@@ -186,4 +186,4 @@ No. The 13 reference libraries were written for the study so they could not be i
 - [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents)
 - [xerj corpus index --fresh failed. How do I rebuild a corpus index?](/answers/rebuild-reference-corpus-index) (same intent: code search for agents)
 - [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete) (same intent: code search for agents)
-- [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep) (same intent: code search for agents)
+- [The best grep and ripgrep alternatives for AI coding agents in 2026](/compare/best-grep-alternative-for-ai-coding-agents-2026) (same intent: code search for agents)

@@ -159,4 +159,4 @@ Yes. Gzip is transparent on every parsed family, so a `.jsonl.gz` file indexes l
 - [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)
 - [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)
 - [I have a directory of CSV exports. How do I query them without opening each one in Excel?](/answers/index-multiple-csv-files) (same intent: JSONL and data files)
-- [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map) (same intent: JSONL and data files)
+- [The best local full-text search for JSONL and CSV files in 2026, with a published benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) (same intent: JSONL and data files)

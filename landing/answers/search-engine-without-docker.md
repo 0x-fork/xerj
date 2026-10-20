@@ -142,4 +142,5 @@ No. XERJ is single-node: there is no data-plane replication and no failover, so 
 - [Is there an Elasticsearch-compatible engine that isn't Elasticsearch?](/compare/xerj-vs-elasticsearch-local)
 - [What's a local alternative to Meilisearch that indexes a folder by itself?](/compare/xerj-vs-meilisearch)
 - [Does XERJ support S3 storage, alerting or custom plugins yet?](/answers/does-xerj-support-s3-alerting-plugins) (same intent: search engine alternatives)
+- [The best lightweight Elasticsearch-compatible search servers in 2026](/compare/best-lightweight-elasticsearch-compatible-server-2026) (same intent: search engine alternatives)
 - [Do I need Typesense for an agent to search my docs?](/compare/xerj-vs-typesense) (same intent: search engine alternatives)

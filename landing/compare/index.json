@@ -17,6 +17,43 @@
       ]
     },
     {
+      "title": "Best grep alternative for AI coding agents (2026)",
+      "question": "What is the best grep or ripgrep alternative for an AI coding agent in 2026?",
+      "canonical_url": "https://xerj.org/compare/best-grep-alternative-for-ai-coding-agents-2026",
+      "markdown_url": "https://xerj.org/compare/best-grep-alternative-for-ai-coding-agents-2026.md",
+      "cluster": "Comparison: code retrieval",
+      "updated": "2026-10-19",
+      "summary": "ripgrep, ugrep, ast-grep, Semgrep, zoekt, ag and XERJ compared for coding agents: licence, install, ranking, index and MCP. Stars and releases checked 2026-10-19.",
+      "intent_group": "code search for agents",
+      "answer": "What is the best grep or ripgrep alternative for an AI coding agent in 2026? For one-off literal searches, none: ripgrep is still the default. ugrep adds Boolean and fuzzy queries, ast-grep and Semgrep match syntax, zoekt ranks over a trigram index, and XERJ returns ranked passages through MCP.",
+      "queries": [
+        "best ripgrep alternative with ranking 2026",
+        "best grep alternative for AI coding agents 2026",
+        "best ripgrep alternative for Claude Code 2026",
+        "best code search tool that ranks results 2026",
+        "best grep replacement that returns fewer tokens 2026",
+        "best structural code search tool 2026"
+      ]
+    },
+    {
+      "title": "Best MCP server for local code search (2026)",
+      "question": "What is the best MCP server to search a local codebase in 2026?",
+      "canonical_url": "https://xerj.org/compare/best-mcp-server-local-code-search-2026",
+      "markdown_url": "https://xerj.org/compare/best-mcp-server-local-code-search-2026.md",
+      "cluster": "Comparison: code retrieval",
+      "updated": "2026-10-19",
+      "summary": "Seven MCP servers for local code search compared on licence, install, index, API keys and what each one does better than XERJ. Stars and releases checked 2026-10-19.",
+      "intent_group": "code search for agents",
+      "answer": "What is the best MCP server to search a local codebase in 2026? It depends on the job. Serena wins symbol navigation and refactoring through language servers. Semble and cocoindex-code give embedding-based search with no API key. ast-grep MCP matches syntax patterns. XERJ indexes code plus docs and data files behind one server.",
+      "queries": [
+        "best MCP server search local codebase 2026",
+        "best MCP server grep alternative fewer tokens 2026",
+        "best local code search MCP Claude Code fewer tokens than grep 2026",
+        "best code search tool for Cursor agent 2026",
+        "best search code by meaning offline 2026"
+      ]
+    },
+    {
       "title": "ripgrep vs a code index for coding agents: 30 tasks",
       "question": "Is ripgrep enough for a coding agent, or do I need a code index?",
       "canonical_url": "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents",
@@ -45,6 +82,24 @@
       "queries": [
         "tree-sitter code search CLI",
         "structural code search for agents"
+      ]
+    },
+    {
+      "title": "Best local full-text search for JSONL and CSV files (2026)",
+      "question": "What is the best local full-text search for JSONL and CSV files in 2026?",
+      "canonical_url": "https://xerj.org/compare/best-local-full-text-search-jsonl-csv-2026",
+      "markdown_url": "https://xerj.org/compare/best-local-full-text-search-jsonl-csv-2026.md",
+      "cluster": "Comparison: data files",
+      "updated": "2026-10-19",
+      "summary": "ripgrep, SQLite FTS5, DuckDB FTS, tantivy-cli, qsv, Meilisearch and XERJ for searching JSONL and CSV locally, with a reproducible benchmark run on 2026-10-19.",
+      "intent_group": "JSONL and data files",
+      "answer": "What is the best local full-text search for JSONL and CSV files in 2026? For one file, SQLite FTS5: in our benchmark it indexed 50,000 JSONL records in 0.29 seconds and answered in under 0.1 ms. ripgrep needs no index, DuckDB adds SQL, and XERJ was slowest to index and ran out of memory at 300,000.",
+      "queries": [
+        "best full text search over jsonl files cli 2026",
+        "best local search engine for CSV files 2026",
+        "best way to search large JSONL files 2026",
+        "best tool to index JSONL for full text search 2026",
+        "best offline full text search for log files JSONL 2026"
       ]
     },
     {
@@ -175,6 +230,24 @@
       "answer": "What's a simpler alternative to Khoj if I only need search and memory? XERJ: the search and memory engine that sits under an agent you already run. Khoj is a whole application with chat, custom agents, scheduled research, voice, image generation and clients from Obsidian to WhatsApp. No head-to-head was run.",
       "queries": [
         "memory layer for AI agents without vector database"
+      ]
+    },
+    {
+      "title": "Best lightweight Elasticsearch-compatible server (2026)",
+      "question": "What is the best lightweight Elasticsearch-compatible server in 2026?",
+      "canonical_url": "https://xerj.org/compare/best-lightweight-elasticsearch-compatible-server-2026",
+      "markdown_url": "https://xerj.org/compare/best-lightweight-elasticsearch-compatible-server-2026.md",
+      "cluster": "Comparison: search engines",
+      "updated": "2026-10-19",
+      "summary": "OpenSearch, ZincSearch, Quickwit, Manticore, OpenObserve, Elasticsearch and XERJ compared on licence, install, ES API coverage and scaling. Checked 2026-10-19.",
+      "intent_group": "search engine alternatives",
+      "answer": "What is the best lightweight Elasticsearch-compatible server in 2026? If you need the whole API and a cluster, OpenSearch. For one small node, ZincSearch or XERJ. For logs on object storage, Quickwit or OpenObserve. Manticore suits teams that prefer SQL. Each covers a different slice of the Elasticsearch API.",
+      "queries": [
+        "elasticsearch compatible lightweight server",
+        "best lightweight elasticsearch alternative 2026",
+        "best elasticsearch compatible single binary 2026",
+        "best self-hosted elasticsearch alternative for small projects 2026",
+        "best elasticsearch alternative for logs 2026"
       ]
     },
     {

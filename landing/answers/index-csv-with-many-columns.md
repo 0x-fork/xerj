@@ -146,6 +146,6 @@ XERJ falls back to a string type when fewer than 95% of the non-null values pars
 - [How do I full-text search a SQLite database I just copied onto disk?](/answers/full-text-search-sqlite-database)
 - [Aggregations](/docs/aggregations)
 - [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)
+- [The best local full-text search for JSONL and CSV files in 2026, with a published benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) (same intent: JSONL and data files)
 - [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map) (same intent: JSONL and data files)
-- [I have a JSON export of Jira issues (or Zendesk tickets). How do I search it like a help-center search?](/answers/search-zendesk-ticket-json-export) (same intent: JSONL and data files)

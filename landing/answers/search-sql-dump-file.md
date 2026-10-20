@@ -167,4 +167,4 @@ Read `ax_locator` and `ax_path`. In the captured run `ax_locator` held `tarticle
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
 - [I have a directory of CSV exports. How do I query them without opening each one in Excel?](/answers/index-multiple-csv-files) (same intent: JSONL and data files)
 - [How do I search a .csv.gz or .json.gz without unzipping it first?](/answers/search-gzipped-csv-or-json) (same intent: JSONL and data files)
-- [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)
+- [The best local full-text search for JSONL and CSV files in 2026, with a published benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) (same intent: JSONL and data files)
