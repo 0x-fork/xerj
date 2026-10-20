@@ -70,14 +70,6 @@ search/170_terms_query.yml · Terms Query with No.of terms exceeding index.max_t
 search/220_total_hits_object.yml · hits.total as an object
 search/260_parameter_validation.yml · test negative size throws IAE
 search/260_parameter_validation.yml · test negative terminate_after throws IAE
-search/30_limits.yml · Docvalues_fields size limit
-search/30_limits.yml · Prefix length limit
-search/30_limits.yml · Regexp length limit
-search/30_limits.yml · Request window limits without scroll
-search/30_limits.yml · Request window limits with scroll
-search/30_limits.yml · Request with negative from value in body
-search/30_limits.yml · Request with negative from value url parameter
-search/30_limits.yml · Rescore window limits
 search/320_disallow_queries.yml · Test disallow expensive queries
 search/330_fetch_fields.yml · error for flattened includes whole path
 search/330_fetch_fields.yml · error includes field name

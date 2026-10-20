@@ -3843,7 +3843,7 @@ pub struct EsSearchBody {
     /// `null` / absent → default 10.  `0` means return aggregations only.
     #[serde(default = "default_size")]
     pub size: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_negative_from")]
     pub from: usize,
     #[serde(default)]
     pub sort: Option<Value>,
@@ -6322,6 +6322,52 @@ fn strip_internal_tracking(v: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// `from` in a search body: ES refuses a negative value with
+/// `[from] parameter cannot be negative but was [-1]` (30_limits.yml) instead
+/// of a generic JSON type error.
+fn deserialize_non_negative_from<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FromVisitor;
+    impl serde::de::Visitor<'_> for FromVisitor {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a non-negative integer")
+        }
+        fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<usize, E> {
+            usize::try_from(n).map_err(|_| E::custom(negative_from_reason(n)))
+        }
+        // A huge positive `from` (e.g. u64::MAX) must reach the result-window
+        // check rather than fail as a JSON type error.
+        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<usize, E> {
+            Ok(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+    }
+    deserializer.deserialize_any(FromVisitor)
+}
+
+fn negative_from_reason(n: i64) -> String {
+    format!("[from] parameter cannot be negative but was [{n}]")
+}
+
+/// ES's `illegal_argument_exception` for `?from=-1`.
+fn negative_from_error(n: i64) -> Response {
+    let reason = negative_from_reason(n);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                "type": "illegal_argument_exception",
+                "reason": reason,
+            },
+            "status": 400,
+        })),
+    )
+        .into_response()
 }
 
 fn default_size() -> usize {
@@ -11692,7 +11738,10 @@ async fn search_impl(
     if let Some(ref from_s) = params.from {
         match from_s.parse::<usize>() {
             Ok(n) => body.from = n,
-            Err(_) => return int_param_parse_error("from", from_s),
+            Err(_) => match from_s.parse::<i64>() {
+                Ok(n) if n < 0 => return negative_from_error(n),
+                _ => return int_param_parse_error("from", from_s),
+            },
         }
     }
     // URL-level `seq_no_primary_term=true` / `version=true` promote the
@@ -11726,6 +11775,9 @@ async fn search_impl(
     // this size after building the response.
     let is_scroll_request = params.scroll.is_some();
     let scroll_page_size = body.size;
+    // The caller's `from`, before the scroll snapshot below rewrites it; the
+    // per-index window checks (`find_index_request_limit_violation`) need it.
+    let requested_from = body.from;
     if is_scroll_request {
         // RC4 blocker 11: enforce the open-scroll cap BEFORE running the
         // search — each context pins a fully-hydrated Vec<Hit>, so an
@@ -13616,6 +13668,22 @@ async fn search_impl(
                 return ApiError::new(xerj_common::XerjError::invalid_query(reason))
                     .into_response();
             }
+        }
+    }
+
+    // Per-index request limits ES enforces before executing a search
+    // (`search/30_limits.yml`): result window / scroll batch size, rescore
+    // window, docvalue_fields count, regex and prefix length.
+    for ix in &participating_indices {
+        if let Some(reason) = find_index_request_limit_violation(
+            &state,
+            ix,
+            &body,
+            requested_from,
+            scroll_page_size,
+            is_scroll_request,
+        ) {
+            return ApiError::new(xerj_common::XerjError::invalid_query(reason)).into_response();
         }
     }
 
@@ -24089,12 +24157,172 @@ pub async fn delete_index_template(
 // DELETE /_search/scroll            — clear scroll
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// An integer `index.<key>` setting in any of the three spellings a settings
+/// document can carry it (see [`index_max_result_window`]).
+fn index_int_setting(state: &AppState, ix: &str, key: &str) -> Option<u64> {
+    let s = state.engine.index_settings.get(ix).map(|v| v.clone())?;
+    let as_int = |v: &Value| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    };
+    let dotted = format!("index.{key}");
+    s.pointer(&format!("/index/{key}"))
+        .and_then(as_int)
+        .or_else(|| s.get("index").and_then(|i| i.get(&dotted)).and_then(as_int))
+        .or_else(|| s.get(&dotted).and_then(as_int))
+}
+
+/// The per-index request limits Elasticsearch checks before running a search,
+/// with its messages (`search/30_limits.yml`). Each was previously either
+/// unchecked (an HTTP 200) or refused deeper with a different message:
+///
+/// * `from + size` over `index.max_result_window` (default 10 000), or for a
+///   scroll the batch `size` — ES's `Result window is too large` / `Batch size
+///   is too large`. The engine's own window check stays as a backstop.
+/// * a rescore `window_size` over `index.max_rescore_window` (defaults to the
+///   result window);
+/// * more `docvalue_fields` than `index.max_docvalue_fields_search` (100);
+/// * a `regexp`, `prefix` or `/regex/` `query_string` longer than
+///   `index.max_regex_length` (1000 characters).
+fn find_index_request_limit_violation(
+    state: &AppState,
+    ix: &str,
+    body: &EsSearchBody,
+    from: usize,
+    size: usize,
+    is_scroll: bool,
+) -> Option<String> {
+    let max_window = index_max_result_window(state, ix);
+    let window = from.saturating_add(size);
+    if window > max_window {
+        return Some(if is_scroll {
+            format!(
+                "Batch size is too large, size must be less than or equal to: [{max_window}] but \
+                 was [{window}]. Scroll batch sizes cost as much memory as result windows so \
+                 they are controlled by the [index.max_result_window] index level setting."
+            )
+        } else {
+            format!(
+                "Result window is too large, from + size must be less than or equal to: \
+                 [{max_window}] but was [{window}]. See the scroll api for a more efficient way \
+                 to request large data sets. This limit can be set by changing the \
+                 [index.max_result_window] index level setting."
+            )
+        });
+    }
+
+    let max_rescore = index_int_setting(state, ix, "max_rescore_window")
+        .map(|v| v as usize)
+        .unwrap_or(max_window);
+    let rescores: Vec<&Value> = match body.rescore.as_ref() {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(item @ Value::Object(_)) => vec![item],
+        _ => Vec::new(),
+    };
+    for rescore in rescores {
+        if let Some(w) = rescore.get("window_size").and_then(Value::as_u64) {
+            if w as usize > max_rescore {
+                return Some(format!(
+                    "Rescore window [{w}] is too large. It must be less than [{max_rescore}]. \
+                     This prevents allocating massive heaps for storing the results to be \
+                     rescored. This limit can be set by changing the [index.max_rescore_window] \
+                     index level setting."
+                ));
+            }
+        }
+    }
+
+    let max_dv = index_int_setting(state, ix, "max_docvalue_fields_search").unwrap_or(100);
+    if let Some(Value::Array(fields)) = body.docvalue_fields.as_ref() {
+        if fields.len() as u64 > max_dv {
+            return Some(format!(
+                "Trying to retrieve too many docvalue_fields. Must be less than or equal to: \
+                 [{max_dv}] but was [{}]. This limit can be set by changing the \
+                 [index.max_docvalue_fields_search] index level setting.",
+                fields.len()
+            ));
+        }
+    }
+
+    let max_regex = index_int_setting(state, ix, "max_regex_length").unwrap_or(1000) as usize;
+    body.query
+        .as_ref()
+        .and_then(|q| find_overlong_pattern(q, max_regex))
+}
+
+/// The first `regexp`, `prefix` or `/regex/` `query_string` in `query` whose
+/// pattern is longer than `max` characters, as ES's message.
+fn find_overlong_pattern(query: &Value, max: usize) -> Option<String> {
+    let too_long = |kind: &str, len: usize, query_name: &str| {
+        format!(
+            "The length of {kind} [{len}] used in the {query_name} Query request has exceeded the \
+             allowed maximum of [{max}]. This maximum can be set by changing the \
+             [index.max_regex_length] index level setting."
+        )
+    };
+    /// `{field: "pattern"}` or `{field: {"value": "pattern"}}`.
+    fn field_patterns(clause: &Value) -> Vec<&str> {
+        clause
+            .as_object()
+            .map(|o| {
+                o.values()
+                    .filter_map(|v| {
+                        v.as_str()
+                            .or_else(|| v.get("value").and_then(Value::as_str))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    match query {
+        Value::Object(o) => {
+            for (key, value) in o {
+                match key.as_str() {
+                    "regexp" => {
+                        for p in field_patterns(value) {
+                            let len = p.chars().count();
+                            if len > max {
+                                return Some(too_long("regex", len, "Regexp"));
+                            }
+                        }
+                    }
+                    "prefix" => {
+                        for p in field_patterns(value) {
+                            let len = p.chars().count();
+                            if len > max {
+                                return Some(too_long("prefix", len, "Prefix"));
+                            }
+                        }
+                    }
+                    "query_string" => {
+                        let text = value.get("query").and_then(Value::as_str).unwrap_or("");
+                        let t = text.trim();
+                        if t.len() >= 2 && t.starts_with('/') && t.ends_with('/') {
+                            let len = t[1..t.len() - 1].chars().count();
+                            if len > max {
+                                return Some(too_long("regex", len, "Regexp"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(reason) = find_overlong_pattern(value, max) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_overlong_pattern(v, max)),
+        _ => None,
+    }
+}
+
 /// An index's `index.max_result_window`, in any of the three spellings a
 /// settings document can carry it (nested `index.max_result_window`, a flat
 /// dotted key under `index`, or a top-level dotted key), defaulting to the
 /// node's `limits.max_result_window` (10,000 by default, the ES default) like
-/// the engine's own check. Shared by the `ids` clause check and the
-/// `rerank.window` check.
+/// the engine's own check. Shared by the `ids` clause check, the
+/// `rerank.window` check and [`find_index_request_limit_violation`].
 fn index_max_result_window(state: &AppState, ix: &str) -> usize {
     state
         .engine
