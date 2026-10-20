@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai — Blog: the engineering log</title>
-<meta name="description" content="Measured results with the losses left in: the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.">
+<meta name="description" content="Measured results with the losses left in: Corpus Hub v2 and xerj ask, the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="website">
 <meta property="og:title" content="XERJ.ai — Blog: the engineering log">
-<meta property="og:description" content="Measured results with the losses left in: the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.">
+<meta property="og:description" content="Measured results with the losses left in: Corpus Hub v2 and xerj ask, the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.">
 <meta property="og:url" content="https://xerj.org/blog/">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
 <meta property="og:image:width" content="1200">
@@ -25,7 +25,7 @@
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="XERJ.ai — Blog: the engineering log">
-<meta name="twitter:description" content="Measured results with the losses left in: the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.">
+<meta name="twitter:description" content="Measured results with the losses left in: Corpus Hub v2 and xerj ask, the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
 {
@@ -59,7 +59,7 @@
   "@context": "https://schema.org",
   "@type": "CollectionPage",
   "name": "XERJ.ai — Blog: the engineering log",
-  "description": "Measured results with the losses left in: the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.",
+  "description": "Measured results with the losses left in: Corpus Hub v2 and xerj ask, the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.",
   "url": "https://xerj.org/blog/",
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
@@ -129,6 +129,24 @@
   <!-- Reverse-chronological by hand while there is one post; new posts PREPEND.
        Move to a generator only past ~10 posts. -->
   <ol class="blog-list">
+    <li>
+      <a class="bl-card" href="/blog/corpus-hub-v2">
+        <img class="bl-thumb" src="/blog/covers/corpus-hub-v2-thumb.webp" width="640" height="336" alt="Cover art: a faint wall of 251 small tiles above 14 larger square-matrix tiles; a yellow route runs from the top into one yellow tile and down to a framed node" loading="lazy" decoding="async">
+        <div class="bl-meta">
+          <p class="bl-date"><time datetime="2026-10-19">2026-10-19</time> · CORPUS HUB · XERJ ASK</p>
+          <h2 class="bl-title">Corpus Hub v2: ask the question, get the one pack that answers it</h2>
+          <p class="bl-excerpt">Type a question and <code>xerj</code> picks the corpus from a signed
+          catalogue, pulls that one pre-indexed pack (lz4: <strong>4.4 MB</strong>) and answers on your
+          machine: <strong>1.7 to 2.3 s</strong> cold, <strong>37 to 57 ms</strong> warm. Ambiguous
+          questions come back as a choice (exit 4), and a dead hub now has its own code (exit 6). The hub
+          site gained contributor pages, agent scores kept apart from human stars, per-corpus traffic and
+          field reports that become PRs. The routing miss we hit, and the catalogue lagging the packs
+          (<strong>14</strong> routable of <strong>251</strong> built), are in the post.</p>
+          <p class="bl-byline">AUTHOR · XERJ ENGINEERING TEAM · PUBLISHED · 2026-10-19</p>
+          <span class="bl-read">READ THE POST &rarr;</span>
+        </div>
+      </a>
+    </li>
     <li>
       <a class="bl-card" href="/blog/the-exploit-hub">
         <img class="bl-thumb" src="/blog/covers/the-exploit-hub-thumb.webp" width="640" height="336" alt="Cover art: a network of small square nodes; a yellow hub linked to 36 yellow nodes, an ink node with one link, and an empty square frame with none" loading="lazy" decoding="async">

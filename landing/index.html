@@ -474,19 +474,37 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
     instead of taking it.
   </p>
 
-  <div class="recipes" style="grid-template-columns:repeat(2,1fr); margin-top:var(--sp-6);">
-    <a class="recipe" href="/blog/jev-vs-a-bm25-vote">
-      <span class="num">2026-09-22 · BENCHMARKS · DECISIONS</span>
-      <span class="title">A BM25 vote ties Jev on spam and beats it on intent</span>
-      <p class="lead">Five hundred decisions each on two public datasets. A statistical tie on
-      spam, a nine-point win on 77-way intent at zero marginal cost, and one dataset where Jev
-      beats us outright.</p>
+  <!-- Newest three posts, same order and thumbnails as /blog/ (covers from
+       scripts/seo/blog_covers/). Update when a post is published. -->
+  <style>
+    #blog .home-posts { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: var(--sp-6); }
+    #blog .home-posts .recipe { gap: var(--sp-3); }
+    #blog .home-posts img { display: block; width: 100%; height: auto; aspect-ratio: 640 / 336;
+                            border: 1px solid var(--z-line); background: #f6f4ee; }
+    #blog .home-posts .num { color: var(--z-mute); }
+    #blog .home-posts .lead { font-size: 15px; line-height: 1.55; }
+    #blog .home-posts .recipe:hover img { border-color: var(--z-accent); }
+    @media (max-width: 900px) { #blog .home-posts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 600px) { #blog .home-posts { grid-template-columns: minmax(0, 1fr); } }
+  </style>
+  <div class="recipes home-posts">
+    <a class="recipe" href="/blog/corpus-hub-v2">
+      <img src="/blog/covers/corpus-hub-v2-thumb.webp" width="640" height="336" alt="Cover art: a faint wall of 251 small tiles above 14 larger square-matrix tiles; a yellow route runs from the top into one yellow tile and down to a framed node" loading="lazy" decoding="async">
+      <span class="num">2026-10-19 · CORPUS HUB · XERJ ASK</span>
+      <span class="title">Corpus Hub v2: ask the question, get the one pack that answers it</span>
+      <p class="lead">Type a question and <code>xerj</code> picks the corpus from a signed catalogue, pulls that one pre-indexed pack (lz4: 4.4&nbsp;MB) and answers on your machine: 1.7 to 2.3&nbsp;s cold, 37 to 57&nbsp;ms warm.</p>
     </a>
-    <a class="recipe" href="/blog/does-xerj-beat-jev">
-      <span class="num">2026-09-21 · BENCHMARKS · RERANKING</span>
-      <span class="title">Does XERJ beat JEV? On the bill, outright. On FiQA, no.</span>
-      <p class="lead">1,271 judged BEIR queries. The hosted judge wins SciFact and FiQA, our
-      local hybrid keeps NFCorpus, and the rerank run billed $0.6375 against our zero.</p>
+    <a class="recipe" href="/blog/the-exploit-hub">
+      <img src="/blog/covers/the-exploit-hub-thumb.webp" width="640" height="336" alt="Cover art: a network of small square nodes; a yellow hub linked to 36 yellow nodes, an ink node with one link, and an empty square frame with none" loading="lazy" decoding="async">
+      <span class="num">2026-10-08 · CYBER-EXPLOITS CORPUS · EVAL</span>
+      <span class="title">The exploit hub, tested on three fresh CVEs</span>
+      <p class="lead">One query over 1.09 million PoC documents named the exact route and field for CVE-2026-23744; the third case proved the corpus adds nothing when its stratum is empty, and we count it.</p>
+    </a>
+    <a class="recipe" href="/blog/eval-scars-from-agent-memory">
+      <img src="/blog/covers/eval-scars-from-agent-memory-thumb.webp" width="640" height="336" alt="Cover art: six clusters of diagonal scratch marks made of small squares, five in ink and one in yellow" loading="lazy" decoding="async">
+      <span class="num">2026-10-07 · GUEST · AGENT MEMORY · EVAL</span>
+      <span class="title">Six eval scars from a production agent-memory system</span>
+      <p class="lead">Chunxiao Wang (Assay / nautilus-compass) on six patterns that each cost a real failure, from topic slicing to the masking bug that scores every query zero.</p>
     </a>
   </div>
 

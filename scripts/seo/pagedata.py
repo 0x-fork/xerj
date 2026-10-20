@@ -200,11 +200,30 @@ PAGES: dict[str, dict[str, str]] = {
         og_image="og/blog-the-exploit-hub.png",
         og_image_alt="Cover: “The exploit hub, tested on three fresh CVEs” in display type beside the post’s square-matrix art, labelled with its figures. The art: a network of small square nodes; a yellow hub linked to 36 yellow nodes, an ink node with one link, and an empty square frame with none",
     ),
+    # Corpus Hub v2 post, 2026-10-19. Every figure was measured or read live
+    # that day: timings from four cold + eleven warm runs of xerj v1.0.0-rc.97
+    # in an isolated HOME (lz4 pack 4,623,814 B, pack-lz4-0774d055); exit codes
+    # from engine/crates/xerj-hub/src/ask.rs and PR #1905; counts from the
+    # hub.xerj.org header (513 live), GitHub Releases (251 distinct slugs with
+    # a published *.hubpack.tar.zst) and the signed catalogue (14 entries,
+    # generated 2026-10-18T02:13Z); feedback/traffic JSON from /api/corpus-
+    # feedback and /api/hub-traffic for act; field-report loop #1838 -> #1848.
+    # 2026-10-20 refresh before publishing: repo stars/forks/contributors, hub
+    # stars (/api/hub-stars) and the Releases pack count (245 -> 251) re-read;
+    # contributor totals and the top-ten table re-checked, unchanged.
+    "blog/corpus-hub-v2.html": dict(
+        label="Corpus Hub v2", kind="article",
+        title="Corpus Hub v2: ask a question, get the one pack that answers",
+        description="Hub v2 routes a plain question to one signed corpus, pulls only that pack (lz4: 4.4 MB) and answers locally: 1.7 to 2.3 s cold, under 60 ms warm.",
+        published="2026-10-19", updated="2026-10-20",
+        og_image="og/blog-corpus-hub-v2.png",
+        og_image_alt="Cover: “Corpus Hub v2” in display type beside the post’s square-matrix art, labelled with its figures. The art: a faint wall of 251 small tiles above 14 larger square-matrix tiles; a yellow route runs from the top into one yellow tile and down to a framed node",
+    ),
     "blog/index.html": dict(
         label="Blog", kind="collection",
         title="XERJ.ai — Blog: the engineering log",
-        description="Measured results with the losses left in: the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.",
-        updated="2026-10-08",
+        description="Measured results with the losses left in: Corpus Hub v2 and xerj ask, the exploit hub tested on three fresh CVEs, guest eval scars from a production agent-memory system, the Corpus Hub launch, the rc.80 gates post, the Jev decisions study, the JEV rerank verdict, the storage formats that cut the index 28%, and the signed rust-vulns corpus pack.",
+        updated="2026-10-19",
     ),
     "demo/index.html": dict(
         label="Real-data demo", kind="software",
