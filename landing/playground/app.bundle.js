@@ -5272,7 +5272,7 @@ borrows the accent color.`
     loading: false,
     filters: loadAllFilters(),
     // { [dashId]: { field: value } }
-    theme: document.documentElement.getAttribute("data-theme") || "night",
+    theme: document.documentElement.getAttribute("data-theme") || "day",
     edit: localStorage.getItem(LS.edit) === "1",
     mobile: localStorage.getItem("xerj.mobile") === "1",
     layouts: loadAllLayouts(),

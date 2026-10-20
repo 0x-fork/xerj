@@ -16,12 +16,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>XERJ.AI · observe</title>
 <meta name="description" content="The XERJ observability dashboards application. Deliberately not indexed — open it from the playground gate at xerj.org/playground instead.">
-<meta name="color-scheme" content="dark light">
+<meta name="color-scheme" content="light dark">
 <script>
   // Theme bootstrap — runs before CSS to prevent a flash of wrong theme.
   (function () {
     var t = localStorage.getItem('xerj.theme');
-    if (t !== 'day' && t !== 'night') t = 'night';
+    if (t !== 'day' && t !== 'night') t = 'day';  // light by default; NIGHT is opt-in
     document.documentElement.setAttribute('data-theme', t);
   })();
 </script>

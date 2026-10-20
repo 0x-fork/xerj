@@ -5,8 +5,8 @@
 
 /* ---- post components: vt tables, vchart, wire, loss, stat-band ---- */
 /* page-local: a negative colour the system lacks, both themes */
-  :root                  { --z-neg: #d9575f; }
-  html[data-theme='day'] { --z-neg: #a32b2e; }
+  :root                    { --z-neg: #8f2427; }  /* 8.2:1 on the light page */
+  html[data-theme='night'] { --z-neg: #e2767c; }
 
   /* vertical comparison chart — same component as the benchmarks hub */
   .vchart { margin: var(--sp-6) 0 0; }
@@ -40,7 +40,7 @@
              letter-spacing:var(--track-label); text-transform:uppercase; color:var(--z-mute); }
   .vc-axis span { min-width:0; }
   .vc-axis .sub { display:block; font-style:normal; letter-spacing:.03em;
-                  text-transform:none; opacity:.72; margin-top:3px; }
+                  text-transform:none; margin-top:3px; }
   .vc-axis .win { color:var(--z-accent); opacity:1; }
   .vc-title { margin-top:var(--sp-4); padding-top:var(--sp-3);
               border-top:1px solid var(--z-faint);
@@ -70,7 +70,7 @@
 
   /* verdict table */
   .vt-wrap { overflow-x:auto; margin-top:var(--sp-6); }
-  table.vt { width:100%; border-collapse:collapse; font-family:var(--font-data); font-size:13.5px; }
+  table.vt { width:100%; border-collapse:collapse; font-family:var(--font-data); font-size:15px; }
   .vt th { text-align:left; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
            color:var(--z-mute); font-weight:600; padding:9px 12px 9px 0; border-bottom:1px solid var(--z-ink); }
   .vt td { padding:10px 12px 10px 0; border-bottom:1px solid var(--z-faint); vertical-align:top; }
@@ -103,27 +103,27 @@
   .wp .wn { font-family:var(--font-data); font-size:12px; font-weight:700; letter-spacing:.08em; color:var(--z-accent); }
   .wp h3 { margin:0; font-family:var(--font-display); font-weight:800; font-size:var(--fs-20); letter-spacing:.01em; }
   .wp .wm { margin-left:auto; font-family:var(--font-data); font-size:12px; color:var(--z-mute); letter-spacing:.04em; }
-  .wp p { margin:8px 0 0; color:var(--z-mute); font-size:15px; line-height:1.6; max-width:920px; }
+  .wp p { margin:8px 0 0; color:var(--z-mute); font-size:var(--fs-16); line-height:var(--lh-body); max-width:var(--measure); }
   .wp p strong { color:var(--z-ink); }
   .wp.neg { border-left-color:var(--z-neg); }
   .wp.neg .wn { color:var(--z-neg); }
 
   .loss { border:1px solid var(--z-line); border-left:3px solid var(--z-neg); padding:16px 20px;
-          margin-top:var(--sp-6); font-size:15px; color:var(--z-mute); line-height:1.65; max-width:980px; }
+          margin-top:var(--sp-6); font-size:var(--fs-16); color:var(--z-mute); line-height:var(--lh-body); max-width:var(--measure); }
   .loss strong { color:var(--z-ink); }
   .src { font-family:var(--font-data); font-size:12px; letter-spacing:.03em; color:var(--z-mute); margin-top:var(--sp-4); }
 
   /* terminal blocks */
-  pre.code { margin:var(--sp-5) 0 0; padding:18px 20px; border:1px solid var(--z-line);
-             overflow-x:auto; font-family:var(--font-data); font-size:12.5px; line-height:1.75;
-             color:var(--z-mute); background:var(--z-bg); }
+  pre.code { margin:var(--sp-5) 0 0; padding:18px 20px; border:1px solid var(--z-code-line);
+             overflow-x:auto; font-family:var(--font-data); font-size:var(--fs-13); line-height:1.7;
+             color:var(--z-mute); background:var(--z-code-bg); }
   pre.code .prompt { color:var(--z-accent); font-weight:700; user-select:none; }
   pre.code .out { color:var(--z-ink); }
-  pre.code .cmt { opacity:.62; }
+  pre.code .cmt { font-style:italic; }  /* was opacity:.62 (fell below 4.5:1) */
 
   /* bullet lists — same rule the hub carries locally */
-  ul.deep { list-style:none; padding:0; max-width:920px; }
-  ul.deep li { margin:14px 0; line-height:1.65; color:var(--z-mute); font-size:15px; }
+  ul.deep { list-style:none; padding:0; max-width:var(--measure); }
+  ul.deep li { margin:14px 0; line-height:var(--lh-body); color:var(--z-ink); font-size:var(--fs-16); }
   ul.deep li strong { color:var(--z-ink); }
   ul.deep code.inline { color:var(--z-ink); }
 
