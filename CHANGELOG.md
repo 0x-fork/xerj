@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on 16 to rank 1 on 91, with symbol lookups unchanged
   ([harness](benchmarks/search-exact-phrase/README.md)).
 
+- `xerj autoindex --help` now states the existing `--bulk-mb` maximum of 24.
+
 ## [1.0.0-rc.97] - 2026-10-17
 
 <!-- TODO(release manager): set the date above to the tag date. -->

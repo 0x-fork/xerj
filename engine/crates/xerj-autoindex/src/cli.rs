@@ -279,7 +279,7 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20the default reduced further on a machine with little\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20free memory)\n\
          \x20\x20\x20\x20--pdf-timeout-secs <N> per-PDF parser timeout (default 120; max 3600)\n\
-         \x20\x20\x20\x20--bulk-mb <N>        bulk cut size in MB (default 8)\n\
+         \x20\x20\x20\x20--bulk-mb <N>        bulk cut size in MB (default 8, max {max_bulk_mb})\n\
          \x20\x20\x20\x20--bulk-timeout-secs <N>\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20bulk HTTP request timeout in seconds (default 300;\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20valid range 1..=3600)\n\
@@ -678,6 +678,7 @@ pub fn help_text_with(feedback: bool) -> String {
         default_budget = crate::objwatch::cost::DEFAULT_MAX_MONTHLY_CLASS_A,
         default_gets = crate::objwatch::cost::DEFAULT_MAX_MONTHLY_CLASS_B,
         max_poll = MAX_POLL_INTERVAL_SECS,
+        max_bulk_mb = MAX_BULK_MB,
         fresh_help = FRESH_HELP,
         resume_policy_help = RESUME_POLICY_HELP,
         defaults = crate::ignore_rules::DEFAULT_IGNORE_PATTERNS.join(" ")
@@ -2242,6 +2243,25 @@ mod tests {
         assert!(err(&["data", "--bulk-mb", "0"]).contains("--bulk-mb needs a number from 1 to 24"));
         assert!(err(&["data", "--bulk-mb", "512"]).contains("--bulk-mb"));
         assert_eq!(index(&["data", "--bulk-mb", "24"]).bulk_mb, 24);
+    }
+
+    #[test]
+    fn bulk_help_documents_the_enforced_maximum() {
+        for feedback in [false, true] {
+            let help = super::help_text_with(feedback);
+            let line = help
+                .lines()
+                .find(|line| line.starts_with("    --bulk-mb <N>"))
+                .expect("--bulk-mb must be documented");
+            assert!(
+                line.contains(&format!("(default 8, max {})", super::MAX_BULK_MB)),
+                "{line}"
+            );
+        }
+        assert!(
+            err(&["data", "--bulk-mb", &(super::MAX_BULK_MB + 1).to_string()])
+                .contains("--bulk-mb")
+        );
     }
 
     #[test]
