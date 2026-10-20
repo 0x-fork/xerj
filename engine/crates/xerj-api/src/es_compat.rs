@@ -7147,6 +7147,358 @@ mod agg_param_validation_tests {
     }
 }
 
+/// Request-time check of pipeline-aggregation placement and `buckets_path`s.
+///
+/// Elasticsearch rejects these with a 400 before running the search; XERJ
+/// answered 200 with a `null` (or silently skipped) pipeline value, so a
+/// misplaced pipeline or a typo in its path looked like "no data". Messages
+/// and rules are ES 8.13's, as pinned by the ES-YAML suite (the cases this
+/// removes from `catch-lenient.txt`):
+///
+/// * `derivative` / `cumulative_sum` / `serial_diff` / `moving_fn` /
+///   `cumulative_cardinality` / `moving_percentiles` need a `histogram`,
+///   `date_histogram` or `auto_date_histogram` parent;
+/// * `bucket_script` / `bucket_selector` / `bucket_sort` must be declared
+///   inside another aggregation, and that parent must be multi-bucket;
+/// * `bucket_sort` must have something to do (`sort`, `size` or `from`);
+/// * `moving_fn`'s `window` must be positive;
+/// * every `buckets_path` (and every `bucket_sort` sort key) must name
+///   aggregations that exist, resolved from the level the pipeline is
+///   declared at — ES's `No aggregation found for path [p]` /
+///   `No aggregation [x] found for path [p]` validation failures.
+///
+/// Path checking is deliberately one-sided: it reports a path only when no
+/// reading of it can name an existing aggregation. Value keys (`p.99`,
+/// `p[99.9]`, `stats.avg`), dotted aggregation names (`v.v`) and anything
+/// past a metric aggregation are left to the executor, as before.
+///
+/// Checked on the request, like [`find_invalid_agg_order_path`], so the
+/// answer does not depend on which executor (fast or general) would run it.
+fn find_invalid_pipeline_agg(aggs: Option<&Value>) -> Option<String> {
+    const SEQUENTIAL: &[&str] = &[
+        "derivative",
+        "cumulative_sum",
+        "serial_diff",
+        "moving_fn",
+        "cumulative_cardinality",
+        "moving_percentiles",
+    ];
+    const SEQUENTIAL_PARENTS: &[&str] = &["histogram", "date_histogram", "auto_date_histogram"];
+    const MULTI_BUCKET_PIPELINES: &[&str] = &["bucket_script", "bucket_selector", "bucket_sort"];
+    const SIBLING: &[&str] = &[
+        "avg_bucket",
+        "max_bucket",
+        "min_bucket",
+        "sum_bucket",
+        "stats_bucket",
+        "extended_stats_bucket",
+        "percentiles_bucket",
+    ];
+    /// Aggregations whose result has no sub-aggregations to walk into: a
+    /// path that reaches one stops being checked (what follows is a value
+    /// key, the executor's business).
+    const LEAF: &[&str] = &[
+        "avg",
+        "sum",
+        "min",
+        "max",
+        "value_count",
+        "cardinality",
+        "stats",
+        "extended_stats",
+        "percentiles",
+        "percentile_ranks",
+        "top_hits",
+        "top_metrics",
+        "weighted_avg",
+        "median_absolute_deviation",
+        "scripted_metric",
+        "matrix_stats",
+        "string_stats",
+        "boxplot",
+        "t_test",
+        "rate",
+        "geo_bounds",
+        "geo_centroid",
+        "geo_line",
+    ];
+    /// ES names a single-bucket parent by its internal result class.
+    fn single_bucket_class(kind: &str) -> Option<&'static str> {
+        Some(match kind {
+            "filter" => "InternalFilter",
+            "global" => "InternalGlobal",
+            "nested" => "InternalNested",
+            "reverse_nested" => "InternalReverseNested",
+            "sampler" | "diversified_sampler" => "InternalSampler",
+            "random_sampler" => "InternalRandomSampler",
+            "missing" => "InternalMissing",
+            _ => return None,
+        })
+    }
+    fn sub_aggs(def: &Value) -> Option<&Value> {
+        def.get("aggs").or_else(|| def.get("aggregations"))
+    }
+    /// The aggregation type key of one definition (`{"avg": {...}, "aggs": ...}`).
+    fn kind_of(def: &Value) -> Option<(&str, &Value)> {
+        def.as_object()?
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "aggs" | "aggregations" | "meta"))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+    fn is_pipeline(kind: &str) -> bool {
+        SEQUENTIAL.contains(&kind)
+            || MULTI_BUCKET_PIPELINES.contains(&kind)
+            || SIBLING.contains(&kind)
+    }
+    /// One path element as an aggregation name at `level`: the whole element
+    /// (minus a `[key]` suffix), or failing that a prefix before a `.` (a
+    /// dotted value key such as `the_percentiles.99`). Returns the matched
+    /// definition and whether a value key followed the name.
+    fn resolve<'a>(
+        level: &'a serde_json::Map<String, Value>,
+        element: &str,
+    ) -> Option<(&'a Value, bool)> {
+        let bracketless = element.find('[').map_or(element, |at| &element[..at]);
+        if let Some(def) = level.get(bracketless) {
+            return Some((def, bracketless.len() != element.len()));
+        }
+        bracketless
+            .rmatch_indices('.')
+            .find_map(|(at, _)| level.get(&bracketless[..at]))
+            .map(|def| (def, true))
+    }
+    /// ES's `No aggregation ... found for path [...]`, or `None` when some
+    /// reading of `path` names existing aggregations from `level`.
+    fn check_path(path: &str, level: Option<&serde_json::Map<String, Value>>) -> Option<String> {
+        let elements: Vec<&str> = path.split('>').collect();
+        let mut level = level;
+        for (i, element) in elements.iter().enumerate() {
+            let last = i + 1 == elements.len();
+            if last && matches!(*element, "_count" | "_key" | "_bucket_count") {
+                return None;
+            }
+            let found = level.and_then(|defs| resolve(defs, element));
+            let Some((def, value_key)) = found else {
+                return Some(if i == 0 {
+                    format!("No aggregation found for path [{path}]")
+                } else {
+                    format!("No aggregation [{element}] found for path [{path}]")
+                });
+            };
+            let kind = kind_of(def).map(|(k, _)| k).unwrap_or("");
+            if value_key || LEAF.contains(&kind) || is_pipeline(kind) {
+                return None;
+            }
+            level = sub_aggs(def).and_then(Value::as_object);
+        }
+        None
+    }
+    /// Every `buckets_path` string of a pipeline: a string, the values of an
+    /// `{alias: path}` object, or the entries of an array.
+    fn buckets_paths(params: &Value) -> Vec<&str> {
+        match params.get("buckets_path") {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Object(o)) => o.values().filter_map(Value::as_str).collect(),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+    /// `bucket_sort`'s sort keys that name aggregations (not `_key`/`_count`).
+    fn sort_paths(params: &Value) -> Vec<&str> {
+        let keys: Vec<&str> = match params.get("sort") {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Object(o)) => o.keys().map(String::as_str).collect(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .flat_map(|e| match e {
+                    Value::String(s) => vec![s.as_str()],
+                    Value::Object(o) => o.keys().map(String::as_str).collect(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        keys.into_iter()
+            .filter(|k| !matches!(*k, "_key" | "_count"))
+            .collect()
+    }
+    fn walk(
+        level: &serde_json::Map<String, Value>,
+        parent: Option<&str>,
+        errors: &mut Vec<String>,
+    ) {
+        for (name, def) in level {
+            let Some((kind, params)) = kind_of(def) else {
+                continue;
+            };
+            if SEQUENTIAL.contains(&kind) {
+                match parent {
+                    None => errors.push(format!(
+                        "{kind} aggregation [{name}] must have a histogram, date_histogram or \
+                         auto_date_histogram as parent but doesn't have a parent"
+                    )),
+                    Some(p) if !SEQUENTIAL_PARENTS.contains(&p) => errors.push(format!(
+                        "{kind} aggregation [{name}] must have a histogram, date_histogram or \
+                         auto_date_histogram as parent"
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if MULTI_BUCKET_PIPELINES.contains(&kind) {
+                match parent.map(|p| (p, single_bucket_class(p))) {
+                    None => errors.push(format!(
+                        "{kind} aggregation [{name}] must be declared inside of another aggregation"
+                    )),
+                    Some((_, Some(class))) => errors.push(format!(
+                        "Expected a multi bucket aggregation but got [{class}] for aggregation [{name}]"
+                    )),
+                    Some((_, None)) => {}
+                }
+            }
+            if kind == "bucket_sort" {
+                let has_sort = match params.get("sort") {
+                    Some(Value::Array(a)) => !a.is_empty(),
+                    Some(Value::Null) | None => false,
+                    Some(_) => true,
+                };
+                let from = params.get("from").and_then(Value::as_u64).unwrap_or(0);
+                if !has_sort && params.get("size").is_none() && from == 0 {
+                    errors.push(format!(
+                        "[{name}] is configured to perform nothing. Please set either of \
+                         [sort, size, from] to use bucket_sort"
+                    ));
+                }
+            }
+            if kind == "moving_fn" {
+                if let Some(w) = params.get("window").and_then(Value::as_i64) {
+                    if w <= 0 {
+                        errors.push("[window] must be a positive, non-zero integer.".to_string());
+                    }
+                }
+            }
+            if is_pipeline(kind) {
+                let paths = if kind == "bucket_sort" {
+                    sort_paths(params)
+                } else {
+                    buckets_paths(params)
+                };
+                for path in paths {
+                    if let Some(e) = check_path(path, Some(level)) {
+                        errors.push(e);
+                    }
+                }
+            }
+            if let Some(subs) = sub_aggs(def).and_then(Value::as_object) {
+                walk(subs, Some(kind), errors);
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    walk(aggs?.as_object()?, None, &mut errors);
+    if errors.is_empty() {
+        return None;
+    }
+    let numbered: String = errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{}: {e};", i + 1))
+        .collect();
+    Some(format!("Validation Failed: {numbered}"))
+}
+
+#[cfg(test)]
+mod pipeline_agg_validation_tests {
+    use super::find_invalid_pipeline_agg;
+    use serde_json::json;
+
+    fn check(aggs: serde_json::Value) -> Option<String> {
+        find_invalid_pipeline_agg(Some(&aggs))
+    }
+
+    /// Shapes the executor already answers correctly must never be refused:
+    /// a false positive here turns a working query into a 400.
+    #[test]
+    fn valid_pipelines_pass() {
+        for aggs in [
+            // derivative / cumulative_sum / moving_fn under date_histogram,
+            // including a pipeline that reads another pipeline.
+            json!({"h": {"date_histogram": {"field": "t", "fixed_interval": "1d"},
+                         "aggs": {"v": {"avg": {"field": "x"}},
+                                  "d": {"derivative": {"buckets_path": "v"}},
+                                  "dd": {"derivative": {"buckets_path": "d"}},
+                                  "c": {"cumulative_sum": {"buckets_path": "_count"}},
+                                  "m": {"moving_fn": {"buckets_path": "v", "window": 2,
+                                                      "script": "MovingFunctions.min(values)"}}}}}),
+            // sibling pipelines: value keys, bracket keys, _count, a dotted
+            // agg name (`v.v`), a pipeline on a terms parent.
+            json!({"t": {"terms": {"field": "k"},
+                         "aggs": {"p": {"percentiles": {"field": "x"}},
+                                  "s": {"stats": {"field": "x"}},
+                                  "v.v": {"avg": {"field": "x"}}}},
+                   "a": {"avg_bucket": {"buckets_path": "t>p.99"}},
+                   "b": {"max_bucket": {"buckets_path": "t>p[99.9]"}},
+                   "c": {"sum_bucket": {"buckets_path": "t>_count"}},
+                   "d": {"min_bucket": {"buckets_path": "t>s.avg"}},
+                   "e": {"avg_bucket": {"buckets_path": "t>v.v.value"}}}),
+            // bucket_script / bucket_selector / bucket_sort under a
+            // multi-bucket parent, with object paths and `_key` sort.
+            json!({"h": {"histogram": {"field": "x", "interval": 1},
+                         "aggs": {"b": {"sum": {"field": "y"}},
+                                  "s": {"bucket_script": {"buckets_path": {"x": "b", "n": "_count"},
+                                                          "script": "params.x / params.n"}},
+                                  "f": {"bucket_selector": {"buckets_path": {"x": "b"},
+                                                            "script": "params.x > 0"}},
+                                  "o": {"bucket_sort": {"sort": [{"b": {"order": "desc"}}, "_key"],
+                                                        "size": 3}}}}}),
+            // bucket_sort with only `size` or `from` does something.
+            json!({"h": {"terms": {"field": "k"},
+                         "aggs": {"o": {"bucket_sort": {"from": 2}}}}}),
+        ] {
+            assert_eq!(check(aggs.clone()), None, "{aggs}");
+        }
+    }
+
+    #[test]
+    fn misplaced_and_mispathed_pipelines_are_refused_with_es_messages() {
+        let cases = [
+            (json!({"h": {"date_histogram": {"field": "t", "fixed_interval": "1h"}},
+                    "d": {"avg_bucket": {"buckets_path": "h>v"}}}),
+             "Validation Failed: 1: No aggregation [v] found for path [h>v];"),
+            (json!({"h": {"date_histogram": {"field": "t", "fixed_interval": "1h"},
+                          "aggs": {"d": {"derivative": {"buckets_path": "missing"}}}}}),
+             "Validation Failed: 1: No aggregation found for path [missing];"),
+            (json!({"a": {"filter": {"term": {"a": 1}},
+                          "aggs": {"b": {"sum": {"field": "b"}},
+                                   "d": {"cumulative_sum": {"buckets_path": "b"}}}}}),
+             "cumulative_sum aggregation [d] must have a histogram, date_histogram or auto_date_histogram as parent"),
+            (json!({"x": {"avg": {"field": "v"}},
+                    "d": {"derivative": {"buckets_path": "x"}}}),
+             "derivative aggregation [d] must have a histogram, date_histogram or auto_date_histogram as parent but doesn't have a parent"),
+            (json!({"a": {"filter": {"term": {"a": 1}},
+                          "aggs": {"b": {"sum": {"field": "b"}},
+                                   "d": {"bucket_selector": {"buckets_path": {"b": "b"},
+                                                             "script": "params.b > 0"}}}}}),
+             "Expected a multi bucket aggregation but got [InternalFilter] for aggregation [d]"),
+            (json!({"b": {"sum": {"field": "b"}},
+                    "d": {"bucket_script": {"buckets_path": {"b": "b"}, "script": "params.b"}}}),
+             "bucket_script aggregation [d] must be declared inside of another aggregation"),
+            (json!({"h": {"terms": {"field": "k"}, "aggs": {"bad": {"bucket_sort": {}}}}}),
+             "[bad] is configured to perform nothing. Please set either of [sort, size, from] to use bucket_sort"),
+            (json!({"h": {"terms": {"field": "k"},
+                          "aggs": {"bad": {"bucket_sort": {"sort": ["garbage"]}}}}}),
+             "No aggregation found for path [garbage]"),
+            (json!({"h": {"histogram": {"field": "x", "interval": 1},
+                          "aggs": {"m": {"moving_fn": {"buckets_path": "_count", "window": -1,
+                                                       "script": "MovingFunctions.min(values)"}}}}}),
+             "[window] must be a positive, non-zero integer."),
+        ];
+        for (aggs, want) in cases {
+            let got = check(aggs.clone()).unwrap_or_else(|| panic!("not refused: {aggs}"));
+            assert!(got.contains(want), "{aggs}\n got: {got}\nwant: {want}");
+        }
+    }
+}
+
 /// Parse an ES time-units string to milliseconds: `"500ms"`, `"30s"`,
 /// `"2m"`, `"1h"`, `"1d"`, `"5micros"`, `"100nanos"`, bare number =
 /// millis. Sub-millisecond values round up to 1 ms so `timeout=100nanos`
@@ -7292,6 +7644,7 @@ fn build_search_request(
     if let Some(msg) = find_invalid_agg_order_path(aggs_value.as_ref())
         .or_else(|| find_invalid_composite_agg(aggs_value.as_ref()))
         .or_else(|| find_invalid_agg_params(aggs_value.as_ref()))
+        .or_else(|| find_invalid_pipeline_agg(aggs_value.as_ref()))
     {
         return Err(xerj_common::XerjError::invalid_query(msg));
     }
@@ -26727,6 +27080,13 @@ async fn msearch_impl(
                         .get("aggs")
                         .or_else(|| search_body_val.get("aggregations")),
                 )
+                .or_else(|| {
+                    find_invalid_pipeline_agg(
+                        search_body_val
+                            .get("aggs")
+                            .or_else(|| search_body_val.get("aggregations")),
+                    )
+                })
             })
         }) {
             responses.push(json!({
@@ -37095,6 +37455,13 @@ pub async fn search_template(
                     .get("aggs")
                     .or_else(|| search_body_val.get("aggregations")),
             )
+            .or_else(|| {
+                find_invalid_pipeline_agg(
+                    search_body_val
+                        .get("aggs")
+                        .or_else(|| search_body_val.get("aggregations")),
+                )
+            })
         })
     }) {
         return ApiError::new(xerj_common::XerjError::invalid_query(msg)).into_response();
@@ -37370,6 +37737,13 @@ async fn msearch_template_impl(
                         .get("aggs")
                         .or_else(|| search_body_val.get("aggregations")),
                 )
+                .or_else(|| {
+                    find_invalid_pipeline_agg(
+                        search_body_val
+                            .get("aggs")
+                            .or_else(|| search_body_val.get("aggregations")),
+                    )
+                })
             })
         }) {
             responses.push(json!({

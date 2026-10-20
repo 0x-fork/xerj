@@ -8,43 +8,20 @@
 # make a new failure go away; a new failure is a regression.
 #
 # Format: <path under yaml/> · <test name>
-aggregations/avg_bucket.yml · bad path
 aggregations/avg_metric.yml · Aggregating wrong datatype test
 aggregations/bucket_script.yml · bad script
-aggregations/bucket_script.yml · invalid parent aggregation
-aggregations/bucket_script.yml · invalid path
-aggregations/bucket_script.yml · top level fails
 aggregations/bucket_selector.yml · bad script
-aggregations/bucket_selector.yml · invalid parent aggregation
-aggregations/bucket_selector.yml · invalid path
-aggregations/bucket_selector.yml · top level fails
-aggregations/bucket_sort.yml · invalid parent aggregation
-aggregations/bucket_sort.yml · invalid path fails
-aggregations/bucket_sort.yml · no action fails
-aggregations/bucket_sort.yml · top level fails
 aggregations/composite.yml · Composite aggregation with invalid format
 aggregations/composite.yml · Composite aggregation with lossy format
-aggregations/cumulative_sum.yml · bad path
-aggregations/cumulative_sum.yml · invalid parent aggregation
-aggregations/derivative.yml · bad path
-aggregations/derivative.yml · invalid parent aggregation
-aggregations/derivative.yml · Not under date_histo
 aggregations/extended_stats_metric.yml · Bad sigma test
 aggregations/matrix_stats_multi_value_field.yml · With script
 aggregations/matrix_stats_multi_value_field.yml · With script params
 aggregations/matrix_stats_single_value_field.yml · With script
 aggregations/matrix_stats_single_value_field.yml · With script params
 aggregations/max_buckets.yml · Max bucket
-aggregations/max_bucket.yml · bad path
 aggregations/max_metric.yml · Aggregating wrong datatype test
-aggregations/min_bucket.yml · bad path
 aggregations/min_metric.yml · Aggregating wrong datatype test
-aggregations/moving_fn.yml · bad path
-aggregations/moving_fn.yml · Bad window
-aggregations/moving_fn.yml · invalid parent aggregation
-aggregations/moving_fn.yml · Not under date_histo
 aggregations/nested.yml · Illegal reverse nested aggregation to a child nested object
-aggregations/percentiles_bucket.yml · bad path
 aggregations/percentiles_hdr_metric.yml · Invalid params test
 aggregations/percentiles_tdigest_metric.yml · Invalid params test
 aggregations/pipeline.yml · Max pipeline on percentiles hdr agg without specifying percent
@@ -64,11 +41,9 @@ aggregations/scripted_metric_allow_list.yml · stored combine_script must be all
 aggregations/scripted_metric_allow_list.yml · stored init_script must be allowed
 aggregations/scripted_metric_allow_list.yml · stored map_script must be allowed
 aggregations/scripted_metric_allow_list.yml · stored reduce_script must be allowed
-aggregations/serial_diff.yml · invalid parent aggregation
 aggregations/sig_terms.yml · IP test
 aggregations/sig_terms.yml · Misspelled fields get "did you mean"
 aggregations/stats_metric_fail_formatting.yml · fail formatting
-aggregations/sum_bucket.yml · bad path
 aggregations/sum_metric.yml · Aggregating wrong datatype test
 aggregations/terms.yml · IP test
 aggregations/top_hits.yml · having
