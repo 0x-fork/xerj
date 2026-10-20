@@ -2799,3 +2799,42 @@ html[data-theme='day'] .hero-bench b.hb-bad { color: #a32b2e; }
   color:var(--z-accent);font-weight:700;white-space:nowrap;text-decoration:none;
   font-family:"JetBrains Mono",monospace;font-size:.8rem;}
 .nav .nav-dl:hover{background:var(--z-accent);color:#0b0b0d;}
+
+/* ============================================================
+ * ANSWER / COMPARE PAGES (build_articles.py, .article-shell).
+ * The article <main> comes first in the DOM and the answers index
+ * after it, so small screens, screen readers and crawlers get the
+ * answer first. On desktop the grid puts the index back in the
+ * left column, so the two-column look is unchanged.
+ * ============================================================ */
+.article-shell > .docs-nav { grid-column: 1; grid-row: 1; }
+.article-shell > .docs-content { grid-column: 2; grid-row: 1; }
+
+@media (max-width: 1000px) {
+  .article-shell > .docs-nav,
+  .article-shell > .docs-content { grid-column: auto; grid-row: auto; }
+  .article-shell > .docs-content { padding-bottom: var(--sp-8); }
+  .article-shell > .docs-nav {
+    border-bottom: 0;
+    border-top: 1px solid var(--z-line);
+    padding: var(--sp-6) 0 0;
+    margin: 0 0 var(--sp-8);
+  }
+  /* ~31px at 390px wide, growing to 56px at 1000px; long questions
+     stay at 3-5 lines on a phone. Desktop keeps --fs-96. */
+  .article-shell .docs-content h1 {
+    font-size: clamp(30px, 4.5vw + 14px, 56px);
+    line-height: 1.04;
+    letter-spacing: 0;
+    margin-bottom: var(--sp-4);
+    overflow-wrap: break-word;
+  }
+  .article-shell .docs-content h1.h1-long {
+    font-size: clamp(25px, 3.6vw + 11px, 48px);
+  }
+  .article-shell .docs-content h2 {
+    font-size: clamp(22px, 2.6vw + 12px, var(--fs-32));
+    line-height: 1.1;
+    margin-top: var(--sp-8);
+  }
+}

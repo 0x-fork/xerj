@@ -23,6 +23,7 @@ TOP_FIELDS = frozenset({
     "title", "h1", "description", "slug", "cluster", "question", "intent",
     "published", "updated", "author", "reviewer", "schema_type", "links_out",
     "evidence", "faq", "noindex", "agent_prompt", "commands",
+    "og_image", "og_image_alt", "structured_data",
 })
 # ``evidence`` is optional.  The block existed to point at capture files that
 # are no longer part of the repository, so an article without one is normal and
@@ -44,8 +45,18 @@ REQUIRED_FIELDS = frozenset({
 STRING_FIELDS = frozenset({
     "title", "h1", "description", "slug", "cluster", "question", "intent",
     "author", "reviewer", "schema_type", "agent_prompt",
+    "og_image", "og_image_alt",
 })
-LIST_FIELDS = frozenset({"links_out", "evidence", "faq", "commands"})
+LIST_FIELDS = frozenset({"links_out", "evidence", "faq", "commands", "structured_data"})
+# Opt-in extra JSON-LD for an article (structured_data: [faq, howto, software]).
+# Off by default, and the site-wide policy in scripts/seo/README.md trap 6
+# still holds for every page that does not opt in.  No page sets the field
+# yet (FAQPage/HowTo stay off until that is decided).  Answer engines read
+# those types as plain structured data even where Google no longer shows a
+# rich result; seo_lint rule 46 lets them through only on a page whose source
+# lists them, and rule 46b requires every FAQPage question to be visible.
+STRUCTURED_DATA_KINDS = frozenset({"faq", "howto", "software"})
+OG_IMAGE_RE = re.compile(r"^og/answers-[a-z0-9]+(?:-[a-z0-9]+)*\.png$")
 MAP_FIELDS = frozenset({"evidence", "faq", "commands"})
 MAP_KEYS = {
     "evidence": frozenset({"claim", "source"}),
@@ -69,8 +80,11 @@ COMMAND_TOKEN_RE = re.compile(r"^-{1,2}[A-Za-z][A-Za-z0-9-]*(?:=.*)?$")
 # engine/crates/xerj-server/src/share.rs).
 # `code` and `corpus` added 2026-09-21 with #977's port of the xc wrapper
 # scripts into the binary (engine/crates/xerj-autoindex/src/xc.rs).
+# `ask`, `search`, `def`, `hub` and `init` added 2026-10-19, checked against
+# `xerj <cmd> --help` on the v1.0.0-rc.97 release binary.
 XERJ_COMMANDS = frozenset({
     "index", "autoindex", "brain", "mcp", "share", "code", "corpus", "help", "version",
+    "ask", "search", "def", "hub", "init",
 })
 SHELL_PRIMITIVES = frozenset({
     "bash", "cd", "command", "curl", "env", "export", "git", "sh", "until", "wget",
@@ -111,6 +125,9 @@ class Article:
     commands: tuple[dict[str, str], ...]
     body: str
     body_start_line: int
+    og_image: str | None = None
+    og_image_alt: str | None = None
+    structured_data: tuple[str, ...] = ()
 
     @property
     def output_rel(self) -> str:
@@ -135,6 +152,14 @@ class Article:
         }
         if self.updated:
             out["updated"] = self.updated
+        if self.og_image:
+            out["og_image"] = self.og_image
+            out["og_image_alt"] = self.og_image_alt
+        if self.structured_data:
+            out["structured_data"] = self.structured_data
+            out["faq"] = self.faq
+            out["howto_steps"] = self.commands
+            out["h1"] = self.h1
         return out
 
 
@@ -415,6 +440,7 @@ def _validate(path: pathlib.Path, values: dict[str, Any], line_map: dict[str, in
     # with a bare KeyError instead of a clean schema decision (found by
     # test_article_schema.py's minimal fixture, #974).
     values.setdefault("commands", [])
+    values.setdefault("structured_data", [])
     for key in LIST_FIELDS:
         value = values[key]
         if not isinstance(value, list):
@@ -484,6 +510,27 @@ def _validate(path: pathlib.Path, values: dict[str, Any], line_map: dict[str, in
             _validate_command(command, path, cmd_line)
             if "```" in command or "```" in note:
                 raise _error(path, cmd_line, "commands values must not contain a Markdown fence")
+    for item in values["structured_data"]:
+        if item not in STRUCTURED_DATA_KINDS:
+            raise _error(path, line_map.get("structured_data", 1),
+                         f"structured_data item {item!r} must be one of "
+                         f"{', '.join(sorted(STRUCTURED_DATA_KINDS))}")
+    if len(set(values["structured_data"])) != len(values["structured_data"]):
+        raise _error(path, line_map.get("structured_data", 1),
+                     "structured_data lists an item twice")
+    if "howto" in values["structured_data"] and len(values["commands"]) < 2:
+        raise _error(path, line_map.get("structured_data", 1),
+                     "structured_data: howto needs at least two commands (the HowTo steps)")
+    if ("og_image" in values) != ("og_image_alt" in values):
+        raise _error(path, line_map.get("og_image", line_map.get("og_image_alt", 1)),
+                     "og_image and og_image_alt go together")
+    if "og_image" in values:
+        if not OG_IMAGE_RE.fullmatch(values["og_image"]):
+            raise _error(path, line_map.get("og_image", 1),
+                         "og_image must be og/answers-<slug>.png")
+        if values["og_image"] != f"og/answers-{slug}.png":
+            raise _error(path, line_map.get("og_image", 1),
+                         f"og_image must be og/answers-{slug}.png for this slug")
     values["noindex"] = values.get("noindex", False)
     values["agent_prompt"] = values.get("agent_prompt")
     values["commands"] = values.get("commands", [])
@@ -534,6 +581,9 @@ def load(path: pathlib.Path, category: str | None = None) -> Article:
         commands=tuple(dict(item) for item in values["commands"]),
         body=body,
         body_start_line=body_start_line,
+        og_image=values.get("og_image"),
+        og_image_alt=values.get("og_image_alt"),
+        structured_data=tuple(values["structured_data"]),
     )
 
 

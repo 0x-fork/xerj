@@ -741,6 +741,29 @@ class Lint:
                 self.gate("fonts.display_swap", rel,
                           "Google Fonts URL lacks display=swap (rule 57)")
 
+    def _visible_text(self, rel: str) -> str:
+        raw = (self.root / rel).read_text(encoding="utf-8")
+        raw = re.sub(r"(?is)<head\b.*?</head>", " ", raw)
+        raw = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", raw)
+        raw = re.sub(r"(?i)</?(?:a|b|code|em|i|kbd|span|strong)\b[^>]*>", "", raw)
+        raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+        return re.sub(r"\s+", " ", html.unescape(raw)).strip()
+
+    def _check_faq_visible(self, rel: str, line: int, node: dict) -> None:
+        """Rule 46b: an opted-in FAQPage must mirror questions shown on the page."""
+        text = self._visible_text(rel)
+        for q in node.get("mainEntity") or []:
+            name = (q or {}).get("name", "")
+            answer = ((q or {}).get("acceptedAnswer") or {}).get("text", "")
+            if not name or name not in text:
+                self.gate("jsonld.faq_not_visible", rel,
+                          f"line {line}: FAQPage question {name[:60]!r} is not "
+                          f"visible on the page (rule 46b)")
+            elif not answer or answer[:80] not in text:
+                self.gate("jsonld.faq_not_visible", rel,
+                          f"line {line}: FAQPage answer to {name[:60]!r} does not "
+                          f"match the visible answer (rule 46b)")
+
     def _check_jsonld(self, rel: str, page: audit_mod.Page, url: str,
                       title: str, desc: str) -> None:
         if not page.jsonld:
@@ -773,9 +796,18 @@ class Lint:
                     continue
                 types.add(t)
                 if t in ("FAQPage", "HowTo"):
-                    self.gate("jsonld.deprecated_type", rel,
-                              f"line {line}: {t} — FAQ rich results end 7 May 2026 "
-                              f"and HowTo was removed outright (rule 46)")
+                    # Opt-in only (README trap 6): a page whose article source
+                    # lists the type under `structured_data:` may carry it.
+                    opted = pagedata.entry(rel).get("structured_data") or ()
+                    kind = "faq" if t == "FAQPage" else "howto"
+                    if kind not in opted:
+                        self.gate("jsonld.deprecated_type", rel,
+                                  f"line {line}: {t} — FAQ rich results end 7 May 2026 "
+                                  f"and HowTo was removed outright (rule 46); a page "
+                                  f"may carry it only by listing `{kind}` under "
+                                  f"structured_data: in its content source")
+                    elif t == "FAQPage":
+                        self._check_faq_visible(rel, line, node)
                 if "aggregateRating" in node or "review" in node:
                     self.gate("jsonld.fabricated_rating", rel,
                               f"line {line}: aggregateRating/review without a real "

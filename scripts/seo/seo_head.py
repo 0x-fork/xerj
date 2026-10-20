@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from typing import Any
 
 import pagedata
@@ -179,6 +180,67 @@ def breadcrumbs(rel: str, meta: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+
+
+def _plain(text: str) -> str:
+    """Markdown inline text -> the plain text a reader sees on the page."""
+    text = _MD_LINK.sub(r"\1", text)
+    return re.sub(r"\s+", " ", text.replace("`", "").replace("**", "")).strip()
+
+
+def extra_structured_data(url: str, desc: str, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Opt-in JSON-LD for an article whose source lists `structured_data:`.
+
+    No page opts in yet. See README trap 6 and seo_lint rule 46 for the
+    policy and the visible-content check.
+    """
+    kinds = meta.get("structured_data") or ()
+    out: list[dict[str, Any]] = []
+    if "faq" in kinds and meta.get("faq"):
+        out.append({
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [{
+                "@type": "Question",
+                "name": _plain(item["q"]),
+                "acceptedAnswer": {"@type": "Answer", "text": _plain(item["a"])},
+            } for item in meta["faq"]],
+        })
+    if "howto" in kinds and meta.get("howto_steps"):
+        out.append({
+            "@context": "https://schema.org",
+            "@type": "HowTo",
+            "name": _plain(meta.get("h1") or meta["label"]),
+            "description": desc,
+            "tool": [{"@type": "HowToTool", "name": "xerj (Apache-2.0)"}],
+            "step": [{
+                "@type": "HowToStep",
+                "position": i,
+                "name": _plain(step.get("note") or step["cmd"]),
+                "text": step["cmd"],
+            } for i, step in enumerate(meta["howto_steps"], start=1)],
+        })
+    if "software" in kinds:
+        out.append({
+            "@context": "https://schema.org",
+            "@type": "SoftwareApplication",
+            "name": "XERJ",
+            "alternateName": urlmap.SITE_NAME,
+            "applicationCategory": "DeveloperApplication",
+            "applicationSubCategory": "Search engine",
+            "operatingSystem": "Linux, macOS, Windows",
+            "url": urlmap.SITE_ORIGIN + "/product",
+            "downloadUrl": GITHUB + "/releases/latest",
+            "license": LICENSE,
+            "isAccessibleForFree": True,
+            "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+            "codeRepository": GITHUB,
+            "publisher": {"@id": ORG_ID},
+        })
+    return out
+
+
 def build_block(rel: str, title: str, desc: str, published: str,
                 modified: str, meta: dict[str, Any] | None = None) -> str:
     """Emit the exact SEO block used by ``fix_heads.py``."""
@@ -210,6 +272,7 @@ def build_block(rel: str, title: str, desc: str, published: str,
         ld(website()),
         ld(page_body(rel, meta, url, title, desc, published, modified)),
     ]
+    lines += [ld(obj) for obj in extra_structured_data(url, desc, meta)]
     crumbs = breadcrumbs(rel, meta)
     if crumbs is not None:
         lines.append(ld(crumbs))

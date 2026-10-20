@@ -131,5 +131,57 @@ class CommittedContentTests(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class StructuredDataOptInTests(unittest.TestCase):
+    """The opt-in FAQPage/HowTo/SoftwareApplication JSON-LD (README trap 6)."""
+
+    OPT_IN = ('structured_data: [faq, howto, software]\n'
+              'og_image: "og/answers-schema-test-article.png"\n'
+              'og_image_alt: "Cover for the schema test article."\n'
+              'commands:\n'
+              '  - cmd: "xerj autoindex ./data"\n'
+              '    note: "Index the folder"\n'
+              '  - cmd: "xerj search \'query\'"\n'
+              '    note: "Search it"\n')
+
+    def _load(self, extra: str):
+        text = FRONTMATTER.replace("faq:\n", extra + "faq:\n", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            return load(_write(pathlib.Path(tmp), text))
+
+    def test_default_is_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            article = load(_write(pathlib.Path(tmp), FRONTMATTER))
+        self.assertEqual(article.structured_data, ())
+        self.assertNotIn("structured_data", article.head_meta())
+
+    def test_opt_in_emits_three_blocks(self):
+        import seo_head
+        article = self._load(self.OPT_IN)
+        meta = article.head_meta()
+        self.assertEqual(meta["og_image"], "og/answers-schema-test-article.png")
+        blocks = seo_head.extra_structured_data("https://xerj.org/x", "d", meta)
+        self.assertEqual([b["@type"] for b in blocks],
+                         ["FAQPage", "HowTo", "SoftwareApplication"])
+        self.assertEqual(len(blocks[0]["mainEntity"]), 4)
+        self.assertEqual(blocks[1]["step"][1]["text"], "xerj search 'query'")
+        self.assertNotIn("aggregateRating", blocks[2])
+
+    def test_unknown_kind_is_rejected(self):
+        with self.assertRaises(FrontmatterError) as ctx:
+            self._load("structured_data: [faq, review]\n")
+        self.assertIn("must be one of", str(ctx.exception))
+
+    def test_howto_needs_commands(self):
+        with self.assertRaises(FrontmatterError) as ctx:
+            self._load("structured_data: [howto]\n")
+        self.assertIn("howto needs at least two commands", str(ctx.exception))
+
+    def test_og_image_must_match_slug(self):
+        with self.assertRaises(FrontmatterError):
+            self._load('og_image: "og/answers-other.png"\nog_image_alt: "x"\n')
+        with self.assertRaises(FrontmatterError):
+            self._load('og_image: "og/answers-schema-test-article.png"\n')
+
+
 if __name__ == "__main__":
     unittest.main()

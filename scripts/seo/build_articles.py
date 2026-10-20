@@ -774,9 +774,15 @@ def _head(title: str, description: str, rel: str, block: str,
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
-<link rel="stylesheet" href="/style.css?v=90f643e">
+<link rel="stylesheet" href="/style.css?v=as2">
 {alternate}{block}
 </head>'''
+
+
+# Questions longer than this get a smaller H1 on phones (style.css, .h1-long)
+# so a verbatim user question still fits in about five lines at 390px.
+# Desktop sizing does not change.
+H1_LONG_CHARS = 80
 
 
 def render_article(article: article_data.Article, context: BuildContext) -> str:
@@ -793,15 +799,15 @@ def render_article(article: article_data.Article, context: BuildContext) -> str:
 {_head(article.title, article.description, rel, block, markdown_path(article))}
 <body>
 {primary_nav()}
-<div class="docs-shell">
-{article_nav(context, article)}
+<div class="docs-shell article-shell">
 <main class="docs-content">
   {breadcrumb(rel, meta)}
   <div class="kicker"><span>{esc_text(article.category.upper())} · {esc_text(article.cluster.upper())}</span></div>
-  <h1>{_inline(article.h1, article, article.body_start_line, context.markdown_href)}</h1>
+  <h1{' class="h1-long"' if len(article.h1) > H1_LONG_CHARS else ''}>{_inline(article.h1, article, article.body_start_line, context.markdown_href)}</h1>
   <div class="source-note">{esc_text(source_note)}</div>
 {body}
 </main>
+{article_nav(context, article)}
 </div>
 {footer(article.category)}
 <script src="/interact.js"></script>
@@ -852,14 +858,14 @@ def render_hub(category: str, articles: list[article_data.Article],
 {_head(meta["title"], meta["description"], rel, block)}
 <body>
 {primary_nav()}
-<div class="docs-shell">
-{article_nav(context, None)}
+<div class="docs-shell article-shell">
 <main class="docs-content">
   {breadcrumb(rel, meta)}
   <div class="kicker"><span>{esc_text(category.upper())}</span></div>
   <h1>{esc_text(meta["label"])}</h1>
 {chr(10).join(content)}
 </main>
+{article_nav(context, None)}
 </div>
 {footer(category)}
 <script src="/interact.js"></script>

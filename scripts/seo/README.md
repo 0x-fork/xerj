@@ -685,7 +685,18 @@ were removed outright. `aggregateRating`/`Review` would be invented — there is
 review corpus — which is a manual-action risk under Google's structured-data spam
 policies. The emitted set is: `Organization` + `WebSite` sitewide, one page-body
 type (`SoftwareApplication` / `CollectionPage` / `TechArticle` / `Article` /
-`WebPage`), and `BreadcrumbList` below the root. That is all.
+`WebPage`), and `BreadcrumbList` below the root. That is the default.
+
+**One opt-in exception (2026-10-19).** An article source may list
+`structured_data: [faq, howto, software]`. `seo_head.extra_structured_data` then
+adds `FAQPage` (from `faq:`), `HowTo` (from `commands:`, at least two) and a
+`SoftwareApplication` for the product. No page sets the field yet: FAQPage and
+HowTo stay off until that opt-in is decided. Google shows no rich result for
+them, but answer engines and agents read the blocks as plain structured data
+when a page does opt in. `seo_lint` rule 46 lets the two types through only on
+a page that opted in, and rule 46b (`jsonld.faq_not_visible`) fails the page if
+a `FAQPage` question or answer is not visible in the page text. No
+`aggregateRating` / `Review`, ever.
 
 ### 7. JSON-LD needs no CSP change
 
