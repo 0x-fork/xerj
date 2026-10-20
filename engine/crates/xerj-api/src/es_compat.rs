@@ -6787,6 +6787,366 @@ mod composite_agg_validation_tests {
     }
 }
 
+/// Request-time check of aggregation parameters and structure that
+/// Elasticsearch rejects at parse time with a 400, where XERJ answered 200
+/// (ignoring the bad value, or returning an empty/defaulted result). Messages
+/// are ES 8.13's, as pinned by the ES-YAML suite:
+///
+/// * `meta` that is not an object;
+/// * `cardinality`: negative `precision_threshold`, unknown `execution_hint`;
+/// * `filters` with no filters;
+/// * `ip_prefix`: `prefix_length` outside `[0, 32]` (`[0, 128]` for IPv6);
+/// * `median_absolute_deviation`: `compression` ≤ 0, unknown `execution_hint`;
+/// * `percentiles` / `percentile_ranks`: negative `tdigest.compression`,
+///   unknown `tdigest.execution_hint`, and `percentile_ranks` without usable
+///   `values`;
+/// * `terms` with neither `field` nor `script`;
+/// * `random_sampler`: `probability` outside `(0, 0.5]` ∪ `{1.0}`, no
+///   sub-aggregations, a parent, or a sampler / time_series below it;
+/// * `time_series` under `global`, or in a request that also uses an
+///   aggregation incompatible with time-series execution (`composite`,
+///   `auto_date_histogram`, `variable_width_histogram`, `rare_terms`).
+///
+/// Checks that need the field's mapped type (e.g. `avg` on a keyword field)
+/// are not made here.
+fn find_invalid_agg_params(aggs: Option<&Value>) -> Option<String> {
+    const TDIGEST_HINTS: &[&str] = &["default", "high_accuracy"];
+    const CARDINALITY_HINTS: &[&str] = &[
+        "global_ordinals",
+        "segment_ordinals",
+        "direct",
+        "save_memory_heuristic",
+        "save_time_heuristic",
+    ];
+    const TIME_SERIES_INCOMPATIBLE: &[&str] = &[
+        "composite",
+        "auto_date_histogram",
+        "variable_width_histogram",
+        "rare_terms",
+    ];
+    fn sub_aggs(def: &Value) -> Option<&serde_json::Map<String, Value>> {
+        def.get("aggs")
+            .or_else(|| def.get("aggregations"))
+            .and_then(Value::as_object)
+    }
+    fn kind_of(def: &Value) -> Option<(&str, &Value)> {
+        def.as_object()?
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "aggs" | "aggregations" | "meta"))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+    /// The parser token ES names for a JSON value.
+    fn token(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "VALUE_NULL",
+            Value::Bool(_) => "VALUE_BOOLEAN",
+            Value::Number(_) => "VALUE_NUMBER",
+            Value::String(_) => "VALUE_STRING",
+            Value::Array(_) => "START_ARRAY",
+            Value::Object(_) => "START_OBJECT",
+        }
+    }
+    fn hint_error(hint: &str) -> String {
+        format!("Invalid execution_hint [{hint}], valid values are [default, high_accuracy]")
+    }
+    /// `tdigest` options shared by `percentiles` and `percentile_ranks`.
+    fn check_tdigest(params: &Value) -> Option<String> {
+        let tdigest = params.get("tdigest")?;
+        if let Some(c) = tdigest.get("compression").and_then(Value::as_f64) {
+            if c < 0.0 {
+                return Some(format!(
+                    "[compression] must be greater than or equal to 0. Found [{c:?}]"
+                ));
+            }
+        }
+        match tdigest.get("execution_hint").and_then(Value::as_str) {
+            Some(h) if !TDIGEST_HINTS.contains(&h) => Some(hint_error(h)),
+            _ => None,
+        }
+    }
+    /// Every descendant definition below `def`, as `(type, name)`.
+    fn descendants<'a>(def: &'a Value, out: &mut Vec<(&'a str, &'a str)>) {
+        for (name, child) in sub_aggs(def).into_iter().flatten() {
+            if let Some((kind, _)) = kind_of(child) {
+                out.push((kind, name.as_str()));
+            }
+            descendants(child, out);
+        }
+    }
+    fn has_kind(level: &serde_json::Map<String, Value>, kind: &str) -> bool {
+        level.values().any(|def| {
+            kind_of(def).is_some_and(|(k, _)| k == kind)
+                || sub_aggs(def).is_some_and(|subs| has_kind(subs, kind))
+        })
+    }
+    fn check_def(
+        name: &str,
+        def: &Value,
+        kind: &str,
+        params: &Value,
+        ancestors: &[&str],
+        time_series_request: bool,
+    ) -> Option<String> {
+        if let Some(meta) = def.get("meta") {
+            if !meta.is_object() {
+                return Some(format!(
+                    "Expected [START_OBJECT] under [meta], but got a [{}] in [{name}]",
+                    token(meta)
+                ));
+            }
+        }
+        match kind {
+            "cardinality" => {
+                if let Some(p) = params.get("precision_threshold").and_then(Value::as_i64) {
+                    if p < 0 {
+                        return Some(format!(
+                            "[precisionThreshold] must be greater than or equal to 0. \
+                             Found [{p}] in [{name}]"
+                        ));
+                    }
+                }
+                if let Some(h) = params.get("execution_hint").and_then(Value::as_str) {
+                    if !CARDINALITY_HINTS.contains(&h) {
+                        return Some(format!(
+                            "Invalid execution mode for cardinality aggregation. Got [{h}]\
+                             expected one of [{}]",
+                            CARDINALITY_HINTS.join(", ")
+                        ));
+                    }
+                }
+            }
+            "filters" => {
+                let empty = match params.get("filters") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Array(a)) => a.is_empty(),
+                    Some(Value::Object(o)) => o.is_empty(),
+                    Some(_) => false,
+                };
+                if empty {
+                    return Some("[filters] cannot be empty.".to_string());
+                }
+            }
+            "ip_prefix" => {
+                let max = if params.get("is_ipv6").and_then(Value::as_bool) == Some(true) {
+                    128
+                } else {
+                    32
+                };
+                if let Some(len) = params.get("prefix_length").and_then(Value::as_i64) {
+                    if !(0..=max).contains(&len) {
+                        return Some(format!(
+                            "[prefix_length] must be in range [0, {max}] while value is [{len}]"
+                        ));
+                    }
+                }
+            }
+            "median_absolute_deviation" => {
+                if let Some(c) = params.get("compression").and_then(Value::as_f64) {
+                    if c <= 0.0 {
+                        return Some(format!(
+                            "[compression] must be greater than 0. Found [{c:?}] in [{name}]"
+                        ));
+                    }
+                }
+                if let Some(h) = params.get("execution_hint").and_then(Value::as_str) {
+                    if !TDIGEST_HINTS.contains(&h) {
+                        return Some(hint_error(h));
+                    }
+                }
+            }
+            "percentiles" => return check_tdigest(params),
+            "percentile_ranks" => {
+                if let Some(e) = check_tdigest(params) {
+                    return Some(e);
+                }
+                match params.get("values") {
+                    None | Some(Value::Null) => {
+                        return Some(format!("[values] must not be null: [{name}]"))
+                    }
+                    Some(Value::Array(a)) if a.is_empty() => {
+                        return Some(format!("[values] must not be an empty array: [{name}]"))
+                    }
+                    Some(Value::Array(a)) if !a.iter().all(Value::is_number) => {
+                        return Some(format!("[values] must be numbers: [{name}]"))
+                    }
+                    _ => {}
+                }
+            }
+            "terms" => {
+                if params.get("field").is_none() && params.get("script").is_none() {
+                    return Some(
+                        "Required one of fields [field, script], but none were specified."
+                            .to_string(),
+                    );
+                }
+            }
+            "random_sampler" => {
+                if let Some(p) = params.get("probability").and_then(Value::as_f64) {
+                    if p <= 0.0 {
+                        return Some(format!(
+                            "[probability] must be greater than 0.0, was [{p:?}]"
+                        ));
+                    }
+                    if p > 0.5 && p != 1.0 {
+                        return Some(format!(
+                            "[probability] must be between 0.0 and 0.5 or exactly 1.0, \
+                             was [{p:?}]"
+                        ));
+                    }
+                }
+                if !ancestors.is_empty() {
+                    return Some(format!(
+                        "[random_sampler] aggregation [{name}] cannot have a parent aggregation"
+                    ));
+                }
+                if sub_aggs(def).is_none_or(serde_json::Map::is_empty) {
+                    return Some(format!(
+                        "[random_sampler] aggregation [{name}] must have sub-aggregations"
+                    ));
+                }
+                let mut below = Vec::new();
+                descendants(def, &mut below);
+                if let Some((k, n)) = below.iter().find(|(k, _)| {
+                    matches!(
+                        *k,
+                        "sampler" | "diversified_sampler" | "random_sampler" | "time_series"
+                    )
+                }) {
+                    return Some(format!(
+                        "[random_sampler] aggregation [{name}] does not support sampling \
+                         [{k}] aggregation [{n}]"
+                    ));
+                }
+            }
+            "time_series" if ancestors.contains(&"global") => {
+                return Some(
+                    "Time series aggregations cannot be used inside global aggregation."
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        if time_series_request && TIME_SERIES_INCOMPATIBLE.contains(&kind) {
+            let shown = if kind == "composite" {
+                "composite"
+            } else {
+                name
+            };
+            return Some(format!(
+                "[{shown}] aggregation is incompatible with time series execution mode"
+            ));
+        }
+        None
+    }
+    fn walk<'a>(
+        level: &'a serde_json::Map<String, Value>,
+        ancestors: &mut Vec<&'a str>,
+        time_series_request: bool,
+    ) -> Option<String> {
+        for (name, def) in level {
+            let Some((kind, params)) = kind_of(def) else {
+                continue;
+            };
+            if let Some(reason) = check_def(name, def, kind, params, ancestors, time_series_request)
+            {
+                return Some(reason);
+            }
+            if let Some(subs) = sub_aggs(def) {
+                ancestors.push(kind);
+                let found = walk(subs, ancestors, time_series_request);
+                ancestors.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+    let level = aggs?.as_object()?;
+    let time_series_request = has_kind(level, "time_series");
+    walk(level, &mut Vec::new(), time_series_request)
+}
+
+#[cfg(test)]
+mod agg_param_validation_tests {
+    use super::find_invalid_agg_params;
+    use serde_json::json;
+
+    fn check(aggs: serde_json::Value) -> Option<String> {
+        find_invalid_agg_params(Some(&aggs))
+    }
+
+    /// Valid shapes the suite already passes with must never be refused.
+    #[test]
+    fn valid_aggregations_pass() {
+        for aggs in [
+            json!({"c": {"cardinality": {"field": "f", "precision_threshold": 0,
+                                         "execution_hint": "save_memory_heuristic"}}}),
+            json!({"m": {"median_absolute_deviation": {"field": "f", "compression": 500,
+                                                       "execution_hint": "high_accuracy"}}}),
+            json!({"p": {"percentiles": {"field": "f", "tdigest": {"compression": 200,
+                                                                   "execution_hint": "default"}}}}),
+            json!({"r": {"percentile_ranks": {"field": "f", "values": [50, 99],
+                                              "hdr": {"number_of_significant_value_digits": 3}}}}),
+            json!({"i": {"ip_prefix": {"field": "ip", "is_ipv6": true, "prefix_length": 64}}}),
+            json!({"t": {"terms": {"script": {"source": "doc['f'].value"}}}}),
+            json!({"f": {"meta": {"k": "v"},
+                         "filters": {"filters": {"a": {"match": {"x": 1}}}}}}),
+            json!({"s": {"random_sampler": {"probability": 0.1},
+                         "aggs": {"m": {"avg": {"field": "v"}}}}}),
+            json!({"s": {"random_sampler": {"probability": 1.0},
+                         "aggs": {"m": {"avg": {"field": "v"}}}}}),
+            json!({"ts": {"time_series": {"keyed": false},
+                          "aggs": {"d": {"date_histogram": {"field": "@timestamp",
+                                                            "fixed_interval": "1h"}}}}}),
+            // An incompatible type is fine when the request has no time_series.
+            json!({"c": {"composite": {"sources": [{"k": {"terms": {"field": "k"}}}]}},
+                   "r": {"rare_terms": {"field": "k"}}}),
+        ] {
+            assert_eq!(check(aggs.clone()), None, "{aggs}");
+        }
+    }
+
+    #[test]
+    fn invalid_parameters_are_refused_with_es_messages() {
+        let cases = [
+            (json!({"distinct_int": {"cardinality": {"field": "f", "precision_threshold": -1}}}),
+             "[precisionThreshold] must be greater than or equal to 0. Found [-1] in [distinct_int]"),
+            (json!({"c": {"cardinality": {"field": "f", "execution_hint": "bogus"}}}),
+             "Invalid execution mode for cardinality aggregation"),
+            (json!({"the_filter": {"filters": {}}}), "[filters] cannot be empty"),
+            (json!({"the_filter": {"meta": null, "filters": {"filters": {"a": {"match_all": {}}}}}}),
+             "Expected [START_OBJECT] under [meta], but got a [VALUE_NULL] in [the_filter]"),
+            (json!({"i": {"ip_prefix": {"field": "ip", "is_ipv6": false, "prefix_length": 44}}}),
+             "[prefix_length] must be in range [0, 32] while value is [44]"),
+            (json!({"mad": {"median_absolute_deviation": {"field": "f", "compression": 0}}}),
+             "[compression] must be greater than 0. Found [0.0] in [mad]"),
+            (json!({"p": {"percentiles": {"field": "f", "tdigest": {"execution_hint": "no_such_hint"}}}}),
+             "Invalid execution_hint [no_such_hint], valid values are [default, high_accuracy]"),
+            (json!({"r": {"percentile_ranks": {"field": "f", "values": []}}}),
+             "[values] must not be an empty array: [r]"),
+            (json!({"t": {"terms": {"size": 1}}}),
+             "Required one of fields [field, script], but none were specified"),
+            (json!({"sampled": {"random_sampler": {"probability": 1.5},
+                                "aggs": {"m": {"avg": {"field": "v"}}}}}),
+             "[probability] must be between 0.0 and 0.5 or exactly 1.0, was [1.5]"),
+            (json!({"terms": {"terms": {"field": "p"},
+                              "aggs": {"sampled": {"random_sampler": {"probability": 0.1},
+                                                   "aggs": {"m": {"max": {"field": "v"}}}}}}}),
+             "[random_sampler] aggregation [sampled] cannot have a parent aggregation"),
+            (json!({"global": {"global": {}, "aggs": {"ts": {"time_series": {}}}}}),
+             "Time series aggregations cannot be used inside global aggregation."),
+            (json!({"by_time": {"auto_date_histogram": {"field": "@timestamp"},
+                                "aggs": {"ts": {"time_series": {}}}}}),
+             "[by_time] aggregation is incompatible with time series execution mode"),
+        ];
+        for (aggs, want) in cases {
+            let got = check(aggs.clone()).unwrap_or_else(|| panic!("not refused: {aggs}"));
+            assert!(got.contains(want), "{aggs}\n got: {got}\nwant: {want}");
+        }
+    }
+}
+
 /// Parse an ES time-units string to milliseconds: `"500ms"`, `"30s"`,
 /// `"2m"`, `"1h"`, `"1d"`, `"5micros"`, `"100nanos"`, bare number =
 /// millis. Sub-millisecond values round up to 1 ms so `timeout=100nanos`
@@ -6931,6 +7291,7 @@ fn build_search_request(
     }
     if let Some(msg) = find_invalid_agg_order_path(aggs_value.as_ref())
         .or_else(|| find_invalid_composite_agg(aggs_value.as_ref()))
+        .or_else(|| find_invalid_agg_params(aggs_value.as_ref()))
     {
         return Err(xerj_common::XerjError::invalid_query(msg));
     }
@@ -26360,6 +26721,13 @@ async fn msearch_impl(
                     .get("aggs")
                     .or_else(|| search_body_val.get("aggregations")),
             )
+            .or_else(|| {
+                find_invalid_agg_params(
+                    search_body_val
+                        .get("aggs")
+                        .or_else(|| search_body_val.get("aggregations")),
+                )
+            })
         }) {
             responses.push(json!({
                 "error": { "type": "illegal_argument_exception", "reason": msg },
@@ -36721,6 +37089,13 @@ pub async fn search_template(
                 .get("aggs")
                 .or_else(|| search_body_val.get("aggregations")),
         )
+        .or_else(|| {
+            find_invalid_agg_params(
+                search_body_val
+                    .get("aggs")
+                    .or_else(|| search_body_val.get("aggregations")),
+            )
+        })
     }) {
         return ApiError::new(xerj_common::XerjError::invalid_query(msg)).into_response();
     }
@@ -36989,6 +37364,13 @@ async fn msearch_template_impl(
                     .get("aggs")
                     .or_else(|| search_body_val.get("aggregations")),
             )
+            .or_else(|| {
+                find_invalid_agg_params(
+                    search_body_val
+                        .get("aggs")
+                        .or_else(|| search_body_val.get("aggregations")),
+                )
+            })
         }) {
             responses.push(json!({
                 "error": { "type": "illegal_argument_exception", "reason": msg },
