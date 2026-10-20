@@ -1169,6 +1169,7 @@ fn date_resolve_err(e: dates::DateResolveError, fmt: Option<&str>, value: &str) 
             let _ = value; // value context already inside the math substring
             format!("operator not supported for date math [{m}]")
         }
+        UnknownTimeZone(tz) => format!("Unknown time-zone ID: {tz}"),
     };
     QueryError::Parse(ParseError::Invalid(msg))
 }
@@ -1182,9 +1183,10 @@ fn resolve_range_bound(
     round_up: bool,
     formats: Option<&[dates::DateFmt]>,
     fmt_raw: Option<&str>,
+    tz: Option<&dates::TimeZone>,
 ) -> Result<Value> {
     match &v {
-        Value::String(s) => match dates::resolve_date_bound_str(s, round_up, formats) {
+        Value::String(s) => match dates::resolve_date_bound_str_in(s, round_up, formats, tz) {
             Ok(Some(iso)) => Ok(Value::String(iso)),
             Ok(None) => Ok(v),
             Err(e) => Err(date_resolve_err(e, fmt_raw, s)),
@@ -1192,7 +1194,7 @@ fn resolve_range_bound(
         Value::Number(n) => match formats {
             // ES stringifies numbers under an explicit date format
             // (`gte: 1500, format: "uuuu"` parses "1500" as a year).
-            Some(fmts) => match dates::resolve_date_bound_num(n, round_up, fmts) {
+            Some(fmts) => match dates::resolve_date_bound_num_in(n, round_up, fmts, tz) {
                 Ok(Some(iso)) => Ok(Value::String(iso)),
                 Ok(None) => Ok(v),
                 Err(e) => Err(date_resolve_err(e, fmt_raw, &n.to_string())),
@@ -1242,19 +1244,29 @@ fn parse_range(params: &Value) -> Result<QueryNode> {
         Some(f) => Some(dates::compile_formats(f).map_err(|e| date_resolve_err(e, fmt_raw, ""))?),
         None => None,
     };
+    // `time_zone` applies to bounds without their own offset and to date
+    // math rounding; an unknown zone is a 400, as in ES.
+    let tz = match inner.get("time_zone").and_then(|v| v.as_str()) {
+        Some(raw) => {
+            Some(dates::TimeZone::parse(raw).map_err(|e| date_resolve_err(e, fmt_raw, raw))?)
+        }
+        None => None,
+    };
+    let tz = tz.as_ref();
+    let fmts = formats.as_deref();
     // Round-up bounds: `lte` includes its whole covered interval, `gt`
     // excludes its whole covered interval.  `gte`/`lt` round down.
     if let Some(v) = gte.take() {
-        gte = Some(resolve_range_bound(v, false, formats.as_deref(), fmt_raw)?);
+        gte = Some(resolve_range_bound(v, false, fmts, fmt_raw, tz)?);
     }
     if let Some(v) = gt.take() {
-        gt = Some(resolve_range_bound(v, true, formats.as_deref(), fmt_raw)?);
+        gt = Some(resolve_range_bound(v, true, fmts, fmt_raw, tz)?);
     }
     if let Some(v) = lte.take() {
-        lte = Some(resolve_range_bound(v, true, formats.as_deref(), fmt_raw)?);
+        lte = Some(resolve_range_bound(v, true, fmts, fmt_raw, tz)?);
     }
     if let Some(v) = lt.take() {
-        lt = Some(resolve_range_bound(v, false, formats.as_deref(), fmt_raw)?);
+        lt = Some(resolve_range_bound(v, false, fmts, fmt_raw, tz)?);
     }
 
     if gte.is_none() && gt.is_none() && lte.is_none() && lt.is_none() {
@@ -1730,7 +1742,7 @@ fn qs_range_bound(raw: &str) -> Option<Value> {
 /// query_string range bound.
 fn qs_resolve_bound(v: Option<Value>, round_up: bool) -> Result<Option<Value>> {
     match v {
-        Some(b) => Ok(Some(resolve_range_bound(b, round_up, None, None)?)),
+        Some(b) => Ok(Some(resolve_range_bound(b, round_up, None, None, None)?)),
         None => Ok(None),
     }
 }
@@ -1830,10 +1842,10 @@ fn qs_parse_cmp_range(q: &str, field: &str, rest: &str, mut i: usize) -> Result<
     let (mut gt, mut gte, mut lt, mut lte) = (None, None, None, None);
     // ES rounding: `>` and `<=` round the bound up, `>=` and `<` round down.
     match op {
-        ">" => gt = Some(resolve_range_bound(bound, true, None, None)?),
-        ">=" => gte = Some(resolve_range_bound(bound, false, None, None)?),
-        "<" => lt = Some(resolve_range_bound(bound, false, None, None)?),
-        _ => lte = Some(resolve_range_bound(bound, true, None, None)?),
+        ">" => gt = Some(resolve_range_bound(bound, true, None, None, None)?),
+        ">=" => gte = Some(resolve_range_bound(bound, false, None, None, None)?),
+        "<" => lt = Some(resolve_range_bound(bound, false, None, None, None)?),
+        _ => lte = Some(resolve_range_bound(bound, true, None, None, None)?),
     }
     Ok((
         QsTok::Range {
@@ -5540,6 +5552,23 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn test_range_date_time_zone() {
+        let node = q(json!({"range": {"date": {
+            "gte": "2024-03-10", "lt": "2024-03-11", "time_zone": "+05:30"
+        }}}));
+        if let QueryNode::Range { gte, lt, .. } = node {
+            assert_eq!(gte, Some(json!("2024-03-09T18:30:00.000Z")));
+            assert_eq!(lt, Some(json!("2024-03-10T18:30:00.000Z")));
+        } else {
+            panic!("wrong variant");
+        }
+        let err = parse_query(
+            &json!({"range": {"date": {"gte": "2024-03-10", "time_zone": "Mars/Base"}}}),
+        );
+        assert!(err.is_err(), "an unknown time_zone must be rejected");
     }
 
     #[test]
