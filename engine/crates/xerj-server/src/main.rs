@@ -1321,32 +1321,64 @@ async fn serve(
 /// can never advertise a port another process owns — the failure mode that
 /// sent one user's contracts, invoices and bank export into a stranger's data
 /// directory under `ok=true exit=0` (issue #465).
-/// What a bare `xerj` prints when the default port is taken.
+/// The `[server]` config key that moves only this listener.
+fn listener_port_key(name: &str) -> &'static str {
+    match name {
+        "ES-compat" => "es_compat_port",
+        "native REST" => "rest_port",
+        "gRPC" => "grpc_port",
+        _ => "es_compat_port / rest_port / grpc_port",
+    }
+}
+
+/// What startup prints when a listener cannot be bound.
 ///
-/// The old context was `ES-compat: bind 127.0.0.1:9200` plus the OS error.
-/// A bare `xerj` starts the server. When that port is taken, the error did
-/// not mention `--port`, `--auto-port`, or that `--help` lists subcommands.
-fn addr_in_use_message(name: &str, addr: SocketAddr) -> String {
-    format!(
-        "{name}: {addr} is already in use. Pass --port <PORT> to pick a different one, or \
-         --auto-port to take the next free port. If you did not mean to start a server, \
-         `xerj --help` lists the subcommands."
-    )
+/// Always `{name}: bind {addr}: {OS error}` first — the listener, the address
+/// and the reason, which is what the #465 process test pins — then, for the
+/// two failures an operator fixes by moving the port, the flags that move it.
+///
+/// #1687 added a hint for `AddrInUse` only, and #1778 re-appended the OS
+/// reason after it. Two gaps remained. The hint told every listener to "pass
+/// --port <PORT> to pick a different one", but `--port` sets the ES-compat
+/// port and puts native REST on PORT+1 and gRPC on PORT+2, so for those two
+/// it read as if `--port` were their own port. And the Windows refusal from
+/// #1723 / #1738 (`os error 10013`, WSAEACCES — usually a port inside a
+/// Hyper-V/WinNAT excluded range) is `PermissionDenied`, not `AddrInUse`, so
+/// it still printed the bare `native REST: bind 127.0.0.1:8080` with no hint.
+fn bind_error_message(name: &str, addr: SocketAddr, err: &std::io::Error) -> String {
+    let key = listener_port_key(name);
+    let move_it = "--port <BASE> moves all three listeners together (ES-compat BASE, \
+         native REST BASE+1, gRPC BASE+2; e.g. --port 9300)";
+    let only_this =
+        format!("or set `{key}` under [server] in a --config file to move only this one");
+    let not_a_server =
+        "If you did not mean to start a server, `xerj --help` lists the subcommands.";
+    match err.kind() {
+        std::io::ErrorKind::AddrInUse => format!(
+            "{name}: bind {addr}: {err}. Another process is already listening there. \
+             {move_it}, --auto-port takes the next free ports, {only_this}. {not_a_server}"
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            // `--auto-port` only steps past ports that are in use, so it is
+            // not offered for a refused one.
+            let cause = if cfg!(windows) {
+                "Windows refused the port; it is often inside a range reserved by \
+                 Hyper-V or WinNAT (list them with \
+                 `netsh int ipv4 show excludedportrange protocol=tcp`)."
+            } else if addr.port() < 1024 {
+                "Ports below 1024 need elevated privileges."
+            } else {
+                "The operating system refused the port."
+            };
+            format!("{name}: bind {addr}: {err}. {cause} {move_it}, {only_this}. {not_a_server}")
+        }
+        _ => format!("{name}: bind {addr}: {err}"),
+    }
 }
 
 fn bind_listener(addr: SocketAddr, name: &str) -> Result<std::net::TcpListener> {
-    let listener = match std::net::TcpListener::bind(addr) {
-        Ok(listener) => listener,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // The hint first, then the OS reason and the `bind {addr}` wording
-            // the #465 process test (`taken_port_fails_startup`) relies on.
-            anyhow::bail!(
-                "{} ({name}: bind {addr}: {e})",
-                addr_in_use_message(name, addr)
-            );
-        }
-        Err(e) => return Err(e).with_context(|| format!("{name}: bind {addr}")),
-    };
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("{}", bind_error_message(name, addr, &e)))?;
     // Both axum's accept loop and axum-server's rustls acceptor drive this
     // listener from the reactor; a blocking fd would stall the runtime thread
     // on the first accept.
@@ -1358,7 +1390,9 @@ fn bind_listener(addr: SocketAddr, name: &str) -> Result<std::net::TcpListener> 
 
 #[cfg(test)]
 mod bind_listener_tests {
-    use super::{addr_in_use_message, bind_listener};
+    use super::{bind_error_message, bind_listener};
+    use std::io::{Error, ErrorKind};
+    use std::net::SocketAddr;
 
     #[test]
     fn a_taken_port_names_port_and_auto_port() {
@@ -1369,12 +1403,73 @@ mod bind_listener_tests {
         assert!(msg.contains("--port"), "{msg}");
         assert!(msg.contains("--auto-port"), "{msg}");
         assert!(msg.contains("xerj --help"), "{msg}");
-        assert!(msg.contains(&addr.to_string()), "{msg}");
+        // #465's contract: the listener, the address, and the OS reason.
+        assert!(msg.contains(&format!("ES-compat: bind {addr}: ")), "{msg}");
+        assert!(msg.contains("os error"), "the OS error is kept: {msg}");
+        assert!(msg.contains("`es_compat_port`"), "{msg}");
+    }
+
+    /// `--port` is the ES-compat port; the hint for the other two listeners
+    /// must say how it moves them and name the key that moves only them.
+    #[test]
+    fn each_listener_names_its_own_key_and_how_port_moves_it() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let os = Error::from(ErrorKind::AddrInUse);
+        for (name, key) in [
+            ("ES-compat", "es_compat_port"),
+            ("native REST", "rest_port"),
+            ("gRPC", "grpc_port"),
+        ] {
+            let msg = bind_error_message(name, addr, &os);
+            assert!(msg.starts_with(&format!("{name}: bind {addr}: ")), "{msg}");
+            assert!(msg.contains(&format!("`{key}`")), "{msg}");
+            assert!(msg.contains("native REST BASE+1, gRPC BASE+2"), "{msg}");
+            assert!(msg.contains("--auto-port"), "{msg}");
+        }
+    }
+
+    /// #1723 / #1738: Windows' `os error 10013` is `PermissionDenied`, and it
+    /// printed no hint at all. `--auto-port` is not offered: it only steps
+    /// past ports that are in use.
+    #[test]
+    fn a_refused_port_gets_a_hint_without_auto_port() {
+        let os = Error::from(ErrorKind::PermissionDenied);
+        let high: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let msg = bind_error_message("native REST", high, &os);
         assert!(
-            msg.starts_with(&addr_in_use_message("ES-compat", addr)),
+            msg.starts_with("native REST: bind 127.0.0.1:8080: "),
             "{msg}"
         );
-        assert!(msg.contains(&format!("bind {addr}")), "{msg}");
+        assert!(msg.contains("--port <BASE>"), "{msg}");
+        assert!(msg.contains("`rest_port`"), "{msg}");
+        assert!(!msg.contains("--auto-port"), "{msg}");
+        if cfg!(windows) {
+            assert!(msg.contains("excludedportrange"), "{msg}");
+        } else {
+            let low: SocketAddr = "127.0.0.1:80".parse().unwrap();
+            let msg = bind_error_message("native REST", low, &os);
+            assert!(msg.contains("below 1024"), "{msg}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsaeacces_is_classified_as_a_refused_port() {
+        // WSAEACCES, the code in both field reports.
+        let os = Error::from_raw_os_error(10013);
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let msg = bind_error_message("native REST", addr, &os);
+        assert!(msg.contains("excludedportrange"), "{msg}");
+        assert!(msg.contains("os error 10013"), "{msg}");
+    }
+
+    /// Anything else keeps the plain `{name}: bind {addr}: {reason}`.
+    #[test]
+    fn other_bind_errors_are_not_given_a_port_hint() {
+        let os = Error::from(ErrorKind::AddrNotAvailable);
+        let addr: SocketAddr = "10.255.255.1:9200".parse().unwrap();
+        let msg = bind_error_message("ES-compat", addr, &os);
+        assert_eq!(msg, format!("ES-compat: bind {addr}: {os}"));
     }
 }
 
@@ -1463,7 +1558,7 @@ fn bind_listener_candidate(
                 return Ok((listener, candidate));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-            Err(e) => return Err(anyhow::anyhow!("{name}: bind {addr}: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("{}", bind_error_message(name, addr, &e))),
         }
     }
 

@@ -219,6 +219,45 @@ fn a_taken_es_compat_port_ends_the_process() {
     drop(squatter);
 }
 
+/// #1723 / #1738: the field reports hit a taken *native REST* port (8080), and
+/// the error gave no route out. It must name that listener and its address,
+/// keep the OS reason, say how `--port` moves it (`--port` is the ES-compat
+/// port; native REST follows at BASE+1), and name the one config key that
+/// moves only this listener.
+#[test]
+fn a_taken_native_rest_port_says_how_to_move_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (squatter, es, grpc) = squatter_and_two_free_ports();
+    let rest = squatter.local_addr().unwrap().port();
+
+    let out = run(
+        &config_for(dir.path(), rest, grpc, es),
+        dir.path(),
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        out.exited && !out.success,
+        "xerj must exit non-zero without its native REST port\n--- stderr ---\n{}",
+        out.stderr
+    );
+    for needle in [
+        format!("native REST: bind 127.0.0.1:{rest}: "),
+        "Address already in use".to_string(),
+        "native REST BASE+1".to_string(),
+        "`rest_port`".to_string(),
+        "--auto-port".to_string(),
+    ] {
+        assert!(
+            out.stderr.contains(&needle),
+            "the failure must contain {needle:?}\n--- stderr ---\n{}",
+            out.stderr
+        );
+    }
+
+    drop(squatter);
+}
+
 /// The banner is the lie the user acts on, so it gets its own assertion:
 /// nothing that reads as success may reach stdout when a listener was lost.
 #[test]
