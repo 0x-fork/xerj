@@ -1400,6 +1400,50 @@ fn generated_exit_code(summary: &Value) -> i32 {
     }
 }
 
+/// The FIRST line of a finished run's human summary on stdout (#1843).
+///
+/// Exit 3 is success, but an agent that sees a non-zero exit reads failure
+/// unless something it reads first says otherwise. The `xerj-done` line on
+/// stderr already carries `ok=true`, yet it is the LAST line of a long progress
+/// stream and the summary on stdout opened with a timing line that never
+/// mentioned the exit code at all. So every finished run now leads with one
+/// line that starts `ok:` and names the exit code in words; exit 3 also says
+/// what was recorded and where to look, so junk stays visible.
+pub(crate) fn outcome_headline(
+    code: i32,
+    junk_files: u64,
+    junk_records: u64,
+    alias_sweep_failed: bool,
+) -> String {
+    if code != 3 {
+        return format!("ok: indexed and searchable (exit {code}, completed)");
+    }
+    if alias_sweep_failed {
+        return format!(
+            "ok: indexed and searchable — exit 3 ({ALIAS_SWEEP_FAILED_REASON}) is SUCCESS, not \
+             an error: the corpus is indexed and the journal committed; only the catalog's \
+             duplicate-alias cleanup could not run, so rerun the same command once the server \
+             condition clears"
+        );
+    }
+    let mut recorded = Vec::new();
+    if junk_files > 0 {
+        recorded.push(estimate::count_phrase(junk_files, "file", "files"));
+    }
+    if junk_records > 0 {
+        recorded.push(estimate::count_phrase(junk_records, "record", "records"));
+    }
+    let recorded = if recorded.is_empty() {
+        "some input".to_string()
+    } else {
+        recorded.join(" and ")
+    };
+    format!(
+        "ok: indexed and searchable — exit 3 (completed-with-junk) is SUCCESS, not an error: \
+         {recorded} recorded as junk (skipped, never fatal; `xerj autoindex map` lists them)"
+    )
+}
+
 /// Terminal progress line for a run that ends on the generated `--no-graph`
 /// path.
 ///
@@ -5051,6 +5095,16 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
     if cfg.json {
         println!("{summary}");
     } else if !cfg.quiet {
+        let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+        println!(
+            "{}",
+            outcome_headline(
+                generated_exit_code(&summary),
+                count("files_junk"),
+                count("junk_records_total"),
+                false,
+            )
+        );
         println!(
             "generation {} committed — {}, {} live",
             generation,
@@ -9431,11 +9485,36 @@ fn run_index_report_inner(
 
     // ── summary ──────────────────────────────────────────────────────────
     let junk_total_records = junk_records.load(Ordering::Relaxed);
+    // Exit 3 means "completed, some input was unusable". Backend rejections
+    // are not consulted and must not be: a rejected item aborts the run with
+    // an error long before this line, so `rejected_records` is provably 0
+    // here. Splitting them out of `junk_total_records` therefore changes no
+    // exit code.
+    //
+    // A failed alias sweep lands here too, and on 3 rather than on a code of
+    // its own: 3 already means "completed, and something about this run is
+    // recorded rather than fatal" (`cli.rs` EXIT CODES), and inventing a fourth
+    // success code would break every caller that already branches on 0/3. The
+    // `reason` is what tells the two apart.
+    let code = if junk_total_records > 0 || junk_file_count > 0 || alias_sweep_error.is_some() {
+        3
+    } else {
+        0
+    };
     if cfg.json {
         println!("{run_doc}");
     } else if !cfg.quiet {
         println!(
-            "\n{}",
+            "{}",
+            outcome_headline(
+                code,
+                junk_file_count as u64,
+                junk_total_records,
+                alias_sweep_error.is_some(),
+            )
+        );
+        println!(
+            "{}",
             estimate::done_summary_line(
                 wall,
                 plan.datasets.len() as u64,
@@ -9528,22 +9607,6 @@ fn run_index_report_inner(
             println!("{}", mixed_corpus_hint(&fams));
         }
     }
-    // Exit 3 means "completed, some input was unusable". Backend rejections
-    // are not consulted and must not be: a rejected item aborts the run with
-    // an error long before this line, so `rejected_records` is provably 0
-    // here. Splitting them out of `junk_total_records` therefore changes no
-    // exit code.
-    //
-    // A failed alias sweep lands here too, and on 3 rather than on a code of
-    // its own: 3 already means "completed, and something about this run is
-    // recorded rather than fatal" (`cli.rs` EXIT CODES), and inventing a fourth
-    // success code would break every caller that already branches on 0/3. The
-    // `reason` is what tells the two apart.
-    let code = if junk_total_records > 0 || junk_file_count > 0 || alias_sweep_error.is_some() {
-        3
-    } else {
-        0
-    };
     // Terminal line, in every progress mode but `none` (which `--quiet`
     // selects, and which prints nothing by definition). Exit 3 means
     // "completed, some files were unparseable" — success — and an agent reading
@@ -11482,6 +11545,35 @@ mod generation_contract_identity_tests {
             !code.contains("curl"),
             "the code hint must not send the reader to a raw search, got: {code}"
         );
+    }
+
+    /// #1843: exit 3 read as failure because nothing an agent reads FIRST
+    /// said otherwise. Every finished run's stdout summary now opens with an
+    /// `ok:` line that names the exit code in words, and an exit-3 line says
+    /// what was recorded instead of hiding it.
+    #[test]
+    fn a_finished_run_leads_with_an_ok_line_that_spells_out_exit_3() {
+        let clean = outcome_headline(0, 0, 0, false);
+        assert!(clean.starts_with("ok: indexed and searchable"), "{clean}");
+        assert!(clean.contains("exit 0"), "{clean}");
+
+        let junk = outcome_headline(3, 1, 0, false);
+        assert!(junk.starts_with("ok: indexed and searchable"), "{junk}");
+        assert!(
+            junk.contains("exit 3 (completed-with-junk) is SUCCESS, not an error"),
+            "{junk}"
+        );
+        assert!(junk.contains("1 file recorded as junk"), "{junk}");
+        assert!(junk.contains("xerj autoindex"), "{junk}");
+        assert!(!junk.contains('\n'), "one line: {junk}");
+
+        let both = outcome_headline(3, 2, 5, false);
+        assert!(both.contains("2 files and 5 records"), "{both}");
+
+        let sweep = outcome_headline(3, 4, 0, true);
+        assert!(sweep.starts_with("ok: indexed and searchable"), "{sweep}");
+        assert!(sweep.contains(ALIAS_SWEEP_FAILED_REASON), "{sweep}");
+        assert!(sweep.contains("rerun the same command"), "{sweep}");
     }
 
     /// Resume of an already-indexed tokio tree printed
