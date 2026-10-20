@@ -61,6 +61,18 @@ async fn setup_html_is_bundled_and_served() {
         body.contains("one-time setup link") && body.contains("still unclaimed"),
         "a setup URL with no #token= must say where the link was printed"
     );
+    assert!(
+        body.contains("a new link is printed on boot"),
+        "an expired link must say that a restart prints a new one: {body}"
+    );
+    assert!(
+        body.contains("/_xerj-console/login"),
+        "an expired link must point an existing owner at login"
+    );
+    assert!(
+        body.contains("ask the admin who sent it for a new one"),
+        "an expired invite must not be told to restart the node: an invitee cannot"
+    );
 }
 
 #[tokio::test]
