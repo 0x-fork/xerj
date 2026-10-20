@@ -2,7 +2,7 @@
 ---
 title: "RAG without a vector database"
 canonical: "https://xerj.org/answers/rag-without-vector-database"
-updated: "2026-08-23"
+updated: "2026-10-19"
 source: "content/answers/rag-without-vector-database.md"
 ---
 
@@ -156,3 +156,4 @@ One. XERJ is single-node, with no replication, no sharding and no failover, so t
 - [What's the actual difference between a vector database and full-text search when I have a folder?](/answers/vector-database-vs-full-text-search)
 - [Should my agent call a search API or stand up Qdrant for persistent memory?](/compare/xerj-vs-vector-database)
 - [Hybrid search](/docs/recipes/hybrid-search)
+- [Retrieval that says not found, and cites file and line when it does answer](/answers/retrieval-that-says-not-found-with-file-line-citations)

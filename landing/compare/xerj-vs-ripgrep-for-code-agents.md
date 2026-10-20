@@ -2,7 +2,7 @@
 ---
 title: "XERJ compared with ripgrep for code agents"
 canonical: "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/compare/xerj-vs-ripgrep-for-code-agents.md"
 ---
 
@@ -222,3 +222,4 @@ Order of magnitude, several hundred on this tree. The derived figure was about 7
 - [How do I stop my agent from reading the whole repo into context?](/answers/index-monorepo-for-agent)
 - [How do I run syntax-aware code search?](/answers/syntax-aware-code-search-refactoring)
 - [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code)
+- [Local code search MCP for Claude Code that uses fewer tokens than grep](/answers/local-code-search-mcp-fewer-tokens-than-grep)

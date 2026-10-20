@@ -2,7 +2,7 @@
 ---
 title: "XERJ vs Elasticsearch run on one machine"
 canonical: "https://xerj.org/compare/xerj-vs-elasticsearch-local"
-updated: "2026-09-26"
+updated: "2026-10-19"
 source: "content/compare/xerj-vs-elasticsearch-local.md"
 ---
 
@@ -192,3 +192,5 @@ When you read while a heavy writer runs, when you need more than one host, or wh
 - [How do I index Markdown into the Elasticsearch API?](/answers/index-markdown-into-elasticsearch-api)
 - [What can I use for low-volume log search?](/answers/cheap-low-volume-log-search)
 - [Migrate from Elasticsearch](/docs/recipes/migrate-from-elasticsearch)
+- [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)
+- [Batch lookup CVE IDs and GHSA IDs offline, without GitHub API rate limits](/answers/batch-lookup-cve-ghsa-ids-offline)

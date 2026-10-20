@@ -2,7 +2,7 @@
 ---
 title: "How much better is hybrid search than BM25? Measured."
 canonical: "https://xerj.org/answers/hybrid-search-quality-measured-ndcg"
-updated: "2026-09-20"
+updated: "2026-10-19"
 source: "content/answers/hybrid-search-quality-measured-ndcg.md"
 ---
 
@@ -151,3 +151,4 @@ About 3 to 7 documents per second on CPU in this run. SciFact's 5,183 short abst
 - [When should I turn on neural embeddings, and when is the lexical default enough?](/answers/do-search-embeddings-help)
 - [How do I rerank search results with a relevance judge?](/answers/rerank-search-results-calibrated-judge)
 - [I want local search that works offline, no cloud embeddings. What are my options?](/answers/local-embeddings-without-openai-api)
+- [Retrieval that says not found, and cites file and line when it does answer](/answers/retrieval-that-says-not-found-with-file-line-citations)

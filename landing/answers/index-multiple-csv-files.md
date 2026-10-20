@@ -2,7 +2,7 @@
 ---
 title: "How do I search a folder of CSV exports?"
 canonical: "https://xerj.org/answers/index-multiple-csv-files"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/index-multiple-csv-files.md"
 ---
 
@@ -141,3 +141,4 @@ Run `xerj autoindex` on the folder again. Document ids are content-derived and t
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
 - [I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?](/answers/search-file-contents-in-a-folder)
 - [Do I need Typesense for an agent to search my docs?](/compare/xerj-vs-typesense)
+- [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)

@@ -2,7 +2,7 @@
 ---
 title: "How do I index a CSV with many columns?"
 canonical: "https://xerj.org/answers/index-csv-with-many-columns"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/index-csv-with-many-columns.md"
 ---
 
@@ -141,3 +141,4 @@ XERJ falls back to a string type when fewer than 95% of the non-null values pars
 - [I have a directory of CSV exports. How do I query them without opening each one in Excel?](/answers/index-multiple-csv-files)
 - [How do I full-text search a SQLite database I just copied onto disk?](/answers/full-text-search-sqlite-database)
 - [Aggregations](/docs/aggregations)
+- [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)

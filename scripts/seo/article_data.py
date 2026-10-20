@@ -24,6 +24,9 @@ TOP_FIELDS = frozenset({
     "published", "updated", "author", "reviewer", "schema_type", "links_out",
     "evidence", "faq", "noindex", "agent_prompt", "commands",
     "og_image", "og_image_alt", "structured_data",
+    # Optional list of the literal search strings this page is written to
+    # answer. Not rendered as copy; published on the section index.json.
+    "queries",
 })
 # ``evidence`` is optional.  The block existed to point at capture files that
 # are no longer part of the repository, so an article without one is normal and
@@ -47,7 +50,8 @@ STRING_FIELDS = frozenset({
     "author", "reviewer", "schema_type", "agent_prompt",
     "og_image", "og_image_alt",
 })
-LIST_FIELDS = frozenset({"links_out", "evidence", "faq", "commands", "structured_data"})
+LIST_FIELDS = frozenset({"links_out", "evidence", "faq", "commands", "structured_data",
+                         "queries"})
 # Opt-in extra JSON-LD for an article (structured_data: [faq, howto, software]).
 # Off by default, and the site-wide policy in scripts/seo/README.md trap 6
 # still holds for every page that does not opt in.  No page sets the field
@@ -128,6 +132,7 @@ class Article:
     og_image: str | None = None
     og_image_alt: str | None = None
     structured_data: tuple[str, ...] = ()
+    queries: tuple[str, ...] = ()
 
     @property
     def output_rel(self) -> str:
@@ -441,6 +446,7 @@ def _validate(path: pathlib.Path, values: dict[str, Any], line_map: dict[str, in
     # test_article_schema.py's minimal fixture, #974).
     values.setdefault("commands", [])
     values.setdefault("structured_data", [])
+    values.setdefault("queries", [])
     for key in LIST_FIELDS:
         value = values[key]
         if not isinstance(value, list):
@@ -449,6 +455,10 @@ def _validate(path: pathlib.Path, values: dict[str, Any], line_map: dict[str, in
         if not isinstance(value, str) or not value.strip():
             raise _error(path, line_map.get("links_out", 1),
                          f"links_out item {i + 1} must be a non-empty string")
+    for i, value in enumerate(values["queries"]):
+        if not isinstance(value, str) or not value.strip():
+            raise _error(path, line_map.get("queries", 1),
+                         f"queries item {i + 1} must be a non-empty string")
     for key in MAP_FIELDS:
         for i, item in enumerate(values[key]):
             if not isinstance(item, dict):
@@ -584,6 +594,7 @@ def load(path: pathlib.Path, category: str | None = None) -> Article:
         og_image=values.get("og_image"),
         og_image_alt=values.get("og_image_alt"),
         structured_data=tuple(values["structured_data"]),
+        queries=tuple(values.get("queries", [])),
     )
 
 

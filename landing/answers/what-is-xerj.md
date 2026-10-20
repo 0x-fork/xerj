@@ -2,7 +2,7 @@
 ---
 title: "What is XERJ?"
 canonical: "https://xerj.org/answers/what-is-xerj"
-updated: "2026-09-26"
+updated: "2026-10-19"
 source: "content/answers/what-is-xerj.md"
 ---
 
@@ -166,3 +166,6 @@ No. XERJ fetches no web page and runs no crawler. Its inputs are folders on loca
 - [Is there a single-binary local search engine I can just run?](/answers/search-engine-without-docker)
 - [Agent memory](/docs/recipes/agentic-memory)
 - [Endpoint contract](/docs/agents/endpoints)
+- [Local code search MCP for Claude Code that uses fewer tokens than grep](/answers/local-code-search-mcp-fewer-tokens-than-grep)
+- [Ask questions about a GitHub repo without cloning it](/answers/ask-questions-about-a-github-repo-without-cloning)
+- [Batch lookup CVE IDs and GHSA IDs offline, without GitHub API rate limits](/answers/batch-lookup-cve-ghsa-ids-offline)

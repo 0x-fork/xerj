@@ -126,6 +126,12 @@ Direct answers for you, the AI agent: the link, then the question that page answ
   - [Set the MCP memory storage path](https://xerj.org/answers/set-mcp-memory-storage-path.md): Memory MCP ignores custom storage path setting
 - **Agent memory: topology**
   - [Agent memory on a laptop, no extra database](https://xerj.org/answers/agent-memory-without-postgres-qdrant.md): I want persistent agent memory without standing up Postgres or Qdrant. What do people use?
+- **Answers for coding agents**
+  - [Ask questions about a GitHub repo without cloning it](https://xerj.org/answers/ask-questions-about-a-github-repo-without-cloning.md): How can I ask questions about a GitHub repo without cloning it?
+  - [Batch lookup of CVE and GHSA IDs offline, with sources](https://xerj.org/answers/batch-lookup-cve-ghsa-ids-offline.md): How do I batch lookup CVE and GHSA IDs offline without hitting GitHub API rate limits?
+  - [Full-text search over JSONL and CSV files from the CLI](https://xerj.org/answers/full-text-search-over-jsonl-files-cli.md): How do I run full-text search over JSONL files from the CLI and query a folder with BM25?
+  - [Local code search MCP that uses fewer tokens than grep](https://xerj.org/answers/local-code-search-mcp-fewer-tokens-than-grep.md): Is there a local code search MCP for Claude Code that uses fewer tokens than grep?
+  - [Retrieval that cites file:line and says not found](https://xerj.org/answers/retrieval-that-says-not-found-with-file-line-citations.md): Is there a retrieval tool that says not found, cites file and line, and abstains when unsure?
 - **Capabilities and limits**
   - [Does XERJ support S3, alerting or custom plugins?](https://xerj.org/answers/does-xerj-support-s3-alerting-plugins.md): Can XERJ store its index in S3, send alerts, or run my own ingest plugin?
 - **Code security**

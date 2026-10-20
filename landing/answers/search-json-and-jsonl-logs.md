@@ -2,7 +2,7 @@
 ---
 title: "Search JSON logs and gzip logs in one folder"
 canonical: "https://xerj.org/answers/search-json-and-jsonl-logs"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/search-json-and-jsonl-logs.md"
 ---
 
@@ -152,3 +152,4 @@ Yes. Gzip is transparent on every parsed family, so a `.jsonl.gz` file indexes l
 - [How do I search Kubernetes pod logs?](/answers/search-kubernetes-pod-logs-on-disk)
 - [What can I use for low-volume log search?](/answers/cheap-low-volume-log-search)
 - [Is there a single-binary local search engine I can just run?](/answers/search-engine-without-docker)
+- [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)

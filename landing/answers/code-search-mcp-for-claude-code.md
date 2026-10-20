@@ -2,7 +2,7 @@
 ---
 title: "Make an agent cite a file instead of dumping it"
 canonical: "https://xerj.org/answers/code-search-mcp-for-claude-code"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/code-search-mcp-for-claude-code.md"
 ---
 
@@ -176,3 +176,5 @@ No. Both list 6 tools while the binary serves 10. Read `tools/list` from a live 
 - [How do I run syntax-aware code search?](/answers/syntax-aware-code-search-refactoring)
 - [Can ChatGPT search a folder on my laptop, or do I need something else?](/answers/give-chatgpt-claude-local-file-access)
 - [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep)
+- [Local code search MCP for Claude Code that uses fewer tokens than grep](/answers/local-code-search-mcp-fewer-tokens-than-grep)
+- [Ask questions about a GitHub repo without cloning it](/answers/ask-questions-about-a-github-repo-without-cloning)

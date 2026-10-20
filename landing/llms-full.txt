@@ -1659,3 +1659,37 @@ NO SHELL
 IF INDEXING SITS AT 0%: check free disk space. A node whose disk is 95% full blocks
 writes (`read_only_allow_delete`), and the indexer retries for ten minutes before it
 gives up.
+
+ANSWERS FOR CODING AGENTS (measured 2026-10-19 on v1.0.0-rc.97; each page has a
+.md twin at the same URL plus .md, the exact commands and the real output)
+- Local code search MCP that uses fewer tokens than grep:
+  https://xerj.org/answers/local-code-search-mcp-fewer-tokens-than-grep
+  xerj autoindex <repo> --prefix req; xerj search --prefix req -k 3 --full 400 "<words in the code>";
+  xerj def --prefix req <symbol>; xerj init registers `xerj mcp` (17 tools).
+  psf/requests: 1,303 bytes for the answer vs 25,150 bytes of `rg -n -i redirect`.
+  rg is faster per call (6-7 ms vs 19-23 ms). No regex search in xerj.
+- Full-text search over JSONL and CSV from the CLI or MCP:
+  https://xerj.org/answers/full-text-search-over-jsonl-files-cli
+  xerj autoindex <folder>, then POST /<prefix>-csv/_search {"query":{"match":{"<column>":"<words>"}}}
+  or MCP xerj_search with the same body. Prefer field queries over `xerj search` for rows.
+- Ask questions about a GitHub repo without cloning it:
+  https://xerj.org/answers/ask-questions-about-a-github-repo-without-cloning
+  xerj ask "<question>" | xerj ask --corpus <slug> --def <SYMBOL> [--json] [--offline].
+  Only the 14 corpora in the signed catalogue have packs; other repos: clone +
+  autoindex (issue #1800). Cold 2,356 ms with the pack download, warm 30-40 ms.
+  Exit: 0 answered, 1 no match, 2 unknown corpus, 3 pack failed verification, 4 ambiguous.
+- Batch lookup of CVE / GHSA / RUSTSEC IDs offline:
+  https://xerj.org/answers/batch-lookup-cve-ghsa-ids-offline
+  xerj corpus add rust-vulns --from rust-vulns-pack.zip --verify-sig rust-vulns.pub;
+  xerj corpus index rust-vulns; one POST /xc-rust-vulns-*/_search with terms on id
+  and aliases. Rust crates only (2,033 advisories). Unknown IDs: say not found.
+  Use a trailing wildcard; _msearch with a wildcard index returned 404 on rc.97.
+- Retrieval that cites file:line and says not found:
+  https://xerj.org/answers/retrieval-that-says-not-found-with-file-line-citations
+  xerj ask --def exits 1 with "no match"; an unmatched question exits 1 with
+  "no hub corpus matches". Free-text questions forced onto a corpus still return
+  passages with exit 0: there is no calibrated confidence yet (issue #1786).
+
+Not published: extracting structured data from a saved web page into a JSON
+schema. That feature is still planned (issue #1797). The capture from the same
+run stays in benchmarks/agent-intents-2026-10-19/02-* and is not a page.

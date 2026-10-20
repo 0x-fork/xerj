@@ -21,6 +21,10 @@
     <lastmod>2026-10-20</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/ask-questions-about-a-github-repo-without-cloning</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/audit-php-codebase-with-an-index</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
@@ -38,6 +42,10 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/autoindex-server-back-pressure-429</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
+    <loc>https://xerj.org/answers/batch-lookup-cve-ghsa-ids-offline</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
   <url>
@@ -86,6 +94,10 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/full-text-search-browser-history</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
+    <loc>https://xerj.org/answers/full-text-search-over-jsonl-files-cli</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
   <url>
@@ -149,6 +161,10 @@
     <lastmod>2026-10-20</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/local-code-search-mcp-fewer-tokens-than-grep</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/local-embeddings-without-openai-api</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
@@ -198,6 +214,10 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/resume-interrupted-autoindex-run</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
+    <loc>https://xerj.org/answers/retrieval-that-says-not-found-with-file-line-citations</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
   <url>

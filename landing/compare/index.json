@@ -17,7 +17,7 @@
       "canonical_url": "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents",
       "markdown_url": "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents.md",
       "cluster": "Comparison: code retrieval",
-      "updated": "2026-08-21",
+      "updated": "2026-10-19",
       "summary": "30 disclosed tasks on one 331-file code tree. The two tools agree on 18. ripgrep wins 5 named tasks outright, including a substring inside an identifier."
     },
     {
@@ -89,7 +89,7 @@
       "canonical_url": "https://xerj.org/compare/xerj-vs-elasticsearch-local",
       "markdown_url": "https://xerj.org/compare/xerj-vs-elasticsearch-local.md",
       "cluster": "Comparison: local search engines",
-      "updated": "2026-09-26",
+      "updated": "2026-10-19",
       "summary": "The published board is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4. All 4 losses are read p99 under a write flood."
     },
     {
@@ -143,7 +143,7 @@
       "canonical_url": "https://xerj.org/compare/xerj-vs-vector-database",
       "markdown_url": "https://xerj.org/compare/xerj-vs-vector-database.md",
       "cluster": "Comparison: vector database",
-      "updated": "2026-08-23",
+      "updated": "2026-10-19",
       "summary": "Agent memory lives in the index process XERJ already runs, so no second data service starts. On 8 judged queries hybrid linear fusion scored precision@3 0.4583."
     }
   ]

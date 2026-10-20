@@ -901,6 +901,7 @@ def article_index_entry(article: article_data.Article, context: BuildContext) ->
         "cluster": article.cluster,
         "updated": article_modified(article, context),
         "summary": " ".join(article.description.split()),
+        **({"queries": list(article.queries)} if article.queries else {}),
     }
 
 

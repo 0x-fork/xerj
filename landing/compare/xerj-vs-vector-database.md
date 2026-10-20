@@ -2,7 +2,7 @@
 ---
 title: "Search API or Qdrant for agent memory?"
 canonical: "https://xerj.org/compare/xerj-vs-vector-database"
-updated: "2026-08-23"
+updated: "2026-10-19"
 source: "content/compare/xerj-vs-vector-database.md"
 ---
 
@@ -203,3 +203,4 @@ No. XERJ is single-node with no data-plane replication, and filtered kNN falls b
 - [What's a simple way to give an agent long-term memory on my laptop without Qdrant?](/answers/agent-memory-without-postgres-qdrant)
 - [How do I give two agents private memory on one laptop?](/answers/private-agent-memory-namespaces)
 - [How do I stop an agent memory store from filling with near-duplicate notes?](/answers/store-agent-memory-without-llm-call)
+- [Retrieval that says not found, and cites file and line when it does answer](/answers/retrieval-that-says-not-found-with-file-line-citations)
