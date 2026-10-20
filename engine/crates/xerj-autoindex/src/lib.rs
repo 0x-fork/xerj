@@ -1538,6 +1538,22 @@ fn begin_non_graph_generation(
         .context("generation cutover has no committed base")?
         .clone();
     let tx_id = format!("{}-g{}", journal.run_id, base.generation + 1);
+    // #1723: derive the content groups and check the plan's projection onto
+    // them BEFORE sealing. Both depend only on the plan, the inventory and the
+    // base; only the counts need the snapshot (`bind_prepared_counts` below).
+    // A plan that cannot be accepted used to be refused only after the whole
+    // corpus was sealed — ~25 minutes per attempt on the report's corpus.
+    let mut groups = desired_content_groups(&base.groups, &plan, inventory)?;
+    sync::preflight_plan_projection(&plan, &groups).with_context(|| {
+        format!(
+            "autoindex refused generation {} before sealing any file: the plan built from this \
+             walk does not project onto its own content groups, so every run over this input \
+             fails the same way, --fresh included. No snapshot was written and no remote data \
+             was changed. This is an autoindex defect for this corpus; please report it with \
+             this message",
+            base.generation + 1
+        )
+    })?;
     let preparation_contract = preparation_contract_digest(cfg, &plan)?;
     // #971: the prior committed generation's snapshot is the reuse source for
     // sealing. A file whose content digest and preparation identity match its
@@ -1618,6 +1634,61 @@ fn begin_non_graph_generation(
         }
     };
 
+    sync_executor::bind_prepared_counts(&mut groups, &snapshot, &inventory.keys)?;
+    let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
+    let desired = sync::GenerationManifest {
+        generation: base.generation + 1,
+        execution: Some(sync::ExecutionIdentity {
+            version: sync::EXECUTION_IDENTITY_VERSION,
+            root_identity: root_identity.to_owned(),
+            url: cfg.url.clone(),
+            prefix: cfg.prefix.clone(),
+            follow_symlinks: cfg.follow_symlinks,
+            chunker_identity,
+            embedding_identity_sha256: identity.identity_sha256,
+            embedding_backend: identity.backend,
+            embedding_dimension: identity.dimensions,
+            embedding_semantic_contract: identity.semantic_contract,
+            embedding_resumable: identity.resumable,
+            graph_enabled: false,
+            brain: "disabled".into(),
+            detector_identity: DETECTOR_DISABLED_IDENTITY.into(),
+            schema_identity,
+            index_identity,
+            source_policy: sync::SourceExecutionPolicy::DurableSnapshot {
+                reference: format!("sync-snapshots/{tx_id}"),
+                snapshot_digest: snapshot.snapshot_digest,
+            },
+        }),
+        plan,
+        groups,
+    };
+    // A failure here is the generation machinery contradicting itself about
+    // durable state, and the invariant text alone gives the user nothing to
+    // act on (#283). Name the recovery route; the invariant stays attached as
+    // the cause so the report keeps its diagnostic value.
+    let pending = sync::PendingSync::new(tx_id, &base, desired).with_context(|| {
+        format!(
+            "autoindex could not derive generation {} from committed generation {}; the durable \
+             generation state in {} is not internally consistent, and re-running will not repair \
+             it. No remote data was changed. Rebuild with a new --state-dir and a new --prefix",
+            base.generation + 1,
+            base.generation,
+            state_dir.display()
+        )
+    })?;
+    journal.sync_begin(&pending)
+}
+
+/// The desired content groups for a generation: one per planned content
+/// file, canonical path first, then its aliases, reconciled against the
+/// committed base. Counts are zero until [`sync_executor::bind_prepared_counts`]
+/// fills them from the sealed snapshot.
+fn desired_content_groups(
+    base_groups: &[sync::ManifestGroup],
+    plan: &Plan,
+    inventory: &content::Inventory,
+) -> Result<Vec<sync::ManifestGroup>> {
     let aliases_by_content = plan.duplicate_files.iter().fold(
         HashMap::<&str, Vec<sync::ManifestPath>>::new(),
         |mut aliases, alias| {
@@ -1672,51 +1743,7 @@ fn begin_non_graph_generation(
             expected_records_by_dataset: BTreeMap::new(),
         });
     }
-    let mut groups = sync::reconcile_groups(&base.groups, candidates)?;
-    sync_executor::bind_prepared_counts(&mut groups, &snapshot, &inventory.keys)?;
-    let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
-    let desired = sync::GenerationManifest {
-        generation: base.generation + 1,
-        execution: Some(sync::ExecutionIdentity {
-            version: sync::EXECUTION_IDENTITY_VERSION,
-            root_identity: root_identity.to_owned(),
-            url: cfg.url.clone(),
-            prefix: cfg.prefix.clone(),
-            follow_symlinks: cfg.follow_symlinks,
-            chunker_identity,
-            embedding_identity_sha256: identity.identity_sha256,
-            embedding_backend: identity.backend,
-            embedding_dimension: identity.dimensions,
-            embedding_semantic_contract: identity.semantic_contract,
-            embedding_resumable: identity.resumable,
-            graph_enabled: false,
-            brain: "disabled".into(),
-            detector_identity: DETECTOR_DISABLED_IDENTITY.into(),
-            schema_identity,
-            index_identity,
-            source_policy: sync::SourceExecutionPolicy::DurableSnapshot {
-                reference: format!("sync-snapshots/{tx_id}"),
-                snapshot_digest: snapshot.snapshot_digest,
-            },
-        }),
-        plan,
-        groups,
-    };
-    // A failure here is the generation machinery contradicting itself about
-    // durable state, and the invariant text alone gives the user nothing to
-    // act on (#283). Name the recovery route; the invariant stays attached as
-    // the cause so the report keeps its diagnostic value.
-    let pending = sync::PendingSync::new(tx_id, &base, desired).with_context(|| {
-        format!(
-            "autoindex could not derive generation {} from committed generation {}; the durable \
-             generation state in {} is not internally consistent, and re-running will not repair \
-             it. No remote data was changed. Rebuild with a new --state-dir and a new --prefix",
-            base.generation + 1,
-            base.generation,
-            state_dir.display()
-        )
-    })?;
-    journal.sync_begin(&pending)
+    sync::reconcile_groups(base_groups, candidates)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1819,6 +1846,106 @@ fn without_excluded_rels(
         .collect();
     let dropped = before - kept.len();
     (kept, dropped)
+}
+
+#[cfg(test)]
+mod generation_preflight_tests {
+    use super::*;
+
+    /// A temp corpus holding two byte-identical files, resolved the way a run
+    /// resolves it: one content file (`a.txt`) and one alias (`b.txt`).
+    fn duplicate_inventory(dir: &Path) -> content::Inventory {
+        std::fs::write(dir.join("a.txt"), "same bytes").unwrap();
+        std::fs::write(dir.join("b.txt"), "same bytes").unwrap();
+        let files = walk::walk(dir, false).unwrap();
+        let inventory = content::resolve_reporting(files, &|_| {}).unwrap();
+        assert_eq!(inventory.files.len(), 1);
+        assert_eq!(inventory.duplicates.len(), 1);
+        inventory
+    }
+
+    /// The plan a run builds from `inventory`: every content file assigned to
+    /// one dataset, its duplicates recorded as aliases.
+    fn plan_for(inventory: &content::Inventory) -> Plan {
+        let files: HashMap<String, FileAssignment> = inventory
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                (
+                    inventory.keys[i].clone(),
+                    FileAssignment {
+                        rel: file.rel.clone(),
+                        path_id: file.rel_id.clone(),
+                        is_symlink: Some(file.is_symlink),
+                        family: "text".into(),
+                        gzip: false,
+                        content_digest: Some(inventory.digests[i].clone()),
+                        assignments: vec![(None, "docs".into())],
+                        as_document: false,
+                    },
+                )
+            })
+            .collect();
+        Plan {
+            datasets: vec![PlanDataset {
+                slug: "docs".into(),
+                index: "ax-docs".into(),
+                family: "text".into(),
+                group: None,
+                specs: vec![],
+                time_field: None,
+                semantic_field: None,
+                text_analyzer: None,
+                scope: None,
+                sampled_records: 1,
+                file_count: files.len(),
+            }],
+            files,
+            duplicate_files: inventory.duplicates.clone(),
+            alias_paths_indexed: false,
+            ..Plan::default()
+        }
+    }
+
+    #[test]
+    fn a_consistent_plan_passes_the_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = duplicate_inventory(dir.path());
+        let plan = plan_for(&inventory);
+        let groups = desired_content_groups(&[], &plan, &inventory).unwrap();
+        sync::preflight_plan_projection(&plan, &groups)
+            .expect("the plan a run builds must pass the preflight");
+    }
+
+    /// #1723: a plan whose canonical copy is not the lowest native identity —
+    /// the shape the Windows `rel`-vs-`path_id` ranking produced — is refused
+    /// by the preflight, i.e. before `create_prepared_snapshot_reporting` seals
+    /// anything, with the same invariant `PendingSync::new` reports after it.
+    #[test]
+    fn a_plan_that_cannot_project_is_refused_before_sealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inventory = duplicate_inventory(dir.path());
+        // Promote the alias to canonical and demote the real canonical to an
+        // alias. The groups re-rank by `(is_symlink, path_id)` and put `a.txt`
+        // back first, so the plan's canonical (`b.txt`) disagrees with them.
+        let alias = inventory.duplicates[0].clone();
+        let file = inventory.files[0].clone();
+        inventory.files[0].rel = alias.rel.clone();
+        inventory.files[0].rel_id = alias.path_id.clone();
+        inventory.duplicates[0].rel = file.rel.clone();
+        inventory.duplicates[0].path_id = file.rel_id.clone();
+        inventory.duplicates[0].duplicate_of = alias.rel.clone();
+        let plan = plan_for(&inventory);
+
+        let groups = desired_content_groups(&[], &plan, &inventory).unwrap();
+        let err = sync::preflight_plan_projection(&plan, &groups)
+            .expect_err("a plan that cannot project must be refused");
+        assert!(
+            format!("{err:#}").contains("plan canonical projection disagrees with manifest group"),
+            "{err:#}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -976,6 +976,30 @@ fn validate_groups(groups: &[ManifestGroup]) -> Result<()> {
     Ok(())
 }
 
+/// The part of [`PendingSync::new`]'s validation that needs only the plan and
+/// the content groups derived from it, not the sealed snapshot's counts: group
+/// shape and canonical rank ([`validate_groups`]) and the plan's projection
+/// onto the groups ([`validate_plan_projection`]).
+///
+/// #1723: those checks ran only after `create_prepared_snapshot_reporting`
+/// had sealed the whole corpus, so a plan that could never be accepted cost a
+/// full snapshot pass (~25 minutes on the report's 24k-file corpus) before it
+/// was refused, on every attempt. Run on a canonicalized copy, ordered exactly
+/// as `PendingSync::new` orders the real manifest, so it cannot refuse
+/// anything that validation would accept. The groups' counts are still zero
+/// here; neither check reads them.
+pub(crate) fn preflight_plan_projection(plan: &Plan, groups: &[ManifestGroup]) -> Result<()> {
+    let mut manifest = GenerationManifest {
+        generation: 0,
+        execution: None,
+        plan: plan.clone(),
+        groups: groups.to_vec(),
+    };
+    canonicalize_manifest_order(&mut manifest);
+    validate_groups(&manifest.groups)?;
+    validate_plan_projection(&manifest.plan, &manifest.groups)
+}
+
 fn validate_plan_projection(plan: &Plan, groups: &[ManifestGroup]) -> Result<()> {
     let dataset_slugs: HashSet<&str> = plan
         .datasets
