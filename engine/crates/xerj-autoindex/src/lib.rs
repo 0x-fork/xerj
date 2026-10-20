@@ -3210,6 +3210,7 @@ mod phase_a_grouping_tests {
             snapshot_max_bytes: 64 << 30,
             prefix: "t".into(),
             replace_prefix: false,
+            prefix_note: None,
             state_dir: None,
             fresh: true,
             follow_symlinks: false,
@@ -6137,6 +6138,11 @@ fn run_index_report_inner(
     // any endpoint I/O below, and mirrored into the --json result. map/status
     // deliver the same note; they have no progress surface, so they `eprintln`.
     if let Some(note) = &cfg.xerj_url_note {
+        pr.warn(&format!("autoindex: {note}"));
+    }
+    // #1845: a rewritten --prefix is said out loud, next to the other
+    // "this run is not quite what you typed" warning.
+    if let Some(note) = &cfg.prefix_note {
         pr.warn(&format!("autoindex: {note}"));
     }
     // One throughput meter for the whole run: both phase-A routes (the legacy

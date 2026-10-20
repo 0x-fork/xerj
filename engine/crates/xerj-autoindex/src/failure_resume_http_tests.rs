@@ -793,6 +793,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         snapshot_max_bytes: 64 << 30,
         prefix: "failure-test".into(),
         replace_prefix: false,
+        prefix_note: None,
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
         follow_symlinks: false,

@@ -67,6 +67,11 @@ pub struct IndexCfg {
     pub bulk_timeout_secs: u64,
     pub snapshot_max_bytes: u64,
     pub prefix: String,
+    /// #1845: set when `--prefix` was rewritten on the way to `prefix` (a
+    /// trailing `-`/`_`, a `_`, a repeated separator, upper case). Said out loud
+    /// through `pr.warn` because the rewrite is exactly what makes sibling
+    /// projects collide under a `<prefix>-*` wildcard.
+    pub prefix_note: Option<String>,
     /// `--replace-prefix`: this folder may take over a prefix whose catalog
     /// runs were indexed from a different root. Off by default; without it
     /// that run is refused before anything is written.
@@ -287,7 +292,12 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20collapse: each repo indexed on its own has an\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20empty scope and becomes the single dataset\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<prefix>-docs. Use one --prefix per folder,\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20or index the parent folder once\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20or index the parent folder once. A prefix\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20keeps only [a-z0-9] runs joined by single '-',\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20so a trailing '-' or '_' is dropped (the run\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20warns). <prefix>-* also matches a sibling\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20prefix that starts with <prefix>-, so pick\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20prefixes that do not start one another\n\
          \x20\x20\x20\x20--replace-prefix     retire datasets already stored under --prefix\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20that were indexed from a different folder.\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Prints those folders and continues. Without\n\
@@ -722,6 +732,33 @@ fn set_max_file_bytes(
     Ok(())
 }
 
+/// The note for a `--prefix` that was not used exactly as typed (#1845).
+///
+/// A prefix keeps only runs of `[a-z0-9]` joined by single `-`, so
+/// `forbidden-lands-combat-` and `forbidden-lands-combat_` both become
+/// `forbidden-lands-combat`, and its indices `forbidden-lands-combat-docs`. An
+/// agent that added the trailing separator to keep this project apart from a
+/// sibling (`forbidden-lands-combat-sauvegarde`) got no word that it had been
+/// dropped, and the two still collide under `forbidden-lands-combat-*`.
+/// `None` when the prefix was used as given.
+pub(crate) fn prefix_rewrite_note(given: &str, used: &str) -> Option<String> {
+    if given == used || used.is_empty() {
+        return None;
+    }
+    let trailing = given.ends_with(['-', '_']);
+    let why = if trailing {
+        "a trailing '-' or '_' is not kept"
+    } else {
+        "a prefix keeps only lower-case [a-z0-9] runs joined by single '-'"
+    };
+    Some(format!(
+        "--prefix {given:?} is used as {used:?} ({why}). Indices are named {used}-<dataset>, so \
+         a {used}-* wildcard also matches any other prefix that starts with {used}- (for \
+         example {used}-other-<dataset>). If a sibling project's prefix starts with {used}-, \
+         give this one a prefix that is not the start of another (for example {used}-main)"
+    ))
+}
+
 pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut it = args.into_iter().peekable();
     let mut folder: Option<PathBuf> = None;
@@ -751,6 +788,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut prefix = "ax".to_string();
     let mut replace_prefix = false;
     let mut prefix_explicit = false;
+    let mut prefix_given: Option<String> = None;
     let mut state_dir: Option<PathBuf> = None;
     let mut endpoint_url: Option<String> = None;
     let mut endpoint_explicit = false;
@@ -884,6 +922,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--prefix" => {
                 prefix = it.next().ok_or("--prefix needs a value")?;
                 prefix_explicit = true;
+                prefix_given = Some(prefix.clone());
             }
             "--replace-prefix" => replace_prefix = true,
             "--state-dir" => state_dir = it.next().map(PathBuf::from),
@@ -1662,6 +1701,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 bulk_mb,
                 bulk_timeout_secs,
                 snapshot_max_bytes,
+                prefix_note: prefix_given
+                    .as_deref()
+                    .and_then(|given| prefix_rewrite_note(given, &prefix)),
                 prefix,
                 replace_prefix,
                 state_dir,
@@ -2100,6 +2142,35 @@ mod tests {
         );
         // With --no-graph it parses, and the watcher is on.
         assert!(index(&["data", "--watch", "--no-graph"]).watch);
+    }
+
+    /// #1845: `--prefix forbidden-lands-combat-` silently became
+    /// `forbidden-lands-combat`, so a trailing separator meant to keep sibling
+    /// projects apart did nothing and nobody was told. The rewrite is now
+    /// carried as a note naming the prefix actually used and the wildcard
+    /// collision it implies; a prefix used as typed carries none.
+    #[test]
+    fn a_rewritten_prefix_is_named_and_an_exact_one_is_not() {
+        for given in ["forbidden-lands-combat-", "forbidden-lands-combat_"] {
+            let cfg = index(&["data", "--prefix", given]);
+            assert_eq!(cfg.prefix, "forbidden-lands-combat");
+            let note = cfg
+                .prefix_note
+                .expect("a dropped trailing separator must be said");
+            assert!(note.contains(&format!("{given:?}")), "{note}");
+            assert!(note.contains("\"forbidden-lands-combat\""), "{note}");
+            assert!(note.contains("trailing '-' or '_' is not kept"), "{note}");
+            assert!(note.contains("forbidden-lands-combat-*"), "{note}");
+        }
+        let cfg = index(&["data", "--prefix", "My_Proj"]);
+        assert_eq!(cfg.prefix, "my-proj");
+        assert!(cfg.prefix_note.is_some_and(|n| n.contains("\"my-proj\"")));
+        // Used exactly as typed, or not typed at all: nothing to say.
+        assert!(index(&["data", "--prefix", "forbidden-lands-combat"])
+            .prefix_note
+            .is_none());
+        assert!(index(&["data"]).prefix_note.is_none());
+        assert!(super::help_text().contains("trailing '-' or '_' is dropped"));
     }
 
     /// `xerj autoindex` reads its endpoint from `--url` only; setting `XERJ_URL`
