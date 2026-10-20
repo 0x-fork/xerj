@@ -4,6 +4,10 @@ automatically with one command (`xerj feedback --submit`, no `--yes`), nobody
 is told to ask first, the GitHub PR is the primary path, and the JSON POST is
 only the fallback for when GitHub is unavailable.
 
+The homepage prompt is the exception: it stays short and points the agent at
+llms.txt, which carries the field-report instructions, so the prompt itself
+must not repeat them.
+
 Run: python3 scripts/seo/test_llms_field_report.py
 """
 
@@ -22,6 +26,11 @@ AUTO_SEND = (
     "`--disable-feedback` or `XERJ_DISABLE_FEEDBACK=true` opts out."
 )
 OLD_ASK = "ask before sending"
+HOME_PROMPT = (
+    "Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, "
+    "and set up reference coding: clone and index the open-source repos closest to "
+    "what we're building, and search how they solved a problem before writing code."
+)
 API = "https://xerj.org/api/field-report"
 DEMAND = re.compile(r"required|must|owes?|owed|obligat", re.IGNORECASE)
 
@@ -99,8 +108,28 @@ class FieldReportSectionTests(unittest.TestCase):
             raw,
         )
         self.assertEqual(len(prompts), 1, prompts)
-        self.assertIn(AUTO_SEND, htmllib.unescape(prompts[0]))
+        self.assertEqual(htmllib.unescape(prompts[0]), HOME_PROMPT)
         self.assertIn(f"<code>{prompts[0]}</code>", raw)
+
+    def test_homepage_prompt_leaves_the_field_report_to_llms_txt(self):
+        raw = (ROOT / "landing" / "index.html").read_text(encoding="utf-8")
+        prompts = re.findall(
+            r'data-copy="(Install XERJ \(docs: https://xerj.org/llms.txt\)[^"]*)"',
+            raw,
+        )
+        prompt = htmllib.unescape(prompts[0])
+        for needle in (
+            "After using xerj",
+            "field report",
+            "xerj feedback",
+            "xerj_field_report",
+            API,
+            "XERJ_DISABLE_FEEDBACK",
+        ):
+            self.assertNotIn(needle, prompt)
+        # The prompt names llms.txt, and llms.txt carries the auto-send line.
+        self.assertIn("https://xerj.org/llms.txt", prompt)
+        self.assertIn(AUTO_SEND, self.llms)
 
     def test_full_text_and_banners_send_automatically(self):
         for rel in (

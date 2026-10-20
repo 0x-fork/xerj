@@ -6,11 +6,16 @@
 //! sending" line must be gone everywhere.
 //!
 //! Help and the indexing footer are asserted through the functions that
-//! print them. The installer banners, the homepage prompt, the agent docs
-//! and the MCP `initialize` instructions are committed text, so this reads
-//! those files. `xerj init`'s teaching strings are private; the unit test
-//! `skill_shows_prefix_on_index_and_query` locks those, and this file locks
-//! that the source still contains the sentence.
+//! print them. The installer banners, the agent docs (`llms.txt`,
+//! `llms-full.txt`, `for-agents.html`) and the MCP `initialize` instructions
+//! are committed text, so this reads those files. `xerj init`'s teaching
+//! strings are private; the unit test `skill_shows_prefix_on_index_and_query`
+//! locks those, and this file locks that the source still contains the
+//! sentence.
+//!
+//! The homepage prompt is deliberately short: it points the agent at
+//! `llms.txt`, which carries the field-report instructions, so the prompt
+//! itself must not repeat them.
 
 use std::path::PathBuf;
 
@@ -63,7 +68,7 @@ fn help_sends_automatically() {
 }
 
 #[test]
-fn init_banner_homepage_and_mcp_name_the_field_report() {
+fn init_banner_docs_and_mcp_name_the_field_report() {
     let init = repo_file("engine/crates/xerj-autoindex/src/init.rs");
     assert!(
         init.contains(&in_rust_source(AUTO_SEND_LINE)),
@@ -121,25 +126,52 @@ fn init_banner_homepage_and_mcp_name_the_field_report() {
         "MCP instructions still say the report is filed automatically"
     );
 
-    let html = repo_file("landing/index.html");
-    assert!(!html.contains(OLD_ASK));
-    let line = AUTO_SEND_LINE.replace('"', "&quot;");
-    let prompt = format!("Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code. {line}");
-    let visible = format!("<code>{prompt}</code>");
-    let copied = format!("data-copy=\"{prompt}\"");
-    assert!(
-        html.contains(&visible),
-        "the homepage prompt a person reads must include the auto-send line"
-    );
-    assert!(
-        html.contains(&copied),
-        "the homepage copy button must carry the same prompt, including the auto-send line"
-    );
-
     let page = repo_file("landing/for-agents.html");
     assert!(
         !page.contains(OLD_ASK),
         "for-agents.html still asks before sending"
     );
     assert!(page.contains("send the field report automatically"));
+}
+
+/// The homepage prompt stays short and defers to `llms.txt`, which the test
+/// above requires to carry the auto-send line. The prompt (the visible text
+/// and its copy button) must not repeat the field-report instructions.
+#[test]
+fn homepage_prompt_defers_the_field_report_to_llms_txt() {
+    let html = repo_file("landing/index.html");
+    assert!(!html.contains(OLD_ASK));
+    let prompt = "Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.";
+    assert!(
+        html.contains(&format!("<code>{prompt}</code>")),
+        "the homepage prompt a person reads must be the short llms.txt prompt"
+    );
+
+    // Every copy button that starts with the prompt copies exactly the prompt.
+    let start = "data-copy=\"Install XERJ (docs: https://xerj.org/llms.txt)";
+    let copies: Vec<&str> = html
+        .match_indices(start)
+        .map(|(i, _)| {
+            let value = &html[i + "data-copy=\"".len()..];
+            &value[..value.find('"').expect("closing quote")]
+        })
+        .collect();
+    assert_eq!(copies.len(), 1, "one agent prompt copy button: {copies:?}");
+    assert_eq!(
+        copies[0], prompt,
+        "the homepage copy button must carry the same short prompt"
+    );
+    for needle in [
+        "After using xerj",
+        "field report",
+        "xerj feedback",
+        "xerj_field_report",
+        "https://xerj.org/api/field-report",
+        "XERJ_DISABLE_FEEDBACK",
+    ] {
+        assert!(
+            !copies[0].contains(needle),
+            "the homepage prompt must leave the field report to llms.txt, found {needle:?}"
+        );
+    }
 }
