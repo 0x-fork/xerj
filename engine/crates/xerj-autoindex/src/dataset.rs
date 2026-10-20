@@ -296,6 +296,40 @@ pub fn sanitize_slug(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// [`sanitize_slug`] for an index prefix (`--prefix`, and the `xc-<corpus>-b<n>`
+/// prefix `xerj corpus index` passes). Same rules, with one difference: a run
+/// made only of literal `-` is kept as written. `sanitize_slug` collapsed it,
+/// so a corpus named `owner--repo` (every author-approved hub candidate) was
+/// indexed under `xc-owner-repo-…` while `corpus index` verified, and `xerj code`
+/// searched, `xc-owner--repo-…`: 0 records, every build (issue #1889). Any other
+/// separator run (`_`, `.`, spaces, a mix with `-`) still becomes one `-`.
+pub fn sanitize_prefix(s: &str) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let flush = |out: &mut String, run: &mut String| {
+        if !run.is_empty() {
+            if !out.is_empty() {
+                if run.chars().all(|c| c == '-') {
+                    out.push_str(run);
+                } else {
+                    out.push('-');
+                }
+            }
+            run.clear();
+        }
+    };
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            flush(&mut out, &mut run);
+            out.push(c.to_ascii_lowercase());
+        } else {
+            run.push(c);
+        }
+    }
+    // a trailing separator run is dropped, as in `sanitize_slug`
+    out
+}
+
 fn numericish_segment(s: &str) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -432,7 +466,7 @@ fn assign_slugs(clusters: &mut [Cluster], rels: &[String], used: &mut HashSet<St
 /// `ax` does not rename `logs-syslog`. An empty remainder is not produced.
 /// Collisions created by the strip are numbered `-2`, `-3`, in slug order.
 pub fn drop_repeated_prefix(prefix: &str, clusters: &mut [Cluster]) {
-    let prefix = sanitize_slug(prefix);
+    let prefix = sanitize_prefix(prefix);
     if prefix.is_empty() {
         return;
     }
@@ -462,6 +496,25 @@ pub fn drop_repeated_prefix(prefix: &str, clusters: &mut [Cluster]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_prefix_keeps_a_literal_double_hyphen() {
+        // issue #1889: `owner--repo` corpora must index under the name they verify under
+        assert_eq!(
+            sanitize_prefix("xc-0whitedev--java-process-inspector-b1792446398"),
+            "xc-0whitedev--java-process-inspector-b1792446398"
+        );
+        assert_eq!(sanitize_prefix("My_Proj"), "my-proj");
+        assert_eq!(sanitize_prefix("a_-b"), "a-b");
+        assert_eq!(sanitize_prefix("a. b"), "a-b");
+        assert_eq!(sanitize_prefix("--ref--"), "ref");
+        assert_eq!(sanitize_prefix("ref-"), "ref");
+        assert_eq!(sanitize_prefix("___"), "");
+        // without a double hyphen it agrees with sanitize_slug
+        for s in ["ax", "xc-lz4-b17", "Logs 2026", "a__b", "x.y.z"] {
+            assert_eq!(sanitize_prefix(s), sanitize_slug(s), "{s}");
+        }
+    }
     use crate::ids;
 
     fn acc(value: &str) -> FieldAcc {

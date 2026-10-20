@@ -1164,7 +1164,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         }
     }
 
-    let prefix = crate::dataset::sanitize_slug(&prefix);
+    let prefix = crate::dataset::sanitize_prefix(&prefix);
     if prefix.is_empty() {
         return Err("--prefix must contain at least one [a-z0-9] character".into());
     }
