@@ -86,6 +86,11 @@ pub const EXIT_NEEDS_DECISION: i32 = 4;
 /// A pull was refused because this build has no hub public key: not a pack that
 /// failed verification ([`EXIT_UNVERIFIED`]) but one that cannot be judged at all.
 pub const EXIT_NO_KEY: i32 = 5;
+/// The hub catalogue could not be loaded (the hub is unreachable, serves no signed
+/// catalogue, or `--offline` has no cached one). Not [`EXIT_NO_ANSWER`]: that one
+/// says "the hub has nothing for this question", which an agent reads as an answer
+/// about the corpus, while this one is about the hub itself and is worth a retry.
+pub const EXIT_HUB_UNAVAILABLE: i32 = 6;
 
 /// Printed (stderr) when the router finds nothing credible.
 pub const NO_CORPUS_MESSAGE: &str = "no hub corpus matches; see xerj.org/llms.txt";
@@ -1623,8 +1628,13 @@ pub fn run_ask_with(
             Ok(c) => c,
             Err(e) => {
                 return AskOutcome::fail(
-                    EXIT_NO_ANSWER,
-                    format!("cannot load the hub catalogue: {e:#}"),
+                    EXIT_HUB_UNAVAILABLE,
+                    format!(
+                        "cannot load the hub catalogue: {e:#}\n\
+                         (exit {EXIT_HUB_UNAVAILABLE}: the hub itself is unavailable; this says nothing about \
+                         whether a corpus holds the answer. Retry later, point XERJ_HUB_URL at a working hub, \
+                         or ask with --offline once a catalogue is cached.)"
+                    ),
                 )
             }
         }

@@ -1354,7 +1354,9 @@ options:
 exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
 unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
 (candidates are printed; re-run with --corpus <slug>); 5 this build has no hub
-public key, so no pack can be verified (nothing was downloaded)";
+public key, so no pack can be verified (nothing was downloaded); 6 the hub
+catalogue could not be loaded (hub unreachable, no signed catalogue served, or
+--offline with none cached): a hub problem, not an answer about any corpus";
 
 /// The first argument of every real `xerj` subcommand.
 pub const KNOWN_SUBCOMMANDS: &[&str] = &[
@@ -1728,6 +1730,34 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_hub_unavailable_has_its_own_documented_exit_code() {
+        // "the hub catalogue cannot be loaded" used to share exit 1 with "no
+        // match", which an agent reads as an answer about the corpus.
+        let codes = [
+            ask::EXIT_OK,
+            ask::EXIT_NO_ANSWER,
+            ask::EXIT_USAGE,
+            ask::EXIT_UNVERIFIED,
+            ask::EXIT_NEEDS_DECISION,
+            ask::EXIT_NO_KEY,
+            ask::EXIT_HUB_UNAVAILABLE,
+        ];
+        let mut sorted = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            codes.len(),
+            "exit codes must be distinct: {codes:?}"
+        );
+        assert_eq!(ask::EXIT_HUB_UNAVAILABLE, 6);
+        assert!(
+            ASK_USAGE.contains("6 the hub\ncatalogue could not be loaded"),
+            "{ASK_USAGE}"
+        );
+    }
 
     /// A minimal record pack in the layout `xerj corpus build` writes and
     /// `harvest::pack::read_manifest` verifies.

@@ -328,8 +328,8 @@ if [ "${1:-}" = "--inner" ]; then
       run pull env XERJ_HUB_URL="$E2E_DEAD_HUB" "$BIN" hub pull "$E2E_TARGET"; p=$RC; pe=$ERRF
       run ask env XERJ_HUB_URL="$E2E_DEAD_HUB" "$BIN" ask --corpus "$E2E_TARGET" "$E2E_TARGET"
       if [ "$p" != 0 ] && has "cannot load catalogue" "$pe" && has "$MSG_NO_CACHE" "$pe" \
-         && [ "$RC" = 1 ] && has "cannot load the hub catalogue" "$ERRF" && nothing_extracted "$E2E_TARGET"; then
-        check hub-unreachable 0 "empty HOME, nothing listening: pull exit $p and ask exit 1, both '…$MSG_NO_CACHE'; nothing extracted"
+         && [ "$RC" = 6 ] && has "cannot load the hub catalogue" "$ERRF" && nothing_extracted "$E2E_TARGET"; then
+        check hub-unreachable 0 "empty HOME, nothing listening: pull exit $p and ask exit 6, both '…$MSG_NO_CACHE'; nothing extracted"
       else
         check hub-unreachable 1 "pull exit $p, ask exit $RC: $(last_err)"
       fi
@@ -338,9 +338,9 @@ if [ "${1:-}" = "--inner" ]; then
     html)
       run pull env XERJ_HUB_URL="$E2E_HTML_HUB" "$BIN" hub pull "$E2E_TARGET"; p=$RC; pe=$ERRF
       run ask env XERJ_HUB_URL="$E2E_HTML_HUB" "$BIN" ask --corpus "$E2E_TARGET" "$E2E_TARGET"
-      if [ "$p" != 0 ] && has "$MSG_HTML" "$pe" && [ "$RC" = 1 ] && has "$MSG_HTML" "$ERRF" \
+      if [ "$p" != 0 ] && has "$MSG_HTML" "$pe" && [ "$RC" = 6 ] && has "$MSG_HTML" "$ERRF" \
          && [ ! -e "$HOME/.xerj/hub/catalogue.json" ] && nothing_extracted "$E2E_TARGET"; then
-        check hub-html-200 0 "empty HOME, the site's HTML page (200) as the catalogue: '$MSG_HTML' from pull (exit $p) and ask (exit 1); nothing cached or extracted"
+        check hub-html-200 0 "empty HOME, the site's HTML page (200) as the catalogue: '$MSG_HTML' from pull (exit $p) and ask (exit 6); nothing cached or extracted"
       else
         check hub-html-200 1 "pull exit $p, ask exit $RC: $(last_err)"
       fi
@@ -348,8 +348,8 @@ if [ "${1:-}" = "--inner" ]; then
 
     offline)
       run offline-empty "$BIN" ask --offline --corpus "$E2E_TARGET" "$E2E_TARGET"
-      if [ "$RC" = 1 ] && has "$MSG_OFFLINE_NOCAT" "$ERRF"; then
-        check offline-no-catalogue 0 "--offline, empty HOME: exit 1, '$MSG_OFFLINE_NOCAT'"
+      if [ "$RC" = 6 ] && has "$MSG_OFFLINE_NOCAT" "$ERRF"; then
+        check offline-no-catalogue 0 "--offline, empty HOME: exit 6, '$MSG_OFFLINE_NOCAT'"
       else
         check offline-no-catalogue 1 "exit $RC: $(last_err)"
       fi
