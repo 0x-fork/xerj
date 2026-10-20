@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>AST-GREP VS A CODE INDEX FOR AN AGENT?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: CODE RETRIEVAL</span></div>
   <h1>ast-grep vs a code index for an agent?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Should an agent use ast-grep or a code index? Use both. ast-grep matches and rewrites code by syntax pattern, and XERJ rewrites nothing. XERJ answers where a symbol is defined and what its contract says across a tree it already indexed. No head-to-head was run, and none is needed to split these jobs.</p>
+    <p class="key-fact"><strong>Key number:</strong> ast-grep has 16,288 GitHub stars and released 0.51.0 on 2026-10-15. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/ast-grep/ast-grep">github.com/ast-grep/ast-grep</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — ast-grep changes code by syntax pattern, and XERJ does no rewriting at all. XERJ answers where a symbol is defined and what its contract says, across a tree it has already indexed. Install both. No head-to-head was run, and none is needed to split these jobs.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -178,7 +183,7 @@
     <span class="prompt-label">RUN THIS XERJ COMMAND</span>
     <code>xerj mcp --url http://127.0.0.1:9200</code>
     <button type="button" class="prompt-copy" data-copy="xerj mcp --url http://127.0.0.1:9200">COPY COMMAND</button>
-    <span class="hero-proof">Serve the 10 tools an agent calls before it decides what to change. Start the node first; this command does not start one.</span>
+    <span class="hero-proof">Serve the 17 tools an agent calls before it decides what to change. Start the node first; this command does not start one.</span>
   </div>
   <h2>This is not a knockout, and pretending otherwise would be dishonest</h2>
   <p>ast-grep is a command-line tool for structural search, lint and rewriting, and it matches syntax tree nodes rather than text. XERJ is an index that answers questions about a folder.</p>
@@ -195,7 +200,7 @@
   <p>XERJ pays that cost once:</p>
   <pre class="code"><code class="language-sh">xerj autoindex ./repo --prefix code --state-dir ./state-code
 </code></pre>
-  <p>After that, a code document carries <code class="inline">title</code>, <code class="inline">language</code>, a <code class="inline">defs</code> field with one line per definition, a <code class="inline">symbols</code> list with names, kinds and line numbers, and the full body. One query finds where a symbol is defined, and it is the same query in every one of 34 languages.</p>
+  <p>After that, a code document carries <code class="inline">title</code>, <code class="inline">language</code>, a <code class="inline">defs</code> field with one line per definition, a <code class="inline">symbols</code> list with names, kinds and line numbers, and the full body. One query finds where a symbol is defined, and it is the same query in every one of 36 languages.</p>
   <pre class="code"><code class="language-json">{ "query": { "match": { "defs": "parse_config" } }, "_source": ["ax_path"] }
 </code></pre>
   <p>The result is a passage and a path rather than a whole file, which is what keeps an agent's context window from filling with source it did not need.</p>
@@ -234,7 +239,7 @@
   <h3>Can XERJ rewrite code?</h3>
   <p>No. XERJ performs no abstract syntax tree rewriting and no codemod of any kind. It returns passages and paths, and you change the file.</p>
   <h3>What does XERJ extract from code?</h3>
-  <p>Definitions. Each code document carries a defs field and a symbols list with names, kinds and line numbers, across 34 languages.</p>
+  <p>Definitions. Each code document carries a defs field and a symbols list with names, kinds and line numbers, across 36 languages.</p>
   <h3>Does ast-grep keep an index?</h3>
   <p>No. The project states that it builds a syntax tree in memory for each query and does not support offline indexing.</p>
   <h3>Which one does an agent call first?</h3>
@@ -261,6 +266,9 @@
     <li><a href="/answers/code-search-mcp-for-claude-code">I need my agent to find a passage and cite the file, not dump the whole tree. How?</a></li>
     <li><a href="/answers/index-monorepo-for-agent">How do I stop my agent from reading the whole repo into context?</a></li>
     <li><a href="/compare/xerj-vs-ripgrep-for-code-agents">Is ripgrep enough for a coding agent, or do I need a code index?</a></li>
+    <li><a href="/answers/audit-php-codebase-with-an-index">How do I audit a PHP codebase with an index instead of grepping 1,400 files?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/index-reference-library-for-coding-agent">How do I set up reference coding so the agent retrieves a mechanism before writing code?</a> <span class="mute">· same intent: code search for agents</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

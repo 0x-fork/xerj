@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-05",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>WHY WOULD A FOLDER SEARCH MISS FILES THAT I CAN SEE ON DISK?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: EXCLUSIONS</span></div>
   <h1>Why would a folder search miss files that I can see on disk?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-05</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Why would a folder search miss files that I can see on disk? XERJ prints one line per ignore rule with an exact file count, and stores a refusal reason for every file it opened. A capture over 26 files on disk indexed 1, refused 2 with named reasons, excluded 23 through ignore rules, and exited 3.</p>
+    <p class="key-fact"><strong>Key number:</strong> The captured run reconciled 26 files on disk as 1 indexed, 2 refused and 23 excluded. <span class="mute">(as of 2026-10-05 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ prints one line per ignore rule with an exact file count, and stores a refusal reason for every file it opened. A capture over 26 files on disk indexed 1, refused 2 with named reasons, and excluded 23 through ignore rules. The run exited 3 with <code class="inline">reason=completed-with-junk</code>.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -247,6 +252,9 @@ autoindex: ignore rules:   .gitignore:*.tmp — 1 file
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
     <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a></li>
     <li><a href="/answers/estimate-autoindex-time-before-running">How do I estimate folder-indexing time?</a></li>
+    <li><a href="/answers/reindex-taking-forever">Reindexing my files is taking forever. What usually causes that?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/search-files-in-an-s3-bucket">How do I search files that live in an S3 bucket?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/keep-index-current-as-files-change">How do I keep a search index up to date as files change, without re-indexing everything?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

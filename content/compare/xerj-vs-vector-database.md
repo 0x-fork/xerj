@@ -1,5 +1,5 @@
 ---
-title: "Search API or Qdrant for agent memory?"
+title: "Search API or a vector database for agent memory?"
 h1: "Should my agent call a search API or stand up Qdrant for persistent memory?"
 description: "Agent memory lives in the index process XERJ already runs, so no second data service starts. On 8 judged queries hybrid linear fusion scored precision@3 0.4583."
 slug: "xerj-vs-vector-database"
@@ -12,6 +12,14 @@ author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start one local XERJ node, store a fact with POST /_memory/{namespace} and read it back with _recall, then index a labeled corpus into the same node and run the same judged queries as BM25, kNN and hybrid RRF. Report every miss, and report whether any second data service had to start."
+answer: "Should my agent call a search API or a vector store like Qdrant for memory? Call the search API you already run. XERJ serves agent memory at _memory/{namespace} from the process that serves _search. On 8 judged queries hybrid linear fusion scored precision@3 0.4583. Choose Qdrant for filtered vector search at scale."
+key_fact: "Qdrant has 35,143 GitHub stars, is Apache-2.0, and released v1.19.2 on 2026-10-05."
+key_fact_source: "https://github.com/qdrant/qdrant"
+key_fact_date: "2026-10-19"
+intent_group: "agent memory"
+queries:
+  - "memory layer for AI agents without vector database"
+  - "vector database vs full text search"
 commands:
   - cmd: "curl -s -XPUT http://127.0.0.1:9200/eval -H 'content-type: application/json' -d '{\"mappings\":{\"properties\":{\"doc_id\":{\"type\":\"keyword\"},\"title\":{\"type\":\"text\"},\"text\":{\"type\":\"semantic_text\"}}}}'"
     note: "Create one index that carries both the inverted index and the dense vectors."

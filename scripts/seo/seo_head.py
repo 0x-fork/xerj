@@ -275,6 +275,38 @@ def extra_structured_data(url: str, desc: str, meta: dict[str, Any]) -> list[dic
     return out
 
 
+def item_list(url: str, name: str, items: list[dict[str, str]]) -> dict[str, Any]:
+    """ItemList of the tools a best-of page compares, in the page's order."""
+    return {
+        "@context": "https://schema.org",
+        "@type": "ItemList",
+        "@id": f"{url}#tools",
+        "name": _plain(name),
+        "numberOfItems": len(items),
+        "itemListOrder": "https://schema.org/ItemListUnordered",
+        "itemListElement": [{
+            "@type": "ListItem",
+            "position": i,
+            "item": {
+                "@type": "SoftwareApplication",
+                "name": item["name"],
+                "url": item["url"],
+                "applicationCategory": "DeveloperApplication",
+                "license": item["license"],
+                "installUrl": item["url"],
+            },
+        } for i, item in enumerate(items, start=1)],
+    }
+
+
+def geo_blocks(url: str, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """GEO JSON-LD: an ItemList for a best-of page's compared tools (its
+    visible summary table). FAQPage/HowTo stay opt-in in extra_structured_data."""
+    if not meta.get("items"):
+        return []
+    return [item_list(url, meta.get("items_name") or meta.get("title", ""), meta["items"])]
+
+
 def build_block(rel: str, title: str, desc: str, published: str,
                 modified: str, meta: dict[str, Any] | None = None) -> str:
     """Emit the exact SEO block used by ``fix_heads.py``."""
@@ -307,6 +339,7 @@ def build_block(rel: str, title: str, desc: str, published: str,
         ld(page_body(rel, meta, url, title, desc, published, modified)),
     ]
     lines += [ld(obj) for obj in extra_structured_data(url, desc, meta)]
+    lines += [ld(obj) for obj in geo_blocks(url, meta)]
     crumbs = breadcrumbs(rel, meta)
     if crumbs is not None:
         lines.append(ld(crumbs))

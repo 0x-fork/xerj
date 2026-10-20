@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-19",
-  "dateModified": "2026-09-19",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH FILES THAT LIVE IN AN S3 BUCKET?</div>
   <div class="kicker"><span>ANSWERS · INGEST: OBJECT STORAGE</span></div>
   <h1>How do I search files that live in an S3 bucket?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-09-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search files that live in an S3 bucket? Run xerj autoindex s3://bucket/prefix against a running node. XERJ lists the prefix, streams in only the objects whose ETag or size changed, and indexes them with the same extractors it uses for a folder. Credentials come from the environment; the index stays local.</p>
+    <p class="key-fact"><strong>Key number:</strong> Measured against MinIO: an unchanged re-run over 4 keys cost 1 LIST and 0 GET requests, 0 bytes. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/objsource_minio_tests.rs">engine/crates/xerj-autoindex/src/objsource_minio_tests.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Run <code class="inline">xerj autoindex s3://bucket/prefix</code> against a running node. XERJ lists the prefix, streams in only the objects whose ETag or size changed, and indexes them with the same extractors it uses for a folder. Credentials come from the environment. The index stays on local disk.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -317,6 +322,9 @@ autoindex: re-running this at the same size costs 2 class-A request(s) each time
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
     <li><a href="/answers/autoindex-exit-codes">The indexer exited 3 (or 4). Did it fail?</a></li>
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
+    <li><a href="/answers/keep-s3-bucket-index-current">How do I keep an index current when the files live in an object store?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/keep-index-current-as-files-change">How do I keep a search index up to date as files change, without re-indexing everything?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/reindex-taking-forever">Reindexing my files is taking forever. What usually causes that?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

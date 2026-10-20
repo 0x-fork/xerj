@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>SHOULD AN AGENT USE API SEARCH OR VECTOR SEARCH?</div>
   <div class="kicker"><span>ANSWERS · AGENT ACCESS AND MEMORY</span></div>
   <h1>Should an agent use API search or vector search?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Which should an agent call, MCP or API search, or vector search? Start with xerj_search, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets, and the fused xerj_hybrid_search call returned 6 documents against 4, 3 and 3 for the single-signal tools.</p>
+    <p class="key-fact"><strong>Key number:</strong> Four of the 17 XERJ MCP tools retrieve: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code> and <code class="inline">xerj_hybrid_search</code>. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json">landing/docs/agents/schemas/mcp-tools.json</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Start with <code class="inline">xerj_search</code>, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets. The fused <code class="inline">xerj_hybrid_search</code> call returned 6 documents against 4, 3 and 3 for the single-signal tools.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -262,6 +267,9 @@
     <li><a href="/answers/vector-database-vs-full-text-search">What's the actual difference between a vector database and full-text search when I have a folder?</a></li>
     <li><a href="/answers/do-search-embeddings-help">When should I turn on neural embeddings, and when is the lexical default enough?</a></li>
     <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a></li>
+    <li><a href="/answers/rag-without-vector-database">How do I build RAG without a vector database?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/reciprocal-rank-fusion-when-to-use">What is Reciprocal Rank Fusion?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/how-xerj-combines-search">How does XERJ combine BM25 and kNN?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

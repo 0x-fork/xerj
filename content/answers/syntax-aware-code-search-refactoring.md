@@ -7,11 +7,19 @@ cluster: "Files and formats"
 question: "Is there a syntax-aware code search tool for refactoring?"
 intent: "tool-selection"
 published: "2026-08-21"
-updated: "2026-08-21"
+updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with --insecure, run xerj autoindex ./code --prefix code, then send two queries to code-*/_search: a match on body for a symbol name and a match on defs for the same name, and report ax_path, language and the symbols array with kind, name and line for each declaration hit."
+answer: "Is there a syntax-aware code search tool for refactoring? XERJ gives you two code queries on one index: match on body for raw text, and match on defs for declared symbols, which returns a symbols array with kind, name and line. It extracts definitions only and rewrites nothing; for structural rewrites use ast-grep."
+key_fact: "XERJ's tree-sitter registry covers 36 languages, pinned by a unit test."
+key_fact_source: "engine/crates/xerj-autoindex/src/extract/code.rs"
+key_fact_date: "2026-10-19"
+intent_group: "code search for agents"
+queries:
+  - "tree-sitter code search CLI"
+  - "find function definition across repo CLI"
 commands:
   - cmd: "xerj autoindex ./code --url http://127.0.0.1:9410 --prefix code --state-dir ./state-code --progress plain --disable-feedback"
     note: "Index the source tree into the prefix code."
@@ -31,7 +39,7 @@ faq:
   - q: "Does XERJ find every caller of a function?"
     a: "No. Extraction is definitions only, with no call graph and no cross-file reference resolution. Use a language server when a rename must be sound."
   - q: "Which languages does XERJ parse?"
-    a: "34 languages through tree-sitter, including Rust, Go, Python, TypeScript, Java and C++. Our capture exercised `rust`, `python` and `go`."
+    a: "36 languages through tree-sitter, including Rust, Go, Python, TypeScript, Java and C++. Our capture exercised `rust`, `python` and `go`."
   - q: "Does case matter in a symbol query?"
     a: "Yes, in practice. `src/query.go` declares `MergeSegments`, and the query token `merge_segments` did not match it in our capture."
   - q: "What happens if a file fails to parse?"
@@ -87,7 +95,7 @@ One miss is worth naming. The file `src/query.go` declares `MergeSegments`, and 
 
 XERJ extracts definitions only. There is no call graph, no import graph and no cross-file reference resolution, so XERJ does not find callers of a symbol.
 
-That boundary decides the tool choice. Use XERJ to locate every declaration and every textual occurrence across 34 languages. Use a language server or a compiler plugin for a rename that must be sound.
+That boundary decides the tool choice. Use XERJ to locate every declaration and every textual occurrence across 36 languages. Use a language server or a compiler plugin for a rename that must be sound.
 
 ## Caps and failure behavior
 

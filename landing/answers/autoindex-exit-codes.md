@@ -2,11 +2,15 @@
 ---
 title: "What do the xerj autoindex exit codes mean?"
 canonical: "https://xerj.org/answers/autoindex-exit-codes"
-updated: "2026-09-20"
+updated: "2026-10-19"
 source: "content/answers/autoindex-exit-codes.md"
 ---
 
 # The indexer exited 3 (or 4). Did it fail?
+
+**Short answer** (updated 2026-10-19): What does indexer exit code 3 mean for xerj autoindex? It means success: the run completed and recorded some junk files. Exit 0 is a clean completion, 4 means the estimate exceeded --max-minutes and nothing was indexed, 2 is a usage error, and 1 is an endpoint or journal failure. Only exit 4 asks you a question.
+
+**Key number:** The decision gate that produces exit 4 defaults to 10 minutes of estimated work (`DEFAULT_MAX_MINUTES`). (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/gate.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/gate.rs))
 
 **TL;DR** — Exit 3 is a success. `xerj autoindex` exits 0 when the run completed, and 3 when it completed and recorded junk. Exit 4 means the estimate exceeded `--max-minutes` and nothing was indexed. Exit 2 is a usage error, and exit 1 is an endpoint or journal failure. Only 4 is a question.
 
@@ -229,3 +233,6 @@ Retry nothing on 0 or 3. Re-run with `--approve` on 4. Fix the command line on 2
 - [Why would a folder search miss files that I can see on disk?](/answers/why-autoindex-skipped-files)
 - [One dataset was REFUSED by the server. Did I lose the whole index?](/answers/autoindex-dataset-refused-by-server)
 - [The server pushed back with HTTP 429. Did xerj autoindex lose the run?](/answers/autoindex-server-back-pressure-429)
+- [xerj autoindex recorded my Takeout .zip as junk and said to extract it first. Why?](/answers/autoindex-says-extract-the-archive-first) (same intent: operating autoindex)
+- [How do I keep a search index up to date as files change, without re-indexing everything?](/answers/keep-index-current-as-files-change) (same intent: operating autoindex)
+- [How do I keep an index current when the files live in an object store?](/answers/keep-s3-bucket-index-current) (same intent: operating autoindex)

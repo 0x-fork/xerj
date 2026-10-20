@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SET THE MCP MEMORY STORAGE PATH?</div>
   <div class="kicker"><span>ANSWERS · AGENT MEMORY: STORAGE</span></div>
   <h1>How do I set the MCP memory storage path?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Why does the memory MCP ignore my custom storage path setting? XERJ has no memory-specific path. Agent memory is an ordinary index named .xerj-memory-{namespace} inside the node data directory, so --data-dir sets it, and the MCP server stores nothing itself. Our capture stored a memory, restarted on the same directory, and recalled it.</p>
+    <p class="key-fact"><strong>Key number:</strong> xerj mcp exposes 2 memory tools out of 17, and both proxy to the node; neither writes a file of its own. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json">landing/docs/agents/schemas/mcp-tools.json</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ has no memory-specific storage path. Agent memory is an ordinary index named <code class="inline">.xerj-memory-{namespace}</code> inside the node data directory, so <code class="inline">--data-dir</code> sets it. Our capture stored a memory, restarted the node against the same directory, and recalled it.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -238,6 +243,9 @@ drwxr-xr-x  4 root root 160 .xerj-memory-agentmem
     <li><a href="/answers/coding-agent-memory-across-sessions">How do people store user preferences so an agent can recall them next week?</a></li>
     <li><a href="/answers/resume-interrupted-autoindex-run">The indexer died overnight. Do I have to start over?</a></li>
     <li><a href="/docs/storage">Storage &amp; WAL</a></li>
+    <li><a href="/answers/agent-memory-without-postgres-qdrant">What's a simple way to give an agent long-term memory on my laptop without Qdrant?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/private-agent-memory-namespaces">How do I give two agents private memory on one laptop?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/evidence-for-agent-memory-links">How can agent-memory links retain evidence?</a> <span class="mute">· same intent: agent memory</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

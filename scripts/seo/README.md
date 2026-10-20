@@ -200,6 +200,14 @@ two spaces) or an inline `[a, b]`; nested map keys under a list item are
 | `noindex` | bool | `true` adds `robots: noindex` **and** removes the page from `sitemap.xml` (`urlmap.is_noindex` reads it) |
 | `agent_prompt` | string | one logical line, must contain `https://xerj.org/llms.txt`, must not contain a Markdown fence |
 | `commands` | list of `{cmd, note}` | `cmd` must shell-parse, and must start with `xerj` + a real subcommand (`autoindex mcp serve verify help version`) or a flag, or with an allowed shell primitive (`bash cd command curl env export git sh until wget`). No `<placeholders>` |
+| `answer` | string | **GEO.** 40–60 words, answer-first, restating the question; rendered in a "Short answer" card under the H1 and in the `.md` twin |
+| `key_fact` / `key_fact_source` / `key_fact_date` | strings, all three or none | **GEO.** One sentence with a number; source is an `https://` URL, a site path, a repo path that exists (rendered as a GitHub link), or the literal `capture` (the run this page documents); ISO date it was measured or checked |
+| `intent_group` | string | **GEO.** The agent-intent cluster (task column of the query research CSV); groups `llms.txt` and drives "same intent" related links |
+| `queries` | list of string | **GEO.** Literal queries from the research CSV the page targets (published in `index.json`); omit when none fits |
+| `structured_data` | list | opt-in JSON-LD: `faq` → `FAQPage`, `howto` → `HowTo` from `commands:` (≥ 2; command cards get `id="step-N"`), `software`. See trap 6 and lint rules 46/46b. No page sets it in this port |
+| `og_image` / `og_image_alt` | string | both or neither; must be `og/<category>-<slug>.png` and exist under `landing/` |
+| `last_checked` | string | ISO date every third-party fact was re-read (best-of pages) |
+| `items` | list of `{name, url, license, install}` | best-of pages: emitted as `ItemList` of `SoftwareApplication`; `url` must be `https://` |
 
 ### 3.2 `links_out` resolution
 
@@ -690,12 +698,14 @@ type (`SoftwareApplication` / `CollectionPage` / `TechArticle` / `Article` /
 **One opt-in exception (2026-10-19).** An article source may list
 `structured_data: [faq, howto, software]`. `seo_head.extra_structured_data` then
 adds `FAQPage` (from `faq:`), `HowTo` (from `commands:`, at least two) and a
-`SoftwareApplication` for the product. No page sets the field yet: FAQPage and
-HowTo stay off until that opt-in is decided. Google shows no rich result for
-them, but answer engines and agents read the blocks as plain structured data
-when a page does opt in. `seo_lint` rule 46 lets the two types through only on
-a page that opted in, and rule 46b (`jsonld.faq_not_visible`) fails the page if
-a `FAQPage` question or answer is not visible in the page text. No
+`SoftwareApplication` for the product. No page sets `structured_data` in this
+port: FAQPage and HowTo stay off until that opt-in is decided. A best-of page
+can still emit an `ItemList` of the tools in its visible summary table, from
+`items:`, without that opt-in. Google shows no rich result for FAQ or HowTo,
+but answer engines and agents read the blocks as plain structured data when a
+page does opt in. `seo_lint` rule 46 lets the two types through only on a page
+that opted in, and rule 46b (`jsonld.faq_not_visible`) fails the page if a
+`FAQPage` question or answer is not visible in the page text. No
 `aggregateRating` / `Review`, ever.
 
 ### 7. JSON-LD needs no CSP change

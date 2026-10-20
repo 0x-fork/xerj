@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH A SLACK JSON EXPORT?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I search a Slack JSON export?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
+    <p>How do I search a Slack or Discord JSON export? Unzip the export to local disk and run xerj autoindex on the folder. In a captured run, a phrase inside a threaded reply returned 2 hits at incidents/2026-01-15.json with ax_locator e1, and the ts, thread_ts and user values all survived, as did Japanese text.</p>
+    <p class="key-fact"><strong>Key number:</strong> Records keep up to 512 fields each (<code class="inline">MAX_FIELDS_PER_RECORD</code>), so nested Slack message fields map without a schema. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/mod.rs">engine/crates/xerj-autoindex/src/extract/mod.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Unzip the Slack export to local disk, then run <code class="inline">xerj autoindex</code> on the folder. In a captured run, a phrase written inside a threaded reply returned 2 hits at <code class="inline">incidents/2026-01-15.json</code> with <code class="inline">ax_locator</code> <code class="inline">e1</code>. The <code class="inline">ts</code>, <code class="inline">thread_ts</code> and <code class="inline">user</code> values all survived.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -227,9 +232,9 @@
     </tbody>
   </table>
   <p>The <code class="inline">reactions</code> field is worth naming. XERJ did not expand it into 1 keyword per reaction name. The field holds the whole array as a single string such as <code class="inline">[{"name":"+1","users":["U01AAAA","U03CCCC"],"count":2}]</code>, so a reaction-name filter needs a <code class="inline">wildcard</code> or a client-side parse.</p>
-  <h2>If you flatten the export to JSONL, cap the line length</h2>
-  <p>A long Slack message can push a JSONL line past a hard boundary. Keep every line under 4,096 characters, or the whole file is dropped.</p>
-  <p>A captured reproduction used 2 files of 30 valid JSON lines each, identical apart from length. At 4,095 characters the sniffer chose <code class="inline">jsonl</code> and indexed 30 documents. At 4,096 characters it chose <code class="inline">json</code>, failed to parse, and indexed 0.</p>
+  <h2>If you flatten the export to JSONL</h2>
+  <p>A JSONL line at or above 16 MB is skipped and counted as junk. The rest of the file still indexes. The cap is <code class="inline">MAX_LINE</code> (<code class="inline">16 &lt;&lt; 20</code>) in <code class="inline">engine/crates/xerj-autoindex/src/extract/mod.rs</code>.</p>
+  <p>A first line longer than the 8 KB sniff sample can be labelled JSON. The JSON extractor then reads the file as JSONL, one object per line (<code class="inline">jsonl_fallback</code> in <code class="inline">engine/crates/xerj-autoindex/src/extract/json.rs</code>).</p>
   <h2>Discord and other chat exports</h2>
   <p>A Discord export is JSON on disk too. <code class="inline">xerj autoindex</code> picks the family for each file by reading the content, not the file name. The command above is the one to start with. That is where the verified part stops: no Discord export was captured for this page.</p>
   <p>Nothing on this page is a Discord field name. The channel layout, the field names and any per-channel or per-guild filter all depend on what your export contains. Run <code class="inline">xerj autoindex map</code> and read the mapping for one index before you write a filter. The same applies to any other chat archive exported to JSON.</p>
@@ -250,14 +255,22 @@
   <h3>Is ts indexed as a date field?</h3>
   <p>No. XERJ typed <code class="inline">ts</code> and <code class="inline">thread_ts</code> as <code class="inline">double</code> in the captured run, because Slack writes an epoch value with a fractional part.</p>
   <h3>Can I convert the export to JSONL first?</h3>
-  <p>Keep every line under 4,096 characters. A captured reproduction indexed 30 documents at 4,095 characters per line and 0 at 4,096.</p>
+  <p>A line at or above 16 MB is skipped and counted as junk. The cap is <code class="inline">MAX_LINE</code> (<code class="inline">16 &lt;&lt; 20</code>) in <code class="inline">engine/crates/xerj-autoindex/src/extract/mod.rs</code>. The rest of the file still indexes.</p>
   <h3>I downloaded a Discord server export. How do I search it?</h3>
   <p>Unzip it to local disk and run the same <code class="inline">xerj autoindex</code> command on the folder. A Discord export is JSON, and XERJ picks the family by reading the content rather than the file name. No Discord export was captured for this page, so read <code class="inline">xerj autoindex map</code> and the mapping for your own export before you write a filter.</p>
+  <h2>Evidence</h2>
+  <ul>
+    <li>JSONL line cap is 16 MB (MAX_LINE = 16 &lt;&lt; 20). A line at or above that length is skipped; the rest of the file still indexes. — <code>engine/crates/xerj-autoindex/src/extract/mod.rs</code></li>
+    <li>The sniffer reads an 8 KB prefix. A JSONL file whose first line is longer than that prefix can be labelled JSON, and the JSON extractor then falls back to per-line JSONL. — <code>engine/crates/xerj-autoindex/src/extract/json.rs</code></li>
+  </ul>
   <h2>Related</h2>
   <ul>
     <li><a href="/answers/search-json-and-jsonl-logs">What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?</a></li>
     <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
+    <li><a href="/answers/search-zendesk-ticket-json-export">I have a JSON export of Jira issues (or Zendesk tickets). How do I search it like a help-center search?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/full-text-search-sqlite-database">How do I full-text search a SQLite database I just copied onto disk?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

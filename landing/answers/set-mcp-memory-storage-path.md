@@ -2,11 +2,15 @@
 ---
 title: "Set the MCP memory storage path"
 canonical: "https://xerj.org/answers/set-mcp-memory-storage-path"
-updated: "2026-08-23"
+updated: "2026-10-19"
 source: "content/answers/set-mcp-memory-storage-path.md"
 ---
 
 # How do I set the MCP memory storage path?
+
+**Short answer** (updated 2026-10-19): Why does the memory MCP ignore my custom storage path setting? XERJ has no memory-specific path. Agent memory is an ordinary index named .xerj-memory-{namespace} inside the node data directory, so --data-dir sets it, and the MCP server stores nothing itself. Our capture stored a memory, restarted on the same directory, and recalled it.
+
+**Key number:** xerj mcp exposes 2 memory tools out of 17, and both proxy to the node; neither writes a file of its own. (as of 2026-10-19; source: [landing/docs/agents/schemas/mcp-tools.json](https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json))
 
 **TL;DR** — XERJ has no memory-specific storage path. Agent memory is an ordinary index named `.xerj-memory-{namespace}` inside the node data directory, so `--data-dir` sets it. Our capture stored a memory, restarted the node against the same directory, and recalled it.
 
@@ -129,3 +133,6 @@ No. The `node.lock` file guards the directory, and XERJ is single-node with no r
 - [How do people store user preferences so an agent can recall them next week?](/answers/coding-agent-memory-across-sessions)
 - [The indexer died overnight. Do I have to start over?](/answers/resume-interrupted-autoindex-run)
 - [Storage & WAL](/docs/storage)
+- [What's a simple way to give an agent long-term memory on my laptop without Qdrant?](/answers/agent-memory-without-postgres-qdrant) (same intent: agent memory)
+- [How do I give two agents private memory on one laptop?](/answers/private-agent-memory-namespaces) (same intent: agent memory)
+- [How can agent-memory links retain evidence?](/answers/evidence-for-agent-memory-links) (same intent: agent memory)

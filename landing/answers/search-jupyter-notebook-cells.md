@@ -2,11 +2,15 @@
 ---
 title: "Search .ipynb notebooks and the .py files beside them"
 canonical: "https://xerj.org/answers/search-jupyter-notebook-cells"
-updated: "2026-10-05"
+updated: "2026-10-19"
 source: "content/answers/search-jupyter-notebook-cells.md"
 ---
 
 # I need to find a function I wrote in a notebook months ago. How do I search all .ipynb files and the .py next to them?
+
+**Short answer** (updated 2026-10-19): How do I search all my .ipynb files for a function I wrote months ago? Run xerj autoindex on the folder. XERJ writes one document per Markdown-heading section of a notebook, with the heading path and starting cell. A captured query for okapi_transform found both notebooks and the .py file that defines it.
+
+**Key number:** The captured section `Okapi retrieval sweep > Run the sweep` started at cell 3 and returned the printed line `okapi accuracy 0.9137`. (as of 2026-10-05; source: the captured run documented on this page)
 
 **TL;DR** — XERJ writes 1 document per Markdown-heading section of a notebook. In a captured run, the printed accuracy `okapi accuracy 0.9137` came back from the section `Okapi retrieval sweep > Run the sweep`, starting at cell 3, and a query for `okapi_transform` found both notebooks and the `.py` that defines it.
 
@@ -137,7 +141,7 @@ Yes, for text output. Printed text, `text/plain` results and errors are written 
 
 ### Is XERJ notebook-aware?
 
-Yes, from the release after v1.0.0-rc.82. XERJ recognizes a notebook by its content, not its extension, and groups cells by their Markdown headings. It reads any kernel and records the kernel language. It never executes a notebook.
+Yes, in every release after v1.0.0-rc.82; the current release is v1.0.0-rc.97 (checked 2026-10-19). XERJ recognizes a notebook by its content, not its extension, and groups cells by their Markdown headings. It reads any kernel and records the kernel language. It never executes a notebook.
 
 ### Which notebook fields can I filter on?
 
@@ -152,3 +156,6 @@ Yes. A section holds every cell from its heading to the next heading, Markdown a
 - [What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?](/answers/search-json-and-jsonl-logs)
 - [I want local search that works offline, no cloud embeddings. What are my options?](/answers/local-embeddings-without-openai-api)
 - [Can ChatGPT search a folder on my laptop, or do I need something else?](/answers/give-chatgpt-claude-local-file-access)
+- [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code) (same intent: code search for agents)
+- [How do I stop my agent from reading the whole repo into context?](/answers/index-monorepo-for-agent) (same intent: code search for agents)
+- [How do I search Unity YAML scenes and the C# that references them as one project?](/answers/search-unity-project-assets) (same intent: code search for agents)

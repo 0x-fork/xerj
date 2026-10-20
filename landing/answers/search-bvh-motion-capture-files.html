@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH BVH MOTION-CAPTURE FILES?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I search BVH motion-capture files?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search motion-capture data in BVH files? Run xerj autoindex on the folder. XERJ detects the bvh family and writes frames, frame_time_s, duration_s, joint_count and a joints keyword array, with no body field. Our test clip reported 60 frames over 1.999998 seconds, and a terms query on joints returned it.</p>
+    <p class="key-fact"><strong>Key number:</strong> The captured BVH clip reported 60 frames over a duration_s of 1.999998. <span class="mute">(as of 2026-08-21 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Run <code class="inline">xerj autoindex</code> on the folder. XERJ detects the <code class="inline">bvh</code> family and writes <code class="inline">frames</code>, <code class="inline">frame_time_s</code>, <code class="inline">duration_s</code>, <code class="inline">joint_count</code> and a <code class="inline">joints</code> array. Our clip reported 60 frames over 1.999998 seconds, and a <code class="inline">terms</code> query on <code class="inline">joints</code> returned it.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -239,6 +244,9 @@
     <li><a href="/answers/search-unity-project-assets">How do I search Unity YAML scenes and the C# that references them as one project?</a></li>
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
+    <li><a href="/answers/full-text-search-sqlite-database">How do I full-text search a SQLite database I just copied onto disk?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/index-csv-with-many-columns">How do I index a CSV with many columns?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

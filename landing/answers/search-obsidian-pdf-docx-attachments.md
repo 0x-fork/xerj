@@ -2,11 +2,15 @@
 ---
 title: "Search markdown notes and PDFs in one vault"
 canonical: "https://xerj.org/answers/search-obsidian-pdf-docx-attachments"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/search-obsidian-pdf-docx-attachments.md"
 ---
 
 # What's the best way to search markdown notes and PDFs in the same vault?
+
+**Short answer** (updated 2026-10-19): What's the best way to search Markdown notes and PDFs in the same vault? Run xerj autoindex on the vault folder; it reads attachments too. In a captured run a phrase found only inside a PDF attachment returned 1 hit, a phrase only inside a DOCX returned 1 hit, and wikilinks became edges carrying the line that made them.
+
+**Key number:** Omnisearch, the in-app alternative, has 2,169 GitHub stars and released 1.31.0 on 2026-09-05. (as of 2026-10-19; source: [github.com/scambier/obsidian-omnisearch](https://github.com/scambier/obsidian-omnisearch))
 
 **TL;DR** — XERJ `autoindex` reads a vault folder from local disk and extracts text from its attachments. In a captured run, a phrase that exists only inside `pangolin-escalation-matrix.pdf` returned 1 hit, and a phrase only inside `capybara-change-window.docx` returned 1 hit. Wikilinks between the notes became `wikilink` edges, each carrying the line that created it.
 
@@ -144,3 +148,6 @@ No. XERJ reads the vault folder from local disk. The captured node opened 0 non-
 - [How do I index Markdown into the Elasticsearch API?](/answers/index-markdown-into-elasticsearch-api)
 - [Can ChatGPT search a folder on my laptop, or do I need something else?](/answers/give-chatgpt-claude-local-file-access)
 - [How do I search an Obsidian vault from outside Obsidian?](/compare/xerj-vs-obsidian-omnisearch)
+- [Why does my Notion export duplicate titles?](/answers/notion-export-duplicate-search-results) (same intent: logs and docs)
+- [I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?](/answers/search-file-contents-in-a-folder) (same intent: logs and docs)
+- [What's the best local desktop search for a folder of PDFs and docs?](/compare/xerj-vs-recoll) (same intent: logs and docs)

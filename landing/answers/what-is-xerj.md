@@ -8,7 +8,11 @@ source: "content/answers/what-is-xerj.md"
 
 # What is XERJ?
 
-**TL;DR** — XERJ is one Apache-2.0 Rust binary that indexes a local folder and answers search queries over the Elasticsearch REST API. `xerj autoindex` needs no schema and no configuration file. The same process serves agent memory at `/_memory/{namespace}` and 10 MCP tools through `xerj mcp`.
+**Short answer** (updated 2026-10-19): What is XERJ? It is an open-source local search engine for AI agents: a single Apache-2.0 Rust binary. Point xerj autoindex at a folder of code, documents or data files and query it over the Elasticsearch REST API, or let an agent call it through xerj mcp, which also stores agent memory.
+
+**Key number:** A live `tools/list` from v1.0.0-rc.97 returned 17 MCP tools; the engine passes 1366 of 1369 Elasticsearch YAML conformance cases. (as of 2026-10-19; source: [landing/docs/agents/schemas/mcp-tools.json](https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json))
+
+**TL;DR** — XERJ is one Apache-2.0 Rust binary that indexes a local folder and answers search queries over the Elasticsearch REST API. `xerj autoindex` needs no schema and no configuration file. The same process serves agent memory at `/_memory/{namespace}` and 17 MCP tools through `xerj mcp`.
 
 ## Agent prompt
 
@@ -52,7 +56,7 @@ curl -s -XPOST http://127.0.0.1:9200/docs-*/_search -H 'content-type: applicatio
 
 ### Command 5
 
-Note: Attach the running node to an agent host over stdio MCP. This serves 10 tools and starts no node of its own.
+Note: Attach the running node to an agent host over stdio MCP. This serves 17 tools and starts no node of its own.
 
 ```sh
 xerj mcp --url http://127.0.0.1:9200
@@ -85,7 +89,7 @@ Every document carries `ax_path`, `ax_file`, `ax_format` and four more keyword p
 
 ## Hand the same node to an agent
 
-`xerj mcp` is a stdio MCP server inside the same binary. It serves 10 tools against a node that is already running: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`, `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall` and four `xerj_brain_*` operations. The semantic tool runs whichever embedder the node loaded, and the default embedder is lexical feature hashing rather than a neural model.
+`xerj mcp` is a stdio MCP server inside the same binary. It serves 17 tools against a node that is already running: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`, `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`, four `xerj_brain_*` operations, `xerj_map`, `xerj_code_search`, `xerj_plan`, `xerj_field_report` and three `xerj_hub_*` Corpus Hub tools (a live `tools/list` from v1.0.0-rc.97 on 2026-10-19). The semantic tool runs whichever embedder the node loaded, and the default embedder is lexical feature hashing rather than a neural model.
 
 The command does not start a node. Start one first, then register `xerj mcp --url http://127.0.0.1:9200` in the agent host with an absolute path to the binary.
 
@@ -169,3 +173,6 @@ No. XERJ fetches no web page and runs no crawler. Its inputs are folders on loca
 - [Local code search MCP for Claude Code that uses fewer tokens than grep](/answers/local-code-search-mcp-fewer-tokens-than-grep)
 - [Ask questions about a GitHub repo without cloning it](/answers/ask-questions-about-a-github-repo-without-cloning)
 - [Batch lookup CVE IDs and GHSA IDs offline, without GitHub API rate limits](/answers/batch-lookup-cve-ghsa-ids-offline)
+- [What's a local MCP search engine for Claude?](/compare/xerj-vs-localsynapse) (same intent: Find the right tool)
+- [Can ChatGPT search a folder on my laptop, or do I need something else?](/answers/give-chatgpt-claude-local-file-access) (same intent: Find the right tool)
+- [How do I let an agent search a folder on my laptop instead of crawling the web?](/compare/xerj-vs-web-agent-search) (same intent: Find the right tool)

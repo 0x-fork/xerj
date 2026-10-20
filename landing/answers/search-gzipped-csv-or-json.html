@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-09-26",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH A .CSV.GZ OR .JSON.GZ WITHOUT UNZIPPING IT FIRST?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I search a .csv.gz or .json.gz without unzipping it first?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-09-26</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search gzipped CSV exports without unzipping them? Point xerj autoindex at the folder. Gzip is a wrapper, not a family: autoindex strips it during the run and sniffs the bytes underneath, so a .csv.gz becomes typed columns and a .json.gz becomes documents with fields. No query re-reads the archive.</p>
+    <p class="key-fact"><strong>Key number:</strong> The sniffer classifies the decompressed stream from its first 8,192 bytes (<code class="inline">PREFIX</code>), the same window it uses for a plain file. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/sniff.rs">engine/crates/xerj-autoindex/src/sniff.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Gzip is a wrapper, not a family. <code class="inline">xerj autoindex</code> strips it during the run and sniffs the bytes underneath. A <code class="inline">.csv.gz</code> becomes typed columns, and a <code class="inline">.json.gz</code> becomes documents with fields. You never decompress anything yourself, and no query re-reads the archive.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -249,6 +254,9 @@
     <li><a href="/answers/search-json-and-jsonl-logs">What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
     <li><a href="/compare/xerj-vs-ripgrep-all">How do I grep PDFs and Word docs from the command line?</a></li>
+    <li><a href="/answers/search-sql-dump-file">I have a 2GB SQL dump. How do I find rows mentioning a customer without loading it into Postgres?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/full-text-search-sqlite-database">How do I full-text search a SQLite database I just copied onto disk?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

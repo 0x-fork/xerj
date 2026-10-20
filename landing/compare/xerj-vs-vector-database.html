@@ -15,7 +15,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Search API or Qdrant for agent memory?</title>
+<title>Search API or a vector database for agent memory?</title>
 <meta name="description" content="Agent memory lives in the index process XERJ already runs, so no second data service starts. On 8 judged queries hybrid linear fusion scored precision@3 0.4583.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <link rel="canonical" href="https://xerj.org/compare/xerj-vs-vector-database">
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
-<meta property="og:title" content="Search API or Qdrant for agent memory?">
+<meta property="og:title" content="Search API or a vector database for agent memory?">
 <meta property="og:description" content="Agent memory lives in the index process XERJ already runs, so no second data service starts. On 8 judged queries hybrid linear fusion scored precision@3 0.4583.">
 <meta property="og:url" content="https://xerj.org/compare/xerj-vs-vector-database">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
@@ -36,7 +36,7 @@
 <meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Search API or Qdrant for agent memory?">
+<meta name="twitter:title" content="Search API or a vector database for agent memory?">
 <meta name="twitter:description" content="Agent memory lives in the index process XERJ already runs, so no second data service starts. On 8 judged queries hybrid linear fusion scored precision@3 0.4583.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
@@ -70,7 +70,7 @@
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": "Search API or Qdrant for agent memory?",
+  "headline": "Search API or a vector database for agent memory?",
   "description": "Agent memory lives in the index process XERJ already runs, so no second data service starts. On 8 judged queries hybrid linear fusion scored precision@3 0.4583.",
   "url": "https://xerj.org/compare/xerj-vs-vector-database",
   "image": "https://xerj.org/og/xerj-card.png",
@@ -156,6 +156,11 @@
   <div class="kicker"><span>COMPARE · COMPARISON: VECTOR DATABASE</span></div>
   <h1>Should my agent call a search API or stand up Qdrant for persistent memory?</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Should my agent call a search API or a vector store like Qdrant for memory? Call the search API you already run. XERJ serves agent memory at _memory/{namespace} from the process that serves _search. On 8 judged queries hybrid linear fusion scored precision@3 0.4583. Choose Qdrant for filtered vector search at scale.</p>
+    <p class="key-fact"><strong>Key number:</strong> Qdrant has 35,143 GitHub stars, is Apache-2.0, and released v1.19.2 on 2026-10-05. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/qdrant/qdrant">github.com/qdrant/qdrant</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Call the search API you already run. XERJ serves agent memory at <code class="inline">_memory/{namespace}</code> from the same single-node process that serves <code class="inline">_search</code>, so no second data service starts. On 20 labeled documents and 8 judged queries, hybrid linear fusion scored the best precision@3 at 0.4583. Choose Qdrant instead for filtered vector search at scale.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -283,6 +288,9 @@
     <li><a href="/answers/private-agent-memory-namespaces">How do I give two agents private memory on one laptop?</a></li>
     <li><a href="/answers/store-agent-memory-without-llm-call">How do I stop an agent memory store from filling with near-duplicate notes?</a></li>
     <li><a href="/answers/retrieval-that-says-not-found-with-file-line-citations">Retrieval that says not found, and cites file and line when it does answer</a></li>
+    <li><a href="/compare/xerj-vs-khoj">What's a simpler alternative to Khoj if I only need search and memory?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/coding-agent-memory-across-sessions">How do people store user preferences so an agent can recall them next week?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/knowledge-graphs-for-agent-memory">Should agent memory use a knowledge graph?</a> <span class="mute">· same intent: agent memory</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

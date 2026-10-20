@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-09-13",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I STOP AN AGENT MEMORY STORE FROM FILLING WITH NEAR-DUPLICATE NOTES?</div>
   <div class="kicker"><span>ANSWERS · AGENT MEMORY: MODEL DEPENDENCY</span></div>
   <h1>How do I stop an agent memory store from filling with near-duplicate notes?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-09-13</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I dedup agent memory so it stops filling with duplicate notes? Send dedup: true on the store call. XERJ compares the new memory against what the namespace already holds and returns the existing id with deduplicated: true instead of writing a second document. No model or summarization runs on the write path.</p>
+    <p class="key-fact"><strong>Key number:</strong> The default dedup threshold is a cosine similarity of 0.95. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-api/src/memory_api.rs">engine/crates/xerj-api/src/memory_api.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Send <code class="inline">dedup: true</code> on the store call and XERJ returns the existing id with <code class="inline">"deduplicated": true</code> instead of writing a second document. The check compares against the memories the namespace already holds, at a default cosine threshold of 0.95. No model and no summarization runs on the write path.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -255,6 +260,9 @@
     <li><a href="/answers/agent-memory-without-postgres-qdrant">What's a simple way to give an agent long-term memory on my laptop without Qdrant?</a></li>
     <li><a href="/answers/do-search-embeddings-help">When should I turn on neural embeddings, and when is the lexical default enough?</a></li>
     <li><a href="/answers/local-embeddings-without-openai-api">I want local search that works offline, no cloud embeddings. What are my options?</a></li>
+    <li><a href="/answers/coding-agent-memory-across-sessions">How do people store user preferences so an agent can recall them next week?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/evidence-for-agent-memory-links">How can agent-memory links retain evidence?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/knowledge-graphs-for-agent-memory">Should agent memory use a knowledge graph?</a> <span class="mute">· same intent: agent memory</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW CAN AGENT-MEMORY LINKS RETAIN EVIDENCE?</div>
   <div class="kicker"><span>ANSWERS · AGENT MEMORY: PROVENANCE</span></div>
   <h1>How can agent-memory links retain evidence?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Knowledge graphs aren't enough for agent memory; how do you get a know-how graph with evidence? XERJ stores the line that taught each link. All 7 detected edges in our capture carried an evidence object with a quote, a filename and an offset, and retiring a link wrote a tombstone instead of deleting the edge.</p>
+    <p class="key-fact"><strong>Key number:</strong> The shared-term link detector keeps at most 5 edges per document (<code class="inline">MAX_EDGES_PER_DOC</code>), which bounds the link index. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/detect/sharedterm.rs">engine/crates/xerj-autoindex/src/detect/sharedterm.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ stores the line that taught each link. All 7 detected edges in our capture carried an <code class="inline">evidence</code> object with a quote, a filename and an offset. A hand-asserted link carried none, and retiring a link wrote a tombstone instead of deleting the edge.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -234,6 +239,9 @@
     <li><a href="/answers/knowledge-graphs-for-agent-memory">Should agent memory use a knowledge graph?</a></li>
     <li><a href="/answers/coding-agent-memory-across-sessions">How do people store user preferences so an agent can recall them next week?</a></li>
     <li><a href="/use-cases/second-brain">Second brain</a></li>
+    <li><a href="/answers/agent-memory-without-postgres-qdrant">What's a simple way to give an agent long-term memory on my laptop without Qdrant?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/private-agent-memory-namespaces">How do I give two agents private memory on one laptop?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/store-agent-memory-without-llm-call">How do I stop an agent memory store from filling with near-duplicate notes?</a> <span class="mute">· same intent: agent memory</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

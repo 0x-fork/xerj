@@ -2,11 +2,15 @@
 ---
 title: "How do I search a folder of Word contracts?"
 canonical: "https://xerj.org/answers/search-word-documents-in-a-folder"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/search-word-documents-in-a-folder.md"
 ---
 
 # How do I search through a folder of contracts in .docx?
+
+**Short answer** (updated 2026-10-19): How do I search through a folder of contracts in .docx? Run xerj autoindex on the folder, then send a match_phrase query against the paragraphs. In a captured run, 1 DOCX produced 2 documents and a query for second reviewer returned the paragraph and the title. A deliberately expanded zip-bomb file produced 0 documents.
+
+**Key number:** The DOCX decompression guard refuses a file that expands past its cap; the captured expanded file produced 0 documents. (as of 2026-08-21; source: the captured run documented on this page)
 
 **TL;DR** — `xerj autoindex` indexes a folder of Word documents in one command, and a `match_phrase` query then searches their paragraphs. In a captured run, 1 DOCX file produced 2 documents, and a query for `second reviewer` returned the paragraph and the title. A second, deliberately expanded file produced 0 documents.
 
@@ -151,3 +155,6 @@ A small DOCX can expand to hundreds of megabytes when unzipped. The captured 245
 - [I downloaded a bunch of papers as PDFs. How do I search across them?](/answers/search-all-pdfs-in-a-folder)
 - [What's the best way to search markdown notes and PDFs in the same vault?](/answers/search-obsidian-pdf-docx-attachments)
 - [What's a free DocFetcher alternative that an agent can call?](/compare/xerj-vs-docfetcher)
+- [XERJ vs macOS Spotlight for folder content an agent can query](/compare/xerj-vs-spotlight) (same intent: logs and docs)
+- [Is it efficient to index PDF files?](/answers/is-pdf-indexing-efficient) (same intent: logs and docs)
+- [I indexed a folder of email and PDFs. How do I actually read what it found?](/answers/read-indexed-email-and-pdf-folder) (same intent: logs and docs)

@@ -15,7 +15,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XERJ compared with ripgrep for code agents</title>
+<title>ripgrep vs a code index for coding agents: 30 tasks</title>
 <meta name="description" content="30 disclosed tasks on one 331-file code tree. The two tools agree on 18. ripgrep wins 5 named tasks outright, including a substring inside an identifier.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <link rel="canonical" href="https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents">
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
-<meta property="og:title" content="XERJ compared with ripgrep for code agents">
+<meta property="og:title" content="ripgrep vs a code index for coding agents: 30 tasks">
 <meta property="og:description" content="30 disclosed tasks on one 331-file code tree. The two tools agree on 18. ripgrep wins 5 named tasks outright, including a substring inside an identifier.">
 <meta property="og:url" content="https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
@@ -36,7 +36,7 @@
 <meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="XERJ compared with ripgrep for code agents">
+<meta name="twitter:title" content="ripgrep vs a code index for coding agents: 30 tasks">
 <meta name="twitter:description" content="30 disclosed tasks on one 331-file code tree. The two tools agree on 18. ripgrep wins 5 named tasks outright, including a substring inside an identifier.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
@@ -70,7 +70,7 @@
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": "XERJ compared with ripgrep for code agents",
+  "headline": "ripgrep vs a code index for coding agents: 30 tasks",
   "description": "30 disclosed tasks on one 331-file code tree. The two tools agree on 18. ripgrep wins 5 named tasks outright, including a substring inside an identifier.",
   "url": "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents",
   "image": "https://xerj.org/og/xerj-card.png",
@@ -156,6 +156,11 @@
   <div class="kicker"><span>COMPARE · COMPARISON: CODE RETRIEVAL</span></div>
   <h1>Is ripgrep enough for a coding agent, or do I need a code index?</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Is ripgrep enough for a coding agent, or do I need a code index? Keep ripgrep for one-off questions and add an index when an agent asks one tree many questions. On one 331-file tree the two named the same files on 18 of 30 disclosed tasks, and ripgrep 14.1.1 won 5 outright.</p>
+    <p class="key-fact"><strong>Key number:</strong> ripgrep has 69,257 GitHub stars and its latest release is 15.2.0 (2026-07-15); the 30-task run used 14.1.1. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/BurntSushi/ripgrep">github.com/BurntSushi/ripgrep</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Keep ripgrep for one-off questions and reach for the index when an agent asks one tree many questions. On one 331-file code tree the two named the same files on 18 of 30 disclosed tasks. Five of the 30 went to ripgrep 14.1.1 outright. On a substring inside an identifier it found 7 files and the index found 0.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -232,7 +237,7 @@ T28 ripgrep-only: xerj-api/tests/sq8_codes_follow_document_updates.rs, xerj-comm
       <tr><td>T18</td><td>the phrase <code class="inline">index not found</code></td><td>3 files</td><td><strong>4 files</strong></td></tr>
     </tbody>
   </table>
-  <p>For T22 and T20 ripgrep needs a language-specific regular expression, here <code class="inline">struct\s+Ctx</code> and <code class="inline">pub\s+async\s+fn\s+run</code>. XERJ queries the extracted <code class="inline">defs</code> field, which is language-independent and covers 34 languages with one query.</p>
+  <p>For T22 and T20 ripgrep needs a language-specific regular expression, here <code class="inline">struct\s+Ctx</code> and <code class="inline">pub\s+async\s+fn\s+run</code>. XERJ queries the extracted <code class="inline">defs</code> field, which is language-independent and covers 36 languages with one query.</p>
   <pre class="code"><code class="language-sh">curl -s -XPOST 'http://127.0.0.1:9510/c07-*/_search' -H 'content-type: application/json' -d '{"query":{"match":{"defs":"Ctx"}},"size":100,"_source":["ax_path"],"track_total_hits":true}'
 </code></pre>
   <h2>A bigger number is not a better answer</h2>
@@ -264,7 +269,7 @@ T28 ripgrep-only: xerj-api/tests/sq8_codes_follow_document_updates.rs, xerj-comm
   <p>Choose ripgrep for real regular expressions over raw bytes. Choose it for case-insensitive literals across mixed file types, and for a tree that changed 1 second ago. An index answers from the last run, and ripgrep answers from the disk.</p>
   <p>Choose ripgrep for tiny trees and for one-off questions. Several hundred queries against one snapshot is the threshold. Under it, the 5.717-second build and a live node have no return.</p>
   <h2>When the index is worth its cost</h2>
-  <p>Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One <code class="inline">defs</code> query replaces a per-language regular expression and covers 34 languages.</p>
+  <p>Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One <code class="inline">defs</code> query replaces a per-language regular expression and covers 36 languages.</p>
   <p>Choose the index when you want structure alongside text. The index carries <code class="inline">language</code>, <code class="inline">symbol_count</code>, aggregations and <code class="inline">_source</code> narrowing. ripgrep returns lines, and lines are all it returns.</p>
   <h2>The limits you inherit either way</h2>
   <p>XERJ is single-node here and everywhere. There is no replication and no failover, so the index is exactly as durable as the 1 host it lives on.</p>
@@ -299,6 +304,9 @@ T28 ripgrep-only: xerj-api/tests/sq8_codes_follow_document_updates.rs, xerj-comm
     <li><a href="/answers/syntax-aware-code-search-refactoring">How do I run syntax-aware code search?</a></li>
     <li><a href="/answers/code-search-mcp-for-claude-code">I need my agent to find a passage and cite the file, not dump the whole tree. How?</a></li>
     <li><a href="/answers/local-code-search-mcp-fewer-tokens-than-grep">Local code search MCP for Claude Code that uses fewer tokens than grep</a></li>
+    <li><a href="/answers/audit-php-codebase-with-an-index">How do I audit a PHP codebase with an index instead of grepping 1,400 files?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/compare/xerj-vs-ast-grep">ast-grep vs a code index for an agent?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/index-reference-library-for-coding-agent">How do I set up reference coding so the agent retrieves a mechanism before writing code?</a> <span class="mute">· same intent: code search for agents</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

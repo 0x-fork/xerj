@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>IS THERE A WAY TO FULL-TEXT SEARCH MY BROWSER HISTORY FILE ITSELF?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>Is there a way to full-text search my browser history file itself?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Is there a way to full-text search my browser history? Copy Chrome's History SQLite file and run xerj autoindex on the folder. A captured run returned 60 hits for a title phrase and 1 for an exact URL, left all 3 source checksums unchanged, and found no page text, because Chrome stores none.</p>
+    <p class="key-fact"><strong>Key number:</strong> Each record keeps at most 512 fields (<code class="inline">MAX_FIELDS_PER_RECORD</code>), so even a wide SQLite table maps without schema work. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/mod.rs">engine/crates/xerj-autoindex/src/extract/mod.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Copy the Chrome <code class="inline">History</code> SQLite file, then run <code class="inline">xerj autoindex</code> on the folder. A captured run returned 60 hits for a title phrase and 1 hit for an exact URL. All 3 source checksums were unchanged, and <code class="inline">body</code> returned 0 documents because Chrome stores no page text.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -244,6 +249,9 @@
     <li><a href="/answers/full-text-search-sqlite-database">How do I full-text search a SQLite database I just copied onto disk?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
+    <li><a href="/answers/index-csv-with-many-columns">How do I index a CSV with many columns?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/search-json-and-jsonl-logs">What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

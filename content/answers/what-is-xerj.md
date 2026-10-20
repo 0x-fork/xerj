@@ -12,6 +12,14 @@ author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
 agent_prompt: "Act as a coding agent meeting this tool for the first time. Read https://xerj.org/llms.txt, start a node with `xerj --insecure --data-dir ./.xerj-data`, run `xerj autoindex ./docs --url http://127.0.0.1:9200 --prefix docs --progress plain` on the folder you were handed, run `xerj autoindex map --url http://127.0.0.1:9200` to learn the real index and field names, then POST one match_phrase query to /docs-*/_search and answer the user question citing the ax_path of every hit."
+answer: "What is XERJ? It is an open-source local search engine for AI agents: a single Apache-2.0 Rust binary. Point xerj autoindex at a folder of code, documents or data files and query it over the Elasticsearch REST API, or let an agent call it through xerj mcp, which also stores agent memory."
+key_fact: "A live `tools/list` from v1.0.0-rc.97 returned 17 MCP tools; the engine passes 1366 of 1369 Elasticsearch YAML conformance cases."
+key_fact_source: "landing/docs/agents/schemas/mcp-tools.json"
+key_fact_date: "2026-10-19"
+intent_group: "Find the right tool"
+queries:
+  - "local search engine for AI agents MCP server BM25"
+  - "self-hosted Elasticsearch alternative single binary Rust MCP"
 commands:
   - cmd: "xerj --insecure --data-dir ./.xerj-data"
     note: "Start a local development node. One process, no container and no JVM."
@@ -22,7 +30,7 @@ commands:
   - cmd: "curl -s -XPOST http://127.0.0.1:9200/docs-*/_search -H 'content-type: application/json' -d '{\"query\":{\"match_phrase\":{\"body\":\"rotate the signing key\"}},\"size\":5,\"_source\":[\"ax_path\",\"ax_format\",\"title\"]}'"
     note: "Search the folder over the Elasticsearch REST API and read the file path back from every hit."
   - cmd: "xerj mcp --url http://127.0.0.1:9200"
-    note: "Attach the running node to an agent host over stdio MCP. This serves 10 tools and starts no node of its own."
+    note: "Attach the running node to an agent host over stdio MCP. This serves 17 tools and starts no node of its own."
 links_out:
   - "how-xerj-autoindexes-a-folder"
   - "how-xerj-combines-search"
@@ -54,7 +62,7 @@ faq:
     a: "No. XERJ fetches no web page and runs no crawler. Its inputs are folders on local disk and `s3://` bucket prefixes read as a source."
 ---
 
-**TL;DR** — XERJ is one Apache-2.0 Rust binary that indexes a local folder and answers search queries over the Elasticsearch REST API. `xerj autoindex` needs no schema and no configuration file. The same process serves agent memory at `/_memory/{namespace}` and 10 MCP tools through `xerj mcp`.
+**TL;DR** — XERJ is one Apache-2.0 Rust binary that indexes a local folder and answers search queries over the Elasticsearch REST API. `xerj autoindex` needs no schema and no configuration file. The same process serves agent memory at `/_memory/{namespace}` and 17 MCP tools through `xerj mcp`.
 
 ## Point it at a folder and query the folder
 
@@ -83,7 +91,7 @@ Every document carries `ax_path`, `ax_file`, `ax_format` and four more keyword p
 
 ## Hand the same node to an agent
 
-`xerj mcp` is a stdio MCP server inside the same binary. It serves 10 tools against a node that is already running: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`, `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall` and four `xerj_brain_*` operations. The semantic tool runs whichever embedder the node loaded, and the default embedder is lexical feature hashing rather than a neural model.
+`xerj mcp` is a stdio MCP server inside the same binary. It serves 17 tools against a node that is already running: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`, `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`, four `xerj_brain_*` operations, `xerj_map`, `xerj_code_search`, `xerj_plan`, `xerj_field_report` and three `xerj_hub_*` Corpus Hub tools (a live `tools/list` from v1.0.0-rc.97 on 2026-10-19). The semantic tool runs whichever embedder the node loaded, and the default embedder is lexical feature hashing rather than a neural model.
 
 The command does not start a node. Start one first, then register `xerj mcp --url http://127.0.0.1:9200` in the agent host with an absolute path to the binary.
 

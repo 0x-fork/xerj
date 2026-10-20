@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH GZIPPED LOGS WITHOUT DECOMPRESSING THE WHOLE FILE — INCLUDING WHEN JSONL SITS NEXT TO THEM?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1 class="h1-long">How do I search gzipped logs without decompressing the whole file — including when JSONL sits next to them?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search gzipped logs without decompressing the whole file? Let XERJ decompress each .gz log once at index time, so no query reads the compressed file again. In our capture the plain copy and the gzip copy of one log both returned 5001 from _count, and both returned 1250 hits for level=ERROR.</p>
+    <p class="key-fact"><strong>Key number:</strong> The plain and gzip copies of one log both returned a <code class="inline">_count</code> of 5001 and 1250 <code class="inline">level=ERROR</code> hits. <span class="mute">(as of 2026-08-21 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ decompresses a <code class="inline">.gz</code> log once at index time, so a query never reads the compressed file again. In our capture the plain copy and the gzip copy of one log both returned <code class="inline">5001</code> from <code class="inline">_count</code>. Both also returned 1250 hits for <code class="inline">level=ERROR</code>.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -233,6 +238,9 @@
     <li><a href="/answers/search-json-and-jsonl-logs">What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?</a></li>
     <li><a href="/answers/cheap-low-volume-log-search">What can I use for low-volume log search?</a></li>
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
+    <li><a href="/answers/search-kubernetes-pod-logs-on-disk">How do I search Kubernetes pod logs?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/search-all-pdfs-in-a-folder">I downloaded a bunch of papers as PDFs. How do I search across them?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/search-gmail-takeout-mbox-locally">I exported my Gmail with Google Takeout. How do I search that mbox file locally?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

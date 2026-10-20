@@ -1,5 +1,5 @@
 ---
-title: "RAG without a vector database"
+title: "RAG without a vector database: one hybrid index"
 h1: "How do I build RAG without a vector database?"
 description: "Build a RAG retrieval layer on one XERJ index. One hybrid request fuses BM25 and kNN with Reciprocal Rank Fusion, and no second service runs."
 slug: "rag-without-vector-database"
@@ -12,6 +12,14 @@ author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start one single-node XERJ, create an index with a semantic_text field, bulk-load the corpus, then run one hybrid request with fusion rrf and report the returned ids and scores before you write any retrieval code."
+answer: "How do I build RAG without a vector database? Keep the inverted index and the dense vectors in one XERJ index and retrieve with one hybrid request, which fuses a BM25 sub-query and a kNN sub-query with Reciprocal Rank Fusion. No second service runs. Our 20-document capture returned d08, d04 and d10."
+key_fact: "On BEIR SciFact, hybrid RRF with the opt-in neural embedder scored nDCG@10 0.6993, above both BM25 (0.6572) and vectors alone (0.6764)."
+key_fact_source: "benchmarks/beir-hybrid/results/scifact.txt"
+key_fact_date: "2026-09-18"
+intent_group: "retrieval research and eval"
+queries:
+  - "rag without vector database"
+  - "hybrid search bm25 + vectors local"
 commands:
   - cmd: "curl -s -XPUT 'http://127.0.0.1:9440/eval' -H 'content-type: application/json' -d '{\"mappings\":{\"properties\":{\"doc_id\":{\"type\":\"keyword\"},\"title\":{\"type\":\"text\"},\"text\":{\"type\":\"semantic_text\"},\"tags\":{\"type\":\"keyword\"},\"ord\":{\"type\":\"long\"}}}}'"
     note: "Create the one index that holds both the text and the dense vector. Port 9440 is the capture's Elasticsearch-compatible listener; the default is 9200."

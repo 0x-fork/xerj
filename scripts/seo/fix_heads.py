@@ -18,10 +18,12 @@ For every page it guarantees, in `<head>` and nowhere else:
   * the GA4 tag from ``seo_head.ga4_snippet()``, once, immediately after
     ``<head>``.
 
-Deliberately NOT emitted, per scripts' research doc §5:
-  * FAQPage — Google restricted FAQ rich results to government/health sites,
-    and they end entirely on 7 May 2026.
-  * HowTo — the rich result and its documentation were removed outright.
+Emitted only on opt-in (README trap 6, seo_lint rules 46/46b):
+  * FAQPage / HowTo when the article source lists them under
+    `structured_data:`; ItemList from a best-of page's `items:`. Google no
+    longer draws FAQ/HowTo rich results; these are for answer engines.
+
+Deliberately NOT emitted:
   * aggregateRating / Review — we have no review corpus; inventing one is a
     manual-action risk under Google's structured-data spam policies.
 

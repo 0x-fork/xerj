@@ -156,6 +156,11 @@
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I index a CSV with many columns?</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do you index CSV files with a big number of columns or fields? Point xerj autoindex at the file; it infers the mapping with no schema work. In a captured run a 120-column CSV became 128 mapped fields across 501 documents, and a terms aggregation on an inferred keyword column returned 4 exact buckets.</p>
+    <p class="key-fact"><strong>Key number:</strong> Type inference keeps up to 512 fields per dataset (<code class="inline">MAX_FIELDS_PER_DATASET</code>), the ceiling for a very wide CSV. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/infer/mod.rs">engine/crates/xerj-autoindex/src/infer/mod.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — <code class="inline">xerj autoindex</code> infers a mapping for a wide CSV with no schema work. In a captured run a 120-column file became 128 mapped fields, 121 from the file and 7 provenance fields, across 501 documents. A terms aggregation on an inferred <code class="inline">keyword</code> column returned 4 exact buckets of 125.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -243,6 +248,9 @@
     <li><a href="/answers/full-text-search-sqlite-database">How do I full-text search a SQLite database I just copied onto disk?</a></li>
     <li><a href="/docs/aggregations">Aggregations</a></li>
     <li><a href="/answers/full-text-search-over-jsonl-files-cli">Full-text search over JSONL files from the CLI: index a folder and query it with BM25</a></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/search-zendesk-ticket-json-export">I have a JSON export of Jira issues (or Zendesk tickets). How do I search it like a help-center search?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

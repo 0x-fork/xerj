@@ -8,6 +8,10 @@ source: "content/answers/index-csv-with-many-columns.md"
 
 # How do I index a CSV with many columns?
 
+**Short answer** (updated 2026-10-19): How do you index CSV files with a big number of columns or fields? Point xerj autoindex at the file; it infers the mapping with no schema work. In a captured run a 120-column CSV became 128 mapped fields across 501 documents, and a terms aggregation on an inferred keyword column returned 4 exact buckets.
+
+**Key number:** Type inference keeps up to 512 fields per dataset (`MAX_FIELDS_PER_DATASET`), the ceiling for a very wide CSV. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/infer/mod.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/infer/mod.rs))
+
 **TL;DR** — `xerj autoindex` infers a mapping for a wide CSV with no schema work. In a captured run a 120-column file became 128 mapped fields, 121 from the file and 7 provenance fields, across 501 documents. A terms aggregation on an inferred `keyword` column returned 4 exact buckets of 125.
 
 ## Agent prompt
@@ -142,3 +146,6 @@ XERJ falls back to a string type when fewer than 95% of the non-null values pars
 - [How do I full-text search a SQLite database I just copied onto disk?](/answers/full-text-search-sqlite-database)
 - [Aggregations](/docs/aggregations)
 - [Full-text search over JSONL files from the CLI: index a folder and query it with BM25](/answers/full-text-search-over-jsonl-files-cli)
+- [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)
+- [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map) (same intent: JSONL and data files)
+- [I have a JSON export of Jira issues (or Zendesk tickets). How do I search it like a help-center search?](/answers/search-zendesk-ticket-json-export) (same intent: JSONL and data files)

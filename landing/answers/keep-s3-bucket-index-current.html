@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-19",
-  "dateModified": "2026-09-20",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I KEEP AN INDEX CURRENT WHEN THE FILES LIVE IN AN OBJECT STORE?</div>
   <div class="kicker"><span>ANSWERS · OBJECT STORAGE</span></div>
   <h1>How do I keep an index current when the files live in an object store?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-09-20</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>My documents live in an S3 or R2 bucket; how do I keep a XERJ index current as objects change? Poll the prefix with xerj autoindex s3://bucket/prefix --watch, and pick the interval from the operation count. ListObjectsV2 is a Class A operation, one call per 1,000 keys, on every cycle, even for an empty bucket.</p>
+    <p class="key-fact"><strong>Key number:</strong> The default poll interval is 300 seconds and the default budget is 200,000 Class A operations a month. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/objwatch/cost.rs">engine/crates/xerj-autoindex/src/objwatch/cost.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Poll the prefix with <code class="inline">xerj autoindex s3://bucket/prefix --watch</code>. Decide the interval from the operation count, not from the latency you want. <code class="inline">ListObjectsV2</code> is a Class A operation at one call per 1,000 keys, <strong>every cycle</strong>. Cloudflare R2's free tier is 1,000,000 Class A operations a month. A 5-second poll spends half of that to watch an empty bucket. Full detail in <a href="https://github.com/xerj-org/xerj/blob/main/docs/WATCHING_OBJECT_STORAGE.md">docs/WATCHING_OBJECT_STORAGE.md</a>.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -299,6 +304,9 @@
     <li><a href="/answers/does-xerj-support-s3-alerting-plugins">Does XERJ support S3 storage, alerting or custom plugins yet?</a></li>
     <li><a href="/answers/cheap-low-volume-log-search">What can I use for low-volume log search?</a></li>
     <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a></li>
+    <li><a href="/answers/keep-index-current-as-files-change">How do I keep a search index up to date as files change, without re-indexing everything?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/search-files-in-an-s3-bucket">How do I search files that live in an S3 bucket?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/estimate-autoindex-time-before-running">How do I estimate folder-indexing time?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

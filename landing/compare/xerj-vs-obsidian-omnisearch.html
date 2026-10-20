@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>HOW DO I SEARCH AN OBSIDIAN VAULT FROM OUTSIDE OBSIDIAN?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: NOTES AND VAULTS</span></div>
   <h1>How do I search an Obsidian vault from outside Obsidian?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search an Obsidian vault from outside Obsidian? Index the vault folder with XERJ; it reads it with Obsidian closed and answers an agent. Inside Obsidian, Omnisearch wins: an instant search interface, BM25 ranking, and PDFs and images through the Text Extractor plugin. No head-to-head was run.</p>
+    <p class="key-fact"><strong>Key number:</strong> Omnisearch has 2,169 GitHub stars, is GPL-3.0, and released 1.31.0 on 2026-09-05. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/scambier/obsidian-omnisearch">github.com/scambier/obsidian-omnisearch</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Omnisearch wins inside Obsidian: an instant search interface, BM25 ranking, and PDFs and images reached through the Text Extractor plugin. XERJ reads the same folder with Obsidian closed and answers an agent. No head-to-head was run for this page.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -197,7 +202,7 @@
   <h2>Agent access is not a place where XERJ stands alone</h2>
   <p>The Omnisearch README points at a third-party MCP server that detects Omnisearch and exposes it as a BM25-ranked search mode for agents reading a vault. That path exists and it works.</p>
   <p>The difference is what it depends on. That route needs Obsidian running and the local HTTP server enabled.</p>
-  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary as the engine. It serves 10 tools, and it needs no editor at all.</p>
+  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary as the engine. It serves 17 tools, and it needs no editor at all.</p>
   <h2>What XERJ reads in a vault, and how</h2>
   <p>Thirteen families are covered. For a vault the ones that matter are plain text and markdown, PDF, DOCX, HTML, CSV and JSON.</p>
   <p>Ranking is BM25, and a vector clause can be fused into the same query with Reciprocal Rank Fusion or a weighted linear sum. The default embedder is lexical feature hashing, not neural, so the fused vector side carries no meaning-based signal until <code class="inline">--embed-mode neural</code> is turned on.</p>
@@ -248,6 +253,9 @@
     <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a></li>
     <li><a href="/answers/search-word-documents-in-a-folder">How do I search through a folder of contracts in .docx?</a></li>
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
+    <li><a href="/answers/index-markdown-into-elasticsearch-api">How do I index Markdown into the Elasticsearch API?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/notion-export-duplicate-search-results">Why does my Notion export duplicate titles?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/cheap-low-volume-log-search">What can I use for low-volume log search?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

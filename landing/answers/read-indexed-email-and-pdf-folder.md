@@ -2,11 +2,15 @@
 ---
 title: "How do I read email and PDFs after indexing a folder?"
 canonical: "https://xerj.org/answers/read-indexed-email-and-pdf-folder"
-updated: "2026-09-20"
+updated: "2026-10-19"
 source: "content/answers/read-indexed-email-and-pdf-folder.md"
 ---
 
 # I indexed a folder of email and PDFs. How do I actually read what it found?
+
+**Short answer** (updated 2026-10-19): I indexed a folder of email and PDFs; how do I actually read what it found? Run xerj brain on the folder and open the console it prints. The Corpus page lists what was indexed, and the Reader opens an email with headers, body and attachments, or one PDF page. It shows extracted text only.
+
+**Key number:** In the recorded run, xerj brain turned 10 files into 81 records in one dataset and wrote 33 links into the brain. (as of 2026-10-19; source: [docs/usecases/console-reader/live-e2e.json](https://github.com/xerj-org/xerj/blob/main/docs/usecases/console-reader/live-e2e.json))
 
 **TL;DR** — Run `xerj brain <folder>`, then open the console it prints. The Corpus page lists what was indexed, and the Reader opens any record: an email with its headers, body and attachments, or one PDF page, beside the files it links to. The Reader shows extracted text only. It renders no email HTML and no PDF pages.
 
@@ -163,3 +167,6 @@ The console has a read-only guest mode driven by a share record that names one k
 - [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder)
 - [Should agent memory use a knowledge graph?](/answers/knowledge-graphs-for-agent-memory)
 - [Auth & TLS](/docs/security)
+- [I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?](/answers/search-file-contents-in-a-folder) (same intent: logs and docs)
+- [What's the best local desktop search for a folder of PDFs and docs?](/compare/xerj-vs-recoll) (same intent: logs and docs)
+- [Is it efficient to index PDF files?](/answers/is-pdf-indexing-efficient) (same intent: logs and docs)

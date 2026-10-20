@@ -2,11 +2,15 @@
 ---
 title: "XERJ vs LocalSynapse for MCP local file search"
 canonical: "https://xerj.org/compare/xerj-vs-localsynapse"
-updated: "2026-10-03"
+updated: "2026-10-19"
 source: "content/compare/xerj-vs-localsynapse.md"
 ---
 
 # What's a local MCP search engine for Claude?
+
+**Short answer** (updated 2026-10-19): What's a local MCP search engine for Claude? Two candidates: LocalSynapse wins the desktop experience, whole-drive indexing and mail shapes beyond mbox and eml. XERJ wins data files, Excel sheets read as typed tables, and the Elasticsearch query surface. No head-to-head was run for this comparison.
+
+**Key number:** LocalSynapse released v2.21.0 on 2026-10-16; its GitHub repository hosts release artifacts and had 10 stars. (as of 2026-10-19; source: [github.com/LocalSynapse/LocalSynapse](https://github.com/LocalSynapse/LocalSynapse))
 
 **TL;DR** — LocalSynapse wins the desktop experience: a search window you double-click, whole-drive indexing, and mail shapes beyond mbox and eml that XERJ has no extractor for. XERJ wins data files — Excel sheets included, read as typed tables — and the Elasticsearch query surface. No head-to-head was run for this page.
 
@@ -36,7 +40,7 @@ xerj autoindex ./work --prefix work --state-dir ./state-work
 
 ### Command 3
 
-Note: Attach the running node over stdio MCP. Same binary, 10 tools, no desktop window.
+Note: Attach the running node over stdio MCP. Same binary, 17 tools, no desktop window.
 
 ```sh
 xerj mcp --url http://127.0.0.1:9200
@@ -64,7 +68,7 @@ The list holds JSON and JSONL, CSV with dialect detection, structured logs, SQL 
 
 The data end of that list is where the two products part company. A SQLite database, a semicolon CSV with a decimal comma, and a multi-gigabyte SQL export are shapes a document-first indexer usually skips.
 
-Code is the other one. Each code document carries a `defs` field and a `symbols` list with names, kinds and line numbers, across 34 languages.
+Code is the other one. Each code document carries a `defs` field and a `symbols` list with names, kinds and line numbers, across 36 languages.
 
 ## Two different answers to "how does the agent ask?"
 
@@ -72,7 +76,7 @@ LocalSynapse documents an MCP server over stdio that opens no network port, with
 
 XERJ answers over the Elasticsearch REST API. An agent writes the query DSL it already knows: `match_phrase`, `terms`, `range`, aggregations and `_source` narrowing.
 
-`xerj mcp` serves 10 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
+`xerj mcp` serves 17 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
 
 Pick the surface that matches your caller. A small tool list is easier for a simple agent, and a query language is more useful for one that asks precise questions.
 
@@ -140,7 +144,7 @@ Yes, since v1.0.0-rc.81. Each .xlsx sheet becomes its own dataset with one recor
 
 ### How many MCP tools does each side expose?
 
-LocalSynapse documents four. XERJ serves 10 through xerj mcp, including memory tools.
+LocalSynapse documents four. XERJ serves 17 through xerj mcp, including memory tools.
 
 ### Is either one open source?
 
@@ -169,3 +173,5 @@ Give it a local MCP server over an index of those files. Both sides here run on 
 - [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code)
 - [How do I set the MCP memory storage path?](/answers/set-mcp-memory-storage-path)
 - [I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?](/answers/search-file-contents-in-a-folder)
+- [What is XERJ?](/answers/what-is-xerj) (same intent: Find the right tool)
+- [How do I let an agent search a folder on my laptop instead of crawling the web?](/compare/xerj-vs-web-agent-search) (same intent: Find the right tool)

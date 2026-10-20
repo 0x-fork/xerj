@@ -15,7 +15,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XERJ vs Elasticsearch run on one machine</title>
+<title>Elasticsearch-compatible engine that isn't Elasticsearch</title>
 <meta name="description" content="The published board is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4. All 4 losses are read p99 under a write flood.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <link rel="canonical" href="https://xerj.org/compare/xerj-vs-elasticsearch-local">
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
-<meta property="og:title" content="XERJ vs Elasticsearch run on one machine">
+<meta property="og:title" content="Elasticsearch-compatible engine that isn&#x27;t Elasticsearch">
 <meta property="og:description" content="The published board is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4. All 4 losses are read p99 under a write flood.">
 <meta property="og:url" content="https://xerj.org/compare/xerj-vs-elasticsearch-local">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
@@ -36,7 +36,7 @@
 <meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="XERJ vs Elasticsearch run on one machine">
+<meta name="twitter:title" content="Elasticsearch-compatible engine that isn&#x27;t Elasticsearch">
 <meta name="twitter:description" content="The published board is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4. All 4 losses are read p99 under a write flood.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
@@ -70,7 +70,7 @@
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": "XERJ vs Elasticsearch run on one machine",
+  "headline": "Elasticsearch-compatible engine that isn't Elasticsearch",
   "description": "The published board is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4. All 4 losses are read p99 under a write flood.",
   "url": "https://xerj.org/compare/xerj-vs-elasticsearch-local",
   "image": "https://xerj.org/og/xerj-card.png",
@@ -156,6 +156,11 @@
   <div class="kicker"><span>COMPARE · COMPARISON: LOCAL SEARCH ENGINES</span></div>
   <h1>Is there an Elasticsearch-compatible engine that isn't Elasticsearch?</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Is there an Elasticsearch-compatible engine that isn't Elasticsearch? XERJ speaks the Elasticsearch REST API from one binary. One published board measured both on one host: 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4 at 100,000 documents. XERJ is single-node only.</p>
+    <p class="key-fact"><strong>Key number:</strong> Elasticsearch has 78,319 GitHub stars and its latest release is v9.5.5 (2026-10-06); the board was measured against 8.13.4. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/elastic/elasticsearch">github.com/elastic/elasticsearch</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — One published board measures both engines on one host: 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against a live Elasticsearch 8.13.4 at 100,000 documents. Every one of the 4 losses is read p99 under a write flood. XERJ is single-node only.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -271,6 +276,9 @@
     <li><a href="/docs/recipes/migrate-from-elasticsearch">Migrate from Elasticsearch</a></li>
     <li><a href="/answers/full-text-search-over-jsonl-files-cli">Full-text search over JSONL files from the CLI: index a folder and query it with BM25</a></li>
     <li><a href="/answers/batch-lookup-cve-ghsa-ids-offline">Batch lookup CVE IDs and GHSA IDs offline, without GitHub API rate limits</a></li>
+    <li><a href="/answers/does-xerj-support-s3-alerting-plugins">Does XERJ support S3 storage, alerting or custom plugins yet?</a> <span class="mute">· same intent: search engine alternatives</span></li>
+    <li><a href="/compare/xerj-vs-meilisearch">What's a local alternative to Meilisearch that indexes a folder by itself?</a> <span class="mute">· same intent: search engine alternatives</span></li>
+    <li><a href="/compare/xerj-vs-typesense">Do I need Typesense for an agent to search my docs?</a> <span class="mute">· same intent: search engine alternatives</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

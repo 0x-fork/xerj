@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>XERJ CORPUS INDEX --FRESH FAILED. HOW DO I REBUILD A CORPUS INDEX?</div>
   <div class="kicker"><span>ANSWERS · CODING AGENTS: REFERENCE RETRIEVAL</span></div>
   <h1>xerj corpus index --fresh failed. How do I rebuild a corpus index?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I rebuild a reference-coding corpus index from scratch? Run xerj corpus index with --fresh. It builds a replacement beside the existing index, checks that it holds records, switches the state file, and only then deletes the old indices by exact name. A failed build costs you nothing; the old index keeps serving.</p>
+    <p class="key-fact"><strong>Key number:</strong> On v1.0.0-rc.74, xerj autoindex --fresh over a committed generation aborted with exit 1; --fresh now swaps instead of discarding. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/autoindex-resilience/fresh-before-rc74.committed-generation.txt">benchmarks/autoindex-resilience/fresh-before-rc74.committed-generation.txt</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Run <code class="inline">xerj corpus index &lt;corpus&gt; --fresh</code>. It builds a replacement beside the existing index, checks that it holds records, switches the state file, and only then deletes the old indices by exact name. A build that fails costs you nothing. Older releases' wrapper scripts failed on every corpus that had been indexed before.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -275,6 +280,9 @@
     <li><a href="/answers/resume-interrupted-autoindex-run">The indexer died overnight. Do I have to start over?</a></li>
     <li><a href="/answers/autoindex-exit-codes">The indexer exited 3 (or 4). Did it fail?</a></li>
     <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a></li>
+    <li><a href="/answers/index-monorepo-for-agent">How do I stop my agent from reading the whole repo into context?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/compare/xerj-vs-ripgrep-for-code-agents">Is ripgrep enough for a coding agent, or do I need a code index?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/audit-php-codebase-with-an-index">How do I audit a PHP codebase with an index instead of grepping 1,400 files?</a> <span class="mute">· same intent: code search for agents</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

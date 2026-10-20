@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>WHAT IS RECIPROCAL RANK FUSION?</div>
   <div class="kicker"><span>ANSWERS · HYBRID RETRIEVAL: RRF</span></div>
   <h1>What is Reciprocal Rank Fusion?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>What is reciprocal rank fusion, and when should I use it? RRF scores a document by the sum of weight over k plus its rank in every list that returned it. Use it to merge BM25 and kNN results whose scores are not comparable. XERJ uses k = 60, and our captured fused score was exactly 1/61 plus 1/61.</p>
+    <p class="key-fact"><strong>Key number:</strong> The captured fused score for document d02, ranked first in both lists, was 0.032787 with k = 60. <span class="mute">(as of 2026-08-23 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Reciprocal Rank Fusion scores a document by the sum of <code class="inline">weight / (k + rank)</code> across every ranked list that returned it. XERJ uses a default k of 60 inside the <code class="inline">hybrid</code> clause. Our captured fused score for <code class="inline">d02</code> was 0.032787, which is exactly 1/61 plus 1/61.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -262,6 +267,9 @@
     <li><a href="/answers/rag-without-vector-database">How do I build RAG without a vector database?</a></li>
     <li><a href="/answers/improve-basic-faiss-rag-pipeline">How do I improve a basic FAISS RAG pipeline?</a></li>
     <li><a href="/answers/vector-database-vs-full-text-search">What's the actual difference between a vector database and full-text search when I have a folder?</a></li>
+    <li><a href="/answers/mcp-api-search-or-vector-search">Should an agent use API search or vector search?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/hybrid-search-quality-measured-ndcg">How much better is hybrid search than BM25? Measured nDCG numbers</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/do-search-embeddings-help">When should I turn on neural embeddings, and when is the lexical default enough?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

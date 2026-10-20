@@ -15,7 +15,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>How do I stop my agent reading the whole repo?</title>
+<title>Index a monorepo so your agent stops reading the whole repo</title>
 <meta name="description" content="Index the tree once with xerj autoindex, then let the agent query the defs and symbols fields instead of opening files. A dry run first prints every ignore rule.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <link rel="canonical" href="https://xerj.org/answers/index-monorepo-for-agent">
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
-<meta property="og:title" content="How do I stop my agent reading the whole repo?">
+<meta property="og:title" content="Index a monorepo so your agent stops reading the whole repo">
 <meta property="og:description" content="Index the tree once with xerj autoindex, then let the agent query the defs and symbols fields instead of opening files. A dry run first prints every ignore rule.">
 <meta property="og:url" content="https://xerj.org/answers/index-monorepo-for-agent">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
@@ -36,7 +36,7 @@
 <meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="How do I stop my agent reading the whole repo?">
+<meta name="twitter:title" content="Index a monorepo so your agent stops reading the whole repo">
 <meta name="twitter:description" content="Index the tree once with xerj autoindex, then let the agent query the defs and symbols fields instead of opening files. A dry run first prints every ignore rule.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
@@ -70,13 +70,13 @@
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": "How do I stop my agent reading the whole repo?",
+  "headline": "Index a monorepo so your agent stops reading the whole repo",
   "description": "Index the tree once with xerj autoindex, then let the agent query the defs and symbols fields instead of opening files. A dry run first prints every ignore rule.",
   "url": "https://xerj.org/answers/index-monorepo-for-agent",
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I STOP MY AGENT FROM READING THE WHOLE REPO INTO CONTEXT?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I stop my agent from reading the whole repo into context?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I stop my agent from reading the whole repo into context? Index the tree once with xerj autoindex and let the agent query the defs and symbols fields instead of opening files. Run --dry-run first: in our capture it reported files=3, ignored_files=2 and ignored_dirs=3, naming every ignore rule.</p>
+    <p class="key-fact"><strong>Key number:</strong> A reference-coding study measured 9,982 output tokens for the indexed agent against 26,477 for grep-driven Claude Code, 2.7 times fewer, both solving 16/16. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/data/results-multilang-final.json">docs/case-studies/reference-coding/data/results-multilang-final.json</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Run <code class="inline">xerj autoindex --dry-run</code> on the repository first. In our capture the dry run reported <code class="inline">files=3</code>, <code class="inline">ignored_files=2</code> and <code class="inline">ignored_dirs=3</code>, with 60 non-hidden files inside the pruned directories. The indexed tree then gave an agent 3 languages and 11 symbols to query.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -200,7 +205,7 @@ autoindex: ignore rules:   .gitignore:coverage/ — 1 directory pruned (5 non-hi
   <pre class="code"><code class="language-sh">curl -s -XPOST 'http://127.0.0.1:9410/code-*/_search' -H 'content-type: application/json' -d '{"size":0,"aggs":{"by_language":{"terms":{"field":"language","size":40}},"total_symbols":{"sum":{"field":"symbol_count"}}}}'
 </code></pre>
   <p>The <code class="inline">by_language</code> aggregation returned one bucket per language: <code class="inline">go</code>, <code class="inline">python</code> and <code class="inline">rust</code>. Do not carry a captured bucket size over to your own tree. Every per-declaration document carries the <code class="inline">language</code> of the file it came from, so a bucket counts declarations as well as files and moves with the code, not with the file count.</p>
-  <p>XERJ recognizes 34 languages through tree-sitter. This capture exercised 3 of them, so read the answer as the shape of the aggregation and not as a language-coverage test.</p>
+  <p>XERJ recognizes 36 languages through tree-sitter. This capture exercised 3 of them, so read the answer as the shape of the aggregation and not as a language-coverage test.</p>
   <h2>One definition hit an agent can use</h2>
   <p>A <code class="inline">match</code> query on the <code class="inline">defs</code> field returns the file, the language and a <code class="inline">symbols</code> array. Each entry in that array carries a kind, a name and a line number. An agent reads the hit rather than the source file.</p>
   <pre class="code"><code class="language-sh">curl -s -XPOST 'http://127.0.0.1:9410/code-*/_search' -H 'content-type: application/json' -d '{"query":{"match":{"defs":"merge_segments"}},"size":10,"_source":["ax_path","language","title","defs","symbols"],"track_total_hits":true}'
@@ -224,7 +229,7 @@ autoindex: ignore rules:   .gitignore:coverage/ — 1 directory pruned (5 non-hi
   <h3>My agent keeps opening every file in the repo. How do I let it search the folder instead?</h3>
   <p>Run <code class="inline">xerj autoindex</code> on the tree and register <code class="inline">xerj mcp</code> with the agent host. The agent then calls a search tool and gets hits with paths, so the file-by-file walk stops.</p>
   <h3>How do I give a coding agent the whole codebase as searchable context?</h3>
-  <p>Index the tree with <code class="inline">xerj autoindex</code>, which extracts definitions through tree-sitter for 34 languages, and expose the index over MCP. The agent queries it rather than loading the repository.</p>
+  <p>Index the tree with <code class="inline">xerj autoindex</code>, which extracts definitions through tree-sitter for 36 languages, and expose the index over MCP. The agent queries it rather than loading the repository.</p>
   <h3>How do I index a monorepo so my coding agent stops reading files one by one?</h3>
   <p>Point <code class="inline">xerj autoindex</code> at the monorepo root. Built-in rules prune <code class="inline">node_modules/</code>, <code class="inline">vendor/</code>, <code class="inline">target/</code>, <code class="inline">dist/</code>, <code class="inline">build/</code>, <code class="inline">.venv/</code> and <code class="inline">__pycache__/</code>, and <code class="inline">--dry-run</code> prints the plan before anything is written.</p>
   <h3>Which ignore file wins?</h3>
@@ -238,6 +243,9 @@ autoindex: ignore rules:   .gitignore:coverage/ — 1 directory pruned (5 non-hi
     <li><a href="/answers/syntax-aware-code-search-refactoring">How do I run syntax-aware code search?</a></li>
     <li><a href="/answers/code-search-mcp-for-claude-code">I need my agent to find a passage and cite the file, not dump the whole tree. How?</a></li>
     <li><a href="/compare/xerj-vs-ripgrep-for-code-agents">Is ripgrep enough for a coding agent, or do I need a code index?</a></li>
+    <li><a href="/answers/search-yaml-xml-config-repository">How do I find every place a config key is set across YAML and XML in a repo?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/audit-php-codebase-with-an-index">How do I audit a PHP codebase with an index instead of grepping 1,400 files?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/index-reference-library-for-coding-agent">How do I set up reference coding so the agent retrieves a mechanism before writing code?</a> <span class="mute">· same intent: code search for agents</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

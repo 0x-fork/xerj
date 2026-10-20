@@ -2,11 +2,15 @@
 ---
 title: "Search a .csv.gz or .json.gz without unzipping it"
 canonical: "https://xerj.org/answers/search-gzipped-csv-or-json"
-updated: "2026-09-26"
+updated: "2026-10-19"
 source: "content/answers/search-gzipped-csv-or-json.md"
 ---
 
 # How do I search a .csv.gz or .json.gz without unzipping it first?
+
+**Short answer** (updated 2026-10-19): How do I search gzipped CSV exports without unzipping them? Point xerj autoindex at the folder. Gzip is a wrapper, not a family: autoindex strips it during the run and sniffs the bytes underneath, so a .csv.gz becomes typed columns and a .json.gz becomes documents with fields. No query re-reads the archive.
+
+**Key number:** The sniffer classifies the decompressed stream from its first 8,192 bytes (`PREFIX`), the same window it uses for a plain file. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/sniff.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/sniff.rs))
 
 **TL;DR** — Gzip is a wrapper, not a family. `xerj autoindex` strips it during the run and sniffs the bytes underneath. A `.csv.gz` becomes typed columns, and a `.json.gz` becomes documents with fields. You never decompress anything yourself, and no query re-reads the archive.
 
@@ -163,3 +167,6 @@ No. The measured gzip capture on this site is the log family. The CSV and JSON w
 - [What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?](/answers/search-json-and-jsonl-logs)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
 - [How do I grep PDFs and Word docs from the command line?](/compare/xerj-vs-ripgrep-all)
+- [I have a 2GB SQL dump. How do I find rows mentioning a customer without loading it into Postgres?](/answers/search-sql-dump-file) (same intent: JSONL and data files)
+- [How do I full-text search a SQLite database I just copied onto disk?](/answers/full-text-search-sqlite-database) (same intent: JSONL and data files)
+- [I want to point something at a folder and then ask questions about what's in it. What should I use?](/answers/how-xerj-autoindexes-a-folder) (same intent: JSONL and data files)

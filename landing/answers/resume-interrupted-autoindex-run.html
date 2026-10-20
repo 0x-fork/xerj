@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>THE INDEXER DIED OVERNIGHT. DO I HAVE TO START OVER?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: RECOVERY</span></div>
   <h1>The indexer died overnight. Do I have to start over?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>The indexer died overnight; do I have to start over? No. XERJ writes a resume journal into the --state-dir, so re-running the identical autoindex command is idempotent. In a capture the interrupted run, the resumed run and a clean control run all ended at 82,231 documents, and the first 20 document ids matched exactly.</p>
+    <p class="key-fact"><strong>Key number:</strong> A resumed full-corpus generation with all 47,444 operations already applied finished on a restarted node without re-sending them. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/autoindex-resilience/after-955.full-corpus-resume.stderr.txt">benchmarks/autoindex-resilience/after-955.full-corpus-resume.stderr.txt</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ writes a resume journal into the <code class="inline">--state-dir</code>, so re-running the identical <code class="inline">autoindex</code> command is idempotent. In a capture the interrupted run, the resumed run and a clean control run all ended at 82,231 documents. The first 20 document ids matched exactly.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -236,6 +241,9 @@ xerj-done ok=true exit=0 reason=completed wall=1.2s files=0 records=82231
     <li><a href="/answers/read-autoindex-progress">How do I read autoindex progress?</a></li>
     <li><a href="/answers/estimate-autoindex-time-before-running">How do I estimate folder-indexing time?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
+    <li><a href="/answers/autoindex-exit-codes">The indexer exited 3 (or 4). Did it fail?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/keep-index-current-as-files-change">How do I keep a search index up to date as files change, without re-indexing everything?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

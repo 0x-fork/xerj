@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-20",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>CAN I ROUTE TICKETS OR FILTER SPAM FROM LABELLED HISTORY, WITHOUT AN LLM CALL?</div>
   <div class="kicker"><span>ANSWERS · DECISIONS AS RETRIEVAL</span></div>
   <h1>Can I route tickets or filter spam from labelled history, without an LLM call?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-20</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Can I classify text from labelled history without calling an LLM? Yes, if you already have labelled examples. Index them in XERJ, fetch the 10 nearest for each new item, and vote. Measured: 0.933 accuracy on 77-way intent routing with the opt-in neural embedder, and 0.983 on SMS spam with plain BM25.</p>
+    <p class="key-fact"><strong>Key number:</strong> SMS spam detection scored 0.983 accuracy with BM25 over 4,000 labelled examples and 1,000 held-out items, k = 10. <span class="mute">(as of 2026-09-18 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/decisions-as-retrieval/results/run-2026-09-18.txt">benchmarks/decisions-as-retrieval/results/run-2026-09-18.txt</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — If you already have labelled examples, you can route and filter text with no LLM or API call. Index the examples, fetch the 10 nearest for each new item, and vote. Measured: 0.933 accuracy on 77-way intent routing and 0.983 on SMS spam. The 0.933 figure needs <code class="inline">--embed-mode neural</code>, which runs one local MiniLM embedding per item; the spam figure is plain BM25, with no model of any kind.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -248,6 +253,9 @@
     <li><a href="/answers/hybrid-search-quality-measured-ndcg">How much better is hybrid search than BM25? Measured nDCG numbers</a></li>
     <li><a href="/answers/rerank-search-results-calibrated-judge">How do I rerank search results with a relevance judge?</a></li>
     <li><a href="/answers/do-search-embeddings-help">When should I turn on neural embeddings, and when is the lexical default enough?</a></li>
+    <li><a href="/answers/local-embeddings-without-openai-api">I want local search that works offline, no cloud embeddings. What are my options?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/mcp-api-search-or-vector-search">Should an agent use API search or vector search?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/vector-database-vs-full-text-search">What's the actual difference between a vector database and full-text search when I have a folder?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

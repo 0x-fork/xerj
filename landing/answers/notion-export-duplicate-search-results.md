@@ -2,11 +2,15 @@
 ---
 title: "Why does my Notion export duplicate titles?"
 canonical: "https://xerj.org/answers/notion-export-duplicate-search-results"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/notion-export-duplicate-search-results.md"
 ---
 
 # Why does my Notion export duplicate titles?
+
+**Short answer** (updated 2026-10-19): Why does my Notion export duplicate titles in search results? The duplicates come from the export layout and from the 2 documents XERJ writes per Markdown file, not from re-indexing. A captured run indexed the same Notion export twice and returned 8 documents both times, with byte-identical ids, so the index never doubled.
+
+**Key number:** Re-indexing the same 4-file Notion export a second time returned the same 8 documents, with byte-identical ids. (as of 2026-08-21; source: the captured run documented on this page)
 
 **TL;DR** — The duplicate titles come from the export layout and from the 2 documents XERJ writes per Markdown file. Re-indexing is not the cause. A captured run indexed the same export twice and returned 8 documents both times, with byte-identical ids.
 
@@ -148,3 +152,6 @@ All results come from run RUN-B, captured on 2026-08-21 on a 16-core AMD EPYC 96
 - [How do I index Markdown into the Elasticsearch API?](/answers/index-markdown-into-elasticsearch-api)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
 - [The indexer died overnight. Do I have to start over?](/answers/resume-interrupted-autoindex-run)
+- [What's the best way to search markdown notes and PDFs in the same vault?](/answers/search-obsidian-pdf-docx-attachments) (same intent: logs and docs)
+- [How do I search an Obsidian vault from outside Obsidian?](/compare/xerj-vs-obsidian-omnisearch) (same intent: logs and docs)
+- [How do I search a Confluence export?](/answers/search-confluence-html-export) (same intent: logs and docs)

@@ -2,11 +2,15 @@
 ---
 title: "Why does a folder search miss files on disk?"
 canonical: "https://xerj.org/answers/why-autoindex-skipped-files"
-updated: "2026-10-05"
+updated: "2026-10-19"
 source: "content/answers/why-autoindex-skipped-files.md"
 ---
 
 # Why would a folder search miss files that I can see on disk?
+
+**Short answer** (updated 2026-10-19): Why would a folder search miss files that I can see on disk? XERJ prints one line per ignore rule with an exact file count, and stores a refusal reason for every file it opened. A capture over 26 files on disk indexed 1, refused 2 with named reasons, excluded 23 through ignore rules, and exited 3.
+
+**Key number:** The captured run reconciled 26 files on disk as 1 indexed, 2 refused and 23 excluded. (as of 2026-10-05; source: the captured run documented on this page)
 
 **TL;DR** — XERJ prints one line per ignore rule with an exact file count, and stores a refusal reason for every file it opened. A capture over 26 files on disk indexed 1, refused 2 with named reasons, and excluded 23 through ignore rules. The run exited 3 with `reason=completed-with-junk`.
 
@@ -148,3 +152,6 @@ The run finished but refused at least one file. The terminal line reads reason=c
 - [I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?](/answers/search-file-contents-in-a-folder)
 - [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete)
 - [How do I estimate folder-indexing time?](/answers/estimate-autoindex-time-before-running)
+- [Reindexing my files is taking forever. What usually causes that?](/answers/reindex-taking-forever) (same intent: operating autoindex)
+- [How do I search files that live in an S3 bucket?](/answers/search-files-in-an-s3-bucket) (same intent: operating autoindex)
+- [How do I keep a search index up to date as files change, without re-indexing everything?](/answers/keep-index-current-as-files-change) (same intent: operating autoindex)

@@ -499,6 +499,92 @@ def _metadata_link(source: str, article: article_data.Article,
                      f"dangling internal target {source!r} (resolved as {path})")
 
 
+GITHUB_BLOB = "https://github.com/xerj-org/xerj/blob/main/"
+
+
+CAPTURE_LABEL = "the captured run documented on this page"
+
+
+def key_fact_href(article: article_data.Article, context: BuildContext) -> str | None:
+    """Where a reader checks the key number: the URL, the site page, or the
+    file on GitHub (a repo path gets a real link here, unlike evidence rows,
+    because an answer engine needs a URL it can cite). None for "capture":
+    the number comes from this page's own run, so there is nothing to link."""
+    source = (article.key_fact_source or "").strip()
+    if source == article_data.CAPTURE_SOURCE:
+        return None
+    if source.startswith("https://"):
+        return source
+    if source.startswith("/"):
+        return context.resolve(source, article.category, article,
+                               article.body_start_line).href
+    return GITHUB_BLOB + _evidence_repo_path(source)
+
+
+def key_fact_label(article: article_data.Article) -> str:
+    source = (article.key_fact_source or "").strip()
+    if source.startswith("https://"):
+        parsed = urllib.parse.urlsplit(source)
+        return parsed.netloc + (parsed.path.rstrip("/") or "")
+    return source
+
+
+_INTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_INTENT_STOP = frozenset("a an and are can do does for from how i in is it my of on or "
+                         "the to what when which with without you your xerj".split())
+
+
+def _intent_tokens(article: article_data.Article) -> set[str]:
+    text = " ".join([article.title, article.question, *article.queries]).lower()
+    return {t for t in _INTENT_TOKEN_RE.findall(text) if t not in _INTENT_STOP and len(t) > 2}
+
+
+def intent_siblings(article: article_data.Article, context: BuildContext,
+                    limit: int = 3) -> list[article_data.Article]:
+    """Up to ``limit`` other articles in the same intent group, not already in
+    links_out, most-overlapping first. Deterministic: ties break on slug."""
+    if not article.intent_group:
+        return []
+    linked: set[str] = set()
+    for raw in article.links_out:
+        target = context.resolve_article_target(raw, article, article.body_start_line)
+        linked.add(target.rel)
+    mine = _intent_tokens(article)
+    pool = [a for a in context.articles
+            if a is not article and a.intent_group == article.intent_group
+            and a.output_rel not in linked and not a.noindex]
+    pool.sort(key=lambda a: (-len(mine & _intent_tokens(a)), a.category, a.slug))
+    return pool[:limit]
+
+
+def render_answer_card(article: article_data.Article, context: BuildContext,
+                       modified: str) -> str:
+    """The answer-first block under the H1: a 40-60 word answer that restates
+    the question, then one dated, sourced number."""
+    if not article.answer and not article.key_fact and not article.last_checked:
+        return ""
+    out = ['  <div class="prompt-card answer-first" id="short-answer">',
+           f'    <span class="prompt-label">SHORT ANSWER · UPDATED {esc_text(modified)}</span>']
+    if article.answer:
+        out.append("    <p>" + _inline(article.answer, article, article.body_start_line,
+                                       context.markdown_href) + "</p>")
+    if article.key_fact:
+        href = key_fact_href(article, context)
+        out.append('    <p class="key-fact"><strong>Key number:</strong> '
+                   + _inline(article.key_fact, article, article.body_start_line,
+                             context.markdown_href)
+                   + f' <span class="mute">(as of {esc_text(article.key_fact_date or "")} · source: '
+                   + (CAPTURE_LABEL if href is None else
+                      f'<a href="{esc_attr(href)}">{esc_text(key_fact_label(article))}</a>')
+                   + ')</span></p>')
+    if article.last_checked:
+        out.append(f'    <p class="mute">Last checked: {esc_text(article.last_checked)}. Every '
+                   "third-party fact on this page was re-read from the tool's own docs or "
+                   "repository on that date.</p>")
+    out.append("  </div>")
+    return "\n".join(out)
+
+
 def markdown_rel(article: article_data.Article) -> str:
     return f"{article.category}/{article.slug}.md"
 
@@ -531,10 +617,11 @@ def render_commands(article: article_data.Article) -> str:
     if not article.commands:
         return ""
     out: list[str] = []
-    for item in article.commands:
+    for index, item in enumerate(article.commands, start=1):
         command = item["cmd"]
         note = item["note"]
-        out.append("  <div class=\"prompt-card\">")
+        step_id = f' id="step-{index}"' if "howto" in article.structured_data else ""
+        out.append(f"  <div class=\"prompt-card\"{step_id}>")
         out.append("    <span class=\"prompt-label\">RUN THIS XERJ COMMAND</span>")
         out.append(f"    <code>{esc_text(command)}</code>")
         out.append(f"    <button type=\"button\" class=\"prompt-copy\" data-copy=\"{esc_attr(command)}\">"
@@ -573,8 +660,18 @@ def render_markdown_twin(article: article_data.Article, context: BuildContext) -
         "",
         f"# {article.h1}",
         "",
-        tldr,
     ]
+    if article.answer:
+        out += [f"**Short answer** (updated {modified}): {article.answer}", ""]
+    if article.key_fact:
+        href = key_fact_href(article, context)
+        where = CAPTURE_LABEL if href is None else f"[{key_fact_label(article)}]({href})"
+        out += [f"**Key number:** {article.key_fact} (as of {article.key_fact_date}; "
+                f"source: {where})", ""]
+    if article.last_checked:
+        out += [f"Last checked: {article.last_checked}. Every third-party fact on this page "
+                "was re-read from the tool's own docs or repository on that date.", ""]
+    out += [tldr]
     if article.agent_prompt:
         out += ["", "## Agent prompt", "", "```text", article.agent_prompt, "```"]
     if article.commands:
@@ -607,10 +704,14 @@ def render_markdown_twin(article: article_data.Article, context: BuildContext) -
             out.append(f"- {item['claim'].strip()} — {rendered_source}")
 
     out += ["", "## Related", ""]
-    if article.links_out:
+    siblings = intent_siblings(article, context)
+    if article.links_out or siblings:
         for raw in article.links_out:
             target = context.resolve_article_target(raw, article, article.body_start_line)
             out.append(f"- [{target.label}]({target.href})")
+        for sibling in siblings:
+            out.append(f"- [{sibling.h1}]({urlmap.deployed_path(sibling.output_rel)}) "
+                       f"(same intent: {article.intent_group})")
     else:
         out.append("No related pages are listed.")
     return "\n".join(out).rstrip() + "\n"
@@ -659,12 +760,17 @@ def render_article_sections(article: article_data.Article, context: BuildContext
         out.append("  </ul>")
 
     out.append("  <h2>Related</h2>")
-    if article.links_out:
+    siblings = intent_siblings(article, context)
+    if article.links_out or siblings:
         out.append("  <ul>")
         for raw in article.links_out:
             target = context.resolve_article_target(raw, article, article.body_start_line)
             out.append(f'    <li><a href="{esc_attr(target.href)}">'
                        f"{esc_text(target.label)}</a></li>")
+        for sibling in siblings:
+            out.append(f'    <li><a href="{urlmap.deployed_path(sibling.output_rel)}">'
+                       f"{esc_text(sibling.h1)}</a> <span class=\"mute\">· same intent: "
+                       f"{esc_text(article.intent_group or '')}</span></li>")
         out.append("  </ul>")
     else:
         out.append("  <p>No related pages are listed.</p>")
@@ -793,6 +899,9 @@ def render_article(article: article_data.Article, context: BuildContext) -> str:
     block = seo_head.build_block(rel, article.title, article.description,
                                  article.published, modified, meta)
     body = render_article_sections(article, context)
+    answer_card = render_answer_card(article, context, modified)
+    if answer_card:
+        answer_card += "\n"
     marker = f"{GENERATOR_PREFIX}{article.category}/{article.slug}.md instead -->"
     source_note = (f"AUTHOR · {article.author} · REVIEWED BY · {article.reviewer} · "
                    f"PUBLISHED · {article.published} · UPDATED · {modified}")
@@ -806,7 +915,7 @@ def render_article(article: article_data.Article, context: BuildContext) -> str:
   <div class="kicker"><span>{esc_text(article.category.upper())} · {esc_text(article.cluster.upper())}</span></div>
   <h1{' class="h1-long"' if len(article.h1) > H1_LONG_CHARS else ''}>{_inline(article.h1, article, article.body_start_line, context.markdown_href)}</h1>
   <div class="source-note">{esc_text(source_note)}</div>
-{body}
+{answer_card}{body}
 </main>
 {article_nav(context, article)}
 </div>
@@ -901,6 +1010,8 @@ def article_index_entry(article: article_data.Article, context: BuildContext) ->
         "cluster": article.cluster,
         "updated": article_modified(article, context),
         "summary": " ".join(article.description.split()),
+        **({"intent_group": article.intent_group} if article.intent_group else {}),
+        **({"answer": article.answer} if article.answer else {}),
         **({"queries": list(article.queries)} if article.queries else {}),
     }
 
@@ -940,33 +1051,34 @@ def render_llms_section(articles: list[article_data.Article], context: BuildCont
     """
     lines = [
         LLMS_BEGIN,
-        "## Answers",
+        "## Answers and comparisons, grouped by what the agent is trying to do",
         "",
-        "Direct answers for you, the AI agent: the link, then the question that page answers. "
+        "Direct answers for you, the AI agent, grouped by intent: the clusters come from a "
+        "1,000-query study of what agents actually type into search, so find the group that "
+        "matches your task first. Each line is the link, a tag (`answer` or `compare`), then the "
+        "question that page answers. "
         "**Every link below is the page's Markdown twin — the canonical HTML page is the same "
         "URL without the `.md`.** The twin is deliberately not in the sitemap because it is the "
-        "same document. Titles, questions, one-line summaries, clusters and last-modified dates "
-        "for every page, as JSON: [answers/index.json](https://xerj.org/answers/index.json) · "
+        "same document. Titles, questions, short answers, target queries, intents and "
+        "last-modified dates for every page, as JSON: "
+        "[answers/index.json](https://xerj.org/answers/index.json) · "
         "[compare/index.json](https://xerj.org/compare/index.json). Human hubs: "
         "[/answers](https://xerj.org/answers) · [/compare](https://xerj.org/compare).",
         "",
     ]
-    labels = (("answers", None), ("compare", "## Comparisons"))
-    for category, heading in labels:
-        if heading:
-            lines.append(heading)
-            lines.append("")
-        members = sorted((a for a in articles if a.category == category),
-                         key=lambda a: (a.cluster.lower(), a.title.lower()))
-        if not members:
-            lines.append("- No pages are published in this section yet.")
-            lines.append("")
-            continue
-        current_cluster: str | None = None
+    if not articles:
+        lines.append("- No pages are published in this section yet.")
+        lines.append("")
+    groups: dict[str, list[article_data.Article]] = collections.defaultdict(list)
+    for article in articles:
+        groups[article.intent_group or article.cluster].append(article)
+    # Biggest intent first (that is where most agents land), then by name.
+    for group in sorted(groups, key=lambda g: (-len(groups[g]), g.lower())):
+        lines.append(f"### {group}")
+        lines.append("")
+        members = sorted(groups[group],
+                         key=lambda a: (a.category != "compare", a.title.lower()))
         for article in members:
-            if article.cluster != current_cluster:
-                current_cluster = article.cluster
-                lines.append(f"- **{article.cluster}**")
             entry = article_index_entry(article, context)
             # The "canonical = twin minus .md" rule is stated once above the list,
             # so assert the relationship the prose promises still holds.
@@ -974,7 +1086,9 @@ def render_llms_section(articles: list[article_data.Article], context: BuildCont
                 raise BuildError(
                     f"{article.path}: Markdown twin {entry['markdown_url']} is not "
                     f"{entry['canonical_url']}.md, but llms.txt states that rule once")
-            lines.append(f"  - [{entry['title']}]({entry['markdown_url']}): {entry['question']}")
+            tag = "compare" if article.category == "compare" else "answer"
+            lines.append(f"- [{entry['title']}]({entry['markdown_url']}) `{tag}`: "
+                         f"{entry['question']}")
         lines.append("")
     lines.append(LLMS_END)
     return "\n".join(lines).rstrip() + "\n"

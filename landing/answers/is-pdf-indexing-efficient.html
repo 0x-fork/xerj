@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>IS IT EFFICIENT TO INDEX PDF FILES?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>Is it efficient to index PDF files?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Is it inefficient to index PDF files into a search engine? Compared with opening every file by hand, no, though PDF is the slowest family XERJ parses. Extraction runs in an isolated worker process sized from free memory, capped five ways, and each file is parsed once. Image-only PDFs are refused with a reason string.</p>
+    <p class="key-fact"><strong>Key number:</strong> XERJ runs at most 4 concurrent PDF worker processes (<code class="inline">MAX_PDF_WORKERS</code>) and reads at most 100,000 pages per file (<code class="inline">MAX_PAGES</code>). <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/resources.rs">engine/crates/xerj-autoindex/src/resources.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Yes, when the alternative is opening every file by hand, and PDF is still the slowest family XERJ parses. XERJ isolates extraction in a worker process, caps it 5 ways, and parses each file once. In our capture 3 born-digital PDFs produced 9 documents, and the 4th file failed with a reason string.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -254,6 +259,9 @@ autoindex: memory safe zone 966 MiB allows 1 PDF worker(s) at 1536 MiB each, not
     <li><a href="/answers/search-all-pdfs-in-a-folder">I downloaded a bunch of papers as PDFs. How do I search across them?</a></li>
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
     <li><a href="/answers/estimate-autoindex-time-before-running">How do I estimate folder-indexing time?</a></li>
+    <li><a href="/answers/read-indexed-email-and-pdf-folder">I indexed a folder of email and PDFs. How do I actually read what it found?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/compare/xerj-vs-recoll">What's the best local desktop search for a folder of PDFs and docs?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/compare/xerj-vs-spotlight">XERJ vs macOS Spotlight for folder content an agent can query</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

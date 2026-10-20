@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>I HAVE A JSON EXPORT OF JIRA ISSUES (OR ZENDESK TICKETS). HOW DO I SEARCH IT LIKE A HELP-CENTER SEARCH?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1 class="h1-long">I have a JSON export of Jira issues (or Zendesk tickets). How do I search it like a help-center search?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
+    <p>I have a JSON export of support tickets; how do I search it like a real help-center search? Index the exported JSON on local disk with one xerj autoindex run. In a captured run a description phrase returned 36 hits with per-ticket locators such as tickets:e4, and a status aggregation returned 6 buckets of exactly 30.</p>
+    <p class="key-fact"><strong>Key number:</strong> A <code class="inline">status</code> terms aggregation returned 6 buckets of exactly 30 tickets each. <span class="mute">(as of 2026-08-21 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ answers a Zendesk ticket search from the exported JSON on local disk, with 1 <code class="inline">xerj autoindex</code> run. In a captured run, a phrase from a ticket description returned 36 hits with per-ticket locators such as <code class="inline">tickets:e4</code>. A <code class="inline">status</code> aggregation returned 6 buckets of exactly 30.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -237,7 +242,7 @@
   <p>The <code class="inline">date</code> typing is what makes a range query over <code class="inline">created_at</code> work straight after the run. The default embedder in XERJ is lexical feature hashing, so a <code class="inline">semantic_text</code> field written by that embedder cannot connect a query to a synonym. Neural embeddings are opt-in through <code class="inline">--embed-mode neural</code>.</p>
   <h2>What this capture does not show</h2>
   <p>XERJ has no Zendesk connector, no API token flow and no sync job. The node observed 0 distinct non-loopback peers across 185 samples over its whole life. Request the export from Zendesk yourself, save it to disk, then index the folder.</p>
-  <p>If you flatten the export to JSONL, keep every line under 4,096 characters. A captured reproduction indexed 30 documents at 4,095 characters per line and 0 documents at 4,096, with the family flipping from <code class="inline">jsonl</code> to <code class="inline">json</code>.</p>
+  <p>If you flatten the export to JSONL, a line at or above 16 MB is skipped and counted as junk (<code class="inline">MAX_LINE</code>, <code class="inline">16 &lt;&lt; 20</code>, in <code class="inline">engine/crates/xerj-autoindex/src/extract/mod.rs</code>). The rest of the file still indexes.</p>
   <p>XERJ runs single-node here, with no replication and no failover. Every number above comes from RUN-B, captured on 2026-08-21. The binary was a <code class="inline">ci-test</code> profile build, so no wall-clock figure from this run is published as a performance number.</p>
   <h2>FAQ</h2>
   <h3>I have a JSON export of support tickets. How do I search it like a real help-center search?</h3>
@@ -254,11 +259,18 @@
   <p>XERJ typed <code class="inline">tags</code> as a multi-valued <code class="inline">keyword</code>, so a <code class="inline">terms</code> filter with the tag value returns the matching tickets. <code class="inline">custom_fields</code> is <code class="inline">keyword</code> too.</p>
   <h3>Do ticket comments become searchable too?</h3>
   <p>Yes. The captured run put <code class="inline">ticket_comments.json</code> into its own index, <code class="inline">zd-json-ticket-comments</code>, with 61 documents.</p>
+  <h2>Evidence</h2>
+  <ul>
+    <li>JSONL line cap is 16 MB (MAX_LINE = 16 &lt;&lt; 20). A line at or above that length is skipped; the rest of the file still indexes. — <code>engine/crates/xerj-autoindex/src/extract/mod.rs</code></li>
+  </ul>
   <h2>Related</h2>
   <ul>
     <li><a href="/answers/search-json-and-jsonl-logs">What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
     <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/index-multiple-csv-files">I have a directory of CSV exports. How do I query them without opening each one in Excel?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/index-csv-with-many-columns">How do I index a CSV with many columns?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

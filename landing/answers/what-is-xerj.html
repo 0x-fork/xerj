@@ -156,7 +156,12 @@
   <div class="kicker"><span>ANSWERS · PRODUCT IDENTITY</span></div>
   <h1>What is XERJ?</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
-  <p><strong>TL;DR</strong> — XERJ is one Apache-2.0 Rust binary that indexes a local folder and answers search queries over the Elasticsearch REST API. <code class="inline">xerj autoindex</code> needs no schema and no configuration file. The same process serves agent memory at <code class="inline">/_memory/{namespace}</code> and 10 MCP tools through <code class="inline">xerj mcp</code>.</p>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>What is XERJ? It is an open-source local search engine for AI agents: a single Apache-2.0 Rust binary. Point xerj autoindex at a folder of code, documents or data files and query it over the Elasticsearch REST API, or let an agent call it through xerj mcp, which also stores agent memory.</p>
+    <p class="key-fact"><strong>Key number:</strong> A live <code class="inline">tools/list</code> from v1.0.0-rc.97 returned 17 MCP tools; the engine passes 1366 of 1369 Elasticsearch YAML conformance cases. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json">landing/docs/agents/schemas/mcp-tools.json</a>)</span></p>
+  </div>
+  <p><strong>TL;DR</strong> — XERJ is one Apache-2.0 Rust binary that indexes a local folder and answers search queries over the Elasticsearch REST API. <code class="inline">xerj autoindex</code> needs no schema and no configuration file. The same process serves agent memory at <code class="inline">/_memory/{namespace}</code> and 17 MCP tools through <code class="inline">xerj mcp</code>.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
     <code>Act as a coding agent meeting this tool for the first time. Read https://xerj.org/llms.txt, start a node with `xerj --insecure --data-dir ./.xerj-data`, run `xerj autoindex ./docs --url http://127.0.0.1:9200 --prefix docs --progress plain` on the folder you were handed, run `xerj autoindex map --url http://127.0.0.1:9200` to learn the real index and field names, then POST one match_phrase query to /docs-*/_search and answer the user question citing the ax_path of every hit.</code>
@@ -190,7 +195,7 @@
     <span class="prompt-label">RUN THIS XERJ COMMAND</span>
     <code>xerj mcp --url http://127.0.0.1:9200</code>
     <button type="button" class="prompt-copy" data-copy="xerj mcp --url http://127.0.0.1:9200">COPY COMMAND</button>
-    <span class="hero-proof">Attach the running node to an agent host over stdio MCP. This serves 10 tools and starts no node of its own.</span>
+    <span class="hero-proof">Attach the running node to an agent host over stdio MCP. This serves 17 tools and starts no node of its own.</span>
   </div>
   <h2>Point it at a folder and query the folder</h2>
   <p>Two commands take a folder from nothing to searchable. Start the node, then hand <code class="inline">xerj autoindex</code> the directory.</p>
@@ -207,7 +212,7 @@ xerj autoindex ./docs --url http://127.0.0.1:9200 --prefix docs --progress plain
 </code></pre>
   <p>Every document carries <code class="inline">ax_path</code>, <code class="inline">ax_file</code>, <code class="inline">ax_format</code> and four more keyword provenance fields. A hit names the file it came from, so an agent can cite its source instead of guessing.</p>
   <h2>Hand the same node to an agent</h2>
-  <p><code class="inline">xerj mcp</code> is a stdio MCP server inside the same binary. It serves 10 tools against a node that is already running: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code>, <code class="inline">xerj_hybrid_search</code>, <code class="inline">xerj_memory_store</code>, <code class="inline">xerj_memory_recall</code> and four <code class="inline">xerj_brain_*</code> operations. The semantic tool runs whichever embedder the node loaded, and the default embedder is lexical feature hashing rather than a neural model.</p>
+  <p><code class="inline">xerj mcp</code> is a stdio MCP server inside the same binary. It serves 17 tools against a node that is already running: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code>, <code class="inline">xerj_hybrid_search</code>, <code class="inline">xerj_memory_store</code>, <code class="inline">xerj_memory_recall</code>, four <code class="inline">xerj_brain_*</code> operations, <code class="inline">xerj_map</code>, <code class="inline">xerj_code_search</code>, <code class="inline">xerj_plan</code>, <code class="inline">xerj_field_report</code> and three <code class="inline">xerj_hub_*</code> Corpus Hub tools (a live <code class="inline">tools/list</code> from v1.0.0-rc.97 on 2026-10-19). The semantic tool runs whichever embedder the node loaded, and the default embedder is lexical feature hashing rather than a neural model.</p>
   <p>The command does not start a node. Start one first, then register <code class="inline">xerj mcp --url http://127.0.0.1:9200</code> in the agent host with an absolute path to the binary.</p>
   <h2>Store agent memory in the same process</h2>
   <p>Agent memory is an endpoint on the node, not a second deployment. An agent stores a fact with <code class="inline">POST /_memory/{namespace}</code> and reads it back with <code class="inline">_recall</code>, on the same port that answers <code class="inline">_search</code>.</p>
@@ -262,6 +267,9 @@ xerj autoindex ./docs --url http://127.0.0.1:9200 --prefix docs --progress plain
     <li><a href="/answers/local-code-search-mcp-fewer-tokens-than-grep">Local code search MCP for Claude Code that uses fewer tokens than grep</a></li>
     <li><a href="/answers/ask-questions-about-a-github-repo-without-cloning">Ask questions about a GitHub repo without cloning it</a></li>
     <li><a href="/answers/batch-lookup-cve-ghsa-ids-offline">Batch lookup CVE IDs and GHSA IDs offline, without GitHub API rate limits</a></li>
+    <li><a href="/compare/xerj-vs-localsynapse">What's a local MCP search engine for Claude?</a> <span class="mute">· same intent: Find the right tool</span></li>
+    <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a> <span class="mute">· same intent: Find the right tool</span></li>
+    <li><a href="/compare/xerj-vs-web-agent-search">How do I let an agent search a folder on my laptop instead of crawling the web?</a> <span class="mute">· same intent: Find the right tool</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-26",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>I EXPORTED MY GMAIL WITH GOOGLE TAKEOUT. HOW DO I SEARCH THAT MBOX FILE LOCALLY?</div>
   <div class="kicker"><span>ANSWERS · FOLDER INDEXING</span></div>
   <h1>I exported my Gmail with Google Takeout. How do I search that mbox file locally?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-26</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search a Google Takeout mbox file locally? Unzip the Takeout download, run xerj autoindex on the folder with its own --prefix, then search the mailbox over HTTP. The mbox is recognised by content and streamed one message at a time, attached PDFs become per-page documents, and with the default embedder no message text leaves your machine.</p>
+    <p class="key-fact"><strong>Key number:</strong> On a 1 GB synthetic mailbox the client peaked at 296 MiB and finished in 279 s, and all 2,530 planted needles were found. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/mbox-ingest/results/after-mixed-1G-runC-verify-every-needle.json">benchmarks/mbox-ingest/results/after-mixed-1G-runC-verify-every-needle.json</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Unzip the Takeout download, run <code class="inline">xerj autoindex</code> on the folder with its own <code class="inline">--prefix</code>, then search the mailbox over HTTP. The mbox is recognised by its content and streamed one message at a time. Attached PDFs become per-page documents linked to their message. Senders are filterable by bare address, and Gmail thread ids and reply headers become filters and graph edges. With the default embedder, which is lexical (feature hashing, not neural), no message text leaves your machine. The node's ingest memory, which before #1002 (2026-09) pushed a 300 MB mailbox past a laptop's RAM, now finishes a 1 GB mailbox under the node's default 16 GiB cap in 407.7 s; the peak still crosses the cap (21,405.3 MiB on that run) because per-segment caches grow until a merge retires them, tracked as #1032.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -289,6 +294,9 @@ xerj autoindex ~/mail-export --url http://127.0.0.1:9200 --prefix mail --progres
     <li><a href="/answers/resume-interrupted-autoindex-run">The indexer died overnight. Do I have to start over?</a></li>
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
     <li><a href="/docs/recipes/zero-config-autoindex">Zero-config autoindex</a></li>
+    <li><a href="/answers/search-gzip-logs-without-zgrep">How do I search gzipped logs without decompressing the whole file — including when JSONL sits next to them?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/cheap-low-volume-log-search">What can I use for low-volume log search?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/search-all-pdfs-in-a-folder">I downloaded a bunch of papers as PDFs. How do I search across them?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

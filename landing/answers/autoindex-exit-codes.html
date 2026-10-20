@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-09-20",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>THE INDEXER EXITED 3 (OR 4). DID IT FAIL?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: EXIT CODES</span></div>
   <h1>The indexer exited 3 (or 4). Did it fail?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-09-20</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>What does indexer exit code 3 mean for xerj autoindex? It means success: the run completed and recorded some junk files. Exit 0 is a clean completion, 4 means the estimate exceeded --max-minutes and nothing was indexed, 2 is a usage error, and 1 is an endpoint or journal failure. Only exit 4 asks you a question.</p>
+    <p class="key-fact"><strong>Key number:</strong> The decision gate that produces exit 4 defaults to 10 minutes of estimated work (<code class="inline">DEFAULT_MAX_MINUTES</code>). <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/gate.rs">engine/crates/xerj-autoindex/src/gate.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Exit 3 is a success. <code class="inline">xerj autoindex</code> exits 0 when the run completed, and 3 when it completed and recorded junk. Exit 4 means the estimate exceeded <code class="inline">--max-minutes</code> and nothing was indexed. Exit 2 is a usage error, and exit 1 is an endpoint or journal failure. Only 4 is a question.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -300,6 +305,9 @@ error: prepared bulk contained 1 rejected items: {"type":"engine_exception","rea
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
     <li><a href="/answers/autoindex-dataset-refused-by-server">One dataset was REFUSED by the server. Did I lose the whole index?</a></li>
     <li><a href="/answers/autoindex-server-back-pressure-429">The server pushed back with HTTP 429. Did xerj autoindex lose the run?</a></li>
+    <li><a href="/answers/autoindex-says-extract-the-archive-first">xerj autoindex recorded my Takeout .zip as junk and said to extract it first. Why?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/keep-index-current-as-files-change">How do I keep a search index up to date as files change, without re-indexing everything?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/keep-s3-bucket-index-current">How do I keep an index current when the files live in an object store?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

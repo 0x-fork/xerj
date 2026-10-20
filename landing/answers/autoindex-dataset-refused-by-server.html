@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-20",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>ONE DATASET WAS REFUSED BY THE SERVER. DID I LOSE THE WHOLE INDEX?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: EXIT CODES</span></div>
   <h1>One dataset was REFUSED by the server. Did I lose the whole index?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-20</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Why did xerj autoindex say a dataset was refused by the server? The server answered HTTP 400 to that dataset's mapping. autoindex records the dataset's files as junk, indexes every other dataset, and exits 3 with datasets_refused on the terminal line. Re-running does not fix it; fix the cause and rebuild under a new prefix.</p>
+    <p class="key-fact"><strong>Key number:</strong> A forced refusal on a 3-file corpus recorded the CSV dataset's 2 files as junk and still indexed the other dataset. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/autoindex-resilience/refusal-e2e.run1.stderr.txt">benchmarks/autoindex-resilience/refusal-e2e.run1.stderr.txt</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — No. When the server refuses one dataset's mapping, <code class="inline">xerj autoindex</code> records that dataset's files as junk, indexes every other dataset, and exits 3. The terminal line carries <code class="inline">datasets_refused</code> and <code class="inline">files_refused</code>. Only HTTP 400 counts as a refusal. Re-running does not fix it; rebuild under a new prefix after you fix the cause.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -256,6 +261,9 @@ autoindex: 1 of 2 dataset(s) refused, 2 of 3 file(s) not indexed — this run wi
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
     <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a></li>
     <li><a href="/answers/read-autoindex-progress">How do I read autoindex progress?</a></li>
+    <li><a href="/answers/autoindex-server-back-pressure-429">The server pushed back with HTTP 429. Did xerj autoindex lose the run?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/autoindex-says-extract-the-archive-first">xerj autoindex recorded my Takeout .zip as junk and said to extract it first. Why?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/reindex-taking-forever">Reindexing my files is taking forever. What usually causes that?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

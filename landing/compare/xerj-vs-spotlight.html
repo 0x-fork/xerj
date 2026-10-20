@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-09-26",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>XERJ VS MACOS SPOTLIGHT FOR FOLDER CONTENT AN AGENT CAN QUERY</div>
   <div class="kicker"><span>COMPARE · COMPARISON: DESKTOP SEARCH</span></div>
   <h1>XERJ vs macOS Spotlight for folder content an agent can query</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-09-26</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Spotlight can't find text inside my project files; what else is there? XERJ indexes a project folder, code and data files included, for an agent to query over HTTP or MCP. Spotlight remains the Mac's zero-setup system index with whole-disk reach and wide metadata. No head-to-head was run, and nothing here was tested on macOS.</p>
+    <p class="key-fact"><strong>Key number:</strong> XERJ's tree-sitter registry extracts definitions in 36 languages, pinned by a unit test. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/code.rs">engine/crates/xerj-autoindex/src/extract/code.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Spotlight is the Mac's system-wide index: zero setup, whole-disk reach and wide file metadata. XERJ is a folder index an agent calls over HTTP or MCP. No head-to-head was run for this page and nothing here was tested on macOS.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -198,7 +203,7 @@
   <p>XERJ is a single Rust binary that runs one search node. <code class="inline">xerj autoindex &lt;folder&gt;</code> reads the folder, detects each file family by content, infers a dataset per file shape and writes the documents. It takes no configuration file and no mapping.</p>
   <p>The streaming extractors cover JSON and JSONL, CSV with dialect sniffing, structured logs, <code class="inline">sqldump</code> files, SQLite, PDF, DOCX, HTML, XML, YAML, plain text and gzip variants of those.</p>
   <p>The node answers the Elasticsearch REST API. A <code class="inline">match_phrase</code> query and a filter on a keyword field work over plain HTTP. The <code class="inline">xerj autoindex map</code> command prints a data map of what the folder became, and an agent reads it before naming an index and a field.</p>
-  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary and serves 10 tools against a node you already started. Agent memory lives in the engine under <code class="inline">/_memory/{namespace}</code>.</p>
+  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary and serves 17 tools against a node you already started. Agent memory lives in the engine under <code class="inline">/_memory/{namespace}</code>.</p>
   <p>XERJ is single-node. There is no replication and no failover. The default embedder is lexical feature hashing rather than a neural model, and neural retrieval is opt-in through <code class="inline">--embed-mode neural</code>. There is no OCR.</p>
   <h2>Capabilities, side by side</h2>
   <p>Every row is a documented capability of each tool. <strong>No row is a measured result</strong>, and no row is a claim about your Mac.</p>
@@ -214,7 +219,7 @@
       <tr><td>live updates as files change</td><td>yes, and <code class="inline">mdfind -live</code> reports them</td><td>rerun <code class="inline">xerj autoindex</code></td></tr>
       <tr><td>query language</td><td>metadata query expressions</td><td>Elasticsearch query DSL over HTTP</td></tr>
       <tr><td>HTTP query API</td><td>not documented for the system store</td><td>yes, Elasticsearch REST API</td></tr>
-      <tr><td>MCP server for an agent</td><td>none</td><td>yes, <code class="inline">xerj mcp</code>, 10 tools</td></tr>
+      <tr><td>MCP server for an agent</td><td>none</td><td>yes, <code class="inline">xerj mcp</code>, 17 tools</td></tr>
       <tr><td>typed columns from a CSV or a <code class="inline">sqldump</code> file</td><td>not described in the documentation</td><td>yes, a dataset per file shape</td></tr>
       <tr><td>per-file refusal reason</td><td>not described in the documentation</td><td><code class="inline">autoindex-catalog</code>, one reason per file</td></tr>
       <tr><td>agent memory in the engine</td><td>none</td><td>yes, <code class="inline">/_memory/{namespace}</code></td></tr>
@@ -245,7 +250,7 @@
   <h3>Spotlight can't find text inside my project files. What else is there?</h3>
   <p>Index the folder yourself. <code class="inline">xerj autoindex</code> sniffs each file by content and indexes the text, and it does not depend on an importer existing for that file type on your machine.</p>
   <h3>How do I full-text search a folder on a Mac from an agent?</h3>
-  <p>Give the agent an index it can call. <code class="inline">xerj autoindex</code> builds one from the folder and <code class="inline">xerj mcp</code> serves 10 tools against the running node over stdio, so no subprocess wrapper is needed.</p>
+  <p>Give the agent an index it can call. <code class="inline">xerj autoindex</code> builds one from the folder and <code class="inline">xerj mcp</code> serves 17 tools against the running node over stdio, so no subprocess wrapper is needed.</p>
   <h3>Is Spotlight enough for searching PDFs and code?</h3>
   <p>For a person at a keyboard, often yes, and it is already running. For an agent that needs typed fields, a per-file refusal reason and an HTTP API, it is a different job.</p>
   <h3>Did you benchmark XERJ against Spotlight?</h3>
@@ -273,6 +278,9 @@
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
     <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a></li>
+    <li><a href="/answers/is-pdf-indexing-efficient">Is it efficient to index PDF files?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/search-word-documents-in-a-folder">How do I search through a folder of contracts in .docx?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/read-indexed-email-and-pdf-folder">I indexed a folder of email and PDFs. How do I actually read what it found?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

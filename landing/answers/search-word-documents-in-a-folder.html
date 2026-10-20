@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH THROUGH A FOLDER OF CONTRACTS IN .DOCX?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I search through a folder of contracts in .docx?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I search through a folder of contracts in .docx? Run xerj autoindex on the folder, then send a match_phrase query against the paragraphs. In a captured run, 1 DOCX produced 2 documents and a query for second reviewer returned the paragraph and the title. A deliberately expanded zip-bomb file produced 0 documents.</p>
+    <p class="key-fact"><strong>Key number:</strong> The DOCX decompression guard refuses a file that expands past its cap; the captured expanded file produced 0 documents. <span class="mute">(as of 2026-08-21 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — <code class="inline">xerj autoindex</code> indexes a folder of Word documents in one command, and a <code class="inline">match_phrase</code> query then searches their paragraphs. In a captured run, 1 DOCX file produced 2 documents, and a query for <code class="inline">second reviewer</code> returned the paragraph and the title. A second, deliberately expanded file produced 0 documents.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -244,6 +249,9 @@
     <li><a href="/answers/search-all-pdfs-in-a-folder">I downloaded a bunch of papers as PDFs. How do I search across them?</a></li>
     <li><a href="/answers/search-obsidian-pdf-docx-attachments">What's the best way to search markdown notes and PDFs in the same vault?</a></li>
     <li><a href="/compare/xerj-vs-docfetcher">What's a free DocFetcher alternative that an agent can call?</a></li>
+    <li><a href="/compare/xerj-vs-spotlight">XERJ vs macOS Spotlight for folder content an agent can query</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/is-pdf-indexing-efficient">Is it efficient to index PDF files?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/read-indexed-email-and-pdf-folder">I indexed a folder of email and PDFs. How do I actually read what it found?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

@@ -2,11 +2,15 @@
 ---
 title: "How do I read autoindex progress?"
 canonical: "https://xerj.org/answers/read-autoindex-progress"
-updated: "2026-09-20"
+updated: "2026-10-19"
 source: "content/answers/read-autoindex-progress.md"
 ---
 
 # How do I read autoindex progress?
+
+**Short answer** (updated 2026-10-19): How can I see whether folder indexing is still working? Pass --progress plain and read the xerj-progress lines on stderr. A captured 22.2 s run emitted 12 phases in order and ended with xerj-done ok=true. On a single 16 MB file the percentage stays at 0.0%, so read since_progress_s and waiting_on instead.
+
+**Key number:** With --no-graph, a 231-file repository reported 9 phases in order, and its index phase read pct=81.7 at 169/231 items. (as of 2026-10-19; source: [benchmarks/autoindex-resilience/after-fix.small-repo.stderr.txt](https://github.com/xerj-org/xerj/blob/main/benchmarks/autoindex-resilience/after-fix.small-repo.stderr.txt))
 
 **TL;DR** — Pass `--progress plain`, then read the `xerj-progress` lines on stderr. A captured 22.2 s XERJ run emitted 12 phases in order and ended with `xerj-done ok=true exit=0 reason=completed`. On a single 16 MB file the percentage stayed at `0.0%`, so read `since_progress_s` and `waiting_on` instead.
 
@@ -214,3 +218,6 @@ No. --quiet means no progress output, so the decision-JSON recipe and the progre
 - [How do I estimate folder-indexing time?](/answers/estimate-autoindex-time-before-running)
 - [One dataset was REFUSED by the server. Did I lose the whole index?](/answers/autoindex-dataset-refused-by-server)
 - [The server pushed back with HTTP 429. Did xerj autoindex lose the run?](/answers/autoindex-server-back-pressure-429)
+- [How do I keep a search index up to date as files change, without re-indexing everything?](/answers/keep-index-current-as-files-change) (same intent: operating autoindex)
+- [Why would a folder search miss files that I can see on disk?](/answers/why-autoindex-skipped-files) (same intent: operating autoindex)
+- [The indexer exited 3 (or 4). Did it fail?](/answers/autoindex-exit-codes) (same intent: operating autoindex)

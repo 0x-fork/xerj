@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>WHY DOES MY NOTION EXPORT DUPLICATE TITLES?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>Why does my Notion export duplicate titles?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Why does my Notion export duplicate titles in search results? The duplicates come from the export layout and from the 2 documents XERJ writes per Markdown file, not from re-indexing. A captured run indexed the same Notion export twice and returned 8 documents both times, with byte-identical ids, so the index never doubled.</p>
+    <p class="key-fact"><strong>Key number:</strong> Re-indexing the same 4-file Notion export a second time returned the same 8 documents, with byte-identical ids. <span class="mute">(as of 2026-08-21 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — The duplicate titles come from the export layout and from the 2 documents XERJ writes per Markdown file. Re-indexing is not the cause. A captured run indexed the same export twice and returned 8 documents both times, with byte-identical ids.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -245,6 +250,9 @@
     <li><a href="/answers/index-markdown-into-elasticsearch-api">How do I index Markdown into the Elasticsearch API?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
     <li><a href="/answers/resume-interrupted-autoindex-run">The indexer died overnight. Do I have to start over?</a></li>
+    <li><a href="/answers/search-obsidian-pdf-docx-attachments">What's the best way to search markdown notes and PDFs in the same vault?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/compare/xerj-vs-obsidian-omnisearch">How do I search an Obsidian vault from outside Obsidian?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/search-confluence-html-export">How do I search a Confluence export?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

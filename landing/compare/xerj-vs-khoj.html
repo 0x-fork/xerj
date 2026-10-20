@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>WHAT'S A SIMPLER ALTERNATIVE TO KHOJ IF I ONLY NEED SEARCH AND MEMORY?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: PERSONAL SEARCH</span></div>
   <h1>What's a simpler alternative to Khoj if I only need search and memory?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>What's a simpler alternative to Khoj if I only need search and memory? XERJ: the search and memory engine that sits under an agent you already run. Khoj is a whole application with chat, custom agents, scheduled research, voice, image generation and clients from Obsidian to WhatsApp. No head-to-head was run.</p>
+    <p class="key-fact"><strong>Key number:</strong> Khoj has 37,752 GitHub stars, is AGPL-3.0, and its latest release is 2.0.0-beta.28 (2026-03-26). <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/khoj-ai/khoj">github.com/khoj-ai/khoj</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Khoj is a whole application: chat, custom agents, scheduled research, voice, image generation and clients from Obsidian to WhatsApp. XERJ is the search and memory engine that sits under an agent you already run. No head-to-head was run for this page.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -178,7 +183,7 @@
     <span class="prompt-label">RUN THIS XERJ COMMAND</span>
     <code>xerj mcp --url http://127.0.0.1:9200</code>
     <button type="button" class="prompt-copy" data-copy="xerj mcp --url http://127.0.0.1:9200">COPY COMMAND</button>
-    <span class="hero-proof">Attach the running node to the agent you already run. This stdio MCP server serves 10 tools and starts no node of its own.</span>
+    <span class="hero-proof">Attach the running node to the agent you already run. This stdio MCP server serves 17 tools and starts no node of its own.</span>
   </div>
   <h2>Concede the product surface</h2>
   <p>Khoj is not a search library with a demo page attached. Its own documentation describes chat with local or online models and custom agents with their own persona and tools. It also describes scheduled research delivered by email, voice chat, and image generation through third-party providers.</p>
@@ -205,7 +210,7 @@ xerj autoindex ./my-docs --prefix docs --state-dir ./state-docs
   <p>Read that plainly: on the shipped default, Khoj's retrieval understands a paraphrase and XERJ's does not.</p>
   <h2>Where the agent boundary sits</h2>
   <p>Khoj can connect to a Model Context Protocol server built by somebody else, which makes it a client of that ecosystem. Its documentation does not describe Khoj exposing an MCP server of its own, and it does expose an HTTP API with key or bearer authentication for third-party applications.</p>
-  <p>XERJ sits on the other side of that line. <code class="inline">xerj mcp</code> is a stdio MCP server in the same binary, serving 10 tools, and <code class="inline">/_memory/{ns}</code> gives an agent namespaced memory in the engine.</p>
+  <p>XERJ sits on the other side of that line. <code class="inline">xerj mcp</code> is a stdio MCP server in the same binary, serving 17 tools, and <code class="inline">/_memory/{ns}</code> gives an agent namespaced memory in the engine.</p>
   <h2>The limits you inherit with XERJ</h2>
   <p>XERJ is single-node only. There is no data-plane replication and no failover, so one host is the whole deployment.</p>
   <p>The server retains heap for every document it indexes, which is an open tracked defect. Corpora past a few million documents can exhaust memory on one node.</p>
@@ -253,6 +258,9 @@ xerj autoindex ./my-docs --prefix docs --state-dir ./state-docs
     <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a></li>
     <li><a href="/answers/search-file-contents-in-a-folder">I have a folder of PDFs, Word docs, and markdown. How do I search all of them at once?</a></li>
     <li><a href="/answers/agent-memory-without-postgres-qdrant">What's a simple way to give an agent long-term memory on my laptop without Qdrant?</a></li>
+    <li><a href="/compare/xerj-vs-vector-database">Should my agent call a search API or stand up Qdrant for persistent memory?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/coding-agent-memory-across-sessions">How do people store user preferences so an agent can recall them next week?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/evidence-for-agent-memory-links">How can agent-memory links retain evidence?</a> <span class="mute">· same intent: agent memory</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

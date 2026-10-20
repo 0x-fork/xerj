@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-30",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>DOES XERJ SUPPORT S3 STORAGE, ALERTING OR CUSTOM PLUGINS YET?</div>
   <div class="kicker"><span>ANSWERS · CAPABILITIES AND LIMITS</span></div>
   <h1>Does XERJ support S3 storage, alerting or custom plugins yet?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-30</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Can XERJ store its index in S3, send alerts, or run my own ingest plugin? Partly. Since v1.0.0-rc.77 an index can live in an S3-compatible bucket. Since rc.80 _watcher evaluates exactly one watch shape and refuses every other with a 501. User-supplied ingest plugins are not supported; transforms are built-in only.</p>
+    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases; the remaining gaps are listed in the suite. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — The scoreboard moved twice since this page was written: an index can live in an S3-compatible bucket since v1.0.0-rc.77, record corpus packs shipped in rc.78, and alerting became PARTIAL in rc.80 (<code class="inline">_watcher</code> evaluates exactly one watch shape and refuses every other loudly). User-supplied ingest plugins remain built-in-only. This page says exactly what exists, with the file that proves it. The authoritative list is <a href="https://github.com/xerj-org/xerj/blob/main/ROADMAP.md"><code class="inline">ROADMAP.md</code></a>.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -259,6 +264,9 @@
     <li><a href="/answers/filter-knn-exact-scan-caveat">Why did my filtered vector search get slower when I added a filter?</a></li>
     <li><a href="/answers/cheap-low-volume-log-search">What can I use for low-volume log search?</a></li>
     <li><a href="/answers/local-embeddings-without-openai-api">I want local search that works offline, no cloud embeddings. What are my options?</a></li>
+    <li><a href="/compare/xerj-vs-elasticsearch-local">Is there an Elasticsearch-compatible engine that isn't Elasticsearch?</a> <span class="mute">· same intent: search engine alternatives</span></li>
+    <li><a href="/answers/search-engine-without-docker">Is there a single-binary local search engine I can just run?</a> <span class="mute">· same intent: search engine alternatives</span></li>
+    <li><a href="/compare/xerj-vs-meilisearch">What's a local alternative to Meilisearch that indexes a folder by itself?</a> <span class="mute">· same intent: search engine alternatives</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

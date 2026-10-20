@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-26",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>THE SERVER PUSHED BACK WITH HTTP 429. DID XERJ AUTOINDEX LOSE THE RUN?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: EXIT CODES</span></div>
   <h1>The server pushed back with HTTP 429. Did xerj autoindex lose the run?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-26</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Why did xerj autoindex say the server pushed back with HTTP 429? The node shed load for a moment through its memory circuit breaker. autoindex lowers bulk concurrency, re-sends only the rejected items, and reports bulk_retries on the terminal line. It exits 1 only after 600 seconds of re-sends the node never accepts, and the same command resumes.</p>
+    <p class="key-fact"><strong>Key number:</strong> One bulk request carries at most 10,000 actions (<code class="inline">BULK_MAX_ACTIONS</code>), a fifth of the engine's default limit. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/esclient.rs">engine/crates/xerj-autoindex/src/esclient.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — No. A per-item HTTP 429 is the node shedding load for a moment. <code class="inline">xerj autoindex</code> lowers its bulk concurrency, re-sends only the items the node rejected, and continues. The terminal line then carries <code class="inline">bulk_retries=N</code>. The run exits 1 only after 600 seconds of re-sends that the node never takes, and the same command resumes it.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -260,6 +265,9 @@ error: the server kept rejecting …
     <li><a href="/answers/read-autoindex-progress">How do I read autoindex progress?</a></li>
     <li><a href="/answers/resume-interrupted-autoindex-run">The indexer died overnight. Do I have to start over?</a></li>
     <li><a href="/answers/autoindex-dataset-refused-by-server">One dataset was REFUSED by the server. Did I lose the whole index?</a></li>
+    <li><a href="/answers/autoindex-says-extract-the-archive-first">xerj autoindex recorded my Takeout .zip as junk and said to extract it first. Why?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/reindex-taking-forever">Reindexing my files is taking forever. What usually causes that?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

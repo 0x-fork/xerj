@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SEARCH KUBERNETES POD LOGS?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I search Kubernetes pod logs?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
+    <p>How do I grep for specific text across logs from multiple Kubernetes pods? Collect the pod logs to local disk first, then run xerj autoindex on the folder. In a captured run, one match_phrase request returned 18 hits, 6 from each of 3 pod log files. XERJ is not a collector, and the CRI format reads as prose.</p>
+    <p class="key-fact"><strong>Key number:</strong> One <code class="inline">match_phrase</code> request returned 18 hits, 6 per pod, across 3 collected pod logs. <span class="mute">(as of 2026-08-21 · source: the captured run documented on this page)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Collect the pod logs to local disk first, then run <code class="inline">xerj autoindex</code> on the folder. In a captured run, 1 <code class="inline">match_phrase</code> request returned 18 hits spread 6, 6 and 6 across 3 pod log files. XERJ is not the collector, and the CRI format was read as prose text.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -204,7 +209,7 @@
   <h2>The CRI format is read as prose, not as logs</h2>
   <p>All 3 files were detected as <code class="inline">txt-prose</code> in the <code class="inline">autoindex-catalog</code>. The <code class="inline">logs</code> family did not fire on this format, so no <code class="inline">ts</code>, <code class="inline">level</code> or <code class="inline">message</code> field was produced.</p>
   <p>Plan for that. The line text is searchable through <code class="inline">body</code>, so a full-text query for <code class="inline">level=error</code> finds the lines that hold that string. No typed level filter and no date range query exist on this index.</p>
-  <p>If you want typed fields, convert the lines to JSON or JSONL before you index them. Keep every JSONL line under 4,096 characters. A captured reproduction indexed 30 documents at 4,095 characters per line and 0 at 4,096, with the family flipping from <code class="inline">jsonl</code> to <code class="inline">json</code>.</p>
+  <p>If you want typed fields, convert the lines to JSON or JSONL before you index them. A JSONL line at or above 16 MB is skipped and counted as junk (<code class="inline">MAX_LINE</code>, <code class="inline">16 &lt;&lt; 20</code>, in <code class="inline">engine/crates/xerj-autoindex/src/extract/mod.rs</code>). The rest of the file still indexes.</p>
   <h2>What XERJ is not doing here</h2>
   <p>XERJ is not a log collector, not a log shipper and not a cluster component. The node fetched nothing over the network and observed 0 distinct non-loopback peers across 185 samples over its whole life.</p>
   <p>No container runtime and no cluster existed on the capture host. The 3 log files use the real kubelet path layout and the real CRI line format, but the fixture generator wrote them. The claim under test was reading such files from disk after you gather them, and that claim holds.</p>
@@ -224,14 +229,21 @@
   <h3>Did the aggregation agree with the hits in this run?</h3>
   <p>Yes. The terms aggregation on the same request reported 6 documents per file, the same as the hits. Compare both before you publish a count.</p>
   <h3>What if I convert the logs to JSONL first?</h3>
-  <p>Keep every line under 4,096 characters. A captured reproduction indexed 30 documents at 4,095 characters per line and 0 documents at 4,096.</p>
+  <p>A line at or above 16 MB is skipped and counted as junk. The cap is <code class="inline">MAX_LINE</code> (<code class="inline">16 &lt;&lt; 20</code>) in <code class="inline">engine/crates/xerj-autoindex/src/extract/mod.rs</code>. The rest of the file still indexes.</p>
   <h3>Where do these results come from?</h3>
   <p>All results come from run RUN-B, captured on 2026-08-21 on a 16-core AMD EPYC 9645 host.</p>
+  <h2>Evidence</h2>
+  <ul>
+    <li>JSONL line cap is 16 MB (MAX_LINE = 16 &lt;&lt; 20). A line at or above that length is skipped; the rest of the file still indexes. — <code>engine/crates/xerj-autoindex/src/extract/mod.rs</code></li>
+  </ul>
   <h2>Related</h2>
   <ul>
     <li><a href="/answers/search-json-and-jsonl-logs">What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?</a></li>
     <li><a href="/answers/search-gzip-logs-without-zgrep">How do I search gzipped logs without decompressing the whole file — including when JSONL sits next to them?</a></li>
     <li><a href="/answers/cheap-low-volume-log-search">What can I use for low-volume log search?</a></li>
+    <li><a href="/answers/search-all-pdfs-in-a-folder">I downloaded a bunch of papers as PDFs. How do I search across them?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/is-pdf-indexing-efficient">Is it efficient to index PDF files?</a> <span class="mute">· same intent: logs and docs</span></li>
+    <li><a href="/answers/read-indexed-email-and-pdf-folder">I indexed a folder of email and PDFs. How do I actually read what it found?</a> <span class="mute">· same intent: logs and docs</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

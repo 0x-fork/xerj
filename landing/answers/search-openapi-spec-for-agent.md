@@ -2,11 +2,15 @@
 ---
 title: "Let an agent look up endpoints in an API spec"
 canonical: "https://xerj.org/answers/search-openapi-spec-for-agent"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/search-openapi-spec-for-agent.md"
 ---
 
 # My agent needs to look up endpoints in a big OpenAPI spec and the SDK markdown. What's the right way?
+
+**Short answer** (updated 2026-10-19): My agent needs to look up endpoints in a big OpenAPI spec; what's the right way? Index the spec file itself with xerj autoindex and let the agent query it. In a captured run a route name, a description and an operationId each returned 2 hits, 1 per JSON and YAML serialization. Extraction is format-based: body and title only.
+
+**Key number:** Each of 3 lookups (route, description, operationId) returned 2 hits, 1 per serialization of the same spec. (as of 2026-08-21; source: the captured run documented on this page)
 
 **TL;DR** — XERJ makes an OpenAPI document queryable when `xerj autoindex` reads the file from disk. In a captured run, a route name, a description and an `operationId` each returned 2 hits, 1 per serialization. Extraction is format-based: the whole spec produced only `body` and `title`.
 
@@ -145,3 +149,6 @@ Read the hits, not only the buckets. A captured matrix shows `match_phrase` matc
 - [How do I find every place a config key is set across YAML and XML in a repo?](/answers/search-yaml-xml-config-repository)
 - [I need my agent to find a passage and cite the file, not dump the whole tree. How?](/answers/code-search-mcp-for-claude-code)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
+- [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep) (same intent: code search for agents)
+- [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents) (same intent: code search for agents)
+- [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete) (same intent: code search for agents)

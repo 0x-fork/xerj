@@ -2,11 +2,15 @@
 ---
 title: "How do I keep a XERJ index up to date as files change?"
 canonical: "https://xerj.org/answers/keep-index-current-as-files-change"
-updated: "2026-09-20"
+updated: "2026-10-19"
 source: "content/answers/keep-index-current-as-files-change.md"
 ---
 
 # How do I keep a search index up to date as files change, without re-indexing everything?
+
+**Short answer** (updated 2026-10-19): How do I keep a search index up to date as files change, without re-indexing everything? Run xerj autoindex ./folder --watch --no-graph. It indexes once, then reindexes only what the filesystem reports changed. Measured idle cost was 0.00 CPU-seconds per minute, against 1.7 s and a full corpus re-read for every timed re-run.
+
+**Key number:** The --debounce quiet period accepts at most 60,000 ms (`MAX_DEBOUNCE_MS`); longer than a minute is a timer, not a debounce. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/cli.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/cli.rs))
 
 **TL;DR** — `xerj autoindex ./folder --watch --no-graph` indexes once, then
 reindexes what changed. At idle it costs nothing; a re-run on a timer costs a
@@ -233,3 +237,6 @@ A write that produces no filesystem event and leaves size, mtime and inode ident
 - [My codebase indexer says indexed but I don't see my code. How do I check it actually finished?](/answers/check-codebase-index-is-complete)
 - [The indexer exited 3 (or 4). Did it fail?](/answers/autoindex-exit-codes)
 - [How should an agent figure out what's in a messy data folder before searching?](/answers/catalog-files-with-autoindex-map)
+- [How do I keep an index current when the files live in an object store?](/answers/keep-s3-bucket-index-current) (same intent: operating autoindex)
+- [How do I estimate folder-indexing time?](/answers/estimate-autoindex-time-before-running) (same intent: operating autoindex)
+- [How do I read autoindex progress?](/answers/read-autoindex-progress) (same intent: operating autoindex)

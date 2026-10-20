@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>SHOULD AGENT MEMORY USE A KNOWLEDGE GRAPH?</div>
   <div class="kicker"><span>ANSWERS · AGENT MEMORY: LINK RETRIEVAL</span></div>
   <h1>Should agent memory use a knowledge graph?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Is anyone using knowledge graphs for LLM agent memory and context management? Links help, but XERJ is not a graph database. It builds a bounded, graph-shaped link index over documents it already indexed. Our capture produced 7 edges over 6 documents, answered 1 hop with 3 edges and 2 hops with 6, and refused 3 hops.</p>
+    <p class="key-fact"><strong>Key number:</strong> The shared-term detector links a document to at most 5 others (<code class="inline">MAX_EDGES_PER_DOC</code>). <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/detect/sharedterm.rs">engine/crates/xerj-autoindex/src/detect/sharedterm.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Links help, and XERJ is not a graph database. XERJ builds a bounded, graph-shaped link index over the documents it already indexed. Our capture produced 7 edges over 6 documents, answered 1 hop with 3 edges and 2 hops with 6, and refused 3 hops.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -248,6 +253,9 @@ Iterate: expand again from this response's 'reachable' ids.
     <li><a href="/answers/evidence-for-agent-memory-links">How can agent-memory links retain evidence?</a></li>
     <li><a href="/answers/private-agent-memory-namespaces">How do I give two agents private memory on one laptop?</a></li>
     <li><a href="/answers/coding-agent-memory-across-sessions">How do people store user preferences so an agent can recall them next week?</a></li>
+    <li><a href="/answers/agent-memory-without-postgres-qdrant">What's a simple way to give an agent long-term memory on my laptop without Qdrant?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/compare/xerj-vs-vector-database">Should my agent call a search API or stand up Qdrant for persistent memory?</a> <span class="mute">· same intent: agent memory</span></li>
+    <li><a href="/answers/store-agent-memory-without-llm-call">How do I stop an agent memory store from filling with near-duplicate notes?</a> <span class="mute">· same intent: agent memory</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

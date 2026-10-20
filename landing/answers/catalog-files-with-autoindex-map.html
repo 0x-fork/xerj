@@ -15,7 +15,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>How do I find out what is in a messy data folder?</title>
+<title>Find out what is in a messy data folder before searching</title>
 <meta name="description" content="Point xerj autoindex at the folder, then read xerj autoindex map: every dataset it inferred, the fields and types, the time range, and every file it refused.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <link rel="canonical" href="https://xerj.org/answers/catalog-files-with-autoindex-map">
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
-<meta property="og:title" content="How do I find out what is in a messy data folder?">
+<meta property="og:title" content="Find out what is in a messy data folder before searching">
 <meta property="og:description" content="Point xerj autoindex at the folder, then read xerj autoindex map: every dataset it inferred, the fields and types, the time range, and every file it refused.">
 <meta property="og:url" content="https://xerj.org/answers/catalog-files-with-autoindex-map">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
@@ -36,7 +36,7 @@
 <meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="How do I find out what is in a messy data folder?">
+<meta name="twitter:title" content="Find out what is in a messy data folder before searching">
 <meta name="twitter:description" content="Point xerj autoindex at the folder, then read xerj autoindex map: every dataset it inferred, the fields and types, the time range, and every file it refused.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
@@ -70,13 +70,13 @@
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": "How do I find out what is in a messy data folder?",
+  "headline": "Find out what is in a messy data folder before searching",
   "description": "Point xerj autoindex at the folder, then read xerj autoindex map: every dataset it inferred, the fields and types, the time range, and every file it refused.",
   "url": "https://xerj.org/answers/catalog-files-with-autoindex-map",
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-21",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW SHOULD AN AGENT FIGURE OUT WHAT'S IN A MESSY DATA FOLDER BEFORE SEARCHING?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How should an agent figure out what's in a messy data folder before searching?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-21</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How should an agent figure out what is inside a messy data folder before searching? Run xerj autoindex on the folder, then read xerj autoindex map. The map lists every dataset it inferred, each field with type, cardinality and null share, the time range, a ready query, and every file it refused.</p>
+    <p class="key-fact"><strong>Key number:</strong> Type inference keeps at most 512 fields per dataset (<code class="inline">MAX_FIELDS_PER_DATASET</code>), so a map never lists more than that for one dataset. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/infer/mod.rs">engine/crates/xerj-autoindex/src/infer/mod.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — <code class="inline">xerj autoindex map</code> prints the catalog that the last run inferred. In our capture the map described 2 datasets from a 6-file folder. Each dataset carried every field with its type, its cardinality, its null share and a ready-to-send query.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -256,6 +261,9 @@
     <li><a href="/answers/index-multiple-csv-files">I have a directory of CSV exports. How do I query them without opening each one in Excel?</a></li>
     <li><a href="/answers/read-autoindex-progress">How do I read autoindex progress?</a></li>
     <li><a href="/docs/recipes/zero-config-autoindex">Zero-config autoindex</a></li>
+    <li><a href="/answers/how-xerj-autoindexes-a-folder">I want to point something at a folder and then ask questions about what's in it. What should I use?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/search-zendesk-ticket-json-export">I have a JSON export of Jira issues (or Zendesk tickets). How do I search it like a help-center search?</a> <span class="mute">· same intent: JSONL and data files</span></li>
+    <li><a href="/answers/index-csv-with-many-columns">How do I index a CSV with many columns?</a> <span class="mute">· same intent: JSONL and data files</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

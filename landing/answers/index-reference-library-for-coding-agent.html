@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SET UP REFERENCE CODING SO THE AGENT RETRIEVES A MECHANISM BEFORE WRITING CODE?</div>
   <div class="kicker"><span>ANSWERS · CODING AGENTS: REFERENCE RETRIEVAL</span></div>
   <h1 class="h1-long">How do I set up reference coding so the agent retrieves a mechanism before writing code?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I set up reference coding so the agent retrieves a mechanism before writing code? Clone the library you are about to write against, index it with xerj autoindex, and have the agent retrieve the passage before it writes. A published study measured a gain on code the model cannot recall, and a loss on code it knows.</p>
+    <p class="key-fact"><strong>Key number:</strong> Across 16 runs in four languages, the xerj arm solved 16/16 with 9,982 output tokens at $1.58. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/data/results-multilang-final.json">docs/case-studies/reference-coding/data/results-multilang-final.json</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — Clone the library you are about to write against. Index it with <code class="inline">xerj autoindex</code>. Let the agent retrieve the passage before it writes code. A published study measured a gain on code the model cannot recall, and a loss on code it knows.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -216,7 +221,7 @@ xerj autoindex ./ref --url http://127.0.0.1:9200 --prefix ref --state-dir ./stat
     </tbody>
   </table>
   <p>The verdict was objective: the generated code had to compile and pass a hidden test the model never saw.</p>
-  <p><strong>Across five languages, 16 runs.</strong> The native and xerj arms both solved 16/16. The xerj arm spent 9,982 output tokens at $1.58; the native arm spent 26,477 output tokens at $3.27. The bare arm solved 11/16 at $11.18.</p>
+  <p><strong>Across four languages (Python, JavaScript, C and Java), 16 runs.</strong> The native and xerj arms both solved 16/16. The xerj arm spent 9,982 output tokens at $1.58; the native arm spent 26,477 output tokens at $3.27. The bare arm solved 11/16 at $11.18.</p>
   <p><strong>On seven domains carrying a runtime contract the compiler cannot warn about, 21 runs.</strong> The bare arm solved 1/21 while burning $21.90. The native arm solved 21/21 at $4.26 and the xerj arm solved 21/21 at $3.38.</p>
   <p>Both tracks carry the same caveat: <strong>the reference libraries were written for the study</strong>, so no model could have memorized them. That is what makes the contrast measurable, and it is also the reason the result does not automatically transfer to your repository.</p>
   <h2>Where retrieval loses</h2>
@@ -259,7 +264,7 @@ xerj autoindex ./ref --url http://127.0.0.1:9200 --prefix ref --state-dir ./stat
   <p>No. The 13 reference libraries were written for the study so they could not be in a training set. A real private codebase is the untested end state, and the page says so rather than assuming it transfers.</p>
   <h2>Evidence</h2>
   <ul>
-    <li>Across five languages, 16 runs: the xerj arm solved 16/16 with 9,982 output tokens at $1.58, the native arm solved 16/16 with 26,477 output tokens at $3.27, and the bare arm solved 11/16 at $11.18. — <code>docs/case-studies/reference-coding/data/results-multilang-final.json</code></li>
+    <li>Across four languages (Python, JavaScript, C and Java), 16 runs: the xerj arm solved 16/16 with 9,982 output tokens at $1.58, the native arm solved 16/16 with 26,477 output tokens at $3.27, and the bare arm solved 11/16 at $11.18. — <code>docs/case-studies/reference-coding/data/results-multilang-final.json</code></li>
     <li>On the seven domains with an unrecallable runtime contract, 21 runs: the bare arm solved 1/21 at $21.90, the native arm 21/21 at $4.26, and the xerj arm 21/21 at $3.38. — <code>docs/case-studies/reference-coding/CASE_STUDY.md:569</code></li>
     <li>On memorized logic, 6 runs: the bare arm solved 6/6 at $1.49, the native arm 6/6 at $9.14, and the xerj arm 5/6 at $4.40. Retrieval lost that track. — <code>docs/case-studies/reference-coding/data/results-realism.json</code></li>
     <li>On memorized bulk data, 3 runs: every arm solved 3/3, the native arm at $0.60 and the xerj arm at $1.43. Retrieval was overhead. — <code>docs/case-studies/reference-coding/data/results-search.json</code></li>
@@ -272,6 +277,9 @@ xerj autoindex ./ref --url http://127.0.0.1:9200 --prefix ref --state-dir ./stat
     <li><a href="/answers/code-search-mcp-for-claude-code">I need my agent to find a passage and cite the file, not dump the whole tree. How?</a></li>
     <li><a href="/answers/syntax-aware-code-search-refactoring">How do I run syntax-aware code search?</a></li>
     <li><a href="/compare/xerj-vs-ripgrep-for-code-agents">Is ripgrep enough for a coding agent, or do I need a code index?</a></li>
+    <li><a href="/answers/rebuild-reference-corpus-index">xerj corpus index --fresh failed. How do I rebuild a corpus index?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a> <span class="mute">· same intent: code search for agents</span></li>
+    <li><a href="/compare/xerj-vs-ast-grep">ast-grep vs a code index for an agent?</a> <span class="mute">· same intent: code search for agents</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

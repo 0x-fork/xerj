@@ -15,7 +15,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RAG without a vector database</title>
+<title>RAG without a vector database: one hybrid index</title>
 <meta name="description" content="Build a RAG retrieval layer on one XERJ index. One hybrid request fuses BM25 and kNN with Reciprocal Rank Fusion, and no second service runs.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <link rel="canonical" href="https://xerj.org/answers/rag-without-vector-database">
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
-<meta property="og:title" content="RAG without a vector database">
+<meta property="og:title" content="RAG without a vector database: one hybrid index">
 <meta property="og:description" content="Build a RAG retrieval layer on one XERJ index. One hybrid request fuses BM25 and kNN with Reciprocal Rank Fusion, and no second service runs.">
 <meta property="og:url" content="https://xerj.org/answers/rag-without-vector-database">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
@@ -36,7 +36,7 @@
 <meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="RAG without a vector database">
+<meta name="twitter:title" content="RAG without a vector database: one hybrid index">
 <meta name="twitter:description" content="Build a RAG retrieval layer on one XERJ index. One hybrid request fuses BM25 and kNN with Reciprocal Rank Fusion, and no second service runs.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
@@ -70,7 +70,7 @@
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": "RAG without a vector database",
+  "headline": "RAG without a vector database: one hybrid index",
   "description": "Build a RAG retrieval layer on one XERJ index. One hybrid request fuses BM25 and kNN with Reciprocal Rank Fusion, and no second service runs.",
   "url": "https://xerj.org/answers/rag-without-vector-database",
   "image": "https://xerj.org/og/xerj-card.png",
@@ -156,6 +156,11 @@
   <div class="kicker"><span>ANSWERS · HYBRID RETRIEVAL: ARCHITECTURE</span></div>
   <h1>How do I build RAG without a vector database?</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I build RAG without a vector database? Keep the inverted index and the dense vectors in one XERJ index and retrieve with one hybrid request, which fuses a BM25 sub-query and a kNN sub-query with Reciprocal Rank Fusion. No second service runs. Our 20-document capture returned d08, d04 and d10.</p>
+    <p class="key-fact"><strong>Key number:</strong> On BEIR SciFact, hybrid RRF with the opt-in neural embedder scored nDCG@10 0.6993, above both BM25 (0.6572) and vectors alone (0.6764). <span class="mute">(as of 2026-09-18 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/beir-hybrid/results/scifact.txt">benchmarks/beir-hybrid/results/scifact.txt</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — XERJ holds the inverted index and the dense vector in one index, so a RAG retrieval layer needs no second service. One <code class="inline">hybrid</code> request fuses a BM25 sub-query and a kNN sub-query with Reciprocal Rank Fusion. Our 20-document capture returned <code class="inline">d08</code>, <code class="inline">d04</code> and <code class="inline">d10</code>.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -255,6 +260,9 @@
     <li><a href="/compare/xerj-vs-vector-database">Should my agent call a search API or stand up Qdrant for persistent memory?</a></li>
     <li><a href="/docs/recipes/hybrid-search">Hybrid search</a></li>
     <li><a href="/answers/retrieval-that-says-not-found-with-file-line-citations">Retrieval that says not found, and cites file and line when it does answer</a></li>
+    <li><a href="/answers/mcp-api-search-or-vector-search">Should an agent use API search or vector search?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/how-xerj-combines-search">How does XERJ combine BM25 and kNN?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/hybrid-search-quality-measured-ndcg">How much better is hybrid search than BM25? Measured nDCG numbers</a> <span class="mute">· same intent: retrieval research and eval</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

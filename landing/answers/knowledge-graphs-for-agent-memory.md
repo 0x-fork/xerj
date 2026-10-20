@@ -2,11 +2,15 @@
 ---
 title: "Should agent memory use a graph?"
 canonical: "https://xerj.org/answers/knowledge-graphs-for-agent-memory"
-updated: "2026-08-23"
+updated: "2026-10-19"
 source: "content/answers/knowledge-graphs-for-agent-memory.md"
 ---
 
 # Should agent memory use a knowledge graph?
+
+**Short answer** (updated 2026-10-19): Is anyone using knowledge graphs for LLM agent memory and context management? Links help, but XERJ is not a graph database. It builds a bounded, graph-shaped link index over documents it already indexed. Our capture produced 7 edges over 6 documents, answered 1 hop with 3 edges and 2 hops with 6, and refused 3 hops.
+
+**Key number:** The shared-term detector links a document to at most 5 others (`MAX_EDGES_PER_DOC`). (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/detect/sharedterm.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/detect/sharedterm.rs))
 
 **TL;DR** — Links help, and XERJ is not a graph database. XERJ builds a bounded, graph-shaped link index over the documents it already indexed. Our capture produced 7 edges over 6 documents, answered 1 hop with 3 edges and 2 hops with 6, and refused 3 hops.
 
@@ -147,3 +151,6 @@ In an index named `.xerj-memory-{brain}-edges`. `autoindex` creates one per inde
 - [How can agent-memory links retain evidence?](/answers/evidence-for-agent-memory-links)
 - [How do I give two agents private memory on one laptop?](/answers/private-agent-memory-namespaces)
 - [How do people store user preferences so an agent can recall them next week?](/answers/coding-agent-memory-across-sessions)
+- [What's a simple way to give an agent long-term memory on my laptop without Qdrant?](/answers/agent-memory-without-postgres-qdrant) (same intent: agent memory)
+- [Should my agent call a search API or stand up Qdrant for persistent memory?](/compare/xerj-vs-vector-database) (same intent: agent memory)
+- [How do I stop an agent memory store from filling with near-duplicate notes?](/answers/store-agent-memory-without-llm-call) (same intent: agent memory)

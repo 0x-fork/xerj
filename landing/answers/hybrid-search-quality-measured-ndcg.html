@@ -156,6 +156,11 @@
   <div class="kicker"><span>ANSWERS · HYBRID RETRIEVAL: QUALITY</span></div>
   <h1>How much better is hybrid search than BM25? Measured nDCG numbers</h1>
   <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How much better is hybrid search than BM25 alone? On two public BEIR datasets XERJ's hybrid RRF beat both BM25 and vectors: nDCG@10 0.6993 against 0.6572 on SciFact and 0.3448 against 0.3016 on NFCorpus. Those runs used --embed-mode neural with all-MiniLM-L6-v2; the default lexical embedder is not covered.</p>
+    <p class="key-fact"><strong>Key number:</strong> On BEIR NFCorpus (323 test queries, 3,633 documents), hybrid RRF scored nDCG@10 0.3448 against 0.3016 for BM25. <span class="mute">(as of 2026-09-18 · source: <a href="https://github.com/xerj-org/xerj/blob/main/benchmarks/beir-hybrid/results/nfcorpus.txt">benchmarks/beir-hybrid/results/nfcorpus.txt</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — On two public BEIR datasets, XERJ's hybrid RRF beat BM25 alone and beat vectors alone: nDCG@10 0.6993 against 0.6572 on SciFact, and 0.3448 against 0.3016 on NFCorpus. These runs used <code class="inline">--embed-mode neural</code> with all-MiniLM-L6-v2. The default embedder is lexical feature hashing, and these vector figures do not apply to it.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -259,6 +264,9 @@
     <li><a href="/answers/rerank-search-results-calibrated-judge">How do I rerank search results with a relevance judge?</a></li>
     <li><a href="/answers/local-embeddings-without-openai-api">I want local search that works offline, no cloud embeddings. What are my options?</a></li>
     <li><a href="/answers/retrieval-that-says-not-found-with-file-line-citations">Retrieval that says not found, and cites file and line when it does answer</a></li>
+    <li><a href="/answers/rag-without-vector-database">How do I build RAG without a vector database?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/how-xerj-combines-search">How does XERJ combine BM25 and kNN?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
+    <li><a href="/answers/mcp-api-search-or-vector-search">Should an agent use API search or vector search?</a> <span class="mute">· same intent: retrieval research and eval</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

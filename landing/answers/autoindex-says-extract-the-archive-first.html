@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-20",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>XERJ AUTOINDEX RECORDED MY TAKEOUT .ZIP AS JUNK AND SAID TO EXTRACT IT FIRST. WHY?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: EXIT CODES</span></div>
   <h1 class="h1-long">xerj autoindex recorded my Takeout .zip as junk and said to extract it first. Why?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-20</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>Why does xerj autoindex say to extract a zip first? Because autoindex never opens archives. A .zip, .tgz, .7z, .rar or .xz is marked as junk with a reason that quotes the extraction command, the rest of the folder is indexed, and the run exits 3. Extract the archive and run the same command again.</p>
+    <p class="key-fact"><strong>Key number:</strong> autoindex classifies a file from its first 8,192 bytes (<code class="inline">PREFIX</code> in the sniffer), which is how an archive is recognised by magic bytes rather than by its extension. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/sniff.rs">engine/crates/xerj-autoindex/src/sniff.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — autoindex does not open archives. When it meets a <code class="inline">.zip</code>, <code class="inline">.tgz</code>, <code class="inline">.7z</code>, <code class="inline">.rar</code> or <code class="inline">.xz</code>, it marks the file as junk with a reason that quotes the extraction command, and prints that under the run's summary. The run finishes with exit code 3 and the rest of the folder is indexed. Extract the archive and run the same command on the extracted folder.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -215,6 +220,9 @@ xerj autoindex ~/mail-export --url http://127.0.0.1:9200 --prefix mail --progres
     <li><a href="/answers/search-gmail-takeout-mbox-locally">I exported my Gmail with Google Takeout. How do I search that mbox file locally?</a></li>
     <li><a href="/answers/autoindex-exit-codes">The indexer exited 3 (or 4). Did it fail?</a></li>
     <li><a href="/answers/why-autoindex-skipped-files">Why would a folder search miss files that I can see on disk?</a></li>
+    <li><a href="/answers/autoindex-dataset-refused-by-server">One dataset was REFUSED by the server. Did I lose the whole index?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/autoindex-server-back-pressure-429">The server pushed back with HTTP 429. Did xerj autoindex lose the run?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/read-autoindex-progress">How do I read autoindex progress?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

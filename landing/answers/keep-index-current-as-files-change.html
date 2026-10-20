@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-19",
-  "dateModified": "2026-09-20",
+  "dateModified": "2026-10-19",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,7 +155,12 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I KEEP A SEARCH INDEX UP TO DATE AS FILES CHANGE, WITHOUT RE-INDEXING EVERYTHING?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: FRESHNESS</span></div>
   <h1 class="h1-long">How do I keep a search index up to date as files change, without re-indexing everything?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-09-20</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-10-19</div>
+  <div class="prompt-card answer-first" id="short-answer">
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <p>How do I keep a search index up to date as files change, without re-indexing everything? Run xerj autoindex ./folder --watch --no-graph. It indexes once, then reindexes only what the filesystem reports changed. Measured idle cost was 0.00 CPU-seconds per minute, against 1.7 s and a full corpus re-read for every timed re-run.</p>
+    <p class="key-fact"><strong>Key number:</strong> The --debounce quiet period accepts at most 60,000 ms (<code class="inline">MAX_DEBOUNCE_MS</code>); longer than a minute is a timer, not a debounce. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/cli.rs">engine/crates/xerj-autoindex/src/cli.rs</a>)</span></p>
+  </div>
   <p><strong>TL;DR</strong> — <code class="inline">xerj autoindex ./folder --watch --no-graph</code> indexes once, then reindexes what changed. At idle it costs nothing; a re-run on a timer costs a full walk and a full re-hash of the corpus on every tick.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -259,6 +264,9 @@ xerj autoindex ./notes --url http://127.0.0.1:9200 \
     <li><a href="/answers/check-codebase-index-is-complete">My codebase indexer says indexed but I don't see my code. How do I check it actually finished?</a></li>
     <li><a href="/answers/autoindex-exit-codes">The indexer exited 3 (or 4). Did it fail?</a></li>
     <li><a href="/answers/catalog-files-with-autoindex-map">How should an agent figure out what's in a messy data folder before searching?</a></li>
+    <li><a href="/answers/keep-s3-bucket-index-current">How do I keep an index current when the files live in an object store?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/estimate-autoindex-time-before-running">How do I estimate folder-indexing time?</a> <span class="mute">· same intent: operating autoindex</span></li>
+    <li><a href="/answers/read-autoindex-progress">How do I read autoindex progress?</a> <span class="mute">· same intent: operating autoindex</span></li>
   </ul>
 </main>
 <nav class="docs-nav" aria-label="Article sections">

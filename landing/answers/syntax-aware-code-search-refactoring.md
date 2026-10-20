@@ -2,11 +2,15 @@
 ---
 title: "How do I run syntax-aware code search?"
 canonical: "https://xerj.org/answers/syntax-aware-code-search-refactoring"
-updated: "2026-08-21"
+updated: "2026-10-19"
 source: "content/answers/syntax-aware-code-search-refactoring.md"
 ---
 
 # How do I run syntax-aware code search?
+
+**Short answer** (updated 2026-10-19): Is there a syntax-aware code search tool for refactoring? XERJ gives you two code queries on one index: match on body for raw text, and match on defs for declared symbols, which returns a symbols array with kind, name and line. It extracts definitions only and rewrites nothing; for structural rewrites use ast-grep.
+
+**Key number:** XERJ's tree-sitter registry covers 36 languages, pinned by a unit test. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/extract/code.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/code.rs))
 
 **TL;DR** — XERJ gives you 2 code queries on the same index: a `match` on `body` for raw text, and a `match` on `defs` for declared symbols. The definition query returns a `symbols` array with a kind, a name and a line. Extraction is definitions only.
 
@@ -87,7 +91,7 @@ One miss is worth naming. The file `src/query.go` declares `MergeSegments`, and 
 
 XERJ extracts definitions only. There is no call graph, no import graph and no cross-file reference resolution, so XERJ does not find callers of a symbol.
 
-That boundary decides the tool choice. Use XERJ to locate every declaration and every textual occurrence across 34 languages. Use a language server or a compiler plugin for a rename that must be sound.
+That boundary decides the tool choice. Use XERJ to locate every declaration and every textual occurrence across 36 languages. Use a language server or a compiler plugin for a rename that must be sound.
 
 ## Caps and failure behavior
 
@@ -111,7 +115,7 @@ No. Extraction is definitions only, with no call graph and no cross-file referen
 
 ### Which languages does XERJ parse?
 
-34 languages through tree-sitter, including Rust, Go, Python, TypeScript, Java and C++. Our capture exercised `rust`, `python` and `go`.
+36 languages through tree-sitter, including Rust, Go, Python, TypeScript, Java and C++. Our capture exercised `rust`, `python` and `go`.
 
 ### Does case matter in a symbol query?
 
@@ -130,3 +134,6 @@ Nothing is lost. A parse failure is never fatal, and XERJ still indexes the file
 - [How do I stop my agent from reading the whole repo into context?](/answers/index-monorepo-for-agent)
 - [Is ripgrep enough for a coding agent, or do I need a code index?](/compare/xerj-vs-ripgrep-for-code-agents)
 - [Reference-coding for Claude Code](/case-studies/reference-coding)
+- [How do I audit a PHP codebase with an index instead of grepping 1,400 files?](/answers/audit-php-codebase-with-an-index) (same intent: code search for agents)
+- [How do I find every place a config key is set across YAML and XML in a repo?](/answers/search-yaml-xml-config-repository) (same intent: code search for agents)
+- [ast-grep vs a code index for an agent?](/compare/xerj-vs-ast-grep) (same intent: code search for agents)

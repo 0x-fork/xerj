@@ -1,5 +1,5 @@
 ---
-title: "XERJ compared with ripgrep for code agents"
+title: "ripgrep vs a code index for coding agents: 30 tasks"
 h1: "Is ripgrep enough for a coding agent, or do I need a code index?"
 description: "30 disclosed tasks on one 331-file code tree. The two tools agree on 18. ripgrep wins 5 named tasks outright, including a substring inside an identifier."
 slug: "xerj-vs-ripgrep-for-code-agents"
@@ -12,6 +12,15 @@ author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index one code tree with xerj autoindex, then run the same 30 literal, phrase and symbol tasks through ripgrep and through the index, reduce both sides to the set of distinct files, publish every disagreement in both directions, and say which tool you would reach for first."
+answer: "Is ripgrep enough for a coding agent, or do I need a code index? Keep ripgrep for one-off questions and add an index when an agent asks one tree many questions. On one 331-file tree the two named the same files on 18 of 30 disclosed tasks, and ripgrep 14.1.1 won 5 outright."
+key_fact: "ripgrep has 69,257 GitHub stars and its latest release is 15.2.0 (2026-07-15); the 30-task run used 14.1.1."
+key_fact_source: "https://github.com/BurntSushi/ripgrep"
+key_fact_date: "2026-10-19"
+intent_group: "code search for agents"
+queries:
+  - "grep vs semantic search for coding agents"
+  - "local code search MCP Claude Code fewer tokens than grep"
+  - "ripgrep alternative for agents"
 commands:
   - cmd: "xerj autoindex ./crates --url http://127.0.0.1:9510 --prefix c07 --state-dir ./state-c07 --progress plain --disable-feedback"
     note: "Build the index whose cost ripgrep never pays."
@@ -117,7 +126,7 @@ The index won on symbol definitions and on analyzed phrases.
 | T26 | the alternation `(HNSW\|IVF\|PQ)` | 17 files | **24 files** |
 | T18 | the phrase `index not found` | 3 files | **4 files** |
 
-For T22 and T20 ripgrep needs a language-specific regular expression, here `struct\s+Ctx` and `pub\s+async\s+fn\s+run`. XERJ queries the extracted `defs` field, which is language-independent and covers 34 languages with one query.
+For T22 and T20 ripgrep needs a language-specific regular expression, here `struct\s+Ctx` and `pub\s+async\s+fn\s+run`. XERJ queries the extracted `defs` field, which is language-independent and covers 36 languages with one query.
 
 ```sh
 curl -s -XPOST 'http://127.0.0.1:9510/c07-*/_search' -H 'content-type: application/json' -d '{"query":{"match":{"defs":"Ctx"}},"size":100,"_source":["ax_path"],"track_total_hits":true}'
@@ -169,7 +178,7 @@ Choose ripgrep for tiny trees and for one-off questions. Several hundred queries
 
 ## When the index is worth its cost
 
-Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One `defs` query replaces a per-language regular expression and covers 34 languages.
+Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One `defs` query replaces a per-language regular expression and covers 36 languages.
 
 Choose the index when you want structure alongside text. The index carries `language`, `symbol_count`, aggregations and `_source` narrowing. ripgrep returns lines, and lines are all it returns.
 
