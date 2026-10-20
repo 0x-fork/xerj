@@ -27836,17 +27836,69 @@ fn es_aggregator_class_name_ctx(
     }
 }
 
+/// `*`-only glob over an index, alias or field name: `*` matches any run of
+/// characters (including none), anywhere in the pattern, any number of times.
+/// Every other character is literal, as in ES index patterns (`?` is not a
+/// wildcard there).
+///
+/// This used to handle one leading or one trailing `*` and fall back to
+/// string equality for anything else, so `logs-*-2026` (#1933) and
+/// `*-app-*` matched nothing and `_search` answered 0 hits with no error.
 fn glob_match_simple(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let mut parts = pattern.split('*');
+    // `split` always yields at least one item; the first is anchored at the
+    // start of `name`, the last at its end, the middle ones float in order.
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let middle: Vec<&str> = parts.collect();
+    let Some((last, middle)) = middle.split_last() else {
         return true;
+    };
+    for part in middle {
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return name.starts_with(prefix);
+    rest.ends_with(last)
+}
+
+#[cfg(test)]
+mod glob_match_simple_tests {
+    use super::glob_match_simple;
+
+    #[test]
+    fn a_star_anywhere_in_an_index_pattern_matches() {
+        // #1933: a mid-name `*` used to fall through to string equality.
+        assert!(glob_match_simple("logs-*-2026", "logs-app-2026"));
+        assert!(glob_match_simple("logs-*-2026", "logs--2026"));
+        assert!(!glob_match_simple("logs-*-2026", "logs-app-2025"));
+        assert!(glob_match_simple("*-app-*", "logs-app-2026"));
+        assert!(glob_match_simple("l*s-*-20*6", "logs-app-2026"));
+        assert!(
+            !glob_match_simple("ab*ba", "aba"),
+            "anchors may not overlap"
+        );
+        assert!(glob_match_simple("a**b", "ab"));
+        // Unchanged shapes.
+        assert!(glob_match_simple("*", "anything"));
+        assert!(glob_match_simple("logs-*", "logs-app-2026"));
+        assert!(glob_match_simple("*-2026", "logs-app-2026"));
+        assert!(glob_match_simple("logs-app-2026", "logs-app-2026"));
+        assert!(!glob_match_simple("logs-app", "logs-app-2026"));
+        assert!(
+            !glob_match_simple("logs-?pp-2026", "logs-app-2026"),
+            "`?` is literal"
+        );
     }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return name.ends_with(suffix);
-    }
-    pattern == name
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
