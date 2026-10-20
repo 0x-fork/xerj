@@ -7,7 +7,7 @@ cluster: "Files and formats"
 question: "Is there a syntax-aware code search tool for refactoring?"
 intent: "tool-selection"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -96,6 +96,8 @@ One miss is worth naming. The file `src/query.go` declares `MergeSegments`, and 
 XERJ extracts definitions only. There is no call graph, no import graph and no cross-file reference resolution, so XERJ does not find callers of a symbol.
 
 That boundary decides the tool choice. Use XERJ to locate every declaration and every textual occurrence across 36 languages. Use a language server or a compiler plugin for a rename that must be sound.
+
+What an agent reads, against the lines grep prints, is [local code search over MCP](/answers/local-code-search-mcp-fewer-tokens-than-grep).
 
 ## Caps and failure behavior
 

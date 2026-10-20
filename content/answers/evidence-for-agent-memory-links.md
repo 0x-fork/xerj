@@ -7,7 +7,7 @@ cluster: "Agent memory: provenance"
 question: "Agent memory: knowledge graphs aren't enough, we need a know-how graph"
 intent: "informational"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -70,6 +70,8 @@ The quote is useful because the detectors are structural rather than interpretiv
 Confidence is a per-detector constant, not a learned number. Our run carried 0.99 on `sequence` edges, 0.95 on `wikilink` edges and 0.4 on `same_dir` edges.
 
 XERJ invents nothing to fill a gap. XERJ renders a real quote, a structural rationale and an asserted link as three different things.
+
+Code lookup follows the same rule — exit 1 and no invented hit when a symbol is missing, file:line when it answers — on [retrieval that says not found](/answers/retrieval-that-says-not-found-with-file-line-citations).
 
 ## An asserted link carries no evidence
 

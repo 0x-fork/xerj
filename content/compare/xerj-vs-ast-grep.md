@@ -7,7 +7,7 @@ cluster: "Comparison: code retrieval"
 question: "ast-grep vs a code index for an agent?"
 intent: "comparison"
 published: "2026-08-22"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -149,6 +149,8 @@ Choose the index when one tree answers many questions in a session. The build co
 Choose it when the question is about symbols rather than bytes. One definition query then replaces a regular expression per language.
 
 Choose it when an agent needs the answer as a cited passage. The same binary also holds agent memory and an MCP tool list.
+
+What that returns, against the lines grep prints, is [local code search over MCP](/answers/local-code-search-mcp-fewer-tokens-than-grep).
 
 ## The limits you inherit with XERJ
 

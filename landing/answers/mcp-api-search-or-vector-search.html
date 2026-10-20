@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>SHOULD AN AGENT USE API SEARCH OR VECTOR SEARCH?</div>
   <div class="kicker"><span>ANSWERS · AGENT ACCESS AND MEMORY</span></div>
   <h1>Should an agent use API search or vector search?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>Which should an agent call, MCP or API search, or vector search? Start with xerj_search, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets, and the fused xerj_hybrid_search call returned 6 documents against 4, 3 and 3 for the single-signal tools.</p>
     <p class="key-fact"><strong>Key number:</strong> Four of the 17 XERJ MCP tools retrieve: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code> and <code class="inline">xerj_hybrid_search</code>. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json">landing/docs/agents/schemas/mcp-tools.json</a>)</span></p>
   </div>
@@ -243,6 +243,7 @@
   <h2>Which tool to call by default</h2>
   <p>Call <code class="inline">xerj_search</code> first. The tool needs no embedder, no field name and no vector, and it answers structured and phrase questions directly. Escalate to <code class="inline">xerj_hybrid_search</code> when the first result set looks too narrow.</p>
   <p>Call <code class="inline">xerj_semantic_search</code> only on a node started with <code class="inline">--embed-mode neural</code>. On the default lexical embedder it costs an extra round trip to reach a ranking built from token overlap.</p>
+  <p>When the lookup must say that nothing matched, and cite file:line when it does answer, see <a href="/answers/retrieval-that-says-not-found-with-file-line-citations">retrieval that says not found</a>.</p>
   <h2>What this capture is and is not</h2>
   <p>One single-node XERJ process, 20 labeled documents and 1 question through 4 tools. That corpus is far too small to rank retrieval methods. The binary was a <code class="inline">ci-test</code> build, so no timing from the run is a performance figure.</p>
   <h2>FAQ</h2>

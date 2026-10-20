@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I STOP MY AGENT FROM READING THE WHOLE REPO INTO CONTEXT?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I stop my agent from reading the whole repo into context?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>How do I stop my agent from reading the whole repo into context? Index the tree once with xerj autoindex and let the agent query the defs and symbols fields instead of opening files. Run --dry-run first: in our capture it reported files=3, ignored_files=2 and ignored_dirs=3, naming every ignore rule.</p>
     <p class="key-fact"><strong>Key number:</strong> A reference-coding study measured 9,982 output tokens for the indexed agent against 26,477 for grep-driven Claude Code, 2.7 times fewer, both solving 16/16. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/data/results-multilang-final.json">docs/case-studies/reference-coding/data/results-multilang-final.json</a>)</span></p>
   </div>
@@ -223,6 +223,7 @@ autoindex: ignore rules:   .gitignore:coverage/ — 1 directory pruned (5 non-hi
   <p>XERJ writes a content document for each source file. On top of that it writes one document for every declaration in the file, keyed by a <code class="inline">code:&lt;line&gt;:&lt;name&gt;</code> locator. That is what makes a constant or a one-line signature retrievable on its own, rather than only inside the class or method around it. A declaration captured under two kinds at the same line and name collapses to a single document. A document total over a code tree therefore tracks the declaration count, and no fixed ratio to the file count exists. State which convention you count before you compare a document total with a file total, and take the total from your own run.</p>
   <h2>What the capture is and is not</h2>
   <p>The capture indexed a 3-file, 3-language repository on 1 single-node XERJ process. This run measured no large monorepo. The project's own guidance is to plan corpora of at most a few million documents.</p>
+  <p>A public repository that is already a signed pack is a different case: <a href="/answers/ask-questions-about-a-github-repo-without-cloning">ask it without cloning</a>.</p>
   <h2>FAQ</h2>
   <h3>How do I stop my agent from reading the whole repo into context?</h3>
   <p>Index the tree once, then have the agent send a query instead of opening files. A <code class="inline">defs</code> hit names the declaration site with its path, so the agent reads one passage.</p>

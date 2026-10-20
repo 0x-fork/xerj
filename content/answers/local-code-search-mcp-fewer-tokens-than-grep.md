@@ -1,7 +1,7 @@
 ---
 title: "Local code search MCP that uses fewer tokens than grep"
 h1: "Local code search MCP for Claude Code that uses fewer tokens than grep"
-description: "xerj indexes a repo once and returns ranked passages with file:line through a CLI and an MCP server. On psf/requests one answer was 1,303 bytes; rg printed 25,150."
+description: "xerj indexes a repo once and returns ranked passages with file:line via CLI and MCP. On psf/requests one answer was 1,303 bytes; rg printed 25,150."
 slug: "local-code-search-mcp-fewer-tokens-than-grep"
 cluster: "Answers for coding agents"
 question: "Is there a local code search MCP for Claude Code that uses fewer tokens than grep?"

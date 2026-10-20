@@ -7,7 +7,7 @@ cluster: "Agent access and memory"
 question: "I need my agent to find a passage and cite the file, not dump the whole tree. How?"
 intent: "how-to"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -152,3 +152,5 @@ The published `openai-tools.json` and `anthropic-tools.json` still list 6 tools 
 ## What the capture was
 
 One single-node XERJ process and a generated 2-file code tree in Rust and Python. This run measured no large repository, and the binary was a `ci-test` build, so no timing from it is a performance figure.
+
+When the symbol is absent, the same citation path can exit 1 instead of inventing a hit: [retrieval that says not found](/answers/retrieval-that-says-not-found-with-file-line-citations).

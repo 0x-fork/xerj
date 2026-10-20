@@ -2,13 +2,13 @@
 ---
 title: "Code search MCP for Claude Code: cite file:line, not grep"
 canonical: "https://xerj.org/answers/code-search-mcp-for-claude-code"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/answers/code-search-mcp-for-claude-code.md"
 ---
 
 # I need my agent to find a passage and cite the file, not dump the whole tree. How?
 
-**Short answer** (updated 2026-10-19): How do I make my agent find a passage and cite the file, not dump the whole tree? Index the repository with xerj autoindex, register xerj mcp in the agent host, and query the defs field. One captured xerj_search call returned 2 documents whose symbols arrays gave file and line, including merge_segments at src/lib.rs line 17.
+**Short answer** (updated 2026-10-20): How do I make my agent find a passage and cite the file, not dump the whole tree? Index the repository with xerj autoindex, register xerj mcp in the agent host, and query the defs field. One captured xerj_search call returned 2 documents whose symbols arrays gave file and line, including merge_segments at src/lib.rs line 17.
 
 **Key number:** XERJ's tree-sitter registry covers 36 languages, a count pinned by a unit test so the docs cannot drift. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/extract/code.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/code.rs))
 
@@ -143,6 +143,8 @@ The published `openai-tools.json` and `anthropic-tools.json` still list 6 tools 
 ## What the capture was
 
 One single-node XERJ process and a generated 2-file code tree in Rust and Python. This run measured no large repository, and the binary was a `ci-test` build, so no timing from it is a performance figure.
+
+When the symbol is absent, the same citation path can exit 1 instead of inventing a hit: [retrieval that says not found](/answers/retrieval-that-says-not-found-with-file-line-citations).
 
 ## FAQ
 

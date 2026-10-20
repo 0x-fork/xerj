@@ -7,7 +7,7 @@ cluster: "Files and formats"
 question: "How do I stop my agent from reading the whole repo into context?"
 intent: "how-to"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -119,3 +119,5 @@ XERJ writes a content document for each source file. On top of that it writes on
 ## What the capture is and is not
 
 The capture indexed a 3-file, 3-language repository on 1 single-node XERJ process. This run measured no large monorepo. The project's own guidance is to plan corpora of at most a few million documents.
+
+A public repository that is already a signed pack is a different case: [ask it without cloning](/answers/ask-questions-about-a-github-repo-without-cloning).

@@ -2,13 +2,13 @@
 ---
 title: "Index a reference library for a coding agent"
 canonical: "https://xerj.org/answers/index-reference-library-for-coding-agent"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/answers/index-reference-library-for-coding-agent.md"
 ---
 
 # How do I set up reference coding so the agent retrieves a mechanism before writing code?
 
-**Short answer** (updated 2026-10-19): How do I set up reference coding so the agent retrieves a mechanism before writing code? Clone the library you are about to write against, index it with xerj autoindex, and have the agent retrieve the passage before it writes. A published study measured a gain on code the model cannot recall, and a loss on code it knows.
+**Short answer** (updated 2026-10-20): How do I set up reference coding so the agent retrieves a mechanism before writing code? Clone the library you are about to write against, index it with xerj autoindex, and have the agent retrieve the passage before it writes. A published study measured a gain on code the model cannot recall, and a loss on code it knows.
 
 **Key number:** Across 16 runs in four languages, the xerj arm solved 16/16 with 9,982 output tokens at $1.58. (as of 2026-10-19; source: [docs/case-studies/reference-coding/data/results-multilang-final.json](https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/data/results-multilang-final.json))
 
@@ -120,6 +120,8 @@ Do not run this workflow against a popular open-source library the model can alr
 Both workflows start with `xerj autoindex`, and they answer different questions.
 
 Indexing your own tree is about context budget: the agent stops opening every file and queries the index instead. That walkthrough, with the captured ignore accounting, is on [how to stop an agent reading the whole repo](/answers/index-monorepo-for-agent).
+
+A pinned public repository that already ships as a signed pack can be queried without a clone: [ask a repo without cloning](/answers/ask-questions-about-a-github-repo-without-cloning).
 
 Reference coding is about knowledge the agent does not have. The tree is somebody else's library, cloned for the purpose, and the point is the passage that describes the mechanism, not the size of the context.
 

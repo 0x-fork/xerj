@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>IS RIPGREP ENOUGH FOR A CODING AGENT, OR DO I NEED A CODE INDEX?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: CODE RETRIEVAL</span></div>
   <h1>Is ripgrep enough for a coding agent, or do I need a code index?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>Is ripgrep enough for a coding agent, or do I need a code index? Keep ripgrep for one-off questions and add an index when an agent asks one tree many questions. On one 331-file tree the two named the same files on 18 of 30 disclosed tasks, and ripgrep 14.1.1 won 5 outright.</p>
     <p class="key-fact"><strong>Key number:</strong> ripgrep has 69,257 GitHub stars and its latest release is 15.2.0 (2026-07-15); the 30-task run used 14.1.1. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/BurntSushi/ripgrep">github.com/BurntSushi/ripgrep</a>)</span></p>
   </div>
@@ -271,6 +271,7 @@ T28 ripgrep-only: xerj-api/tests/sq8_codes_follow_document_updates.rs, xerj-comm
   <h2>When the index is worth its cost</h2>
   <p>Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One <code class="inline">defs</code> query replaces a per-language regular expression and covers 36 languages.</p>
   <p>Choose the index when you want structure alongside text. The index carries <code class="inline">language</code>, <code class="inline">symbol_count</code>, aggregations and <code class="inline">_source</code> narrowing. ripgrep returns lines, and lines are all it returns.</p>
+  <p>A pinned public repository you have not checked out is <a href="/answers/ask-questions-about-a-github-repo-without-cloning">ask without cloning</a>.</p>
   <h2>The limits you inherit either way</h2>
   <p>XERJ is single-node here and everywhere. There is no replication and no failover, so the index is exactly as durable as the 1 host it lives on.</p>
   <p>Extraction is definitions only, with no call graph and no cross-file reference resolution. XERJ never reports who calls a function, and neither does ripgrep.</p>

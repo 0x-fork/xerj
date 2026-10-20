@@ -2,13 +2,13 @@
 ---
 title: "XERJ vs ast-grep — syntax search and an index"
 canonical: "https://xerj.org/compare/xerj-vs-ast-grep"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/compare/xerj-vs-ast-grep.md"
 ---
 
 # ast-grep vs a code index for an agent?
 
-**Short answer** (updated 2026-10-19): Should an agent use ast-grep or a code index? Use both. ast-grep matches and rewrites code by syntax pattern, and XERJ rewrites nothing. XERJ answers where a symbol is defined and what its contract says across a tree it already indexed. No head-to-head was run, and none is needed to split these jobs.
+**Short answer** (updated 2026-10-20): Should an agent use ast-grep or a code index? Use both. ast-grep matches and rewrites code by syntax pattern, and XERJ rewrites nothing. XERJ answers where a symbol is defined and what its contract says across a tree it already indexed. No head-to-head was run, and none is needed to split these jobs.
 
 **Key number:** ast-grep has 16,288 GitHub stars and released 0.51.0 on 2026-10-15. (as of 2026-10-19; source: [github.com/ast-grep/ast-grep](https://github.com/ast-grep/ast-grep))
 
@@ -127,6 +127,8 @@ Choose the index when one tree answers many questions in a session. The build co
 Choose it when the question is about symbols rather than bytes. One definition query then replaces a regular expression per language.
 
 Choose it when an agent needs the answer as a cited passage. The same binary also holds agent memory and an MCP tool list.
+
+What that returns, against the lines grep prints, is [local code search over MCP](/answers/local-code-search-mcp-fewer-tokens-than-grep).
 
 ## The limits you inherit with XERJ
 

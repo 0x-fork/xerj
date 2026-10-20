@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW CAN AGENT-MEMORY LINKS RETAIN EVIDENCE?</div>
   <div class="kicker"><span>ANSWERS · AGENT MEMORY: PROVENANCE</span></div>
   <h1>How can agent-memory links retain evidence?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>Knowledge graphs aren't enough for agent memory; how do you get a know-how graph with evidence? XERJ stores the line that taught each link. All 7 detected edges in our capture carried an evidence object with a quote, a filename and an offset, and retiring a link wrote a tombstone instead of deleting the edge.</p>
     <p class="key-fact"><strong>Key number:</strong> The shared-term link detector keeps at most 5 edges per document (<code class="inline">MAX_EDGES_PER_DOC</code>), which bounds the link index. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/detect/sharedterm.rs">engine/crates/xerj-autoindex/src/detect/sharedterm.rs</a>)</span></p>
   </div>
@@ -197,6 +197,7 @@
   <p>The quote is useful because the detectors are structural rather than interpretive. A <code class="inline">wikilink</code> edge quotes the wikilink line. A <code class="inline">same_dir</code> edge quotes its own rationale, <code class="inline">00-overview.md and 01-runbook.md share directory .</code>, which the console shows as a reason rather than as a quotation.</p>
   <p>Confidence is a per-detector constant, not a learned number. Our run carried 0.99 on <code class="inline">sequence</code> edges, 0.95 on <code class="inline">wikilink</code> edges and 0.4 on <code class="inline">same_dir</code> edges.</p>
   <p>XERJ invents nothing to fill a gap. XERJ renders a real quote, a structural rationale and an asserted link as three different things.</p>
+  <p>Code lookup follows the same rule — exit 1 and no invented hit when a symbol is missing, file:line when it answers — on <a href="/answers/retrieval-that-says-not-found-with-file-line-citations">retrieval that says not found</a>.</p>
   <h2>An asserted link carries no evidence</h2>
   <p>A link you create by hand is honest about being a claim. The route <code class="inline">POST /_graph/{brain}/link</code> accepts <code class="inline">src</code>, <code class="inline">dst</code>, <code class="inline">type</code>, <code class="inline">weight</code> and <code class="inline">confidence</code>. It returns an edge whose detector is <code class="inline">manual@1</code>.</p>
   <pre class="code"><code class="language-json">{"created":true,"edge_id":"36fda0a72f2b01de15ed79c7b0909c0a",

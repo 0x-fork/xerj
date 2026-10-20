@@ -140,7 +140,9 @@ PAGES: dict[str, dict[str, str]] = {
         label="One vulnerability, three names", kind="article",
         title="One vulnerability, three names — and a pack we sign",
         description="The same Rust vulnerability arrives as RUSTSEC, GHSA and CVE. We collapsed 4,107 advisories to 1,950 identity-resolved records, packed them, and signed the pack — because no vulnerability database we surveyed does.",
-        published="2026-09-27", updated="2026-09-27",
+        published="2026-09-27",
+        # 2026-10-20: one in-body link to the offline advisory-id lookup.
+        updated="2026-10-20",
         og_image="og/blog-one-vulnerability-three-names.png",
         og_image_alt="Cover: “One vulnerability, three names” in display type beside the post’s square-matrix art, labelled with its figures. The art: three outlined boxes trailing lines of small squares that converge on one square-matrix disc with a yellow seal at its centre",
     ),
@@ -165,7 +167,9 @@ PAGES: dict[str, dict[str, str]] = {
         label="The Corpus Hub", kind="article",
         title="The Corpus Hub: pinned, licenced, signed, contributed by PR",
         description="A public registry of corpora for AI agents: reference code pinned to SHAs, record packs ed25519-signed, every source licence-reviewed by a human. The measured use case (2.7× fewer output tokens), the tie we published anyway, and how to contribute yours by PR.",
-        published="2026-10-01", updated="2026-10-01",
+        published="2026-10-01",
+        # 2026-10-20: one in-body link to asking a pinned repo without cloning.
+        updated="2026-10-20",
         og_image="og/blog-the-corpus-hub.png",
         og_image_alt="Cover: “The Corpus Hub” in display type beside the post’s square-matrix art, labelled with its figures. The art: a 10 by 10 wall of square-matrix pack tiles in shades of ink, the first four solid yellow and the fifth framed",
     ),
@@ -196,7 +200,9 @@ PAGES: dict[str, dict[str, str]] = {
         label="The exploit hub", kind="article",
         title="The exploit hub, tested on three fresh CVEs",
         description="We ran the exploit corpus against three CVEs it had never seen: one query named the exact route and field for one, an in-corpus 2026 exploit named the exact denylist segments the vendor shipped for another, and the third proved the corpus adds nothing when its stratum is empty. Losses included.",
-        published="2026-10-08", updated="2026-10-08",
+        published="2026-10-08",
+        # 2026-10-20: one in-body link to offline CVE/GHSA id lookup.
+        updated="2026-10-20",
         og_image="og/blog-the-exploit-hub.png",
         og_image_alt="Cover: “The exploit hub, tested on three fresh CVEs” in display type beside the post’s square-matrix art, labelled with its figures. The art: a network of small square nodes; a yellow hub linked to 36 yellow nodes, an ink node with one link, and an empty square frame with none",
     ),

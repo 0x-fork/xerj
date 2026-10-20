@@ -68,7 +68,14 @@
 
 # Agent-readable Markdown twins are alternate representations of the HTML
 # articles, not HTML pages. Keep the charset explicit for direct fetches.
+# X-Robots-Tag: noindex keeps the twin out of the search index while leaving
+# it fetchable (HTTP 200, no robots.txt Disallow). Cloudflare Pages applies
+# every matching _headers rule and joins a repeated header with a comma;
+# these rules are the only X-Robots-Tag on the path, and one `*` splat is
+# the documented matcher (https://developers.cloudflare.com/pages/configuration/headers/).
 /answers/*.md
   Content-Type: text/markdown; charset=utf-8
+  X-Robots-Tag: noindex
 /compare/*.md
   Content-Type: text/markdown; charset=utf-8
+  X-Robots-Tag: noindex

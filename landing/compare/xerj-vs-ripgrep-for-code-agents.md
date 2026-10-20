@@ -2,13 +2,13 @@
 ---
 title: "ripgrep vs a code index for coding agents: 30 tasks"
 canonical: "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/compare/xerj-vs-ripgrep-for-code-agents.md"
 ---
 
 # Is ripgrep enough for a coding agent, or do I need a code index?
 
-**Short answer** (updated 2026-10-19): Is ripgrep enough for a coding agent, or do I need a code index? Keep ripgrep for one-off questions and add an index when an agent asks one tree many questions. On one 331-file tree the two named the same files on 18 of 30 disclosed tasks, and ripgrep 14.1.1 won 5 outright.
+**Short answer** (updated 2026-10-20): Is ripgrep enough for a coding agent, or do I need a code index? Keep ripgrep for one-off questions and add an index when an agent asks one tree many questions. On one 331-file tree the two named the same files on 18 of 30 disclosed tasks, and ripgrep 14.1.1 won 5 outright.
 
 **Key number:** ripgrep has 69,257 GitHub stars and its latest release is 15.2.0 (2026-07-15); the 30-task run used 14.1.1. (as of 2026-10-19; source: [github.com/BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep))
 
@@ -170,6 +170,8 @@ Choose ripgrep for tiny trees and for one-off questions. Several hundred queries
 Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One `defs` query replaces a per-language regular expression and covers 36 languages.
 
 Choose the index when you want structure alongside text. The index carries `language`, `symbol_count`, aggregations and `_source` narrowing. ripgrep returns lines, and lines are all it returns.
+
+A pinned public repository you have not checked out is [ask without cloning](/answers/ask-questions-about-a-github-repo-without-cloning).
 
 ## The limits you inherit either way
 

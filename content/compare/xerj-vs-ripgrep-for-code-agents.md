@@ -7,7 +7,7 @@ cluster: "Comparison: code retrieval"
 question: "Is ripgrep enough for a coding agent, or do I need a code index?"
 intent: "comparison"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -181,6 +181,8 @@ Choose ripgrep for tiny trees and for one-off questions. Several hundred queries
 Choose the index when an agent asks one tree many questions per session. Choose it when the questions are about symbols rather than bytes. One `defs` query replaces a per-language regular expression and covers 36 languages.
 
 Choose the index when you want structure alongside text. The index carries `language`, `symbol_count`, aggregations and `_source` narrowing. ripgrep returns lines, and lines are all it returns.
+
+A pinned public repository you have not checked out is [ask without cloning](/answers/ask-questions-about-a-github-repo-without-cloning).
 
 ## The limits you inherit either way
 

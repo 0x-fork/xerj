@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>AST-GREP VS A CODE INDEX FOR AN AGENT?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: CODE RETRIEVAL</span></div>
   <h1>ast-grep vs a code index for an agent?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>Should an agent use ast-grep or a code index? Use both. ast-grep matches and rewrites code by syntax pattern, and XERJ rewrites nothing. XERJ answers where a symbol is defined and what its contract says across a tree it already indexed. No head-to-head was run, and none is needed to split these jobs.</p>
     <p class="key-fact"><strong>Key number:</strong> ast-grep has 16,288 GitHub stars and released 0.51.0 on 2026-10-15. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/ast-grep/ast-grep">github.com/ast-grep/ast-grep</a>)</span></p>
   </div>
@@ -226,6 +226,7 @@
   <p>Choose the index when one tree answers many questions in a session. The build cost amortises and the per-query cost does not.</p>
   <p>Choose it when the question is about symbols rather than bytes. One definition query then replaces a regular expression per language.</p>
   <p>Choose it when an agent needs the answer as a cited passage. The same binary also holds agent memory and an MCP tool list.</p>
+  <p>What that returns, against the lines grep prints, is <a href="/answers/local-code-search-mcp-fewer-tokens-than-grep">local code search over MCP</a>.</p>
   <h2>The limits you inherit with XERJ</h2>
   <p>XERJ is single-node only. There is no data-plane replication and no failover, so one host is the whole deployment.</p>
   <p>The server retains heap for every document it indexes, which is an open tracked defect. Indexing several large repositories into one long-lived node is the shape that grows it.</p>

@@ -1,7 +1,7 @@
 ---
 title: "Full-text search over JSONL and CSV files from the CLI"
 h1: "Full-text search over JSONL files from the CLI: index a folder and query it with BM25"
-description: "xerj autoindex reads JSONL and CSV with no schema, then answers BM25 queries per field from the CLI or MCP. 2,902 rows indexed in 12.4 s; queries took 1 ms."
+description: "xerj autoindex reads JSONL and CSV with no schema, then answers BM25 per field from the CLI or MCP. 2,902 rows indexed in 12.4 s; queries took 1 ms."
 slug: "full-text-search-over-jsonl-files-cli"
 cluster: "Answers for coding agents"
 question: "How do I run full-text search over JSONL files from the CLI and query a folder with BM25?"

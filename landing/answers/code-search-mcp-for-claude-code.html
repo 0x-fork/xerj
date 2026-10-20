@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>I NEED MY AGENT TO FIND A PASSAGE AND CITE THE FILE, NOT DUMP THE WHOLE TREE. HOW?</div>
   <div class="kicker"><span>ANSWERS · AGENT ACCESS AND MEMORY</span></div>
   <h1 class="h1-long">I need my agent to find a passage and cite the file, not dump the whole tree. How?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>How do I make my agent find a passage and cite the file, not dump the whole tree? Index the repository with xerj autoindex, register xerj mcp in the agent host, and query the defs field. One captured xerj_search call returned 2 documents whose symbols arrays gave file and line, including merge_segments at src/lib.rs line 17.</p>
     <p class="key-fact"><strong>Key number:</strong> XERJ's tree-sitter registry covers 36 languages, a count pinned by a unit test so the docs cannot drift. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/code.rs">engine/crates/xerj-autoindex/src/extract/code.rs</a>)</span></p>
   </div>
@@ -245,6 +245,7 @@ none of postgres/qdrant/redis/weaviate/milvus/chroma/elasticsearch/opensearch/ol
   <p>The published <code class="inline">openai-tools.json</code> and <code class="inline">anthropic-tools.json</code> still list 6 tools while the binary serves 17 (v1.0.0-rc.97, checked 2026-10-19). The 11 missing names include the 4 <code class="inline">xerj_brain_*</code> tools, <code class="inline">xerj_code_search</code> and the 3 <code class="inline">xerj_hub_*</code> tools. Read <code class="inline">tools/list</code> from a live server, or the generated <code class="inline">mcp-tools.json</code>, instead of copying either file.</p>
   <h2>What the capture was</h2>
   <p>One single-node XERJ process and a generated 2-file code tree in Rust and Python. This run measured no large repository, and the binary was a <code class="inline">ci-test</code> build, so no timing from it is a performance figure.</p>
+  <p>When the symbol is absent, the same citation path can exit 1 instead of inventing a hit: <a href="/answers/retrieval-that-says-not-found-with-file-line-citations">retrieval that says not found</a>.</p>
   <h2>FAQ</h2>
   <h3>I need my agent to find a passage and cite the file, not dump the whole tree. How?</h3>
   <p>Register <code class="inline">xerj mcp</code> and let the agent call <code class="inline">xerj_search</code>. Each hit carries a <code class="inline">symbols</code> array with <code class="inline">name</code>, <code class="inline">kind</code> and <code class="inline">line</code>, so the answer can cite the declaration site.</p>

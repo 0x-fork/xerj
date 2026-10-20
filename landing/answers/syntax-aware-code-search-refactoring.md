@@ -2,13 +2,13 @@
 ---
 title: "How do I run syntax-aware code search?"
 canonical: "https://xerj.org/answers/syntax-aware-code-search-refactoring"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/answers/syntax-aware-code-search-refactoring.md"
 ---
 
 # How do I run syntax-aware code search?
 
-**Short answer** (updated 2026-10-19): Is there a syntax-aware code search tool for refactoring? XERJ gives you two code queries on one index: match on body for raw text, and match on defs for declared symbols, which returns a symbols array with kind, name and line. It extracts definitions only and rewrites nothing; for structural rewrites use ast-grep.
+**Short answer** (updated 2026-10-20): Is there a syntax-aware code search tool for refactoring? XERJ gives you two code queries on one index: match on body for raw text, and match on defs for declared symbols, which returns a symbols array with kind, name and line. It extracts definitions only and rewrites nothing; for structural rewrites use ast-grep.
 
 **Key number:** XERJ's tree-sitter registry covers 36 languages, pinned by a unit test. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/extract/code.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/extract/code.rs))
 
@@ -92,6 +92,8 @@ One miss is worth naming. The file `src/query.go` declares `MergeSegments`, and 
 XERJ extracts definitions only. There is no call graph, no import graph and no cross-file reference resolution, so XERJ does not find callers of a symbol.
 
 That boundary decides the tool choice. Use XERJ to locate every declaration and every textual occurrence across 36 languages. Use a language server or a compiler plugin for a rename that must be sound.
+
+What an agent reads, against the lines grep prints, is [local code search over MCP](/answers/local-code-search-mcp-fewer-tokens-than-grep).
 
 ## Caps and failure behavior
 

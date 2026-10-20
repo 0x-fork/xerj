@@ -2,13 +2,13 @@
 ---
 title: "Index a monorepo so your agent stops reading the whole repo"
 canonical: "https://xerj.org/answers/index-monorepo-for-agent"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/answers/index-monorepo-for-agent.md"
 ---
 
 # How do I stop my agent from reading the whole repo into context?
 
-**Short answer** (updated 2026-10-19): How do I stop my agent from reading the whole repo into context? Index the tree once with xerj autoindex and let the agent query the defs and symbols fields instead of opening files. Run --dry-run first: in our capture it reported files=3, ignored_files=2 and ignored_dirs=3, naming every ignore rule.
+**Short answer** (updated 2026-10-20): How do I stop my agent from reading the whole repo into context? Index the tree once with xerj autoindex and let the agent query the defs and symbols fields instead of opening files. Run --dry-run first: in our capture it reported files=3, ignored_files=2 and ignored_dirs=3, naming every ignore rule.
 
 **Key number:** A reference-coding study measured 9,982 output tokens for the indexed agent against 26,477 for grep-driven Claude Code, 2.7 times fewer, both solving 16/16. (as of 2026-10-19; source: [docs/case-studies/reference-coding/data/results-multilang-final.json](https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/data/results-multilang-final.json))
 
@@ -114,6 +114,8 @@ XERJ writes a content document for each source file. On top of that it writes on
 ## What the capture is and is not
 
 The capture indexed a 3-file, 3-language repository on 1 single-node XERJ process. This run measured no large monorepo. The project's own guidance is to plan corpora of at most a few million documents.
+
+A public repository that is already a signed pack is a different case: [ask it without cloning](/answers/ask-questions-about-a-github-repo-without-cloning).
 
 ## FAQ
 

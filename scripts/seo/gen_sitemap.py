@@ -11,12 +11,17 @@ This script replaces that with a derivation:
   * one `<url>` per HTML file under `landing/`, minus `urlmap.SITEMAP_EXCLUDE`;
   * `<loc>` = `urlmap.deployed_url(file)` — absolute, https, extensionless,
     byte-identical to that page's `<link rel="canonical">` and `og:url`;
-  * `<lastmod>` = `git log -1 --format=%cs -- <file>`, i.e. the file's real
-    last commit date, so the value is verifiable by construction.  Google only
-    uses lastmod "if it's consistently and verifiably ... accurate"; a wrong
-    lastmod is worse than none because it burns the field's credibility
-    sitewide.  When git cannot answer, the filesystem mtime is used and the
-    substitution is printed loudly on stderr.
+  * `<lastmod>` is the page's content date, not `git log -1` of the HTML.
+    A sitewide head or nav commit (the GA4 tag is one) otherwise stamps every
+    URL with one day, and a shallow checkout does the same via mtime. Google
+    only uses lastmod "if it's consistently and verifiably ... accurate"; a
+    wrong lastmod is worse than none because it burns the field's credibility
+    sitewide. Order, in `urlmap.DateSource.page_lastmod`: article `updated:`
+    front matter, then JSON-LD `dateModified`, then a `pagedata.py` `updated`,
+    then (full history only) the last commit that changed more than shared
+    chrome, then the `<lastmod>` already committed for that URL, then mtime.
+    The committed-sitemap step is what keeps a shallow regen from rewriting
+    every undated URL to today. Substitutions are printed on stderr.
   * **no `<priority>`, no `<changefreq>`.**  Google: "Google ignores
     <priority> and <changefreq> values."  Bing (July 2025): both "are ignored
     by Bing and do not influence how your content is crawled or ranked."
@@ -49,11 +54,13 @@ MAX_BYTES = 50_000_000
 
 
 def build(root: pathlib.Path, dates: urlmap.DateSource) -> str:
+    prior = dates.committed_lastmods(root / "sitemap.xml")
     rows: list[tuple[str, str]] = []
     for rel in urlmap.iter_pages(root):
         if not urlmap.in_sitemap(rel):
             continue
-        rows.append((urlmap.deployed_url(rel), dates.last_modified(root / rel)))
+        rows.append((urlmap.deployed_url(rel),
+                     dates.page_lastmod(rel, root / rel, prior)))
     rows.sort()
 
     # UTC, like the dates themselves: dt.date.today() is the runner's local
@@ -109,11 +116,19 @@ def main(argv: list[str] | None = None) -> int:
     dates = urlmap.DateSource(urlmap.repo_root())
     if not dates.git_ok:
         print("WARNING: git history is unavailable or shallow — "
-              "every <lastmod> below falls back "
-              "to the filesystem mtime, which Google will not be able to verify",
+              "pages with no in-file content date keep the committed "
+              "<lastmod>, and only URLs missing from that file fall back "
+              "to the filesystem mtime",
               file=sys.stderr)
 
     xml = build(root, dates)
+
+    if dates.prior_used:
+        print(f"NOTE: <lastmod> kept the committed sitemap value for "
+              f"{len(dates.prior_used)} URL(s) with no in-file content date "
+              f"and no full git history", file=sys.stderr)
+        for p in dates.prior_used:
+            print(f"  committed-sitemap {p}", file=sys.stderr)
 
     if dates.fallbacks:
         print(f"WARNING: <lastmod> fell back to filesystem mtime for "

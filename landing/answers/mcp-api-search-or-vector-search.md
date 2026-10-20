@@ -2,13 +2,13 @@
 ---
 title: "API search or vector search for an agent"
 canonical: "https://xerj.org/answers/mcp-api-search-or-vector-search"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/answers/mcp-api-search-or-vector-search.md"
 ---
 
 # Should an agent use API search or vector search?
 
-**Short answer** (updated 2026-10-19): Which should an agent call, MCP or API search, or vector search? Start with xerj_search, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets, and the fused xerj_hybrid_search call returned 6 documents against 4, 3 and 3 for the single-signal tools.
+**Short answer** (updated 2026-10-20): Which should an agent call, MCP or API search, or vector search? Start with xerj_search, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets, and the fused xerj_hybrid_search call returned 6 documents against 4, 3 and 3 for the single-signal tools.
 
 **Key number:** Four of the 17 XERJ MCP tools retrieve: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search` and `xerj_hybrid_search`. (as of 2026-10-19; source: [landing/docs/agents/schemas/mcp-tools.json](https://github.com/xerj-org/xerj/blob/main/landing/docs/agents/schemas/mcp-tools.json))
 
@@ -130,6 +130,8 @@ curl -s -XPOST 'http://127.0.0.1:9500/qvec/_doc/q1' -H 'content-type: applicatio
 Call `xerj_search` first. The tool needs no embedder, no field name and no vector, and it answers structured and phrase questions directly. Escalate to `xerj_hybrid_search` when the first result set looks too narrow.
 
 Call `xerj_semantic_search` only on a node started with `--embed-mode neural`. On the default lexical embedder it costs an extra round trip to reach a ranking built from token overlap.
+
+When the lookup must say that nothing matched, and cite file:line when it does answer, see [retrieval that says not found](/answers/retrieval-that-says-not-found-with-file-line-citations).
 
 ## What this capture is and is not
 

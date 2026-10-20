@@ -76,7 +76,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -155,9 +155,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I SET UP REFERENCE CODING SO THE AGENT RETRIEVES A MECHANISM BEFORE WRITING CODE?</div>
   <div class="kicker"><span>ANSWERS · CODING AGENTS: REFERENCE RETRIEVAL</span></div>
   <h1 class="h1-long">How do I set up reference coding so the agent retrieves a mechanism before writing code?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-20</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-20</span>
     <p>How do I set up reference coding so the agent retrieves a mechanism before writing code? Clone the library you are about to write against, index it with xerj autoindex, and have the agent retrieve the passage before it writes. A published study measured a gain on code the model cannot recall, and a loss on code it knows.</p>
     <p class="key-fact"><strong>Key number:</strong> Across 16 runs in four languages, the xerj arm solved 16/16 with 9,982 output tokens at $1.58. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/docs/case-studies/reference-coding/data/results-multilang-final.json">docs/case-studies/reference-coding/data/results-multilang-final.json</a>)</span></p>
   </div>
@@ -238,6 +238,7 @@ xerj autoindex ./ref --url http://127.0.0.1:9200 --prefix ref --state-dir ./stat
   <h2>How this differs from indexing your own monorepo</h2>
   <p>Both workflows start with <code class="inline">xerj autoindex</code>, and they answer different questions.</p>
   <p>Indexing your own tree is about context budget: the agent stops opening every file and queries the index instead. That walkthrough, with the captured ignore accounting, is on <a href="/answers/index-monorepo-for-agent">how to stop an agent reading the whole repo</a>.</p>
+  <p>A pinned public repository that already ships as a signed pack can be queried without a clone: <a href="/answers/ask-questions-about-a-github-repo-without-cloning">ask a repo without cloning</a>.</p>
   <p>Reference coding is about knowledge the agent does not have. The tree is somebody else's library, cloned for the purpose, and the point is the passage that describes the mechanism, not the size of the context.</p>
   <h2>The retrieval boundary</h2>
   <p>Extraction is definitions only. There is no call graph, no import graph and no cross-file reference resolution, so a <code class="inline">defs</code> hit names the declaration site and never the call site.</p>

@@ -1,7 +1,7 @@
 ---
 title: "Retrieval that cites file:line and says not found"
 h1: "Retrieval that says not found, and cites file and line when it does answer"
-description: "xerj answers with file:line and exits 1 with no match when a symbol or corpus is missing. Free-text questions still return passages; confidence is issue #1786."
+description: "xerj answers with file:line and exits 1 with no match when a symbol or corpus is missing. Free-text questions still return passages; confidence is #1786."
 slug: "retrieval-that-says-not-found-with-file-line-citations"
 cluster: "Answers for coding agents"
 question: "Is there a retrieval tool that says not found, cites file and line, and abstains when unsure?"

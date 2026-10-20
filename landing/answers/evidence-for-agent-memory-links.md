@@ -2,13 +2,13 @@
 ---
 title: "Evidence behind agent-memory links"
 canonical: "https://xerj.org/answers/evidence-for-agent-memory-links"
-updated: "2026-10-19"
+updated: "2026-10-20"
 source: "content/answers/evidence-for-agent-memory-links.md"
 ---
 
 # How can agent-memory links retain evidence?
 
-**Short answer** (updated 2026-10-19): Knowledge graphs aren't enough for agent memory; how do you get a know-how graph with evidence? XERJ stores the line that taught each link. All 7 detected edges in our capture carried an evidence object with a quote, a filename and an offset, and retiring a link wrote a tombstone instead of deleting the edge.
+**Short answer** (updated 2026-10-20): Knowledge graphs aren't enough for agent memory; how do you get a know-how graph with evidence? XERJ stores the line that taught each link. All 7 detected edges in our capture carried an evidence object with a quote, a filename and an offset, and retiring a link wrote a tombstone instead of deleting the edge.
 
 **Key number:** The shared-term link detector keeps at most 5 edges per document (`MAX_EDGES_PER_DOC`), which bounds the link index. (as of 2026-10-19; source: [engine/crates/xerj-autoindex/src/detect/sharedterm.rs](https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/detect/sharedterm.rs))
 
@@ -66,6 +66,8 @@ The quote is useful because the detectors are structural rather than interpretiv
 Confidence is a per-detector constant, not a learned number. Our run carried 0.99 on `sequence` edges, 0.95 on `wikilink` edges and 0.4 on `same_dir` edges.
 
 XERJ invents nothing to fill a gap. XERJ renders a real quote, a structural rationale and an asserted link as three different things.
+
+Code lookup follows the same rule — exit 1 and no invented hit when a symbol is missing, file:line when it answers — on [retrieval that says not found](/answers/retrieval-that-says-not-found-with-file-line-citations).
 
 ## An asserted link carries no evidence
 

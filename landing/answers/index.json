@@ -8,7 +8,7 @@
       "canonical_url": "https://xerj.org/answers/mcp-api-search-or-vector-search",
       "markdown_url": "https://xerj.org/answers/mcp-api-search-or-vector-search.md",
       "cluster": "Agent access and memory",
-      "updated": "2026-10-19",
+      "updated": "2026-10-20",
       "summary": "One question through 4 XERJ MCP tools returned 3 different result sets. Hybrid RRF returned 6 documents and merged both lists on the default lexical embedder.",
       "intent_group": "retrieval research and eval",
       "answer": "Which should an agent call, MCP or API search, or vector search? Start with xerj_search, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets, and the fused xerj_hybrid_search call returned 6 documents against 4, 3 and 3 for the single-signal tools.",
@@ -23,7 +23,7 @@
       "canonical_url": "https://xerj.org/answers/code-search-mcp-for-claude-code",
       "markdown_url": "https://xerj.org/answers/code-search-mcp-for-claude-code.md",
       "cluster": "Agent access and memory",
-      "updated": "2026-10-19",
+      "updated": "2026-10-20",
       "summary": "Local code search MCP for Claude Code with file:line citations: index with xerj autoindex, call xerj_search. One captured call cited 2 symbols without opening files.",
       "intent_group": "code search for agents",
       "answer": "How do I make my agent find a passage and cite the file, not dump the whole tree? Index the repository with xerj autoindex, register xerj mcp in the agent host, and query the defs field. One captured xerj_search call returned 2 documents whose symbols arrays gave file and line, including merge_segments at src/lib.rs line 17.",
@@ -85,7 +85,7 @@
       "canonical_url": "https://xerj.org/answers/evidence-for-agent-memory-links",
       "markdown_url": "https://xerj.org/answers/evidence-for-agent-memory-links.md",
       "cluster": "Agent memory: provenance",
-      "updated": "2026-10-19",
+      "updated": "2026-10-20",
       "summary": "Every detected link in XERJ carries the exact line that taught it. All 7 edges in our capture had an evidence quote, and unlink wrote a tombstone.",
       "intent_group": "agent memory",
       "answer": "Knowledge graphs aren't enough for agent memory; how do you get a know-how graph with evidence? XERJ stores the line that taught each link. All 7 detected edges in our capture carried an evidence object with a quote, a filename and an offset, and retiring a link wrote a tombstone instead of deleting the edge.",
@@ -159,7 +159,7 @@
       "markdown_url": "https://xerj.org/answers/ask-questions-about-a-github-repo-without-cloning.md",
       "cluster": "Answers for coding agents",
       "updated": "2026-10-20",
-      "summary": "xerj ask answers from a signed, pre-indexed pack of a pinned repo, with file:line, the commit and the licence. First answer 2.4 s with the download, then 30-40 ms.",
+      "summary": "xerj ask answers from a signed, pre-indexed pack of a pinned repo, with file:line, commit and licence. First answer 2.4 s with the download, then 30-40 ms.",
       "queries": [
         "ask questions about a GitHub repo without cloning it",
         "ask a GitHub repo without cloning"
@@ -172,7 +172,7 @@
       "markdown_url": "https://xerj.org/answers/batch-lookup-cve-ghsa-ids-offline.md",
       "cluster": "Answers for coding agents",
       "updated": "2026-10-20",
-      "summary": "Load a signed advisory pack into xerj and resolve many CVE, GHSA and RUSTSEC IDs in one offline query, with the source file per answer. 6 IDs: 15 ms, 2 abstained.",
+      "summary": "Load a signed advisory pack into xerj and resolve many CVE, GHSA and RUSTSEC IDs offline in one query, citing the source file. 6 IDs: 15 ms, 2 abstained.",
       "queries": [
         "batch lookup CVE and GHSA IDs offline",
         "batch lookup CVE IDs and GHSA IDs without GitHub API rate limits"
@@ -185,7 +185,7 @@
       "markdown_url": "https://xerj.org/answers/full-text-search-over-jsonl-files-cli.md",
       "cluster": "Answers for coding agents",
       "updated": "2026-10-20",
-      "summary": "xerj autoindex reads JSONL and CSV with no schema, then answers BM25 queries per field from the CLI or MCP. 2,902 rows indexed in 12.4 s; queries took 1 ms.",
+      "summary": "xerj autoindex reads JSONL and CSV with no schema, then answers BM25 per field from the CLI or MCP. 2,902 rows indexed in 12.4 s; queries took 1 ms.",
       "queries": [
         "full-text search over JSONL files from the CLI",
         "index a folder of JSONL files and query it with BM25"
@@ -198,7 +198,7 @@
       "markdown_url": "https://xerj.org/answers/local-code-search-mcp-fewer-tokens-than-grep.md",
       "cluster": "Answers for coding agents",
       "updated": "2026-10-20",
-      "summary": "xerj indexes a repo once and returns ranked passages with file:line through a CLI and an MCP server. On psf/requests one answer was 1,303 bytes; rg printed 25,150.",
+      "summary": "xerj indexes a repo once and returns ranked passages with file:line via CLI and MCP. On psf/requests one answer was 1,303 bytes; rg printed 25,150.",
       "queries": [
         "local code search MCP for Claude Code that uses fewer tokens than grep",
         "local code search MCP fewer tokens than grep"
@@ -211,7 +211,7 @@
       "markdown_url": "https://xerj.org/answers/retrieval-that-says-not-found-with-file-line-citations.md",
       "cluster": "Answers for coding agents",
       "updated": "2026-10-20",
-      "summary": "xerj answers with file:line and exits 1 with no match when a symbol or corpus is missing. Free-text questions still return passages; confidence is issue #1786.",
+      "summary": "xerj answers with file:line and exits 1 with no match when a symbol or corpus is missing. Free-text questions still return passages; confidence is #1786.",
       "queries": [
         "retrieval that says not found and cites file and line",
         "retrieval tool that abstains when unsure and cites file:line"
@@ -267,7 +267,7 @@
       "canonical_url": "https://xerj.org/answers/index-reference-library-for-coding-agent",
       "markdown_url": "https://xerj.org/answers/index-reference-library-for-coding-agent.md",
       "cluster": "Coding agents: reference retrieval",
-      "updated": "2026-10-19",
+      "updated": "2026-10-20",
       "summary": "Clone the library you are about to write against, index it with xerj autoindex, and retrieve the passage first. The published study, with the tracks where it loses.",
       "intent_group": "code search for agents",
       "answer": "How do I set up reference coding so the agent retrieves a mechanism before writing code? Clone the library you are about to write against, index it with xerj autoindex, and have the agent retrieve the passage before it writes. A published study measured a gain on code the model cannot recall, and a loss on code it knows.",
@@ -443,7 +443,7 @@
       "canonical_url": "https://xerj.org/answers/syntax-aware-code-search-refactoring",
       "markdown_url": "https://xerj.org/answers/syntax-aware-code-search-refactoring.md",
       "cluster": "Files and formats",
-      "updated": "2026-10-19",
+      "updated": "2026-10-20",
       "summary": "XERJ indexes source files with a defs field and a symbols array, so one query finds declarations with kind, name and line while another finds raw text.",
       "intent_group": "code search for agents",
       "answer": "Is there a syntax-aware code search tool for refactoring? XERJ gives you two code queries on one index: match on body for raw text, and match on defs for declared symbols, which returns a symbols array with kind, name and line. It extracts definitions only and rewrites nothing; for structural rewrites use ast-grep.",
@@ -514,7 +514,7 @@
       "canonical_url": "https://xerj.org/answers/index-monorepo-for-agent",
       "markdown_url": "https://xerj.org/answers/index-monorepo-for-agent.md",
       "cluster": "Files and formats",
-      "updated": "2026-10-19",
+      "updated": "2026-10-20",
       "summary": "Index the tree once with xerj autoindex, then let the agent query the defs and symbols fields instead of opening files. A dry run first prints every ignore rule.",
       "intent_group": "code search for agents",
       "answer": "How do I stop my agent from reading the whole repo into context? Index the tree once with xerj autoindex and let the agent query the defs and symbols fields instead of opening files. Run --dry-run first: in our capture it reported files=3, ignored_files=2 and ignored_dirs=3, naming every ignore rule.",

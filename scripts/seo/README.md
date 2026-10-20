@@ -468,7 +468,13 @@ The file is a **derivation**, not a document:
   minus any article whose frontmatter sets `noindex: true`;
 * `<loc>` = `urlmap.deployed_url(file)` — absolute, https, extensionless,
   byte-identical to that page's canonical and `og:url`;
-* `<lastmod>` = `git log -1 --format=%cs -- <file>`;
+* `<lastmod>` = the page's content date (`DateSource.page_lastmod`): article
+  `updated:` front matter, else JSON-LD `dateModified`, else a `pagedata.py`
+  `updated`, else — on a full clone — the last commit that changed more than
+  shared chrome (`<head>`, the primary nav, the generated footer). A shallow
+  checkout keeps the `<lastmod>` already committed for that URL, and only a
+  URL missing from the file falls back to mtime. `git log -1` of the HTML
+  file is not the date: a sitewide head commit would stamp every URL today;
 * **no `<priority>`, no `<changefreq>`.** Google ignores both; Bing stated in
   July 2025 that both are ignored and influence nothing. Emitting them is noise;
 * **no non-HTML assets.** A `.txt` or `.json` URL produces no search result.
@@ -481,16 +487,19 @@ The file is a **derivation**, not a document:
 2. `<lastmod>` is the reason. Google uses `lastmod` only "if it's consistently
    and verifiably accurate", and the judgement is **sitewide**: one page whose
    `lastmod` drifts from reality teaches the crawler to ignore the field for
-   every page. Deriving it from `git log` makes it verifiable by construction.
-   The predecessor of this file was hand-maintained — 24 entries for an 80-page
-   site, 18 of which were URLs that 308-redirected rather than pages, four of
-   which were non-HTML assets, and all 24 carrying a `lastmod` that disagreed
-   with git. That is the failure this script exists to prevent.
+   every page. The date is the content date above, which is checkable from the
+   source front matter, the page's own `dateModified`, or `git log` of a
+   content change. The predecessor of this file was hand-maintained — 24
+   entries for an 80-page site, 18 of which were URLs that 308-redirected
+   rather than pages, four of which were non-HTML assets, and all 24 carrying
+   a `lastmod` that disagreed with git. That is the failure this script exists
+   to prevent.
 
-When git cannot answer (uncommitted file, shallow clone, no git), the tool falls
-back to the filesystem mtime and prints `WARNING: <lastmod> fell back to
-filesystem mtime` on stderr. In CI that warning means the checkout is wrong —
-see trap 3.
+When none of the content dates apply and git cannot answer (uncommitted file,
+shallow clone, no git), the tool keeps the `<lastmod>` already committed for
+that URL. Only a URL that is not in the file yet falls back to the filesystem
+mtime, and that prints `WARNING: <lastmod> fell back to filesystem mtime` on
+stderr. A shallow checkout no longer restamps the whole sitemap to today.
 
 ---
 
@@ -623,37 +632,34 @@ to it.
 ### 2. `dateModified` comes from git, so the first commit is never the last one
 
 Since #974 an article's `dateModified` comes from its **required `updated:`
-frontmatter field** — author-controlled data, immune to the loop below. What
-still comes from `git log -1 --format=%cs -- <file>` (`urlmap.DateSource`) is
-the sitemap's `<lastmod>`, which dates the *generated* HTML file itself. That
-is deliberate: it is the condition Google states for trusting the field. It
-also means:
+frontmatter field** — author-controlled data, immune to the loop below. The
+sitemap's `<lastmod>` uses that same field for a generated article (then the
+page's JSON-LD `dateModified`, then a pinned `pagedata.py` date). It does
+**not** use `git log -1` of the generated HTML: a sitewide head commit, and a
+shallow checkout whose files all share today's mtime, stamped every URL with
+one day. `git log` is only the fallback for a hand-written page that publishes
+no date, and only for a commit that changed more than shared chrome. That
+also means a hand-written page with no pinned date still moves `<lastmod>`
+when you commit a body edit, because that commit is now the content change.
+Re-run `gen_sitemap.py --write` after the commit (and amend, or add a
+follow-up commit) so `--check` sees the same day. A generated article does
+not: its date is `updated:`, and regenerating the HTML does not change it.
 
-```
-edit source  ->  build (date = today's mtime fallback)  ->  commit
-             ->  the source's git date is now the commit date
-             ->  build again: the generated output changes
-             ->  commit again  ->  now it converges
-```
-
-**It converges in exactly one extra round.** The loop is: commit your work, then
-immediately re-run `build_articles.py --write` and `gen_sitemap.py --write`, and
-`--amend` (or add) the resulting diff. After that, re-running the generators
-produces a zero diff, because the second commit does not change the *source*
-file's date — only the generated file's, and the generated file's own date is
-not an input.
-
-The stderr warning `WARNING: <lastmod> fell back to filesystem mtime` is the
-signal that a file is not committed yet. It is expected locally on new work and
-is a bug in CI.
+The stderr warning `WARNING: <lastmod> fell back to filesystem mtime` means a
+URL had no in-file date, no usable git history, and no committed sitemap
+entry. It is expected for a brand-new untracked page and is a bug in CI if it
+fires for a page that is already in `sitemap.xml`.
 
 ### 3. CI needs `fetch-depth: 0`
 
-`actions/checkout` defaults to a shallow clone with no tags. On a shallow clone
-`git log -1 -- <file>` returns nothing for most files, every date degrades to the
-filesystem mtime, generated output no longer matches the committed output, and
-`fix_heads.py --check` fails — with an error that looks like a content problem
-and is not. `landing-constants-guard.sh` fails differently on the same cause: it
+`actions/checkout` defaults to a shallow clone with no tags. Sitemap
+`<lastmod>` does not require that full history for a page that carries
+`updated:` or `dateModified`: those dates are in the checkout. A page with
+neither keeps the `<lastmod>` already committed, so a shallow
+`gen_sitemap.py --check` does not restamp the file to today.
+`fix_heads.py` can still move a date that is computed from `git log` when the
+page has no pinned date and no JSON-LD date to keep, and
+`landing-constants-guard.sh` fails differently on the same cause: it
 resolves "newest released tag" through `git tag --list`, which a shallow checkout
 does not fetch. Both `seo.yml` and the `landing-constants-guard` job in `ci.yml`
 already set `fetch-depth: 0`. Any new workflow that touches this toolchain must

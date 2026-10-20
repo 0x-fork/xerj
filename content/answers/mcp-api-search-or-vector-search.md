@@ -7,7 +7,7 @@ cluster: "Agent access and memory"
 question: "MCP/API search or vector search — which should an agent call?"
 intent: "tool-selection"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -136,6 +136,8 @@ curl -s -XPOST 'http://127.0.0.1:9500/qvec/_doc/q1' -H 'content-type: applicatio
 Call `xerj_search` first. The tool needs no embedder, no field name and no vector, and it answers structured and phrase questions directly. Escalate to `xerj_hybrid_search` when the first result set looks too narrow.
 
 Call `xerj_semantic_search` only on a node started with `--embed-mode neural`. On the default lexical embedder it costs an extra round trip to reach a ranking built from token overlap.
+
+When the lookup must say that nothing matched, and cite file:line when it does answer, see [retrieval that says not found](/answers/retrieval-that-says-not-found-with-file-line-citations).
 
 ## What this capture is and is not
 

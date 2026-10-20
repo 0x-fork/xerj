@@ -27,7 +27,7 @@ markup is the source of truth):
                        and the "partial set" case (worse than none)
    4. structured     — JSON-LD presence, JSON validity, @context/@type
    5. sitemap        — disk-vs-sitemap both ways, URL form mismatches,
-                       <lastmod> vs the file's real last-change date
+                       <lastmod> vs the page's content date
    6. headings       — missing/multiple H1, skipped levels, empty headings
    7. links          — broken internal links, orphan pages, click depth from
                        the homepage, .html links that shadow a directory index
@@ -43,10 +43,10 @@ Design notes
 ------------
 * Stdlib only (html.parser, urllib.parse, xml.etree, json, subprocess). No
   network access: every check is answerable from the working tree.
-* `git log -1 --format=%cs -- <file>` supplies the real last-change date for
-  the <lastmod> comparison. Some checkouts in this workspace have broken git
-  metadata; when git fails the script falls back to filesystem mtime and says
-  so, in the report and in the JSON (`meta.date_source`).
+* `<lastmod>` is compared to `urlmap.DateSource.page_lastmod` (article
+  `updated`, JSON-LD `dateModified`, a pinned `pagedata` date, then a
+  chrome-stripped git date). A shallow checkout keeps the committed sitemap
+  value instead of the filesystem mtime. `meta.date_source` is `content-date`.
 * Nothing is written to the site. This tool measures; it never fixes.
 """
 
@@ -124,7 +124,7 @@ CHECKS: dict[str, tuple[str, str]] = {
     "sitemap.dead_url":         ("critical", "sitemap.xml URL resolves to no file on disk"),
     "sitemap.markdown":          ("critical", "sitemap.xml advertises an alternate Markdown twin"),
     "sitemap.form_mismatch":    ("medium",   "sitemap URL form differs from the canonical deployed form"),
-    "sitemap.stale_lastmod":    ("low",      "<lastmod> disagrees with the file's real last-change date"),
+    "sitemap.stale_lastmod":    ("low",      "<lastmod> disagrees with the page's content date"),
     "h1.missing":               ("high",     "page has no <h1>"),
     "h1.multiple":              ("medium",   "more than one <h1>"),
     "heading.skip":             ("medium",   "heading level skipped (e.g. h2 → h4)"),
@@ -553,34 +553,19 @@ class Audit:
 
     # -- git / mtime dates
     def last_change_date(self, page_path: str) -> str | None:
-        if self.date_source == "git":
-            try:
-                out = subprocess.run(
-                    ["git", "log", "-1", "--format=%cs", "--", page_path],
-                    cwd=self.root, capture_output=True, text=True, timeout=20,
-                )
-                if out.returncode == 0:
-                    val = out.stdout.strip()
-                    if val:
-                        return val
-                    return None  # file exists but is untracked/uncommitted
-                self.date_source = "mtime"
-                self.notes.append(
-                    "git is unusable in this checkout ("
-                    + (out.stderr.strip().splitlines() or ["no stderr"])[0]
-                    + "); <lastmod> is compared against filesystem mtime instead"
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                self.date_source = "mtime"
-                self.notes.append(
-                    f"git is unusable in this checkout ({exc}); "
-                    "<lastmod> is compared against filesystem mtime instead"
-                )
-        import datetime
-        p = self.root / page_path
-        if not p.exists():
+        # Same content date gen_sitemap writes, so a sitewide head commit
+        # does not look like every page changed today.
+        if getattr(self, "_content_dates", None) is None:
+            import urlmap
+            self._content_dates = urlmap.DateSource(urlmap.repo_root())
+            self._content_prior = self._content_dates.committed_lastmods(
+                self.root / "sitemap.xml")
+            self.date_source = "content-date"
+        try:
+            return self._content_dates.page_lastmod(
+                page_path, self.root / page_path, self._content_prior)
+        except OSError:
             return None
-        return datetime.date.fromtimestamp(p.stat().st_mtime).isoformat()
 
     # ── checks ──────────────────────────────────────────────────────────
     def run(self):
