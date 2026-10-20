@@ -119,6 +119,11 @@ pub const MAX_RECORDS_PER_FILE: usize = 4 << 10; // 4096
 /// answer spanning a boundary stays retrievable from both sides.
 pub const SECTION_OVERLAP: usize = 200;
 
+/// How far the paragraph-overlap tail may move back to land on a word (see
+/// [`tail`]). A run with no whitespace inside the window snaps forward to the
+/// next word instead, or keeps the char boundary when there is none.
+const WORD_SNAP_BYTES: usize = 64;
+
 /// Open a (possibly gzipped) file as a buffered reader of DECODED-transparent
 /// bytes, optionally capped at `limit` decoded bytes (sampling).
 pub fn open_reader(path: &Path, gzip: bool, limit: Option<u64>) -> Result<Box<dyn BufRead + Send>> {
@@ -546,7 +551,13 @@ pub fn sanitize_field_name(name: &str) -> String {
     }
 }
 
-/// Last `n` bytes of `s`, snapped back to a char boundary.
+/// Last `n` bytes of `s`, snapped back to a char boundary, then onto a word
+/// so the next section does not open in the middle of a token.
+///
+/// A raw 200-byte tail of the previous paragraph is what made a markdown
+/// section of `docs/contributing/pull-requests.md` begin `le to use in tests`
+/// (the tail landed inside `available`). This is the paragraph-overlap
+/// path only; the hard split still cuts on a char boundary.
 fn tail(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
@@ -558,7 +569,50 @@ fn tail(s: &str, n: usize) -> String {
         .last()
         .map(|(i, _)| i)
         .unwrap_or(0);
+    let start = snap_overlap_start(s, start);
     s[start..].to_string()
+}
+
+/// If `start` falls inside a word, move to the nearest whitespace within
+/// [`WORD_SNAP_BYTES`] behind it (the whole word stays in the overlap), or
+/// forward to the next word when that lookbehind has no break.
+fn snap_overlap_start(s: &str, start: usize) -> usize {
+    if start == 0 || start >= s.len() {
+        return start.min(s.len());
+    }
+    let prev_is_word = s[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace());
+    let next_is_word = s[start..]
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace());
+    if !(prev_is_word && next_is_word) {
+        return start;
+    }
+    let look = floor_boundary(s, start.saturating_sub(WORD_SNAP_BYTES));
+    if let Some(rel) = s[look..start].rfind(char::is_whitespace) {
+        let at = look + rel;
+        let ws_len = s[at..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let after = at + ws_len;
+        if after > 0 && after < s.len() {
+            return after;
+        }
+    }
+    let rest = &s[start..];
+    if let Some(rel) = rest.find(char::is_whitespace) {
+        let ws_len = rest[rel..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        let after = start + rel + ws_len;
+        if after < s.len() {
+            return after;
+        }
+    }
+    start
 }
 
 /// Smallest char boundary of `s` that is `>= i` (`s.len()` if `i` is past the
@@ -977,6 +1031,52 @@ mod section_tests {
                 .contains("CHAPTER 26."),
             "a short LAST paragraph is still emitted"
         );
+    }
+
+    /// Paragraph overlap used to keep a raw 200-byte tail, so the next
+    /// section opened inside a word (`le to use` from `available`). The
+    /// overlap still repeats the boundary, and it starts on a word.
+    #[test]
+    fn paragraph_overlap_opens_on_a_word() {
+        let s = "utilities available to use in tests, no matter the crate";
+        // "utilities " is 10 bytes; index 13 is inside "available".
+        let opened = tail(s, s.len() - 13);
+        assert!(
+            opened.starts_with("available"),
+            "overlap opened mid-word: {opened}"
+        );
+
+        // A token longer than the lookbehind has no whitespace behind the
+        // cut, so the overlap skips forward to the next word instead.
+        let long = "A".repeat(WORD_SNAP_BYTES + 8);
+        let big = format!("xx{long} tail of the paragraph");
+        let mid = 2 + 4; // inside the run of A's
+        let opened = tail(&big, big.len() - mid);
+        assert!(
+            opened.starts_with("tail"),
+            "long token should snap forward: {opened:?}"
+        );
+
+        let para = format!(
+            "{}utilities available to use in tests",
+            "pad ".repeat(SECTION_CHARS)
+        );
+        let text = format!(
+            "{para}\n\n{}",
+            "The next paragraph is long enough to force a new section. ".repeat(40)
+        );
+        let secs = split_sections(&text);
+        assert!(secs.len() >= 2, "{}", secs.len());
+        let next = &secs[1];
+        let at = text.find(next.as_str()).expect("overlap is a substring");
+        if at > 0 {
+            let prev = text[..at].chars().next_back().unwrap();
+            assert!(
+                prev.is_whitespace(),
+                "section opened mid-word ({prev:?}): {:?}",
+                &next[..next.len().min(48)]
+            );
+        }
     }
 
     /// A single paragraph larger than two sections must still be bounded.
