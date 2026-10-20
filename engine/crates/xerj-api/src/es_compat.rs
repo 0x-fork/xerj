@@ -7547,7 +7547,18 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
     use xerj_query::ast::{HighlightFieldOptions, HighlightRequest};
 
     let obj = hl_val.as_object()?;
-    let fields_val = obj.get("fields")?.as_object()?;
+    // `fields` is an object, or ES's ordered form: an array of single-field
+    // objects (`[{"title": {}}, {"body": {}}]`). The array used to fail
+    // `as_object()` and drop highlighting with no error (#1946).
+    let field_entries: Vec<(&String, &Value)> = match obj.get("fields")? {
+        Value::Object(m) => m.iter().collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_object)
+            .flat_map(|m| m.iter())
+            .collect(),
+        _ => return None,
+    };
 
     fn pull_tag(
         obj: &serde_json::Map<String, Value>,
@@ -7563,7 +7574,7 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
     }
 
     let mut fields = std::collections::HashMap::new();
-    for (field_name, field_opts) in fields_val {
+    for (field_name, field_opts) in field_entries {
         let opts = if let Some(o) = field_opts.as_object() {
             HighlightFieldOptions {
                 pre_tag: pull_tag(o, "pre_tags", "pre_tag"),
