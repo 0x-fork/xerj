@@ -6592,6 +6592,201 @@ fn find_invalid_agg_order_path(aggs: Option<&Value>) -> Option<String> {
     None
 }
 
+/// Request-time check of `composite` aggregation definitions.
+///
+/// Elasticsearch refuses these at parse time with a 400; XERJ's
+/// `run_composite` instead answered 200 with an empty bucket list (missing or
+/// empty `sources`), silently let a later source overwrite an earlier one of
+/// the same name, ignored a `missing_order` that can never apply, accepted a
+/// page `size` far above `search.max_buckets`, and ran under any parent.
+/// Messages are ES 8.13's, as pinned by `aggregations/composite.yml`:
+///
+/// * `sources` absent → `Required [sources]`; empty or not a list →
+///   `Composite [sources] cannot be null or empty`;
+/// * two sources with one name → `Composite source names must be unique,
+///   found duplicates: [..]`;
+/// * `missing_order` other than `default` without `missing_bucket: true` →
+///   `missingOrder can only be set if missingBucket is true`;
+/// * `size` above `search.max_buckets` → ES's too-many-buckets message;
+/// * a parent other than `nested`, `reverse_nested` or `filter` (through any
+///   chain of those) → `[composite] aggregation cannot be used with a parent
+///   aggregation of type: [..AggregatorFactory]`.
+fn find_invalid_composite_agg(aggs: Option<&Value>) -> Option<String> {
+    fn sub_aggs(def: &Value) -> Option<&Value> {
+        def.get("aggs").or_else(|| def.get("aggregations"))
+    }
+    fn kind_of(def: &Value) -> Option<(&str, &Value)> {
+        def.as_object()?
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "aggs" | "aggregations" | "meta"))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+    /// ES names the blocking parent by its factory class:
+    /// `terms` → `TermsAggregatorFactory`, `date_histogram` →
+    /// `DateHistogramAggregatorFactory`.
+    fn factory_name(kind: &str) -> String {
+        let camel: String = kind
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect();
+        format!("{camel}AggregatorFactory")
+    }
+    fn check(params: &Value, blocking_parent: Option<&str>) -> Option<String> {
+        let sources = match params.get("sources") {
+            None => return Some("Required [sources]".to_string()),
+            Some(Value::Array(a)) if !a.is_empty() => a,
+            Some(_) => return Some("Composite [sources] cannot be null or empty".to_string()),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for source in sources {
+            let Some(obj) = source.as_object() else {
+                continue;
+            };
+            for (name, def) in obj {
+                if !seen.insert(name.as_str()) && !duplicates.contains(name) {
+                    duplicates.push(name.clone());
+                }
+                // `{name: {terms|histogram|...: {..., missing_order}}}`
+                let inner = def.as_object().and_then(|d| d.values().next());
+                if let Some(inner) = inner {
+                    let order = inner.get("missing_order").and_then(Value::as_str);
+                    let bucket = inner
+                        .get("missing_bucket")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if matches!(order, Some(o) if o != "default") && !bucket {
+                        return Some(
+                            "missingOrder can only be set if missingBucket is true".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        if !duplicates.is_empty() {
+            return Some(format!(
+                "Composite source names must be unique, found duplicates: [{}]",
+                duplicates.join(", ")
+            ));
+        }
+        let cap = xerj_engine::aggs::max_buckets() as u64;
+        if let Some(size) = params.get("size").and_then(Value::as_u64) {
+            if size > cap {
+                return Some(format!(
+                    "Trying to create too many buckets. Must be less than or equal to: [{cap}] \
+                     but was [{size}]. This limit can be set by changing the \
+                     [search.max_buckets] cluster level setting."
+                ));
+            }
+        }
+        if let Some(parent) = blocking_parent {
+            return Some(format!(
+                "[composite] aggregation cannot be used with a parent aggregation of type: [{}]",
+                factory_name(parent)
+            ));
+        }
+        None
+    }
+    fn walk(
+        level: &serde_json::Map<String, Value>,
+        blocking_parent: Option<&str>,
+    ) -> Option<String> {
+        for def in level.values() {
+            let Some((kind, params)) = kind_of(def) else {
+                continue;
+            };
+            if kind == "composite" {
+                if let Some(reason) = check(params, blocking_parent) {
+                    return Some(reason);
+                }
+            }
+            // ES lets a composite sit under nested / reverse_nested / filter
+            // (any chain of them); any other parent blocks it.
+            let below = if matches!(kind, "nested" | "reverse_nested" | "filter") {
+                blocking_parent
+            } else {
+                Some(kind)
+            };
+            if let Some(subs) = sub_aggs(def).and_then(Value::as_object) {
+                if let Some(reason) = walk(subs, below) {
+                    return Some(reason);
+                }
+            }
+        }
+        None
+    }
+    walk(aggs?.as_object()?, None)
+}
+
+#[cfg(test)]
+mod composite_agg_validation_tests {
+    use super::find_invalid_composite_agg;
+    use serde_json::json;
+
+    fn check(aggs: serde_json::Value) -> Option<String> {
+        find_invalid_composite_agg(Some(&aggs))
+    }
+
+    /// Shapes `aggregations/composite.yml` already passes with must stay
+    /// valid: top level, under nested / reverse_nested / filter chains, with
+    /// `missing_bucket: true` and an order, and with a sane `size`.
+    #[test]
+    fn valid_composites_pass() {
+        for aggs in [
+            json!({"c": {"composite": {"size": 10, "sources": [
+                {"kw": {"terms": {"field": "keyword"}}},
+                {"long": {"terms": {"field": "long", "missing_bucket": true,
+                                    "missing_order": "last"}}},
+                {"d": {"terms": {"field": "date", "missing_order": "default"}}}]}}}),
+            json!({"n": {"nested": {"path": "nested"},
+                         "aggs": {"f": {"filter": {"term": {"x": 1}},
+                                        "aggs": {"r": {"reverse_nested": {},
+                                                       "aggs": {"c": {"composite": {"sources": [
+                                                           {"kw": {"terms": {"field": "keyword"}}}]}}}}}}}}}),
+            // A composite with sub-aggregations, and an unrelated terms
+            // whose child is NOT a composite.
+            json!({"c": {"composite": {"sources": [{"kw": {"terms": {"field": "keyword"}}}]},
+                         "aggs": {"t": {"terms": {"field": "x"}}}},
+                   "t": {"terms": {"field": "y"}, "aggs": {"m": {"max": {"field": "z"}}}}}),
+        ] {
+            assert_eq!(check(aggs.clone()), None, "{aggs}");
+        }
+    }
+
+    #[test]
+    fn invalid_composites_are_refused_with_es_messages() {
+        let cases = [
+            (json!({"c": {"composite": {"size": 1}}}), "Required [sources]"),
+            (json!({"c": {"composite": {"sources": []}}}),
+             "Composite [sources] cannot be null or empty"),
+            (json!({"c": {"composite": {"sources": [
+                {"keyword": {"terms": {"field": "keyword"}}},
+                {"keyword": {"terms": {"field": "long"}}}]}}}),
+             "Composite source names must be unique, found duplicates: [keyword]"),
+            (json!({"c": {"composite": {"sources": [
+                {"kw": {"terms": {"field": "keyword", "missing_order": "first"}}}]}}}),
+             "missingOrder can only be set if missingBucket is true"),
+            (json!({"c": {"composite": {"size": 1_000_000_000u64, "sources": [
+                {"kw": {"terms": {"field": "keyword"}}}]}}}),
+             "Trying to create too many buckets"),
+            (json!({"t": {"terms": {"field": "long"},
+                          "aggs": {"c": {"composite": {"sources": [
+                              {"kw": {"terms": {"field": "keyword"}}}]}}}}}),
+             "[composite] aggregation cannot be used with a parent aggregation of type: [TermsAggregatorFactory]"),
+        ];
+        for (aggs, want) in cases {
+            let got = check(aggs.clone()).unwrap_or_else(|| panic!("not refused: {aggs}"));
+            assert!(got.contains(want), "{aggs}\n got: {got}\nwant: {want}");
+        }
+    }
+}
+
 /// Parse an ES time-units string to milliseconds: `"500ms"`, `"30s"`,
 /// `"2m"`, `"1h"`, `"1d"`, `"5micros"`, `"100nanos"`, bare number =
 /// millis. Sub-millisecond values round up to 1 ms so `timeout=100nanos`
@@ -6734,7 +6929,9 @@ fn build_search_request(
     if let Some(msg) = find_search_body_script_limit_violation(body, aggs_value.as_ref()) {
         return Err(xerj_common::XerjError::invalid_query(msg));
     }
-    if let Some(msg) = find_invalid_agg_order_path(aggs_value.as_ref()) {
+    if let Some(msg) = find_invalid_agg_order_path(aggs_value.as_ref())
+        .or_else(|| find_invalid_composite_agg(aggs_value.as_ref()))
+    {
         return Err(xerj_common::XerjError::invalid_query(msg));
     }
 
@@ -26145,7 +26342,14 @@ async fn msearch_impl(
             search_body_val
                 .get("aggs")
                 .or_else(|| search_body_val.get("aggregations")),
-        ) {
+        )
+        .or_else(|| {
+            find_invalid_composite_agg(
+                search_body_val
+                    .get("aggs")
+                    .or_else(|| search_body_val.get("aggregations")),
+            )
+        }) {
             responses.push(json!({
                 "error": { "type": "illegal_argument_exception", "reason": msg },
                 "status": 400
@@ -36437,7 +36641,14 @@ pub async fn search_template(
         search_body_val
             .get("aggs")
             .or_else(|| search_body_val.get("aggregations")),
-    ) {
+    )
+    .or_else(|| {
+        find_invalid_composite_agg(
+            search_body_val
+                .get("aggs")
+                .or_else(|| search_body_val.get("aggregations")),
+        )
+    }) {
         return ApiError::new(xerj_common::XerjError::invalid_query(msg)).into_response();
     }
 
@@ -36698,7 +36909,14 @@ async fn msearch_template_impl(
             search_body_val
                 .get("aggs")
                 .or_else(|| search_body_val.get("aggregations")),
-        ) {
+        )
+        .or_else(|| {
+            find_invalid_composite_agg(
+                search_body_val
+                    .get("aggs")
+                    .or_else(|| search_body_val.get("aggregations")),
+            )
+        }) {
             responses.push(json!({
                 "error": { "type": "illegal_argument_exception", "reason": msg },
                 "status": 400

@@ -24,14 +24,8 @@ aggregations/bucket_sort.yml · no action fails
 aggregations/bucket_sort.yml · top level fails
 aggregations/cardinality_metric.yml · invalid execution hint throws
 aggregations/cardinality_metric.yml · Invalid Precision test
-aggregations/composite.yml · Composite aggregation and array size
 aggregations/composite.yml · Composite aggregation with invalid format
 aggregations/composite.yml · Composite aggregation with lossy format
-aggregations/composite.yml · Duplicate sources
-aggregations/composite.yml · Invalid Composite aggregation
-aggregations/composite.yml · missing_order with missing_bucket = false
-aggregations/composite.yml · missing_order without missing_bucket
-aggregations/composite.yml · Missing source
 aggregations/cumulative_sum.yml · bad path
 aggregations/cumulative_sum.yml · invalid parent aggregation
 aggregations/derivative.yml · bad path
