@@ -227,6 +227,18 @@ pub fn sniff_with_name(content_path: &Path, logical_path: &Path) -> Result<Sniff
     let mut s = sniff_bytes(&prefix, content_path, logical_path, gzip)?;
     s.gzip = gzip;
     s.logical_name = logical_path.file_name().map(std::path::PathBuf::from);
+    // #1984: the sniff prefix is 8 KiB. A dump whose first row statement sits
+    // past that — pg_dump writes every CREATE TABLE, then COPY — would
+    // otherwise fall through to text, because the prefix is schema only.
+    // One extra read, and only when the prefix already looks like DDL and
+    // the file continues. The scan stops at the first row statement.
+    if prefix.len() == PREFIX
+        && matches!(s.family, Family::TxtLines | Family::TxtProse)
+        && prefix_is_schema_ddl(&prefix)
+        && file_contains_sql_row_data(content_path, gzip)
+    {
+        s.family = Family::SqlDump;
+    }
     Ok(s)
 }
 
@@ -421,7 +433,7 @@ fn sniff_bytes(
         // A man(7) page: comments and a generator's roff preamble, then
         // `.TH`. Checked before the text heuristics, which would otherwise
         // see the page as txt-lines — or, for sqlite3(1)/psql(1), whose
-        // examples hold `CREATE TABLE …;`, as a SQL dump.
+        // examples hold `INSERT INTO … VALUES`, as a SQL dump.
         // A Jupyter notebook is JSON; without this it reached the generic
         // JSON extractor (one record per cell, a dataset per notebook).
         if crate::extract::ipynb::looks_like_notebook(body) {
@@ -1633,10 +1645,20 @@ fn classify_structured(text: &str, nonblank: &[&str]) -> Option<Family> {
         }
     }
 
-    // SQL dump
-    let upper: String = text.chars().take(4096).collect::<String>().to_uppercase();
-    if (upper.contains("CREATE TABLE") || upper.contains("INSERT INTO")) && text.contains(';') {
+    // SQL dump (#1984). A dump carries rows: `INSERT INTO … VALUES (` or
+    // Postgres `COPY … FROM stdin`. Schema migrations are DDL only
+    // (`CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX`) and the dump
+    // extractor emits nothing for them, so `scan_file` junked the file
+    // ("no records extracted") and the migration was unsearchable. DDL
+    // alone returns None: the text fallback indexes it with line numbers,
+    // and the CSV probe below does not read a trailing `;` as a delimiter.
+    // Row data that starts past the sniff prefix is caught in
+    // `sniff_with_name`, which keeps reading when this prefix is schema.
+    if sql_dump_has_rows(text.as_bytes()) {
         return Some(Family::SqlDump);
+    }
+    if schema_ddl_in_head(text) {
+        return None;
     }
 
     // CSV — dialect probe happens in caller; here just a cheap plausibility test.
@@ -1645,6 +1667,238 @@ fn classify_structured(text: &str, nonblank: &[&str]) -> Option<Family> {
     }
 
     None
+}
+
+/// `CREATE TABLE` inside the first 4 KiB, plus a statement terminator.
+/// The same window the old dump rule used. Row data is decided separately.
+fn schema_ddl_in_head(text: &str) -> bool {
+    let head: String = text
+        .chars()
+        .take(4096)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    head.contains("CREATE TABLE") && text.contains(';')
+}
+
+/// Decoded prefix: schema DDL and no row statement yet. The file may still
+/// hold `INSERT`/`COPY` past the 8 KiB sniff window.
+fn prefix_is_schema_ddl(prefix: &[u8]) -> bool {
+    let (text, _) = decode(prefix);
+    schema_ddl_in_head(&text) && !sql_dump_has_rows(text.as_bytes())
+}
+
+fn file_contains_sql_row_data(path: &Path, gzip: bool) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if gzip {
+        scan_sql_row_data(flate2::read::MultiGzDecoder::new(file))
+    } else {
+        scan_sql_row_data(file)
+    }
+}
+
+fn scan_sql_row_data(mut reader: impl Read) -> bool {
+    let mut probe = SqlRowProbe::default();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return probe.finish(),
+            Ok(n) => {
+                if probe.push(&buf[..n]) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn sql_dump_has_rows(bytes: &[u8]) -> bool {
+    let mut probe = SqlRowProbe::default();
+    probe.push(bytes) || probe.finish()
+}
+
+fn is_sql_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Streaming, ASCII-case-insensitive search for dump row data:
+/// `INSERT [IGNORE] INTO … VALUES (` or `COPY … FROM stdin`.
+///
+/// The two halves of each pattern can be far apart (a wide column list,
+/// or pg_dump's schema section), so a flag remembers the opener and the
+/// window only has to hold one keyword.
+struct SqlRowProbe {
+    /// Recent uppercase bytes. Long enough for `INSERT IGNORE INTO`.
+    win: Vec<u8>,
+    trimmed: bool,
+    seen_insert_into: bool,
+    seen_copy: bool,
+    /// Whitespace after a completed `VALUES`, waiting for `(`.
+    values_ws: bool,
+    /// Whitespace after a completed `FROM` (and a prior `COPY`), waiting
+    /// for `STDIN`.
+    from_ws: bool,
+    /// How many leading bytes of `STDIN` are matched.
+    stdin_at: u8,
+    /// `STDIN` letters are complete; the next byte decides the boundary.
+    stdin_done: bool,
+}
+
+const SQL_ROW_WIN: usize = 96;
+
+impl Default for SqlRowProbe {
+    fn default() -> Self {
+        Self {
+            win: Vec::with_capacity(SQL_ROW_WIN),
+            trimmed: false,
+            seen_insert_into: false,
+            seen_copy: false,
+            values_ws: false,
+            from_ws: false,
+            stdin_at: 0,
+            stdin_done: false,
+        }
+    }
+}
+
+impl SqlRowProbe {
+    fn push(&mut self, chunk: &[u8]) -> bool {
+        chunk.iter().any(|&b| self.push_byte(b))
+    }
+
+    /// EOF is a word boundary, so a statement that ends on `STDIN` still hits.
+    fn finish(&mut self) -> bool {
+        self.push_byte(b'\n')
+    }
+
+    fn push_byte(&mut self, b: u8) -> bool {
+        let u = b.to_ascii_uppercase();
+        let boundary = !is_sql_ident(u);
+
+        if self.stdin_done {
+            self.stdin_done = false;
+            if boundary {
+                return true;
+            }
+        }
+        if self.values_ws {
+            if u == b'(' {
+                return true;
+            }
+            if !u.is_ascii_whitespace() {
+                self.values_ws = false;
+            }
+        }
+        if self.from_ws {
+            if u == b'S' {
+                self.from_ws = false;
+                self.stdin_at = 1;
+            } else if !u.is_ascii_whitespace() {
+                self.from_ws = false;
+            }
+        } else if self.stdin_at > 0 {
+            const STDIN: &[u8] = b"STDIN";
+            if self.stdin_at < STDIN.len() as u8 && u == STDIN[self.stdin_at as usize] {
+                self.stdin_at += 1;
+                if self.stdin_at == STDIN.len() as u8 {
+                    self.stdin_at = 0;
+                    self.stdin_done = true;
+                }
+            } else {
+                self.stdin_at = 0;
+            }
+        }
+
+        if boundary && self.win.last().is_some_and(|c| is_sql_ident(*c)) {
+            if self.seen_insert_into && self.ends_with_word(b"VALUES") {
+                if u == b'(' {
+                    return true;
+                }
+                if u.is_ascii_whitespace() {
+                    self.values_ws = true;
+                }
+            }
+            if self.seen_copy && self.ends_with_word(b"FROM") && u.is_ascii_whitespace() {
+                self.from_ws = true;
+            }
+            if self.ends_with_word(b"INTO") && self.win_is_insert_into() {
+                self.seen_insert_into = true;
+            }
+            if self.ends_with_word(b"COPY") {
+                self.seen_copy = true;
+            }
+        }
+
+        self.win.push(u);
+        if self.win.len() > SQL_ROW_WIN {
+            let extra = self.win.len() - SQL_ROW_WIN;
+            self.win.drain(..extra);
+            self.trimmed = true;
+        }
+        false
+    }
+
+    fn ends_with_word(&self, word: &[u8]) -> bool {
+        if self.win.len() < word.len() || !self.win.ends_with(word) {
+            return false;
+        }
+        let start = self.win.len() - word.len();
+        if start == 0 {
+            // A trimmed window hid the preceding byte, so a keyword sitting
+            // on that edge is not evidence. The file start (never trimmed)
+            // is a real boundary.
+            return !self.trimmed;
+        }
+        !is_sql_ident(self.win[start - 1])
+    }
+
+    /// Window ends at the last letter of `INTO`. True for `INSERT INTO` and
+    /// `INSERT IGNORE INTO`, whitespace only between the words.
+    fn win_is_insert_into(&self) -> bool {
+        let Some(into_at) = self.word_at_end(b"INTO") else {
+            return false;
+        };
+        let after_prev = skip_ws_back(&self.win, into_at);
+        if after_prev == into_at {
+            return false;
+        }
+        if let Some(ign_at) = word_at_end(&self.win[..after_prev], b"IGNORE", self.trimmed) {
+            let after_insert = skip_ws_back(&self.win, ign_at);
+            if after_insert == ign_at {
+                return false;
+            }
+            return word_at_end(&self.win[..after_insert], b"INSERT", self.trimmed).is_some();
+        }
+        word_at_end(&self.win[..after_prev], b"INSERT", self.trimmed).is_some()
+    }
+
+    fn word_at_end(&self, word: &[u8]) -> Option<usize> {
+        word_at_end(&self.win, word, self.trimmed)
+    }
+}
+
+fn word_at_end(win: &[u8], word: &[u8], trimmed: bool) -> Option<usize> {
+    if win.len() < word.len() || !win.ends_with(word) {
+        return None;
+    }
+    let start = win.len() - word.len();
+    if start == 0 {
+        if trimmed {
+            return None;
+        }
+    } else if is_sql_ident(win[start - 1]) {
+        return None;
+    }
+    Some(start)
+}
+
+fn skip_ws_back(win: &[u8], mut end: usize) -> usize {
+    while end > 0 && win[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
 }
 
 fn looks_like_json_start(t: &str) -> bool {
@@ -3679,6 +3933,214 @@ mod tests {
             classify("key: value\nother: 1\nnested:\n  a: 2\n"),
             Family::Yaml
         );
+    }
+
+    /// #1984: a schema migration is DDL with no row data. The dump extractor
+    /// emits nothing for it, and `scan_file` then junks the file, so the
+    /// column definition never becomes searchable.
+    #[test]
+    fn schema_only_sql_migration_is_text_not_an_empty_dump() {
+        let migration = "-- add users\n\
+                         CREATE TABLE users (\n\
+                         id INTEGER PRIMARY KEY,\n\
+                         email TEXT NOT NULL,\n\
+                         created_at TIMESTAMP NOT NULL\n\
+                         );\n\
+                         \n\
+                         ALTER TABLE users ADD COLUMN name TEXT;\n\
+                         \n\
+                         CREATE INDEX idx_users_email ON users (email);\n";
+        assert_eq!(
+            classify(migration),
+            Family::TxtLines,
+            "DDL with no INSERT/COPY is source text, not a dump"
+        );
+
+        // One statement per line, every line ending in `;`. That shape is a
+        // consistent `;`-delimited "CSV"; it must still be text.
+        let one_liners = "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\n\
+                          ALTER TABLE users ADD COLUMN name TEXT;\n\
+                          CREATE INDEX idx_users_email ON users (email);\n";
+        let one_line_family = classify(one_liners);
+        assert!(
+            matches!(one_line_family, Family::TxtLines | Family::TxtProse),
+            "semicolon-terminated DDL classified {one_line_family:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("001_users.sql");
+        std::fs::write(&path, migration).unwrap();
+        let sn = sniff(&path).unwrap();
+        assert_eq!(sn.family, Family::TxtLines);
+        let mut recs = Vec::new();
+        let stats = crate::extract::extract(&path, &sn, None, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        assert!(
+            stats.records > 0,
+            "a migration must be indexed, not skipped"
+        );
+        assert!(
+            recs.iter().any(|r| {
+                r.fields
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.contains("email"))
+                    && r.fields.get("start_line").is_some()
+            }),
+            "the column definition must be searchable with a line number: {recs:?}"
+        );
+    }
+
+    /// #1984: `INSERT INTO … VALUES (` keeps the dump family, including the
+    /// `INSERT IGNORE` form MariaDB emits, and still yields a row.
+    #[test]
+    fn sql_dump_with_insert_values_stays_sqldump() {
+        assert_eq!(
+            classify("CREATE TABLE `t` (\n `a` int\n);\nINSERT INTO `t` VALUES (1);\n"),
+            Family::SqlDump
+        );
+        assert_eq!(
+            classify("insert ignore into t (a) values (1);\n"),
+            Family::SqlDump
+        );
+        // An INSERT … SELECT moves rows but is not a dump of literals.
+        assert_ne!(
+            classify("INSERT INTO t SELECT id FROM other;\n"),
+            Family::SqlDump
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.sql");
+        std::fs::write(
+            &path,
+            "CREATE TABLE `users` (`id` int, `name` varchar(64));\n\
+             INSERT INTO `users` VALUES (1,'ann');\n",
+        )
+        .unwrap();
+        let sn = sniff(&path).unwrap();
+        assert_eq!(sn.family, Family::SqlDump);
+        let mut recs = Vec::new();
+        let stats = crate::extract::extract(&path, &sn, None, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        assert_eq!(stats.records, 1, "{recs:?}");
+        assert_eq!(recs[0].fields["name"], serde_json::json!("ann"));
+    }
+
+    /// #1984: Postgres `COPY … FROM stdin` keeps the dump family.
+    #[test]
+    fn sql_dump_with_copy_from_stdin_stays_sqldump() {
+        let dump = "CREATE TABLE users (id int, name text);\n\
+                    COPY users (id, name) FROM stdin;\n\
+                    1\tann\n\
+                    \\.\n";
+        assert_eq!(classify(dump), Family::SqlDump);
+        assert_eq!(classify("COPY public.users FROM STDIN;\n"), Family::SqlDump);
+        // The letters have to be the keyword, not a longer identifier.
+        assert_ne!(
+            classify("COPYRIGHT notice; CREATE TABLE t (a int);\n"),
+            Family::SqlDump
+        );
+    }
+
+    /// Row data that begins past the 8 KiB sniff prefix still classifies as a
+    /// dump. pg_dump writes the whole schema first; deciding from the prefix
+    /// alone would index that file as text.
+    #[test]
+    fn sql_dump_whose_insert_starts_past_the_sniff_prefix_stays_sqldump() {
+        let mut body = String::from(
+            "CREATE TABLE users (\n  id INTEGER PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
+        );
+        while body.len() <= super::PREFIX {
+            body.push_str("ALTER TABLE users ADD COLUMN c_extra INTEGER;\n");
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = dir.path().join("schema.sql");
+        std::fs::write(&schema, &body).unwrap();
+        let schema_sn = sniff(&schema).unwrap();
+        assert!(
+            matches!(schema_sn.family, Family::TxtLines | Family::TxtProse),
+            "schema past the prefix classified {:?}",
+            schema_sn.family
+        );
+
+        body.push_str("INSERT INTO users (id, email) VALUES (1,'ann@example.com');\n");
+        let dump = dir.path().join("dump.sql");
+        std::fs::write(&dump, &body).unwrap();
+        assert_eq!(sniff(&dump).unwrap().family, Family::SqlDump);
+
+        // A COPY-only file whose data statement starts past the prefix.
+        let mut copy_body = String::from(
+            "CREATE TABLE users (\n  id INTEGER PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
+        );
+        while copy_body.len() <= super::PREFIX {
+            copy_body.push_str("ALTER TABLE users ADD COLUMN c_extra INTEGER;\n");
+        }
+        copy_body.push_str("COPY users (id, email) FROM stdin;\n1\tann\n\\.\n");
+        let copy = dir.path().join("copy.sql");
+        std::fs::write(&copy, copy_body).unwrap();
+        assert_eq!(sniff(&copy).unwrap().family, Family::SqlDump);
+    }
+
+    /// The row-data probe is a state machine over a byte stream. A keyword
+    /// split across reads (the file scan uses 64 KiB chunks) must still hit,
+    /// and a longer identifier must not.
+    #[test]
+    fn sql_row_probe_matches_across_chunk_boundaries() {
+        let positive = [
+            "INSERT INTO t VALUES (1)",
+            "insert ignore into t(a) values(1)",
+            "COPY users (id, name) FROM stdin;",
+            "COPY public.users FROM STDIN",
+            "INSERT\nINTO\nt\nVALUES\n(1)",
+        ];
+        // The opener and the tuple can be far apart: a wide column list, or
+        // pg_dump's schema section before the first COPY.
+        let mut wide_insert = String::from("INSERT INTO t (");
+        wide_insert.push_str(&"col,".repeat(80));
+        wide_insert.push_str(") VALUES (1)");
+        let mut wide_copy = String::from("COPY t (");
+        wide_copy.push_str(&"col,".repeat(80));
+        wide_copy.push_str(") FROM stdin;");
+        let wide = [wide_insert, wide_copy];
+        for sample in positive {
+            let bytes = sample.as_bytes();
+            for split in 0..=bytes.len() {
+                let mut probe = SqlRowProbe::default();
+                let hit =
+                    probe.push(&bytes[..split]) || probe.push(&bytes[split..]) || probe.finish();
+                assert!(hit, "missed {sample:?} split at {split}");
+            }
+        }
+        for sample in &wide {
+            assert!(
+                sql_dump_has_rows(sample.as_bytes()),
+                "wide column list must still be a dump"
+            );
+            let bytes = sample.as_bytes();
+            let mid = bytes.len() / 2;
+            let mut probe = SqlRowProbe::default();
+            let hit = probe.push(&bytes[..mid]) || probe.push(&bytes[mid..]) || probe.finish();
+            assert!(hit, "wide column list missed across a chunk split");
+        }
+        for sample in [
+            "CREATE TABLE t (a int);",
+            "INSERT INTO t SELECT id FROM other;",
+            "COPYRIGHT notice; FROM stdin;",
+            "INSERT INTO t VALUES 1;",
+            "REINSERT INTO t VALUES (1);",
+        ] {
+            assert!(
+                !sql_dump_has_rows(sample.as_bytes()),
+                "false hit on {sample:?}"
+            );
+        }
     }
 
     /// #1142 class 1: markdown opening with an HTML fragment (Hugo front-matter
