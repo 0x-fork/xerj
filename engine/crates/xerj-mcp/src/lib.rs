@@ -1219,15 +1219,15 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                     },
                     "verdict": {
                         "type": "string",
-                        "description": "What worked and what did not. Capped at 80 characters on the wire; put the long text in notes."
+                        "description": "What worked and what did not, in one or two sentences (up to 1000 characters). Put the long report in notes."
                     },
                     "version": {
                         "type": "string",
-                        "description": "xerj version, if known. Optional."
+                        "description": "xerj version. Optional: when omitted, this binary's own version is sent."
                     },
                     "os": {
                         "type": "string",
-                        "description": "OS and architecture. Optional."
+                        "description": "OS and architecture. Optional: when omitted, this machine's OS and architecture are sent."
                     },
                     "indexed": {
                         "type": "string",
@@ -1324,6 +1324,19 @@ async fn call_field_report(args: &Value) -> Value {
     let os = match opt_text(args, "os") {
         Ok(v) => v,
         Err(msg) => return tool_text(msg, true),
+    };
+    // Fill the facts this process can observe, the same way `xerj feedback`
+    // does, so a report filed without them still says which build and
+    // platform it came from.
+    let version = if version.trim().is_empty() {
+        format!("xerj v{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        version
+    };
+    let os = if os.trim().is_empty() {
+        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+    } else {
+        os
     };
     let indexed = match opt_text(args, "indexed") {
         Ok(v) => v,
@@ -3997,6 +4010,22 @@ mod tests {
         assert!(!request.contains(token), "{request}");
         assert!(request.contains("\"agent\":\"Test Agent\""), "{request}");
         assert!(request.contains("\"notes\":\"full report\""), "{request}");
+        // version and os were omitted: the observable facts are filled in.
+        assert!(
+            request.contains(&format!(
+                "\"version\":\"xerj v{}\"",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!(
+                "\"os\":\"{} {}\"",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )),
+            "{request}"
+        );
     }
 
     /// GitHub first, endpoint second: with no `xerj` (and so no PR path)

@@ -636,15 +636,15 @@
           },
           "verdict": {
             "type": "string",
-            "description": "What worked and what did not. Capped at 80 characters on the wire; put the long text in notes."
+            "description": "What worked and what did not, in one or two sentences (up to 1000 characters). Put the long report in notes."
           },
           "version": {
             "type": "string",
-            "description": "xerj version, if known. Optional."
+            "description": "xerj version. Optional: when omitted, this binary's own version is sent."
           },
           "os": {
             "type": "string",
-            "description": "OS and architecture. Optional."
+            "description": "OS and architecture. Optional: when omitted, this machine's OS and architecture are sent."
           },
           "indexed": {
             "type": "string",
