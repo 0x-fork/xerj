@@ -1236,6 +1236,89 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
     assert!(indexed.contains("second.csv"), "{indexed:?}");
 }
 
+/// #1911: one file that changed between phase A's digest and phase B's read
+/// (a live lock file on Windows) aborted the whole run with "bulk/backend
+/// failures", after other files' records were already live — 87 partial
+/// indices and a journal to clean by hand, and a retry met the same file. It is
+/// now one skipped file with the reason in the catalog: every other file is
+/// indexed and journaled, the run completes with exit 3, and the next run
+/// indexes the file's new content.
+#[test]
+fn a_file_that_changes_mid_run_is_skipped_and_the_run_finishes() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("first.csv"), "id,value\n1,first\n").unwrap();
+    fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
+    let live = corpus.path().join("app.lock");
+    fs::write(&live, "pid 1\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    let grow = live.clone();
+    arm_phase_b_start_hook(state_dir.path(), move || {
+        let mut f = fs::OpenOptions::new().append(true).open(grow).unwrap();
+        f.write_all(b"pid 2 took the lock\n").unwrap();
+    });
+    let (code, report) =
+        run_index_report(config.clone()).expect("one changing file must not abort the run");
+    assert_eq!(
+        code, 3,
+        "a skipped file is completed-with-junk, not a failure"
+    );
+    let report = report.unwrap();
+    assert_eq!(report["files_junk"], 1, "{report}");
+    assert_eq!(
+        file_done_count(state_dir.path()),
+        2,
+        "every other file is journaled done"
+    );
+    {
+        let locked = endpoint.state.lock().unwrap();
+        let mut paths: Vec<&str> = data_rows(&locked)
+            .iter()
+            .filter_map(|doc| doc["ax_path"].as_str())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths, vec!["first.csv", "second.csv"], "{paths:?}");
+        let skipped: Vec<&Value> = locked
+            .catalog_docs
+            .values()
+            .filter(|doc| doc["path"].as_str() == Some("app.lock"))
+            .collect();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the changed file is recorded: {skipped:?}"
+        );
+        assert_eq!(skipped[0]["status"], "skipped", "{}", skipped[0]);
+        let reason = skipped[0]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("changed while this run was reading it"),
+            "{reason}"
+        );
+        assert!(reason.contains("changed size"), "{reason}");
+        assert!(reason.contains("rerun"), "{reason}");
+    }
+
+    // The file has settled: the same command picks up its current content.
+    let (code, _) = run_index_report(config).expect("the rerun completes");
+    assert_eq!(code, 0, "nothing is left to skip once the file is still");
+    let locked = endpoint.state.lock().unwrap();
+    let indexed: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(indexed.contains("app.lock"), "{indexed:?}");
+}
+
 #[test]
 fn completed_plan_rejects_vanished_content_group_before_remote_mutation() {
     let _guard = FAILPOINT_TEST_LOCK

@@ -2098,6 +2098,40 @@ impl Drop for SampleLimitOverride {
 #[cfg(test)]
 static REPLACEMENT_FAILPOINT: Mutex<Option<(u8, std::path::PathBuf)>> = Mutex::new(None);
 
+/// A test-only action run once when phase B starts, for the run that uses the
+/// given state directory: the window between phase A's digest and phase B's
+/// read, where a live file (a lock file, a log) changes under the run (#1911).
+/// Keyed on the state directory for the same reason as
+/// [`REPLACEMENT_FAILPOINT`].
+#[cfg(test)]
+type PhaseBStartHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static PHASE_B_START_HOOK: Mutex<Option<PhaseBStartHook>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_phase_b_start_hook(state_dir: &Path, action: impl FnOnce() + Send + 'static) {
+    *PHASE_B_START_HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((state_dir.to_path_buf(), Box::new(action)));
+}
+
+#[cfg(test)]
+fn phase_b_start_hook(state_dir: &Path) {
+    let action = {
+        let mut armed = PHASE_B_START_HOOK.lock().unwrap_or_else(|p| p.into_inner());
+        match armed.as_ref() {
+            Some((dir, _)) if dir == state_dir => armed.take().map(|(_, action)| action),
+            _ => None,
+        }
+    };
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn phase_b_start_hook(_state_dir: &Path) {}
+
 /// Arm [`replacement_failpoint`] for the run that uses `state_dir`, once.
 #[cfg(test)]
 pub(crate) fn arm_replacement_failpoint(boundary: u8, state_dir: &Path) {
@@ -7905,6 +7939,7 @@ fn run_index_report_inner(
         "phase B: indexing {} files with {} workers → {}",
         n_todo, cfg.workers, cfg.url
     ));
+    phase_b_start_hook(&state_dir);
     if n_pdf_spools > 0 {
         pr.note(&format!(
             "phase B: reusing {n_pdf_spools} run-local PDF extraction(s); these PDFs will not be \
@@ -8047,11 +8082,17 @@ fn run_index_report_inner(
                     continue;
                 }
             };
+            // #1911: a file that changed since phase A hashed it (a lock
+            // file, a log, a sqlite -wal) is ONE skipped file, not a reason
+            // to abort every other file's run. Nothing of it is staged yet.
             if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
-                let mut errors = bulk_errors.lock().unwrap();
-                if errors.len() < 5 {
-                    errors.push(format!("{error:#}"));
-                }
+                extra_junk.lock().unwrap().push(changed_during_run_junk(
+                    key,
+                    &f.rel,
+                    &format_str(Some(&sn)),
+                    f.size,
+                    &error,
+                ));
                 continue;
             }
             // File-card anchor node (§6.6.2a): one card doc per corpus
@@ -8387,10 +8428,18 @@ fn run_index_report_inner(
                 }
             }
             if send_err.is_none() {
+                // #1911: changed while it was being extracted. Its records are
+                // only staged locally (visibility starts below), so skipping it
+                // here leaves nothing of it on the node from this run.
                 if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
-                    send_err = Some(format!(
-                        "{error:#}; no records from this changing file were made visible"
+                    extra_junk.lock().unwrap().push(changed_during_run_junk(
+                        key,
+                        &f.rel,
+                        &format_str(Some(&sn)),
+                        f.size,
+                        &error,
                     ));
+                    continue;
                 }
             }
             // Visibility begins only after extraction and the second
@@ -9669,6 +9718,35 @@ fn run_index_report_inner(
     );
     drop(ticker);
     Ok((code, Some(run_doc)))
+}
+
+/// The catalog entry for a source file that changed between phase A's digest
+/// and phase B's read (#1911).
+///
+/// That used to land in `bulk_errors`, which aborts the whole run after phase B:
+/// one live lock file on Windows stopped a 1,894-file run at ~258 s and left
+/// its partial indices and journal for hand cleanup — and every retry met the
+/// same still-changing file. It is now one `skipped` file with the reason, the
+/// run finishes (exit 3, like any other skipped file), and because the file is
+/// never journaled done, the next run picks up whatever it then holds.
+fn changed_during_run_junk(
+    file_key: &str,
+    rel: &str,
+    format: &str,
+    bytes: u64,
+    error: &anyhow::Error,
+) -> JunkFile {
+    JunkFile {
+        file_key: file_key.to_string(),
+        rel: rel.to_string(),
+        format: format.to_string(),
+        status: "skipped".into(),
+        reason: format!(
+            "changed while this run was reading it, so it was skipped and nothing from it was \
+             made visible ({error:#}); rerun to index its current content"
+        ),
+        bytes,
+    }
 }
 
 fn format_str(sn: Option<&Sniffed>) -> String {
