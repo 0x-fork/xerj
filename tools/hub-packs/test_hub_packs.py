@@ -33,7 +33,7 @@ SHA_C = "c" * 40
 def manifest_text(slug: str, repos: list[tuple[str, str, str]], extra: str = "") -> str:
     """A manifest in the registry's own hand-formatted style (one repo per line)."""
     body = ",\n".join(
-        f'  {{"repo":"{n}","url":"{u}","licence":"MIT","sha":"{s}","files":3,"bytes":99,'
+        f'  {{"repo":"{n}","url":"{u.replace(chr(92), "/")}","licence":"MIT","sha":"{s}","files":3,"bytes":99,'
         f'"review":{{"spdx":"MIT","use":"adapt-with-attribution","by":"xerj-org","at":"2026-08-12"}}}}'
         for n, u, s in repos
     )
@@ -298,7 +298,7 @@ class RepinTests(unittest.TestCase):
 
     def test_ls_remote_reads_the_default_branch_head_of_a_real_repository(self):
         up, shas = make_upstream(self.root, "up")
-        url = f"file://{up}"
+        url = f"file://{up.as_posix()}"
         self.assertEqual(hp.git_head_of(url, "file:https"), shas[-1])
         cs = self.corpora([("feed", "weekly", url, shas[0])])
         (p,), notes = hp.find_proposals(cs, hp.REPIN_CLASSES, lambda u: hp.git_head_of(u, "file:https"), "2026-10-14")
@@ -311,7 +311,7 @@ class RepinTests(unittest.TestCase):
     def test_only_https_is_spoken_by_default(self):
         up, _ = make_upstream(self.root, "up")
         marker = self.root / "pwned"
-        self.assertIsNone(hp.git_head_of(f"file://{up}"), "file:// needs the test-only widening")
+        self.assertIsNone(hp.git_head_of(f"file://{up.as_posix()}"), "file:// needs the test-only widening")
         self.assertIsNone(hp.git_head_of(f"ext::sh -c touch% {marker}"), "ext:: would run a command")
         self.assertIsNone(hp.git_head_of("git://example.test/r"))
         self.assertIsNone(hp.git_head_of(f"--upload-pack=touch {marker}"))
@@ -330,7 +330,7 @@ class RepinTests(unittest.TestCase):
         self.assertFalse(marker.exists(), "GIT_ALLOW_PROTOCOL=https stops an ext:: URL from running anything")
 
     def test_a_dead_remote_is_none_not_an_exception(self):
-        self.assertIsNone(hp.git_head_of(f"file://{self.root}/nowhere", "file:https"))
+        self.assertIsNone(hp.git_head_of(f"file://{self.root.as_posix()}/nowhere", "file:https"))
 
 
 GH_STUB = textwrap.dedent(
@@ -386,9 +386,15 @@ class ApplyTests(unittest.TestCase):
         self.origin = origin
         self.state = self.root / "gh-state.json"
         self.state.write_text(json.dumps({"calls": [], "prs": [], "next": 100}))
-        self.gh = self.root / "gh"
-        self.gh.write_text(GH_STUB.format(python=sys.executable, state=str(self.state)))
-        self.gh.chmod(0o755)
+        if sys.platform == "win32":
+            self.gh_py = self.root / "gh_stub.py"
+            self.gh_py.write_text(GH_STUB.format(python=sys.executable, state=str(self.state)))
+            self.gh = self.root / "gh.cmd"
+            self.gh.write_text(f'@"{sys.executable}" "{self.gh_py}" %*\n')
+        else:
+            self.gh = self.root / "gh"
+            self.gh.write_text(GH_STUB.format(python=sys.executable, state=str(self.state)))
+            self.gh.chmod(0o755)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -926,7 +932,7 @@ class CommandLineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             root = pathlib.Path(t)
             up, shas = make_upstream(root, "up")
-            url = f"file://{up}"
+            url = f"file://{up.as_posix()}"
             reg, backlog = write_registry(
                 root, [row("feed", refresh="daily")], {"feed": manifest_text("feed", [("feed", url, shas[0])])}
             )

@@ -872,7 +872,7 @@ impl TimerDirs {
         // XDG says a relative XDG_CONFIG_HOME is invalid and must be ignored.
         let config = env("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
+            .filter(|p| p.is_absolute() || p.has_root())
             .unwrap_or_else(|| home.join(".config"));
         Ok(TimerDirs {
             systemd_user: config.join("systemd").join("user"),
