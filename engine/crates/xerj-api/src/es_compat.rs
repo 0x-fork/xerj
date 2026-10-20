@@ -1075,10 +1075,17 @@ pub async fn create_index(
         return ApiError::new(e).into_response();
     }
 
+    if let Some(refusal) = create_index_body_refusal(&index, &body) {
+        return refusal;
+    }
+
     // Validate mapping field types before creating — ES returns
     // mapper_parsing_exception for unsupported types.
     let mappings_val = body.get("mappings").cloned().unwrap_or(Value::Null);
     if let Some(props) = mappings_val.get("properties").and_then(Value::as_object) {
+        if let Some(refusal) = empty_field_name_refusal(props) {
+            return refusal;
+        }
         if let Err(reason) = validate_properties(props) {
             let e = xerj_common::XerjError::invalid_mapping(reason);
             return ApiError::new(e).into_response();
@@ -1251,6 +1258,185 @@ pub async fn create_index(
     }
 }
 
+/// A 400 in Elasticsearch's error shape, for refusals whose `type` (or
+/// `caused_by`) a caller matches on and that no `XerjError` variant renders.
+fn es_bad_request(error_type: &str, reason: &str, caused_by: Option<(&str, &str)>) -> Response {
+    let mut error = json!({
+        "root_cause": [{ "type": error_type, "reason": reason }],
+        "type": error_type,
+        "reason": reason,
+    });
+    if let Some((cause_type, cause_reason)) = caused_by {
+        error["caused_by"] = json!({ "type": cause_type, "reason": cause_reason });
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": error, "status": 400 })),
+    )
+        .into_response()
+}
+
+/// ES refuses a mapping that declares a field with an empty name
+/// (`mapper_parsing_exception` caused by `illegal_argument_exception`
+/// `field name cannot be an empty string`); XERJ accepted it. Checked through
+/// `properties` and multi-field `fields` at every depth.
+fn empty_field_name_refusal(props: &serde_json::Map<String, Value>) -> Option<Response> {
+    fn has_empty(props: &serde_json::Map<String, Value>) -> bool {
+        props.iter().any(|(name, spec)| {
+            name.is_empty()
+                || ["properties", "fields"].iter().any(|k| {
+                    spec.get(*k)
+                        .and_then(Value::as_object)
+                        .is_some_and(has_empty)
+                })
+        })
+    }
+    has_empty(props).then(|| {
+        es_bad_request(
+            "mapper_parsing_exception",
+            "Failed to parse mapping: field name cannot be an empty string",
+            Some((
+                "illegal_argument_exception",
+                "field name cannot be an empty string",
+            )),
+        )
+    })
+}
+
+/// One index setting from a create-index `settings` object, in any of the
+/// spellings ES accepts: `{"index.a.b": v}`, `{"a.b": v}`,
+/// `{"index": {"a": {"b": v}}}`, `{"a": {"b": v}}` or `{"index": {"a.b": v}}`.
+fn create_setting<'a>(settings: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let dotted = path.join(".");
+    let nested = |root: &'a Value| {
+        path.iter()
+            .try_fold(root, |v, key| v.get(*key))
+            .or_else(|| root.get(&dotted))
+    };
+    settings
+        .get(format!("index.{dotted}"))
+        .or_else(|| settings.get("index").and_then(nested))
+        .or_else(|| nested(settings))
+}
+
+/// Request-shape and setting checks ES applies to a create-index body before
+/// anything is created (`indices.create/10_basic.yml`,
+/// `search/550_ignore_above_invalid.yml`). Each was previously accepted with
+/// a 200. Run before the index exists, so a refusal leaves nothing behind.
+fn create_index_body_refusal(index: &str, body: &Value) -> Option<Response> {
+    for section in ["mappings", "settings", "aliases"] {
+        if let Some(v) = body.get(section) {
+            if !v.is_object() && !v.is_null() {
+                return Some(es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "Malformed [{section}] section for index [{index}], should include an \
+                         inner object describing the {section}"
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+    if let Some(props) = body.pointer("/mappings/properties") {
+        if !props.is_object() {
+            return Some(es_bad_request(
+                "mapper_parsing_exception",
+                "Failed to parse mapping: [properties] must be a map type",
+                None,
+            ));
+        }
+    }
+    if let Some(settings) = body.get("settings") {
+        if create_setting(settings, &["soft_deletes", "enabled"])
+            .is_some_and(|v| v == &json!(false) || v == &json!("false"))
+        {
+            return Some(es_bad_request(
+                "illegal_argument_exception",
+                "Creating indices with soft-deletes disabled is no longer supported. Please do \
+                 not specify a value for setting [index.soft_deletes.enabled].",
+                None,
+            ));
+        }
+        if create_setting(settings, &["mode"]).and_then(Value::as_str) == Some("lookup") {
+            let shards = create_setting(settings, &["number_of_shards"]).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            });
+            if let Some(n) = shards.filter(|n| *n != 1) {
+                return Some(es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "index with [lookup] mode must have [index.number_of_shards] set to 1 \
+                         or unset; provided {n}"
+                    ),
+                    None,
+                ));
+            }
+        }
+        let ignore_above = create_setting(settings, &["mapping", "ignore_above"]).and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        });
+        if let Some(n) = ignore_above.filter(|n| *n < 0) {
+            return Some(es_bad_request(
+                "illegal_argument_exception",
+                &format!(
+                    "Failed to parse value [{n}] for setting [index.mapping.ignore_above] must be \
+                     >= 0"
+                ),
+                None,
+            ));
+        }
+    }
+    if let Some(aliases) = body.get("aliases").and_then(Value::as_object) {
+        for (alias, spec) in aliases {
+            if let Some(reason) = alias_value_type_error(alias, spec) {
+                return Some(es_bad_request("illegal_argument_exception", &reason, None));
+            }
+        }
+    }
+    None
+}
+
+/// The Java type name ES's alias parser reports for a JSON value.
+fn alias_value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "String",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "Number",
+        Value::Array(_) => "Array",
+        Value::Object(_) => "Object",
+        Value::Null => "null",
+    }
+}
+
+/// ES's `Unsupported <Type> type value [v] for field [f] in alias [a]`: the
+/// flag fields take booleans, the routing fields strings or numbers.
+fn alias_value_type_error(alias: &str, spec: &Value) -> Option<String> {
+    let spec = spec.as_object()?;
+    for (field, v) in spec {
+        let ok = match field.as_str() {
+            "is_write_index" | "is_hidden" => v.is_boolean() || v.is_null(),
+            "routing" | "index_routing" | "search_routing" => {
+                v.is_string() || v.is_number() || v.is_null()
+            }
+            _ => true,
+        };
+        if !ok {
+            let shown = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            return Some(format!(
+                "Unsupported {} type value [{shown}] for field [{field}] in alias [{alias}]",
+                alias_value_type_name(v)
+            ));
+        }
+    }
+    None
+}
+
 /// ES mapper_parsing_exception emits for unsupported field types. Accept
 /// the set of types we actually implement and explicitly reject the few
 /// that YAML tests exercise as "invalid" (`baz`, `foobar`, etc.).
@@ -1272,7 +1458,36 @@ fn validate_properties(props: &serde_json::Map<String, Value>) -> Result<(), Str
             // as a multi-field would otherwise still be accepted, echoed back
             // by `GET /_mapping`, and dropped on the floor. One shared
             // resolver means one accepted set and one error message.
+            if matches!(t, "keyword" | "flattened" | "wildcard") {
+                if let Some(n) = obj.get("ignore_above").and_then(Value::as_i64) {
+                    if n < 0 {
+                        return Err(format!(
+                            "Failed to parse mapping: [ignore_above] must be positive, got [{n}]"
+                        ));
+                    }
+                }
+            }
             if t == "dense_vector" {
+                if let Some(opts) = obj.get("index_options") {
+                    if obj.get("index").and_then(Value::as_bool) == Some(false) {
+                        return Err(
+                            "Failed to parse mapping: Field [index_options] requires field \
+                             [index] to be configured and set to true"
+                                .to_string(),
+                        );
+                    }
+                    let element = obj
+                        .get("element_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("float");
+                    let kind = opts.get("type").and_then(Value::as_str).unwrap_or("");
+                    if kind.starts_with("bbq") && matches!(element, "byte" | "bit") {
+                        return Err(format!(
+                            "Failed to parse mapping: [index_options] of type [{kind}] is not \
+                             supported for element_type [{element}]"
+                        ));
+                    }
+                }
                 resolve_vector_quantization(name, spec)?;
             }
         }
@@ -1883,6 +2098,20 @@ async fn get_index_inner(
     index: String,
     params: GetIndexParams,
 ) -> axum::response::Response {
+    // A name that starts with `_` (other than `_all`) can never be an index:
+    // ES answers 400 `invalid_index_name_exception`, not a 404. (A leading
+    // `-` in a list is an exclusion, so only `_` is checked.)
+    if let Some(bad) = index
+        .split(',')
+        .map(str::trim)
+        .find(|p| p.starts_with('_') && *p != "_all")
+    {
+        return es_bad_request(
+            "invalid_index_name_exception",
+            &format!("Invalid index name [{bad}], must not start with '_', '-', or '+'"),
+            None,
+        );
+    }
     let ignore_unavailable = params.ignore_unavailable.as_deref() == Some("true");
     // ES default: wildcard / `_all` selectors default `allow_no_indices=true`
     // (a pattern that matches nothing returns `{}` rather than 404). Explicit
@@ -2288,6 +2517,9 @@ pub async fn put_mapping(
 
     // Validate any `properties` field types once, up front.
     if let Some(props) = body.get("properties").and_then(Value::as_object) {
+        if let Some(refusal) = empty_field_name_refusal(props) {
+            return refusal;
+        }
         if let Err(reason) = validate_properties(props) {
             let e = xerj_common::XerjError::invalid_mapping(reason);
             return ApiError::new(e).into_response();
@@ -22673,6 +22905,67 @@ pub async fn put_alias(
     Path((index, alias)): Path<(String, String)>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
+    // ES's alias-name and body checks (`indices.put_alias/10_basic.yml`),
+    // before anything is attached.
+    const ALIAS_FORBIDDEN: &[char] = &[' ', '"', '*', '\\', '<', '|', ',', '>', '/', '?'];
+    if alias.contains(ALIAS_FORBIDDEN) {
+        return es_bad_request(
+            "invalid_alias_name_exception",
+            &format!(
+                "Invalid alias name [{alias}]: must not contain the following characters \
+                 [ , \", *, \\, <, |, ,, >, /, ?]"
+            ),
+            None,
+        );
+    }
+    // A concrete index of that name (not this alias already existing —
+    // re-putting an alias to change its filter or routing stays allowed).
+    if !state.engine.aliases.contains_key(&alias) && state.engine.get_index(&alias).is_ok() {
+        return es_bad_request(
+            "invalid_alias_name_exception",
+            &format!(
+                "Invalid alias name [{alias}]: an index or data stream exists with the same name \
+                 as the alias"
+            ),
+            None,
+        );
+    }
+    if let Some(fields) = body.0.as_ref().and_then(Value::as_object) {
+        const ALIAS_FIELDS: &[&str] = &[
+            "filter",
+            "routing",
+            "index_routing",
+            "search_routing",
+            "is_write_index",
+            "is_hidden",
+        ];
+        for (field, v) in fields {
+            if !ALIAS_FIELDS.contains(&field.as_str()) {
+                return es_bad_request(
+                    "illegal_argument_exception",
+                    &format!("[{alias}] Unsupported field [{field}]"),
+                    None,
+                );
+            }
+            if field.ends_with("routing") && (v.is_array() || v.is_object()) {
+                let token = if v.is_array() {
+                    "START_ARRAY"
+                } else {
+                    "START_OBJECT"
+                };
+                return es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "[{alias}] failed to parse field [{field}]: Unexpected token [{token}]"
+                    ),
+                    None,
+                );
+            }
+        }
+        if let Some(reason) = alias_value_type_error(&alias, &Value::Object(fields.clone())) {
+            return es_bad_request("illegal_argument_exception", &reason, None);
+        }
+    }
     let targets = resolve_index_selector(&state, &index).await;
     let alias_meta: Value = body
         .0
@@ -44011,6 +44304,18 @@ pub async fn put_legacy_template(
     Path(name): Path<String>,
     Json(mut body): Json<Value>,
 ) -> impl IntoResponse {
+    let has_patterns = match body.get("index_patterns") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        _ => false,
+    };
+    if !has_patterns {
+        return es_bad_request(
+            "action_request_validation_exception",
+            "Validation Failed: 1: index patterns are missing;",
+            None,
+        );
+    }
     if let Some(ip) = body.get("index_patterns") {
         if ip.is_string() {
             body["index_patterns"] = json!([ip.as_str().unwrap_or_default()]);

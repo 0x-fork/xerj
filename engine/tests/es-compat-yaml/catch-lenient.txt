@@ -101,17 +101,6 @@ aggregations/top_hits.yml · having
 aggregations/weighted_avg.yml · Multi weight field not allowed
 bulk/10_basic.yml · empty action
 bulk/60_deprecated.yml · Deprecated parameters should fail in Bulk query
-indices/indices.create/10_basic.yml · Create index with invalid mappings
-indices/indices.create/10_basic.yml · Create index without soft deletes
-indices/indices.create/10_basic.yml · Create lookup index with two shards
-indices/indices.create/10_basic.yml · Poorly formatted request returns bad_request
-indices/indices.create/10_basic.yml · Throw exception for unsupported value type
-indices/indices.get/10_basic.yml · Should return an exception when querying invalid indices
-indices/indices.put_alias/10_basic.yml · Can't create alias with invalid characters
-indices/indices.put_alias/10_basic.yml · Can't create alias with the same name as an index
-indices/indices.put_alias/10_basic.yml · Throw exception for unknown token
-indices/indices.put_mapping/10_basic.yml · Create index with invalid mappings
-indices/indices.put_template/10_basic.yml · Put index template without index_patterns
 indices/indices.put_template/10_basic.yml · Put template create
 scroll/10_basic.yml · Scroll cannot used the request cache
 scroll/10_basic.yml · Scroll with size 0
@@ -152,10 +141,4 @@ search/40_indices_boost.yml · Indices boost for nonexistent index/alias
 search/40_indices_boost.yml · Remote expressions not supported in indices boost
 search/500_date_range.yml · test bad dates in range - future
 search/500_date_range.yml · test bad dates in range - past
-search/550_ignore_above_invalid.yml · flattened ignore_above mapping setting negative value
-search/550_ignore_above_invalid.yml · ignore_above index setting negative value
-search/550_ignore_above_invalid.yml · keyword ignore_above mapping setting negative value
-search/550_ignore_above_invalid.yml · wildcard ignore_above mapping setting negative value
 search/90_search_after.yml · Format sort values
-vectors/search.vectors/46_knn_search_bbq_ivf.yml · Test bad quantization parameters
-vectors/search.vectors/search.vectors/46_knn_search_bbq_ivf.yml · Test bad quantization parameters
