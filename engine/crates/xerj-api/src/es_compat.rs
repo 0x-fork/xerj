@@ -26522,7 +26522,7 @@ async fn msearch_impl(
         }
 
         // Parse search request.
-        let search_req = match xerj_query::parse_request(&effective_body)
+        let mut search_req = match xerj_query::parse_request(&effective_body)
             .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
         {
             Ok(r) => r,
@@ -26535,6 +26535,10 @@ async fn msearch_impl(
                 continue;
             }
         };
+
+        // `highlight` the way `_search` reads it (`pre_tags` arrays, the
+        // array form of `fields`), not `parse_request`'s serde shape (#1945).
+        search_req.highlight = effective_body.get("highlight").and_then(parse_highlight);
 
         // Resolve index names (comma-separated or "*" = all).
         let index_names: Vec<String> = if let Some(pit) = pit_context.as_ref() {
@@ -26644,12 +26648,18 @@ async fn msearch_impl(
                 } else {
                     Some(h.source.clone())
                 };
-                json!({
+                let mut hit = json!({
                     "_index": idx_name,
                     "_id": h.id,
                     "_score": h.score as f64,
                     "_source": source,
-                })
+                });
+                // The engine already built the fragments; this renderer used
+                // to drop them (#1945).
+                if let Some(hl) = h.highlight {
+                    hit["highlight"] = json!(hl);
+                }
+                hit
             })
             .collect();
 
