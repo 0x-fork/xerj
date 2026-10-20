@@ -4326,6 +4326,72 @@ mod tests {
         journal.sync_begin(&pending).unwrap();
     }
 
+    /// The `windows:` native identity `stable_path_id` writes for `rel` on a
+    /// Windows walk: each UTF-16 unit of the NATIVE path (separator `\`) as
+    /// four hex digits. `native_path_id_supported` accepts it on every
+    /// platform, so a Windows walk can be reproduced from a macOS/Linux one.
+    fn windows_path_id(rel: &str) -> String {
+        let mut out = String::from("windows:");
+        for unit in rel.replace('/', "\\").encode_utf16() {
+            use std::fmt::Write;
+            write!(out, "{unit:04x}").unwrap();
+        }
+        out
+    }
+
+    /// #1723: `corpus index` on Windows aborted every generation — even with
+    /// `--fresh` — with "plan canonical projection disagrees with manifest
+    /// group" once the corpus held byte-identical files at `Pill/x.scss` and
+    /// `PillS/x.scss` (any pair whose paths first differ at a separator on
+    /// one side and a digit, `A-Z`, or `:;<=>?@[` on the other).
+    ///
+    /// The inventory picked the canonical copy by `rel`, where the separator
+    /// is `/` (0x2F) and sorts first; the manifest ranks by `path_id`, the
+    /// native identity, where the separator is `\` (0x5C) and sorts after
+    /// those characters. The plan projected one path, the manifest group
+    /// another, and `PendingSync::new` refused the generation.
+    #[test]
+    fn windows_duplicate_canonical_agrees_between_plan_and_manifest() {
+        let corpus = tempfile::tempdir().unwrap();
+        for dir in ["Pill", "PillS", "Pill1"] {
+            std::fs::create_dir_all(corpus.path().join(dir)).unwrap();
+            std::fs::write(corpus.path().join(dir).join("x.scss"), ".pill{}\n").unwrap();
+        }
+        std::fs::write(corpus.path().join("other.txt"), "unrelated").unwrap();
+        let mut files = walk::walk(corpus.path(), false).unwrap();
+        for file in &mut files {
+            file.rel_id = windows_path_id(&file.rel);
+        }
+        let inventory = crate::content::resolve_reporting(files, &|_| {}).unwrap();
+        assert_eq!(inventory.files.len(), 2, "three copies, one content file");
+        let canonical = inventory
+            .files
+            .iter()
+            .find(|file| file.rel.ends_with("x.scss"))
+            .unwrap();
+        assert_eq!(
+            canonical.rel, "Pill1/x.scss",
+            "the canonical copy is the lowest native identity: `1` (0x31) and \
+             `S` (0x53) both sort below `\\` (0x5C)"
+        );
+
+        let mut plan = plan_for_all(&inventory);
+        plan.duplicate_files = inventory.duplicates.clone();
+        let groups = groups_from_inventory(&inventory, &plan, &[]).unwrap();
+        let base = CommittedManifest::genesis().unwrap();
+        PendingSync::new(
+            "tx-1723".into(),
+            &base,
+            GenerationManifest {
+                generation: 1,
+                execution: Some(execution("tx-1723", "digest")),
+                plan,
+                groups,
+            },
+        )
+        .expect("#1723: plan and manifest must agree on the canonical duplicate");
+    }
+
     #[test]
     fn inventory_bridge_retains_counts_only_for_identical_content() {
         let corpus = tempfile::tempdir().unwrap();

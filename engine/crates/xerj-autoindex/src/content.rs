@@ -132,8 +132,21 @@ fn resolve_with_digests(files: Vec<FileEntry>, digests: Vec<String>) -> Result<I
             continue;
         }
         let mut indices = indices.clone();
-        // Prefer a real in-tree path over a followed symlink as canonical.
-        indices.sort_by_key(|&index| (files[index].is_symlink, files[index].rel.clone()));
+        // Prefer a real in-tree path over a followed symlink as canonical,
+        // then the lowest NATIVE identity — the exact `(is_symlink, path_id)`
+        // rank the sync manifest re-derives and validates
+        // (`sync::normalize_paths` / `validate_groups`). Ranking by `rel`
+        // here was #1723: on Windows `rel` writes the separator as `/`
+        // (0x2F) while `path_id` keeps the native `\` (0x5C), so for
+        // `Pill/x.scss` vs `PillS/x.scss` the two orders disagree, the plan
+        // projected one canonical and the manifest group another, and every
+        // generation of such a corpus was refused ("plan canonical projection
+        // disagrees with manifest group"), `--fresh` included. Unix `rel` is
+        // the raw path, so the two orders agree there for UTF-8 names.
+        indices.sort_by(|&left, &right| {
+            (files[left].is_symlink, files[left].rel_id.as_str())
+                .cmp(&(files[right].is_symlink, files[right].rel_id.as_str()))
+        });
         // A digest match is still only a candidate: verify exact bytes.
         let mut representatives: Vec<usize> = Vec::new();
         for index in indices {
