@@ -1073,7 +1073,10 @@ fn record(
     // The detector is text-matching heuristics and has been wrong before.
     // When a manifest disagrees with the checkout, say so rather than
     // overwrite quietly.
-    if !declared.is_empty() && declared != shown {
+    // `shown` is the detector's reading, or a completed review's licence
+    // when the detector read UNKNOWN (#1893). A coarse `BSD` reading agrees
+    // with a manifest that names the BSD clause.
+    if !declared.is_empty() && !xccode::licence::licence_readings_agree(declared, &shown) {
         eprintln!("          ! manifest says licence={declared}, checkout reads {lic} — verify before copying");
     }
     entries.push(manifest::ManifestRepo {
