@@ -15873,6 +15873,131 @@ mod wildcard_regexp_filter_tests {
     }
 }
 
+/// #1745: filter / filters aggs must apply the same analyzer token rules as
+/// `_count` for match / term / match_phrase. Cases from #1748
+/// (@gyanu2507), run through the mapping-aware path from #1752: only clauses
+/// on declared `text` fields are analyzed, while `keyword` values are matched
+/// whole, so a multi-word keyword value never matches one of its words.
+#[cfg(test)]
+mod match_term_phrase_filter_tests {
+    use super::run_aggs_with_schema;
+    use serde_json::{json, Value};
+    use xerj_common::types::{FieldConfig, FieldType, Schema};
+
+    fn schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("title", FieldType::Text));
+        schema
+            .fields
+            .push(FieldConfig::new("tag", FieldType::Keyword));
+        schema
+    }
+
+    fn books() -> Vec<Value> {
+        vec![
+            json!({"title": "lazy dog sleeps", "tag": "new york"}),
+            json!({"title": "Quick dogs run", "tag": "york"}),
+            json!({"title": "the fox and the dog", "tag": "New York"}),
+        ]
+    }
+
+    /// `doc_count` of a single `filter` agg over `books()`.
+    fn filter_count(clause: Value) -> Option<u64> {
+        let docs = books();
+        let out = run_aggs_with_schema(&json!({"f": {"filter": clause}}), &docs, &docs, &schema());
+        out["f"]["doc_count"].as_u64()
+    }
+
+    #[test]
+    fn match_on_text_is_token_equality_not_substring() {
+        // "dogs" is its own token: `dog` must not match it.
+        assert_eq!(filter_count(json!({"match": {"title": "dog"}})), Some(2));
+        assert_eq!(filter_count(json!({"match": {"title": "DOG"}})), Some(2));
+    }
+
+    #[test]
+    fn match_multi_term_defaults_to_or_and_honours_operator_and() {
+        assert_eq!(
+            filter_count(json!({"match": {"title": "quick fox"}})),
+            Some(2)
+        );
+        assert_eq!(
+            filter_count(json!({"match": {"title": {"query": "quick fox", "operator": "and"}}})),
+            Some(0)
+        );
+        assert_eq!(
+            filter_count(json!({"match": {"title": {"query": "fox dog", "operator": "and"}}})),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn match_phrase_requires_adjacency_and_honours_slop() {
+        assert_eq!(
+            filter_count(json!({"match_phrase": {"title": "fox dog"}})),
+            Some(0),
+            "fox … and the … dog is not adjacent"
+        );
+        assert_eq!(
+            filter_count(json!({"match_phrase": {"title": "fox and"}})),
+            Some(1)
+        );
+        assert_eq!(
+            filter_count(json!({"match_phrase": {"title": "the fox and the dog"}})),
+            Some(1)
+        );
+        // fox is position 1 and dog position 4: two moves are needed.
+        assert_eq!(
+            filter_count(json!({"match_phrase": {"title": {"query": "fox dog", "slop": 1}}})),
+            Some(0)
+        );
+        assert_eq!(
+            filter_count(json!({"match_phrase": {"title": {"query": "fox dog", "slop": 2}}})),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn term_on_keyword_matches_the_whole_value_only() {
+        // A multi-word keyword value is one term: `york` must not match
+        // "new york", and the comparison is case-sensitive.
+        assert_eq!(filter_count(json!({"term": {"tag": "york"}})), Some(1));
+        assert_eq!(filter_count(json!({"term": {"tag": "new york"}})), Some(1));
+        assert_eq!(filter_count(json!({"term": {"tag": "New York"}})), Some(1));
+        assert_eq!(filter_count(json!({"term": {"tag": "new"}})), Some(0));
+        assert_eq!(
+            filter_count(json!({"terms": {"tag": ["york", "new york"]}})),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn filters_agg_buckets_and_other_bucket_match_issue_1745_counts() {
+        let docs = books();
+        let out = run_aggs_with_schema(
+            &json!({"f": {"filters": {
+                "other_bucket_key": "rest",
+                "filters": {
+                    "dog": {"match": {"title": "dog"}},
+                    "phrase": {"match_phrase": {"title": "fox dog"}},
+                    "ny": {"term": {"tag": "new york"}},
+                }
+            }}}),
+            &docs,
+            &docs,
+            &schema(),
+        );
+        let buckets = &out["f"]["buckets"];
+        assert_eq!(buckets["dog"]["doc_count"].as_u64(), Some(2), "{out}");
+        assert_eq!(buckets["phrase"]["doc_count"].as_u64(), Some(0), "{out}");
+        assert_eq!(buckets["ny"]["doc_count"].as_u64(), Some(1), "{out}");
+        // Only "Quick dogs run" (tag `york`) matches none of the three.
+        assert_eq!(buckets["rest"]["doc_count"].as_u64(), Some(1), "{out}");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Capability-manifest drift guard (issue #211)
 // ─────────────────────────────────────────────────────────────────────────────
