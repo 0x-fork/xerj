@@ -26528,13 +26528,13 @@ async fn msearch_impl(
         // Resolve index names (comma-separated or "*" = all).
         let index_names: Vec<String> = if let Some(pit) = pit_context.as_ref() {
             pit.indices.clone()
-        } else if index_name == "*" || index_name == "_all" {
-            state.engine.index_name_list()
         } else {
-            index_name
-                .split(',')
-                .flat_map(|n| state.engine.resolve_alias(n.trim()))
-                .collect()
+            // #1932: expand wildcards and aliases through the same selector
+            // the other read endpoints use. `resolve_alias` knew aliases
+            // only, so `logs-*` reached `get_index` as a literal name and the
+            // item answered 404. A pattern that matches nothing is an empty
+            // result, and a missing concrete name still fails the item.
+            resolve_index_selector(&state, &index_name).await
         };
 
         let index_names: Vec<String> = if idx_constraints.is_empty() {
