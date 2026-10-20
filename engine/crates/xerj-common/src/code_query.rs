@@ -184,3 +184,28 @@ pub fn normalize_code_search_query(query: &str) -> String {
         content.join(" ")
     }
 }
+
+/// Boost on the exact-phrase clause `xerj search` and the plain-string
+/// `xerj_search` MCP tool put on content fields (`body`, and `text` /
+/// `message` / `impl` where mapped).
+///
+/// Below the `defs` phrase boost (8) on purpose: when a query is both a
+/// symbol's words and a phrase in some file, the definition still ranks
+/// first. It only has to beat the `most_fields` sum a short `defs` list
+/// collects from partial term overlap (`MemoryCandidate` matching
+/// `memory candidate …`), which on a long file body is several times the
+/// body's own BM25 score.
+pub const EXACT_PHRASE_BOOST: f64 = 4.0;
+
+/// The text an exact-phrase content clause matches, or `None` when the query
+/// is a single token.
+///
+/// This is the trimmed query as typed, not [`normalize_code_search_query`]'s
+/// output: dropping glue words or duplicate tokens from a pasted error
+/// message would turn it into a phrase the file does not contain. A single
+/// token is left to the existing clauses — as a phrase it scores the same
+/// documents as the `multi_match` and would only inflate them.
+pub fn exact_phrase_query(query: &str) -> Option<&str> {
+    let trimmed = query.trim();
+    trimmed.split_whitespace().nth(1).map(|_| trimmed)
+}

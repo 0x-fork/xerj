@@ -1896,18 +1896,25 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
         Some(Value::String(q)) if !q.trim().is_empty() => {
             plain_string = true;
             let shaped = xerj_common::code_query::normalize_code_search_query(q);
-            body.insert(
-                "query".into(),
-                json!({ "bool": { "should": [
-                    { "multi_match": {
-                        "query": shaped,
-                        "fields": ["name^4", "code^2", "body", "defs^3", "title"],
-                        "type": "most_fields"
-                    }},
-                    { "match_phrase": { "defs": { "query": shaped, "boost": 8 } } },
-                    { "term": { "name": { "value": q.trim(), "boost": 10 } } }
-                ]}}),
-            );
+            let mut should = vec![
+                json!({ "multi_match": {
+                    "query": shaped,
+                    "fields": ["name^4", "code^2", "body", "defs^3", "title"],
+                    "type": "most_fields"
+                }}),
+                json!({ "match_phrase": { "defs": { "query": shaped, "boost": 8 } } }),
+                json!({ "term": { "name": { "value": q.trim(), "boost": 10 } } }),
+            ];
+            // Same exact-phrase leg as `xerj search`: a pasted error string
+            // must rank the file that contains it, not a `defs` list that
+            // shares two of its words.
+            if let Some(phrase) = xerj_common::code_query::exact_phrase_query(q) {
+                should.push(json!({ "match_phrase": { "body": {
+                    "query": phrase,
+                    "boost": xerj_common::code_query::EXACT_PHRASE_BOOST
+                } } }));
+            }
+            body.insert("query".into(), json!({ "bool": { "should": should } }));
         }
         Some(q) if !q.is_null() => {
             body.insert("query".into(), q.clone());

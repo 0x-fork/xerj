@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `xerj search` and a plain-string `xerj_search` rank a file that contains
+  the query as an exact phrase (a pasted error message or log line) at the
+  top. The bag-of-words leg alone let a short `defs` list sharing two of the
+  words outrank the long file holding all of them in order. On 100 exact
+  string literals from XERJ's own sources the defining file went from rank 1
+  on 16 to rank 1 on 91, with symbol lookups unchanged
+  ([harness](benchmarks/search-exact-phrase/README.md)).
+
 ## [1.0.0-rc.97] - 2026-10-17
 
 <!-- TODO(release manager): set the date above to the tag date. -->

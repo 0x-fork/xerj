@@ -176,6 +176,11 @@ const SEARCH_MM_FIELDS: &[(&str, &str)] = &[
 /// #916 shape exactly.
 const PROSE_EXTRA_FIELDS: &[&str] = &["text", "impl", "message"];
 
+/// Analyzed content fields that get the exact-phrase clause when the
+/// `multi_match` names them. `name`, `code` and `title` are keywords and
+/// `defs` has its own phrase clause.
+const PHRASE_CONTENT_FIELDS: &[&str] = &["body", "text", "impl", "message"];
+
 /// Every field `xerj search` might name in `multi_match`, `term`, or
 /// `match_phrase`. A numeric mapping of one of these on any index in the
 /// wildcard fails the whole request (`For input string`, #1284).
@@ -397,6 +402,24 @@ fn build_search_query(
     }
     if field_lookup_ok(mapped, numeric, "name") {
         should.push(json!({ "term": { "name": { "value": query.trim(), "boost": 10 } } }));
+    }
+    // An exact phrase in a content field. A pasted error message or log
+    // line is the strongest signal of which file is meant, and the
+    // bag-of-words `multi_match` alone ranks a short `defs` list sharing two
+    // of its words above the long file holding all of them in order. Only
+    // the content fields the `multi_match` already names, so the mapping and
+    // numeric drops (#1601, #1284) apply unchanged. Appended last so the
+    // historical clause positions do not move.
+    if let Some(phrase) = xerj_common::code_query::exact_phrase_query(query) {
+        for field in &fields {
+            let base = field.split('^').next().unwrap_or(field);
+            if PHRASE_CONTENT_FIELDS.contains(&base) {
+                should.push(json!({ "match_phrase": { base: {
+                    "query": phrase,
+                    "boost": xerj_common::code_query::EXACT_PHRASE_BOOST
+                } } }));
+            }
+        }
     }
     json!({
         "size": k,
@@ -1464,13 +1487,15 @@ mod tests {
         let mapped = names_of(&["body", "title", "text", "impl"]);
         let body = search_query_body_for_mapping("retention ceiling", 5, Some(&mapped), None);
         let should = body["query"]["bool"]["should"].as_array().unwrap();
-        assert_eq!(should.len(), 1, "{body}");
         assert!(should[0].get("match_phrase").is_none(), "{body}");
-        assert!(should[0].get("term").is_none(), "{body}");
+        assert!(should.iter().all(|c| c.get("term").is_none()), "{body}");
         assert_eq!(
             should[0]["multi_match"]["fields"],
             json!(["body", "title", "text", "impl"])
         );
+        // The exact-phrase legs name only mapped content fields; `title` is
+        // a keyword and gets none.
+        assert_eq!(phrase_fields(&body), vec!["body", "text", "impl"], "{body}");
         let rendered = body["query"].to_string();
         assert!(!rendered.contains("\"defs\""), "{rendered}");
         assert!(!rendered.contains("\"name\""), "{rendered}");
@@ -1484,8 +1509,72 @@ mod tests {
         let mapped = names_of(&["message", "ts", "host"]);
         let body = search_query_body_for_mapping("SIP 403 Forbidden", 3, Some(&mapped), None);
         let should = body["query"]["bool"]["should"].as_array().unwrap();
-        assert_eq!(should.len(), 1, "{body}");
+        assert_eq!(should.len(), 2, "{body}");
         assert_eq!(should[0]["multi_match"]["fields"], json!(["message"]));
+        assert_eq!(phrase_fields(&body), vec!["message"], "{body}");
+    }
+
+    /// Fields named by the exact-phrase legs, in order. The `defs` phrase
+    /// leg is the symbol clause, not one of these.
+    fn phrase_fields(body: &Value) -> Vec<String> {
+        body["query"]["bool"]["should"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.get("match_phrase").and_then(Value::as_object))
+            .flat_map(|m| m.keys().cloned())
+            .filter(|f| f != "defs")
+            .collect()
+    }
+
+    /// A pasted error message is matched as typed, glue words included:
+    /// the normalized `multi_match` text drops `the`/`must`, and a phrase
+    /// built from that would not occur in the file.
+    #[test]
+    fn exact_phrase_leg_matches_the_query_as_typed() {
+        let query = "  the boosted whole-value doc must rank first ";
+        let body = search_query_body(query, 5);
+        let should = body["query"]["bool"]["should"].as_array().unwrap();
+        let leg = should
+            .iter()
+            .find_map(|c| c.pointer("/match_phrase/body"))
+            .unwrap_or_else(|| panic!("no exact-phrase leg on body: {body}"));
+        assert_eq!(leg["query"], "the boosted whole-value doc must rank first");
+        assert_eq!(
+            leg["boost"],
+            json!(xerj_common::code_query::EXACT_PHRASE_BOOST)
+        );
+        assert_ne!(
+            should[0]["multi_match"]["query"], leg["query"],
+            "the multi_match keeps the normalized text"
+        );
+    }
+
+    /// One token is a lookup: no phrase leg, and the #916 clauses stay at
+    /// their historical positions for every query.
+    #[test]
+    fn single_token_query_gets_no_exact_phrase_leg() {
+        for query in ["normalize_code_search_query", "IOSIntfLine", "  flush  "] {
+            let body = search_query_body(query, 5);
+            assert!(phrase_fields(&body).is_empty(), "{body}");
+        }
+        let body = search_query_body("rotate the WAL segment", 5);
+        let should = body["query"]["bool"]["should"].as_array().unwrap();
+        assert!(should[0].get("multi_match").is_some(), "{body}");
+        assert!(should[1].pointer("/match_phrase/defs").is_some(), "{body}");
+        assert!(should[2].pointer("/term/name").is_some(), "{body}");
+        assert_eq!(phrase_fields(&body), vec!["body"], "{body}");
+    }
+
+    /// A content field some index maps as numeric is dropped from the
+    /// phrase legs too (#1284): naming it fails the whole wildcard request.
+    #[test]
+    fn exact_phrase_leg_skips_a_numeric_content_field() {
+        let mapped = names_of(&["name", "code", "body", "defs", "title", "message"]);
+        let numeric: BTreeSet<String> = ["message".to_string()].into_iter().collect();
+        let body =
+            search_query_body_for_mapping("SIP 403 Forbidden", 3, Some(&mapped), Some(&numeric));
+        assert_eq!(phrase_fields(&body), vec!["body"], "{body}");
     }
 
     /// A code corpus — and an unreadable mapping — keep the #916 shape,
