@@ -426,7 +426,7 @@ fn build_search_query(
         "query": { "bool": { "should": should }},
         // No `body` here: whole-file bodies are the token flood (measured ~9x
         // the size of the matching passage). `_passage` carries the snippet.
-        "_source": ["ax_path", "line", "start_line", "language", "kind", "code", "title", "heading", "page", "cell"],
+        "_source": ["ax_path", "ax_locator", "line", "start_line", "language", "kind", "code", "title", "heading", "page", "cell"],
         "fields": ["_passage"]
     })
 }
@@ -481,10 +481,40 @@ pub(crate) fn hit_location(hit: &Value) -> String {
     if let Some(n) = src.get("cell").and_then(Value::as_u64).filter(|n| *n > 0) {
         return format!("{path} cell {n}");
     }
+    // A row of a JSONL/CSV/JSON/YAML/spreadsheet file is one record: the
+    // passage ordinal counts lines of that record's own text, not of the
+    // file, so `rows.jsonl:1` named a different row for every hit (#1934).
+    // Cite the record by its locator instead (a byte offset or a row number).
+    if let Some(loc) = record_locator(src) {
+        return format!("{path}#{loc}");
+    }
     match passage_line(hit) {
         Some(n) => xerj_common::xccode::passage::cite_path_line(path, n),
         None => path.to_string(),
     }
+}
+
+/// The `ax_locator` of a record that is one row or element of a data file,
+/// where a passage ordinal is not a file line: `b<byte offset>` (JSONL rows,
+/// log records, byte-addressed chunks), `r<N>` (CSV rows), `row<N>` (HTML
+/// table rows), `<sheet>!r<N>` (spreadsheet rows), `<key>:e<N>` (JSON array
+/// elements) and `d<N>` / `d<N>e<N>` (YAML documents). Whole files (`file`),
+/// code records and prose sections are left to the line logic.
+fn record_locator(src: &Value) -> Option<&str> {
+    let loc = src.get("ax_locator").and_then(Value::as_str)?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let yaml = loc
+        .strip_prefix('d')
+        .is_some_and(|rest| match rest.split_once('e') {
+            Some((doc, elem)) => digits(doc) && digits(elem),
+            None => digits(rest),
+        });
+    let row = ["b", "r", "row"]
+        .iter()
+        .any(|p| loc.strip_prefix(p).is_some_and(digits));
+    let sheet_row = loc.rsplit_once("!r").is_some_and(|(_, n)| digits(n));
+    let element = loc.rsplit_once(":e").is_some_and(|(_, n)| digits(n));
+    (row || yaml || sheet_row || element).then_some(loc)
 }
 
 /// A line an agent can cite: `_source.line` / `start_line`, else a lexical
@@ -985,7 +1015,7 @@ pub fn run_search_cli() -> i32 {
         }
     }
     println!(
-        "\n{} passage(s) from '{pattern}'. Cite ax_path:line for anything you rely on.",
+        "\n{} passage(s) from '{pattern}'. Cite ax_path:line (ax_path#locator for a data row) for anything you rely on.",
         hits.len()
     );
     0
@@ -1348,6 +1378,51 @@ mod tests {
             hit_location(&synthetic_defs_hit),
             "crates/fjall/src/batch.rs"
         );
+    }
+
+    /// #1934: two JSONL rows both printed as `xerj-prs.jsonl:1` because the
+    /// passage ordinal counts lines inside the row's own `body`. A data row
+    /// is cited by its locator; whole files, code and sections keep lines.
+    #[test]
+    fn a_data_row_is_cited_by_its_locator_not_a_passage_ordinal() {
+        let row = |loc: &str, ordinal: u64| {
+            json!({
+                "_source": { "ax_path": "xerj-prs.jsonl", "ax_locator": loc },
+                "fields": { "_passage": [{ "field": "body", "ordinal": ordinal }] }
+            })
+        };
+        assert_eq!(hit_location(&row("b0", 0)), "xerj-prs.jsonl#b0");
+        assert_eq!(hit_location(&row("b68801", 0)), "xerj-prs.jsonl#b68801");
+        assert_ne!(
+            hit_location(&row("b9229", 0)),
+            hit_location(&row("b68801", 0)),
+            "two rows never share a citation"
+        );
+        for (loc, want) in [
+            ("r17", "xerj-prs.jsonl#r17"),
+            ("row3", "xerj-prs.jsonl#row3"),
+            ("Sheet1!r5", "xerj-prs.jsonl#Sheet1!r5"),
+            ("items:e12", "xerj-prs.jsonl#items:e12"),
+            ("d0e4", "xerj-prs.jsonl#d0e4"),
+            ("d2", "xerj-prs.jsonl#d2"),
+        ] {
+            assert_eq!(hit_location(&row(loc, 3)), want);
+        }
+        // Lines still win where they are lines.
+        assert_eq!(hit_location(&row("file", 4)), "xerj-prs.jsonl:5");
+        assert_eq!(hit_location(&row("code", 4)), "xerj-prs.jsonl:5");
+        assert_eq!(hit_location(&row("s2", 4)), "xerj-prs.jsonl:5");
+        assert_eq!(hit_location(&row("bogus", 4)), "xerj-prs.jsonl:5");
+        let lined = json!({
+            "_source": { "ax_path": "a.jsonl", "ax_locator": "b40", "line": 3 }
+        });
+        assert_eq!(hit_location(&lined), "a.jsonl:3");
+        // No locator (an older index, or `xerj def`): unchanged.
+        let bare = json!({
+            "_source": { "ax_path": "a.rs" },
+            "fields": { "_passage": [{ "field": "body", "ordinal": 9 }] }
+        });
+        assert_eq!(hit_location(&bare), "a.rs:10");
     }
 
     /// A PDF passage with ordinal 0 is page 4, not line 1. A notebook section
