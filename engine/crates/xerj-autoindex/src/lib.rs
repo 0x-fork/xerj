@@ -156,7 +156,20 @@ pub fn next_hint(
 }
 
 fn with_field_report(hint: String) -> String {
-    format!("{hint}\n{}", xerj_common::feedback::AUTO_SEND_LINE)
+    with_field_report_if(hint, xerj_common::feedback::enabled())
+}
+
+/// The footer honours the same opt-out as every other surface
+/// (`--disable-feedback` anywhere on the command line, or
+/// `XERJ_DISABLE_FEEDBACK=true`). It used not to, so `xerj corpus index`, which
+/// prints this footer from the autoindex run it drives, kept inviting a field
+/// report after the operator had switched the invitation off (issue #1903).
+fn with_field_report_if(hint: String, enabled: bool) -> String {
+    if enabled {
+        format!("{hint}\n{}", xerj_common::feedback::AUTO_SEND_LINE)
+    } else {
+        hint
+    }
 }
 
 /// The code-aware search hint that follows `next_hint` whenever source code
@@ -11251,6 +11264,23 @@ mod map_metadata_tests {
 #[cfg(test)]
 mod generation_contract_identity_tests {
     use super::*;
+
+    #[test]
+    fn field_report_footer_honours_the_opt_out() {
+        // issue #1903: `xerj corpus index` printed it under XERJ_DISABLE_FEEDBACK=true
+        let on = with_field_report_if("next: x".to_string(), true);
+        assert!(on.contains(xerj_common::feedback::AUTO_SEND_LINE), "{on}");
+        let off = with_field_report_if("next: x".to_string(), false);
+        assert_eq!(off, "next: x");
+        assert!(!xerj_common::feedback::enabled_from(
+            ["xerj", "corpus", "index", "lz4", "--disable-feedback"],
+            None
+        ));
+        assert!(!xerj_common::feedback::enabled_from(
+            ["xerj", "corpus", "index", "lz4"],
+            Some("true".to_string())
+        ));
+    }
 
     fn dataset(slug: &str, index: &str, family: &str) -> PlanDataset {
         PlanDataset {
