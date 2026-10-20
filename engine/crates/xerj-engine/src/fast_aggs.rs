@@ -5021,8 +5021,16 @@ impl<'a> FastCtx<'a> {
         } else {
             let data_min = bucket_ids.keys().min().copied();
             let data_max = bucket_ids.keys().max().copied();
-            let min_key = extended_min.map(key_of).or(data_min).unwrap_or(0);
-            let max_key = extended_max.map(key_of).or(data_max).unwrap_or(0);
+            // #1819: the wider of the bounds and the data, as in
+            // `run_histogram` — `extended_bounds` never drops data buckets.
+            let min_key = match (extended_min.map(key_of), data_min) {
+                (Some(e), Some(d)) => e.min(d),
+                (e, d) => e.or(d).unwrap_or(0),
+            };
+            let max_key = match (extended_max.map(key_of), data_max) {
+                (Some(e), Some(d)) => e.max(d),
+                (e, d) => e.or(d).unwrap_or(0),
+            };
             let span = max_key.saturating_sub(min_key);
             if span > bucket_cap {
                 return Some(json!({

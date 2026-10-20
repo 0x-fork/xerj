@@ -7880,14 +7880,20 @@ fn run_histogram(
     } else {
         let data_min = buckets.keys().min().copied();
         let data_max = buckets.keys().max().copied();
-        let min_key = extended_min
-            .map(|v| ((v - offset) / interval).floor() as i64)
-            .or(data_min)
-            .unwrap_or(0);
-        let max_key = extended_max
-            .map(|v| ((v - offset) / interval).floor() as i64)
-            .or(data_max)
-            .unwrap_or(0);
+        // #1819: `extended_bounds` only ADDS empty buckets — the fill range
+        // is the wider of the bounds and the data, so a bound inside the data
+        // never drops a bucket that holds documents (only `hard_bounds`, below,
+        // does). `date_histogram` widens the same way (`range_min.min(key)`).
+        let ext_min_key = extended_min.map(|v| ((v - offset) / interval).floor() as i64);
+        let ext_max_key = extended_max.map(|v| ((v - offset) / interval).floor() as i64);
+        let min_key = match (ext_min_key, data_min) {
+            (Some(e), Some(d)) => e.min(d),
+            (e, d) => e.or(d).unwrap_or(0),
+        };
+        let max_key = match (ext_max_key, data_max) {
+            (Some(e), Some(d)) => e.max(d),
+            (e, d) => e.or(d).unwrap_or(0),
+        };
         // Guard against pathological inputs (tiny intervals with a wide
         // numeric span — a few billion buckets would DoS the process).
         // ES rejects aggs that exceed `search.max_buckets` (default 65536).
