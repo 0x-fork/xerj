@@ -745,6 +745,39 @@ impl IgnoreStack {
         }
     }
 
+    /// #1844: a `.xerjignore` `!pattern` that names a hidden entry looks like it
+    /// re-includes it, and `--help` documents `!pattern` as the re-include. It
+    /// cannot: the dotfile rule is not an ignore rule (see [`HIDDEN_RULE`]) and
+    /// runs before any ignore file is consulted. Saying so — once per entry,
+    /// with the named-root workaround — replaces a silent no-op.
+    ///
+    /// Only `.xerjignore` is asked: a `.gitignore` `!.env.example` is about
+    /// what git tracks, not a request to XERJ, and warning on it would fire on
+    /// half the repositories in existence. Call it for the hidden entry the
+    /// walker is about to skip, after [`IgnoreStack::truncate_to`].
+    pub fn note_hidden_reinclude(&mut self, path: &Path, is_dir: bool) {
+        if !self.opts.enabled {
+            return;
+        }
+        let decision = self
+            .layers
+            .iter()
+            .rev()
+            .find_map(|layer| self.decide_with(layer.xerj.as_ref(), path, is_dir));
+        let Some((false, label)) = decision else {
+            return;
+        };
+        let kind = if is_dir { "directory" } else { "file" };
+        self.warn(format!(
+            "`{label}` re-includes the hidden {kind} {rel}, but hidden (dot-named) entries are \
+             never indexed: that rule keeps .env and .ssh out, and no ignore file, !pattern or \
+             --no-ignore lifts it. To index it, name it as its own root: `xerj autoindex {abs} \
+             --prefix <name>`",
+            rel = self.rel(path),
+            abs = path.display(),
+        ));
+    }
+
     /// A symlink target outside the indexed root, also decided by the walker
     /// (it needs the canonical root, which this stack does not carry) and
     /// reported through the same accounting. See [`ESCAPED_ROOT_RULE`].

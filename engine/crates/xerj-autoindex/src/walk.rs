@@ -367,6 +367,7 @@ fn walk_impl(
         // without descending does not have. `cp -al`, `rsync --link-dest` and
         // hard-linked package stores all produce that shape without an attacker.
         if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
+            stack.note_hidden_reinclude(entry.path(), is_dir);
             stack.record_hidden(is_dir);
             if is_dir {
                 it.skip_current_dir();
@@ -753,6 +754,60 @@ mod hidden_skip_tests {
             "{rels:?}"
         );
         assert_eq!(off.dirs_pruned, 0, "{off:?}");
+    }
+
+    /// #1844: `!.openfox/` in a `.xerjignore` had no effect on the dotfile
+    /// prune and nothing said so. The hidden directory stays out (the rule is
+    /// what keeps `.env` and `.ssh` out), but the run now names the pattern
+    /// that tried and the named-root command that works; a `.gitignore`
+    /// negation of a dotfile (`!.env.example`) is git's business and stays
+    /// silent.
+    #[test]
+    fn a_xerjignore_re_include_of_a_hidden_dir_is_refused_out_loud() {
+        use super::walk_reporting;
+        use crate::ignore_rules::{IgnoreOptions, HIDDEN_RULE};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".xerjignore"), "!.openfox/\n").unwrap();
+        fs::write(root.join(".gitignore"), ".env*\n!.env.example\n").unwrap();
+        fs::write(root.join(".env.example"), "KEY=").unwrap();
+        fs::write(root.join("top.md"), "# top").unwrap();
+        fs::create_dir_all(root.join(".openfox/workflows")).unwrap();
+        fs::write(root.join(".openfox/workflows/w.md"), "# wf").unwrap();
+
+        let (files, report) = walk_reporting(root, false, IgnoreOptions::default()).unwrap();
+        let rels: Vec<String> = files.into_iter().map(|e| e.rel).collect();
+        assert_eq!(rels, vec!["top.md".to_string()], "{rels:?}");
+        assert_eq!(report.by_rule[HIDDEN_RULE].dirs, 1, "{report:?}");
+
+        let warned: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("re-includes the hidden"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{:?}", report.warnings);
+        let warning = warned[0];
+        assert!(warning.contains(".xerjignore:!.openfox/"), "{warning}");
+        assert!(warning.contains("directory .openfox"), "{warning}");
+        assert!(warning.contains("never indexed"), "{warning}");
+        assert!(warning.contains("xerj autoindex "), "{warning}");
+        assert!(warning.contains(".openfox --prefix <name>"), "{warning}");
+        assert!(
+            report
+                .summary_lines()
+                .iter()
+                .any(|l| l.starts_with("ignore rules: ") && l.contains("re-includes the hidden")),
+            "the warning must reach the printed report"
+        );
+
+        // --no-ignore reads no ignore file, so there is no pattern to answer.
+        let (_, off) = walk_reporting(root, false, IgnoreOptions::off()).unwrap();
+        assert!(
+            off.warnings.iter().all(|w| !w.contains("re-includes")),
+            "{:?}",
+            off.warnings
+        );
     }
 
     /// Create a real checkout at `path`. Returns false when the `git` binary

@@ -407,6 +407,8 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20.xerjignore  same syntax as .gitignore, XERJ-only. Use it to exclude\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20something git tracks, or to re-include (!pattern) something\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20git ignores. Outranks .gitignore at any depth.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20!pattern cannot re-include a hidden (dot-named)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20entry: see HIDDEN below.\n\
          \x20\x20\x20\x20\x20\x20.gitignore   including nested ones and negation; the closest file wins.\n\
          \x20\x20\x20\x20\x20\x20.git/info/exclude  per-checkout excludes, including nested checkouts.\n\
          \x20\x20\x20\x20\x20\x20built-in     {defaults}\n\
@@ -424,6 +426,11 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20ignored_files_in_pruned_dirs_exact=false to say so).\n\
          \x20\x20\x20\x20The folder you name is never rejected: if it is itself ignored, it is\n\
          \x20\x20\x20\x20indexed anyway and the run says which rule it would have matched.\n\
+         \x20\x20\x20\x20HIDDEN: dot-named files and directories below the folder (.env, .git,\n\
+         \x20\x20\x20\x20.ssh, .<tool>/) are skipped by a separate rule that runs before any\n\
+         \x20\x20\x20\x20ignore file. No .xerjignore !pattern and no --no-ignore lifts it (the\n\
+         \x20\x20\x20\x20run warns when a .xerjignore tries). To index one, name it as the\n\
+         \x20\x20\x20\x20root, which is never rejected: xerj autoindex ./.openfox --prefix openfox\n\
          \n\
          OBJECT STORAGE:\n\
          \x20\x20\x20\x20`xerj autoindex s3://bucket/prefix` indexes objects instead of files.\n\
