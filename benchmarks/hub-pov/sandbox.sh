@@ -41,7 +41,8 @@
 #
 # USAGE:
 #   benchmarks/hub-pov/sandbox.sh [--home DIR] [--rm-home] [--ro PATH]...
-#                                 [--net isolated|host] -- CMD [ARGS...]
+#                                 [--net isolated|host] [--forward-port PORT]...
+#                                 -- CMD [ARGS...]
 #     --home DIR   use DIR as the arm's fresh HOME (default: a new `mktemp -d`).
 #                  Must NOT be the real user's home; the script refuses that.
 #     --rm-home    delete the HOME on exit (default: keep it so the harness can
@@ -51,6 +52,12 @@
 #                  dirs, the catalogue override). NEVER pass a dir holding gold answers.
 #     --net MODE   `isolated` (default; needs pasta + nft) or `host` (the old shared
 #                  network — only for debugging the jail itself, never for an arm).
+#     --forward-port PORT  (isolated only; repeatable) forward the jail's loopback
+#                  PORT to the host's loopback PORT, and nothing else. Only for a
+#                  server the HARNESS started and owns for this run (e.g. the
+#                  whole-hub e2e's sentinel-checked stand-in hub); NEVER a node or
+#                  service port (9200, 9297-9299, ...), which is exactly what the
+#                  isolation exists to keep out of reach.
 #   Everything after `--` is the command run inside the jail.
 #   The resolved HOME is printed to stderr as `sandbox-home: <dir>` for the harness.
 #
@@ -75,6 +82,7 @@ RM_HOME=0
 NET=isolated
 IN_NETNS=0
 RO_PATHS=()
+FWD_PORTS=()
 ORIG_ARGS=("$@")
 
 # ---- parse args ----------------------------------------------------------
@@ -84,6 +92,12 @@ while [ $# -gt 0 ]; do
     --rm-home) RM_HOME=1; shift ;;
     --ro)      RO_PATHS+=("${2:?--ro needs a path}"); shift 2 ;;
     --net)     NET="${2:?--net needs isolated|host}"; shift 2 ;;
+    --forward-port)
+               [[ ${2:-} =~ ^[0-9]+$ ]] && [ "$2" -ge 1024 ] && [ "$2" -le 65535 ] \
+                 || { echo "sandbox.sh: --forward-port needs a port number in 1024-65535" >&2; exit 2; }
+               case "$2" in 9200|9297|9298|9299)
+                 echo "sandbox.sh: refusing to forward node port $2 into the jail" >&2; exit 2 ;; esac
+               FWD_PORTS+=("$2"); shift 2 ;;
     --_in-netns) IN_NETNS=1; shift ;;   # internal: re-exec'd inside pasta
     --)        shift; break ;;
     *) echo "sandbox.sh: unknown arg '$1' (did you forget '--' before the command?)" >&2; exit 2 ;;
@@ -121,7 +135,10 @@ if [ "$NET" = isolated ] && [ "$IN_NETNS" -eq 0 ]; then
   # pasta puts us in a user namespace as uid 0; remember the real ids so the jail
   # maps back to them (claude refuses --dangerously-skip-permissions as root).
   export SANDBOX_HOST_UID="$(id -u)" SANDBOX_HOST_GID="$(id -g)"
-  exec pasta --config-net -q -t none -u none -T none -U none --no-map-gw \
+  # --forward-port: forward ONLY those ns-loopback ports to the host (default none).
+  tcp_ns=none
+  [ ${#FWD_PORTS[@]} -gt 0 ] && tcp_ns=$(IFS=,; echo "${FWD_PORTS[*]}")
+  exec pasta --config-net -q -t none -u none -T "$tcp_ns" -U none --no-map-gw \
     -- bash "$(realpath "$0")" --_in-netns --home "$HOME_DIR" "${ORIG_ARGS[@]}"
 fi
 

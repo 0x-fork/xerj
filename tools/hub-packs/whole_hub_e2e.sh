@@ -585,7 +585,16 @@ phase() { # phase-name home-name [env...] -- [args...]
   echo "-- phase $name (HOME $home)"
   local rc=0
   if [ "$SANDBOX" = 1 ]; then
-    CLAUDE_CONFIG_DIR="$OUT/sandbox-cfg" bash "$SANDBOX_SH" --home "$home" -- \
+    # The jail masks /home and keeps its own loopback. On a CI runner the repo, the
+    # binary and --out all live under /home/runner, so expose exactly what a phase
+    # reads (this script and its e2e/ files, the binary, the questions, the
+    # stand-in hub's request log, the file:// pack dirs) read-only, and forward
+    # only the stand-in hub's port (ours: the sentinel proved it). DEAD_PORT and
+    # every node port stay unreachable, as they must.
+    local ro=(--ro "$HERE" --ro "$BIN" --ro "$(dirname "$QFILE")" --ro "$OUT/logs")
+    local d; for d in "$OUT/rel" "$OUT/lab/target"; do [ -d "$d" ] && ro+=(--ro "$d"); done
+    CLAUDE_CONFIG_DIR="$OUT/sandbox-cfg" bash "$SANDBOX_SH" --home "$home" "${ro[@]}" \
+      --forward-port "$PORT" -- \
       "${base[@]}" bash "$SELF" --inner "$name" "$@" 2> >(grep -v '^sandbox-home:' >&2) || rc=$?
   else
     env -i HOME="$home" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
@@ -718,9 +727,12 @@ fi
 # ── fold ────────────────────────────────────────────────────────────────────
 n_fail=$(jq -s '[.[] | select(.result != "pass")] | length' "$CHECKS")
 n_all=$(jq -s length "$CHECKS")
-rp_pass=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result == "e2e passed")] | length' 2>/dev/null || echo 0)
-rp_pend=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result == "pending")] | length' 2>/dev/null || echo 0)
-rp_fail=$(cat "$OUT/rows/"*.json 2>/dev/null | jq -s '[.[] | select(.result != "e2e passed" and .result != "pending")] | length' 2>/dev/null || echo 0)
+# rows_count <jq-select>: rows/ may be empty (no catalogue), and under pipefail a
+# failing `cat` plus an `|| echo 0` fallback used to print "0<newline>0".
+rows_count() { { cat "$OUT/rows/"*.json 2>/dev/null || true; } | jq -s "[.[] | select($1)] | length"; }
+rp_pass=$(rows_count '.result == "e2e passed"')
+rp_pend=$(rows_count '.result == "pending"')
+rp_fail=$(rows_count '.result != "e2e passed" and .result != "pending"')
 verdict=$([ "$n_fail" = 0 ] && echo "GREEN" || echo "RED")
 {
   echo "# Hub v2 whole-hub end-to-end (spec §12.4)"
