@@ -429,7 +429,10 @@ mod tests {
         // sed over this file. If a reformat ever wrapped the declaration, they
         // would read "" and go quietly dormant instead of publishing.
         let line = format!("\npub const HUB_PUBKEY_HEX: &str = \"{HUB_PUBKEY_HEX}\";\n");
-        assert!(include_str!("hub.rs").contains(&line), "{line}");
+        assert!(
+            include_str!("hub.rs").replace("\r\n", "\n").contains(&line),
+            "{line}"
+        );
     }
 
     #[test]

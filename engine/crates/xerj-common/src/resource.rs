@@ -419,7 +419,92 @@ fn probe_total_memory() -> Option<u64> {
     sysctl_u64(c"hw.memsize")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+#[allow(clippy::upper_case_acronyms)]
+mod win_mem {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    pub struct MEMORYSTATUSEX {
+        pub dwLength: u32,
+        pub dwMemoryLoad: u32,
+        pub ullTotalPhys: u64,
+        pub ullAvailPhys: u64,
+        pub ullTotalPageFile: u64,
+        pub ullAvailPageFile: u64,
+        pub ullTotalVirtual: u64,
+        pub ullAvailVirtual: u64,
+        pub ullAvailExtendedVirtual: u64,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    pub struct PROCESS_MEMORY_COUNTERS {
+        pub cb: u32,
+        pub PageFaultCount: u32,
+        pub PeakWorkingSetSize: usize,
+        pub WorkingSetSize: usize,
+        pub QuotaPeakPagedPoolUsage: usize,
+        pub QuotaPagedPoolUsage: usize,
+        pub QuotaPeakNonPagedPoolUsage: usize,
+        pub QuotaNonPagedPoolUsage: usize,
+        pub PagefileUsage: usize,
+        pub PeakPagefileUsage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+        pub fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        pub fn K32GetProcessMemoryInfo(
+            hProcess: *mut std::ffi::c_void,
+            ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
+            cb: u32,
+        ) -> i32;
+    }
+
+    pub fn status() -> Option<MEMORYSTATUSEX> {
+        let mut s = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            dwMemoryLoad: 0,
+            ullTotalPhys: 0,
+            ullAvailPhys: 0,
+            ullTotalPageFile: 0,
+            ullAvailPageFile: 0,
+            ullTotalVirtual: 0,
+            ullAvailVirtual: 0,
+            ullAvailExtendedVirtual: 0,
+        };
+        // SAFETY: GlobalMemoryStatusEx writes dwLength bytes into s.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut s) };
+        (ok != 0 && s.ullTotalPhys > 0).then_some(s)
+    }
+
+    pub fn rss() -> Option<u64> {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 0,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        // SAFETY: K32GetProcessMemoryInfo writes cb bytes to counters for the current process.
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        (ok != 0 && counters.WorkingSetSize > 0).then_some(counters.WorkingSetSize as u64)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn probe_total_memory() -> Option<u64> {
+    win_mem::status().map(|s| s.ullTotalPhys)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn probe_total_memory() -> Option<u64> {
     None
 }
@@ -432,7 +517,12 @@ fn probe_available_memory() -> Option<u64> {
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn probe_available_memory() -> Option<u64> {
+    win_mem::status().map(|s| s.ullAvailPhys)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn probe_available_memory() -> Option<u64> {
     None
 }
@@ -481,7 +571,12 @@ fn probe_rss() -> Option<u64> {
     Some(unsafe { info.assume_init() }.pti_resident_size)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn probe_rss() -> Option<u64> {
+    win_mem::rss()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn probe_rss() -> Option<u64> {
     None
 }
@@ -733,13 +828,13 @@ mod tests {
             // Windows PDF-throttling bug this API shape exists to prevent.
             assert_eq!(memory_safe_zone_bytes(), None);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             let rss = current_rss_bytes().expect("RSS must be probeable here");
             assert!(rss > 0, "a running process has non-zero RSS");
             assert_eq!(
                 available_memory_bytes().is_some(),
-                cfg!(target_os = "linux")
+                cfg!(any(target_os = "linux", target_os = "windows"))
             );
         }
     }

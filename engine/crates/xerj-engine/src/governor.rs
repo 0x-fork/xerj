@@ -1170,7 +1170,8 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 }
 
 /// `(total_bytes, avail_bytes)` for the filesystem backing `path`, via
-/// `statvfs(2)`. Returns `None` on syscall failure.
+/// `statvfs(2)` on Unix or `GetDiskFreeSpaceExW` on Windows.
+/// Returns `None` on syscall failure.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 pub fn disk_stats(path: &str) -> Option<(u64, u64)> {
@@ -1193,7 +1194,62 @@ pub fn disk_stats(path: &str) -> Option<(u64, u64)> {
     Some((total, avail))
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+pub fn disk_stats(path: &str) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let p = if path.is_empty() {
+        std::path::Path::new(".")
+    } else {
+        std::path::Path::new(path)
+    };
+    let abs = std::path::absolute(p).ok()?;
+    let candidate = if abs.exists() {
+        abs
+    } else {
+        abs.ancestors().find(|a| a.exists())?.to_path_buf()
+    };
+
+    let mut os_str = candidate.into_os_string();
+    let s = os_str.to_string_lossy();
+    if s.ends_with(':') {
+        os_str.push("\\");
+    }
+
+    let mut wide: Vec<u16> = os_str.encode_wide().collect();
+    wide.push(0);
+
+    let mut free_bytes_available: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_free_bytes: u64 = 0;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes_available,
+            &mut total_bytes,
+            &mut total_free_bytes,
+        )
+    };
+
+    if ok != 0 && total_bytes > 0 {
+        Some((total_bytes, free_bytes_available))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn disk_stats(_path: &str) -> Option<(u64, u64)> {
     None
 }
@@ -1787,6 +1843,18 @@ mod tests {
     fn disk_used_pct_bounded() {
         let p = disk_used_pct("/");
         assert!(p <= 100);
+    }
+
+    #[test]
+    fn this_machine_disk_stats_are_sane() {
+        if cfg!(any(unix, target_os = "windows")) {
+            let (total, avail) =
+                disk_stats(".").expect("disk_stats must succeed on the current directory");
+            assert!(total > 0, "total disk space must be positive");
+            assert!(avail <= total, "available disk space cannot exceed total");
+            let pct = disk_used_pct(".");
+            assert!(pct <= 100, "disk used percentage must be <= 100");
+        }
     }
 
     #[test]
