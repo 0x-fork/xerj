@@ -519,6 +519,10 @@ fn run_corpus_add(args: &[String]) -> i32 {
     // three-slot tuple tripped clippy's type_complexity on the pinned
     // CI toolchain.
     let mut pin_query: Option<manifest::QueryHints> = None;
+    // repo -> (sha, review) from the hub pin: a human's licence review of the
+    // repo at that sha, recorded when the checkout lands there (#1893).
+    let mut pin_reviews: std::collections::HashMap<String, (String, Value)> =
+        std::collections::HashMap::new();
     let (name, rows): (String, Vec<(String, String, String, String)>) = if let Some(path) = &from {
         let hub = match manifest::read_hub_manifest(Path::new(path)) {
             Ok(h) => h,
@@ -536,6 +540,11 @@ fn run_corpus_add(args: &[String]) -> i32 {
         };
         println!("rebuilding corpus '{resolved}' from {path}");
         pin_query = hub.query;
+        for r in &hub.rows {
+            if let (Some(review), false) = (&r.review, r.sha.is_empty()) {
+                pin_reviews.insert(r.repo.clone(), (r.sha.clone(), review.clone()));
+            }
+        }
         (
             resolved,
             hub.rows
@@ -594,12 +603,21 @@ fn run_corpus_add(args: &[String]) -> i32 {
     // review{} blocks are PRESERVED across a rebuild when repo+sha match —
     // a human's licence review survives a re-clone (additive, never edited).
     let previous = manifest::read_corpus_manifest(&dest.join("corpus.json")).ok();
+    // A hub pin's review of the same repo at the same sha comes next: it is
+    // the review the registry shipped for exactly this checkout (#1893).
     let carry = |repo: &str, sha: &str| -> Option<Value> {
-        let m = previous.as_ref()?;
-        m.repos.iter().find_map(|r| {
-            (r.repo == repo && r.sha == sha)
-                .then(|| r.review.clone())
-                .flatten()
+        let kept = previous.as_ref().and_then(|m| {
+            m.repos.iter().find_map(|r| {
+                (r.repo == repo && r.sha == sha)
+                    .then(|| r.review.clone())
+                    .flatten()
+            })
+        });
+        kept.or_else(|| {
+            pin_reviews
+                .get(repo)
+                .filter(|(pinned, _)| !sha.is_empty() && pinned == sha)
+                .map(|(_, review)| review.clone())
         })
     };
 
@@ -1034,16 +1052,30 @@ fn record(
         "          licence={lic} sha={} files={files}",
         &sha[..12.min(sha.len())]
     );
-    if let Some(w) = xccode::licence::clone_warning_line(&lic) {
+    let review = carry(repo_name, &sha);
+    // The recorded `licence` stays the detector's reading; a completed human
+    // review fills in a licence the detector could not identify (#1893), and
+    // that is what `xerj code` labels passages with.
+    let shown = xccode::licence::effective_licence(&lic, review.as_ref());
+    if shown != lic {
+        let by = review
+            .as_ref()
+            .and_then(|r| r.get("by"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        println!(
+            "          licence {shown} per the manifest's review by {by} (the detector read {lic})"
+        );
+    }
+    if let Some(w) = xccode::licence::clone_warning_line(&shown) {
         eprintln!("{w}");
     }
     // The detector is text-matching heuristics and has been wrong before.
     // When a manifest disagrees with the checkout, say so rather than
     // overwrite quietly.
-    if !declared.is_empty() && declared != lic {
+    if !declared.is_empty() && declared != shown {
         eprintln!("          ! manifest says licence={declared}, checkout reads {lic} — verify before copying");
     }
-    let review = carry(repo_name, &sha);
     entries.push(manifest::ManifestRepo {
         repo: repo_name.to_string(),
         url: url.to_string(),

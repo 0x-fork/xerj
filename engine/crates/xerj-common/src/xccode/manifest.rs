@@ -101,17 +101,25 @@ pub fn read_corpus_manifest(path: &Path) -> Result<CorpusManifest, String> {
     serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
 }
 
-/// repo -> recorded licence for a corpus. ALWAYS the recorded string, never
+/// repo -> recorded licence for a corpus. ALWAYS the recorded data, never
 /// re-derived at query time: the licence decision was made once, at clone
 /// time, against the checkout — re-deriving it per query is how prose drift
-/// becomes load-bearing.
+/// becomes load-bearing. The recorded data includes the repo's human review:
+/// when the detector could not identify a licence and a completed review
+/// names one, the review's SPDX is the label (#1893, see
+/// [`super::licence::effective_licence`]).
 pub fn licence_map(root: &Path, corpus: &str) -> HashMap<String, String> {
     let path = root.join("corpora").join(corpus).join("corpus.json");
     read_corpus_manifest(&path)
         .map(|m| {
             m.repos
                 .iter()
-                .map(|r| (r.repo.clone(), r.licence.clone()))
+                .map(|r| {
+                    (
+                        r.repo.clone(),
+                        super::licence::effective_licence(&r.licence, r.review.as_ref()),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -205,6 +213,10 @@ pub struct HubRow {
     pub url: String,
     pub sha: String,
     pub declared_licence: String,
+    /// The row's `review` block, verbatim (a human's licence review of the
+    /// repo at `sha`). `xerj corpus add` records it in the cloned corpus.json
+    /// when the checkout lands at that same sha (#1893).
+    pub review: Option<Value>,
 }
 
 /// A whole validated hub manifest: the corpus name plus its rows. The
@@ -275,6 +287,7 @@ pub fn read_hub_manifest(path: &Path) -> Result<HubManifest, String> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            review: r.get("review").filter(|v| v.is_object()).cloned(),
         });
     }
     Ok(HubManifest {
@@ -389,6 +402,40 @@ mod tests {
         assert_eq!(m.get("sonic").map(String::as_str), Some("MPL-2.0"));
         assert!(!m.contains_key("nope"));
         assert!(licence_map(&dir, "never-cloned").is_empty());
+    }
+
+    #[test]
+    fn licence_map_uses_a_completed_review_for_an_unknown_licence() {
+        // #1893: 18f-content-guide's checkout reads UNKNOWN, its review says
+        // CC0-1.0; passages must be labelled CC0-1.0, not "do not copy".
+        let dir = tmp();
+        let pin = dir.join("18f.json");
+        let sha = "1b1723d3d5b8f91d92c16487c88b56265dc0ec3a";
+        let review = json!({ "spdx": "CC0-1.0", "use": "adapt-with-attribution", "by": "xerj-org", "at": "2026-10-13", "note": "LICENSE.md verified" });
+        std::fs::write(&pin, json!({ "corpus": "18f-content-guide", "repos": [ { "repo": "content-guide", "url": "https://github.com/18F/content-guide", "licence": "CC0-1.0", "sha": sha, "review": review } ] }).to_string()).unwrap();
+        let hub = read_hub_manifest(&pin).unwrap();
+        assert_eq!(hub.rows[0].review.as_ref(), Some(&review));
+
+        let cdir = dir.join("corpora").join("18f-content-guide");
+        std::fs::create_dir_all(&cdir).unwrap();
+        write_corpus_manifest_kind(
+            &cdir.join("corpus.json"),
+            "18f-content-guide",
+            None,
+            "2026-10-19T00:00:00Z",
+            &[ManifestRepo {
+                repo: "content-guide".into(),
+                url: "https://github.com/18F/content-guide".into(),
+                licence: "UNKNOWN".into(),
+                sha: sha.into(),
+                files: None,
+                bytes: None,
+                review: hub.rows[0].review.clone(),
+            }],
+            None,
+        );
+        let m = licence_map(&dir, "18f-content-guide");
+        assert_eq!(m.get("content-guide").map(String::as_str), Some("CC0-1.0"));
     }
 
     #[test]

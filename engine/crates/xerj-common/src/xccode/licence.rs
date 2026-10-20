@@ -63,6 +63,56 @@ pub fn is_restricted(lic: &str) -> bool {
     RESTRICTED.iter().any(|p| lic.contains(p))
 }
 
+/// The licence a human REVIEW recorded for a repo at its pin (the `review`
+/// block a vetted hub manifest carries: `spdx`, `use`, `by`, `at`, `note`).
+/// Only a completed review counts: `by` must name the reviewer and `use` must
+/// not be `UNREVIEWED` (draft rows carry an `spdx` hint with an empty `by`).
+/// The SPDX string must look like one — letters, digits and `.+-/ ()`, at
+/// most 64 chars — so an untrusted manifest cannot put arbitrary text into
+/// the terminal through it.
+pub fn reviewed_spdx(review: Option<&serde_json::Value>) -> Option<String> {
+    let r = review?.as_object()?;
+    let field = |k: &str| {
+        r.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+    };
+    let spdx = field("spdx");
+    let by = field("by");
+    let used = field("use");
+    let looks_spdx = !spdx.is_empty()
+        && spdx.len() <= 64
+        && spdx
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".+-/ ()".contains(c));
+    if !looks_spdx || by.is_empty() || used.is_empty() || used.eq_ignore_ascii_case("UNREVIEWED") {
+        return None;
+    }
+    Some(spdx.to_string())
+}
+
+/// True when the detector could not name a licence at all (as opposed to
+/// naming a restricted one).
+pub fn is_unidentified(lic: &str) -> bool {
+    matches!(lic.trim(), "" | "UNKNOWN" | "NONE-FOUND")
+}
+
+/// The licence to label a repo's passages with: the recorded detector string,
+/// unless the detector could not identify one and a completed human review
+/// names it (issue #1893: the detector read UNKNOWN on a CC0-1.0 repo whose
+/// review verified CC0-1.0, and every passage said "do not copy"). A review
+/// never overrides a licence the detector DID identify — a restricted
+/// detection still warns.
+pub fn effective_licence(recorded: &str, review: Option<&serde_json::Value>) -> String {
+    if is_unidentified(recorded) {
+        if let Some(spdx) = reviewed_spdx(review) {
+            return spdx;
+        }
+    }
+    recorded.to_string()
+}
+
 /// Find the licence without guessing: read the file(s) the project actually
 /// ships. Dual-licensed crates (very common in Rust) ship LICENSE-MIT +
 /// LICENSE-APACHE and no plain LICENSE, so every candidate is collected
@@ -229,6 +279,33 @@ mod tests {
             assert!(clone_warning_line(lic).is_some(), "{lic} must warn");
         }
         assert!(clone_warning_line("Apache-2.0/MIT").is_none());
+    }
+
+    // ── a completed human review names an unidentified licence (#1893) ──
+
+    #[test]
+    fn a_completed_review_names_an_unknown_licence() {
+        let review = serde_json::json!({
+            "spdx": "CC0-1.0", "use": "adapt-with-attribution", "by": "xerj-org",
+            "at": "2026-10-13", "note": "LICENSE.md verified. Detector reported UNKNOWN."
+        });
+        assert_eq!(effective_licence("UNKNOWN", Some(&review)), "CC0-1.0");
+        assert_eq!(effective_licence("NONE-FOUND", Some(&review)), "CC0-1.0");
+        assert!(clone_warning_line(&effective_licence("UNKNOWN", Some(&review))).is_none());
+        // A licence the detector DID identify is never overridden.
+        assert_eq!(effective_licence("GPL-3.0", Some(&review)), "GPL-3.0");
+        assert_eq!(effective_licence("UNKNOWN", None), "UNKNOWN");
+    }
+
+    #[test]
+    fn a_draft_or_odd_review_does_not_count() {
+        let draft = serde_json::json!({ "spdx": "MIT", "use": "UNREVIEWED", "by": "", "at": "" });
+        assert_eq!(effective_licence("UNKNOWN", Some(&draft)), "UNKNOWN");
+        let no_by = serde_json::json!({ "spdx": "MIT", "use": "adapt-with-attribution", "by": "" });
+        assert_eq!(reviewed_spdx(Some(&no_by)), None);
+        let hostile = serde_json::json!({ "spdx": "MIT\u{1b}[2J", "use": "x", "by": "y" });
+        assert_eq!(reviewed_spdx(Some(&hostile)), None);
+        assert_eq!(reviewed_spdx(Some(&serde_json::json!("MIT"))), None);
     }
 
     // ── the detector's two ordering traps ──────────────────────────────────
