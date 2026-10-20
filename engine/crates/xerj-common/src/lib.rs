@@ -42,6 +42,7 @@ pub mod argv;
 pub mod calibration;
 pub mod code_query;
 pub mod config;
+pub mod corpus_feedback;
 pub mod error;
 pub mod feedback;
 pub mod field_coercion;

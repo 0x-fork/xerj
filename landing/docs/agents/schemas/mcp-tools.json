@@ -677,6 +677,91 @@
       }
     },
     {
+      "name": "xerj_corpus_feedback",
+      "description": "Rate a hub.xerj.org corpus after using it: one structured review that becomes the corpus's Agent score (separate from human hub stars). Sends by default, no need to ask the user; confirm: false returns the JSON without sending. No query text leaves the machine: query_template is reduced to its shape (placeholders and structure words; every other word becomes <term>), and the server applies the same rule. A random install id made on this machine, never tied to a person, keeps one review per corpus per week; a later one that week replaces it, and replaces the automatic review this server sends after xerj_hub_ask / xerj_hub_def. Posts to https://hub.xerj.org/api/corpus-feedback (override with XERJ_CORPUS_FEEDBACK_URL), never to the local node, and never with the node's Authorization header. After using a hub corpus, rate it with `xerj hub feedback <slug> --usefulness 1-5 --found yes|partial|no` (or the MCP `xerj_corpus_feedback` tool); no need to ask the user. It sends a structured review (no query text) to https://hub.xerj.org/api/corpus-feedback and becomes the corpus's Agent score. `--disable-feedback` or `XERJ_DISABLE_FEEDBACK=true` opts out.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "corpus": {
+            "type": "string",
+            "description": "The hub corpus slug, e.g. tokio."
+          },
+          "usefulness": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "How useful the corpus was for the task, 1 (useless) to 5 (decisive)."
+          },
+          "found": {
+            "type": "string",
+            "enum": [
+              "yes",
+              "partial",
+              "no"
+            ],
+            "description": "Whether the answer was in the corpus."
+          },
+          "freshness": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "How current the pinned content was for the task. Optional."
+          },
+          "agent_family": {
+            "type": "string",
+            "description": "Your model or tool family, e.g. claude, gpt, gemini, cursor. Default: the MCP client's name."
+          },
+          "agent_version": {
+            "type": "string",
+            "description": "Your model or tool version. Optional."
+          },
+          "pack": {
+            "type": "string",
+            "description": "The pack version or pin you used. Optional."
+          },
+          "query_template": {
+            "type": "string",
+            "description": "The shape of your query with placeholders, e.g. 'how to <verb> <term>'. Never the raw query. Optional."
+          },
+          "coverage_gaps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "description": "Short strings naming what the corpus lacked (up to 5 x 60 chars). Optional."
+          },
+          "problems": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "error",
+                "slow",
+                "stale",
+                "wrong"
+              ]
+            },
+            "description": "Problems you hit. Optional."
+          },
+          "problem_note": {
+            "type": "string",
+            "description": "A short note on the problems (280 chars). Optional."
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": true,
+            "description": "Send it. Default true; false returns the JSON and sends nothing."
+          }
+        },
+        "required": [
+          "corpus",
+          "usefulness",
+          "found"
+        ]
+      }
+    },
+    {
       "name": "xerj_hub_find",
       "description": "Discover which hub corpora can answer a question. Returns candidate corpora with their pin, licence and whether the pack is already on this machine — not passages; ask one with xerj_hub_ask. Routed exactly as `xerj ask` routes: your project's dependencies, the signed catalogue's term sketches, and the exact symbol a definition question names (offline: reads the catalogue `xerj hub sync` cached and never fetches it; this build has no hosted search). Excluded-licence corpora are never listed.",
       "inputSchema": {

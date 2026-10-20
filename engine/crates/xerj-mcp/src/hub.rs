@@ -263,10 +263,40 @@ async fn run(ctx: &Ctx, mut a: AskArgs) -> Value {
         Ok(l) => l,
         Err(e) => return tool_text(e, true),
     };
+    let question = a.question.clone();
     match tokio::task::spawn_blocking(move || ask::run_ask_with(&a, None, launcher)).await {
-        Ok(outcome) => outcome_result(outcome),
+        Ok(outcome) => {
+            if let Some(answer) = &outcome.answer {
+                auto_review(answer, &question);
+            }
+            outcome_result(outcome)
+        }
         Err(e) => tool_text(format!("join error: {e}"), true),
     }
+}
+
+/// One automatic review per corpus per week after a hub answer
+/// ([`xerj_hub::feedback::auto_review_for_answer`]: hits or not, the pack's age,
+/// the question's shape only). Sent in the background, so the tool result is
+/// never held; failures are silent. Off with the feedback opt-out. The agent's
+/// own `xerj_corpus_feedback` replaces it on the server.
+fn auto_review(answer: &xerj_common::hub::Answer, question: &str) {
+    let (family, version) = crate::client_family();
+    let Some(review) =
+        xerj_hub::feedback::auto_review_for_answer(answer, question, &family, &version)
+    else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let path = xerj_hub::feedback::state_path();
+        if let Some(r) = xerj_hub::feedback::claim_auto(&path, "mcp", review) {
+            let _ = xerj_hub::feedback::send_blocking(
+                &r,
+                &xerj_common::corpus_feedback::endpoint_from_env(),
+                xerj_hub::feedback::AUTO_TIMEOUT,
+            );
+        }
+    });
 }
 
 /// The re-ask hint as the CLI words it, and as a tool caller needs it.

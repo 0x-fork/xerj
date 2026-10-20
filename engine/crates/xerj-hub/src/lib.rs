@@ -18,6 +18,7 @@ pub mod build_catalogue;
 pub mod catalogue;
 pub mod cli;
 pub mod def;
+pub mod feedback;
 mod flock;
 pub mod lockfile;
 pub mod node;

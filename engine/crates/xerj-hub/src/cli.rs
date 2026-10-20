@@ -65,6 +65,9 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
         this build has no hub public key to verify with (nothing is downloaded),
         1 for anything else (an excluded licence and a pack over the size limit
         are refused here too).
+  feedback <slug> --usefulness <1-5> --found <yes|partial|no> [...]
+        Rate a corpus after using it: one structured review (no query text) for
+        its Agent score on hub.xerj.org (see `xerj hub feedback -h`).
   status
         Cached packs, the automatic node, the hosted setting, catalogue age.
   stop
@@ -86,6 +89,7 @@ fn hub_verb(arg: &str) -> bool {
             | "build-catalogue"
             | "sync"
             | "pull"
+            | "feedback"
             | "status"
             | "stop"
             | "config"
@@ -108,6 +112,7 @@ pub fn run_hub_cli(args: &[String]) -> i32 {
         "build-catalogue" => crate::build_catalogue::run(rest),
         "sync" => crate::sync::run_sync(rest),
         "pull" => run_pull(rest),
+        "feedback" => crate::feedback::run_feedback(rest),
         "status" => run_status(rest),
         "stop" => run_stop(rest),
         "config" => run_config(rest),
@@ -615,6 +620,8 @@ fn run_pull(args: &[String]) -> i32 {
                 return 0;
             }
             "--quiet" => quiet = true,
+            // Read by xerj_common::feedback::enabled() from the whole argv.
+            "--disable-feedback" => {}
             "--url" => match args.get(i + 1) {
                 Some(v) => {
                     url = Some(v.clone());
@@ -674,17 +681,32 @@ fn run_pull(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match pull_with(&plan, &resolved.url, resolved.managed, quiet) {
+    let started = std::time::Instant::now();
+    let outcome = pull_with(&plan, &resolved.url, resolved.managed, quiet);
+    // One automatic pull note per corpus per week (worked? slow?) and the line
+    // that asks the agent to rate the corpus once it has used it. Feedback off
+    // (--disable-feedback / XERJ_DISABLE_FEEDBACK) sends and prints nothing.
+    if !matches!(outcome, Ok(Pulled::Already)) {
+        crate::feedback::auto_after_pull(&slug, &plan.pin8, outcome.is_err(), started.elapsed());
+    }
+    let ask_to_rate = || {
+        if !quiet && xerj_common::feedback::enabled() {
+            eprintln!("{}", xerj_common::corpus_feedback::AUTO_SEND_LINE);
+        }
+    };
+    match outcome {
         Ok(Pulled::Already) => {
             if !quiet {
                 println!("{slug}: already present");
             }
+            ask_to_rate();
             0
         }
         Ok(Pulled::Done(line)) => {
             if !quiet {
                 println!("{line}");
             }
+            ask_to_rate();
             0
         }
         Err(PullError { code, message }) => {
@@ -2197,7 +2219,7 @@ mod tests {
 
     #[test]
     fn hub_usage_lists_the_new_commands() {
-        for word in ["status", "stop", "config hosted"] {
+        for word in ["status", "stop", "config hosted", "feedback <slug>"] {
             assert!(HUB_USAGE.contains(word), "{word}");
         }
         assert_eq!(run_hub_cli(&strs(&["status", "extra"])), 2);
