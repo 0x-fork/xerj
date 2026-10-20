@@ -2030,7 +2030,15 @@ fn run_corpus_list(args: &[String]) -> i32 {
             .unwrap_or_default();
         match live {
             usize::MAX => println!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}"),
-            0 => println!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"),
+            0 => {
+                println!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}");
+                // #1846: a name the index prefix rewrites (`curl_cffi`) was
+                // indexed under another spelling, so "0 indices" is not the
+                // whole story — say which name to move it to.
+                if let Err(why) = xccode::pathgate::valid_corpus_name(name) {
+                    println!("  {why}");
+                }
+            }
             n => {
                 loaded += 1;
                 println!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}");
