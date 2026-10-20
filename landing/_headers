@@ -1,10 +1,14 @@
 # Cloudflare Pages headers — applied to all routes.
+#
+# GA4 gtag.js (G-Z77ETCDJYL). The /* policy follows Google's GA4 rules
+# without Google Signals or ads hosts. The tag host must stay listed in
+# seo_lint.ALLOWED_SCRIPT_SRC.
 /*
   X-Frame-Options: SAMEORIGIN
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: interest-cohort=()
-  Content-Security-Policy: default-src 'self' blob:; style-src 'self' blob: https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' blob: https://fonts.gstatic.com; img-src 'self' blob: data:; script-src 'self' blob: 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' blob: https://cloudflareinsights.com https://api.github.com; frame-ancestors 'self';
+  Content-Security-Policy: default-src 'self' blob:; style-src 'self' blob: https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' blob: https://fonts.gstatic.com; img-src 'self' blob: data: https://*.google-analytics.com https://*.googletagmanager.com; script-src 'self' blob: 'unsafe-inline' https://static.cloudflareinsights.com https://*.googletagmanager.com; connect-src 'self' blob: https://cloudflareinsights.com https://api.github.com https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; frame-ancestors 'self';
 
 # Site-wide stylesheet changes with the design — must revalidate on
 # every deploy (ETag 304s keep this cheap). A stale copy here breaks

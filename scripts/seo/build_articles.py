@@ -766,6 +766,7 @@ def _head(title: str, description: str, rel: str, block: str,
     return f'''<!DOCTYPE html>
 <html lang="en" data-theme="day">
 <head>
+{seo_head.ga4_snippet()}
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{seo_head.text_esc(title)}</title>

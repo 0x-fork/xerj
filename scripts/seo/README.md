@@ -23,7 +23,7 @@ content/compare/<slug>.md   ─┤                      ├─> landing/answers/
 scripts/seo/pagedata.py     ─┤                      ├─> landing/answers/index.json    (hub search index)
 scripts/seo/urlmap.py       ─┘                      └─> a spliced block in landing/llms.txt
 
-landing/**/*.html  ── fix_heads.py ──> the <!-- seo:begin --> … <!-- seo:end --> block in every <head>
+landing/**/*.html  ── fix_heads.py ──> the <!-- seo:begin --> … <!-- seo:end --> block in every <head>, and the GA4 snippet at the top of <head>
 landing/**/*.html  ── fix_links.py ──> every internal <a href>, plus the site-map footer block
 landing/**/*.html  ── gen_sitemap.py ─> landing/sitemap.xml
 (brand tokens)     ── mk_og_card.py ──> landing/og/xerj-card.png
@@ -707,6 +707,16 @@ data to a page can never require touching `landing/_headers`, and `seo_lint.py`
 rule 55 fails the build if anyone widens `script-src` on account of it. (The
 `'unsafe-inline'` already in the policy predates this work; it is something to
 remove later, not to build on.)
+
+The GA4 tag is the exception that is a script. `seo_head.ga4_snippet()` emits
+Google's standard async `gtag.js` snippet once, immediately after `<head>`, on
+every page (`fix_heads.py` for pages already on disk, `build_articles.py` for
+generated articles). Rule 55's allowlist includes `https://*.googletagmanager.com`
+for that tag and still fails any other `script-src` host. `landing/_headers`
+also allows `https://*.google-analytics.com` and `https://*.analytics.google.com`
+on `connect-src`, and the Analytics and Tag Manager hosts on `img-src`, so the
+tag's collect calls are not blocked. That set is Google's GA4 policy without
+Google Signals. It does not allow `google.com`, DoubleClick, or ads hosts.
 
 ### 8. When `factcheck.py` fires, fix the claim — never the wording
 

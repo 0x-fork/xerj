@@ -56,8 +56,13 @@ SITEMAP_NS = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 #: change.  Rule 55 exists to stop someone "fixing" that non-problem by
 #: widening the policy.  The `'unsafe-inline'` here predates this work and is
 #: something to remove later, not to build on.
+#:
+#: ``https://*.googletagmanager.com`` is the GA4 gtag.js host emitted by
+#: ``seo_head.ga4_snippet()``.  It is a real script, not a JSON-LD workaround.
+#: The inline config block uses the ``'unsafe-inline'`` token already listed.
 ALLOWED_SCRIPT_SRC = frozenset({
     "'self'", "blob:", "'unsafe-inline'", "https://static.cloudflareinsights.com",
+    "https://*.googletagmanager.com",
 })
 
 #: Internal links that are known-broken and consciously left that way.

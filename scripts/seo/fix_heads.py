@@ -14,7 +14,9 @@ For every page it guarantees, in `<head>` and nowhere else:
   * the `<title>` and `<meta name="description">` from `pagedata.py`;
   * `<meta name="robots" content="noindex">` on, and only on, the pages in
     `urlmap.NOINDEX`;
-  * `lang` on `<html>` and a viewport meta, if the page was missing them.
+  * `lang` on `<html>` and a viewport meta, if the page was missing them;
+  * the GA4 tag from ``seo_head.ga4_snippet()``, once, immediately after
+    ``<head>``.
 
 Deliberately NOT emitted, per scripts' research doc §5:
   * FAQPage — Google restricted FAQ rich results to government/health sites,
@@ -36,8 +38,11 @@ than by luck — there is no "already applied?" heuristic to get wrong.
 CSP note: `<script type="application/ld+json">` is a *data block* per WHATWG
 HTML ("prepare the script element" returns at step 13, before the CSP inline
 check at step 21).  It is never an inline script, so `script-src` never
-applies.  Do not touch `landing/_headers`; `seo_lint.py` fails the build if
-anyone widens `script-src` on account of this file.
+applies to it.  Do not widen `script-src` on account of JSON-LD;
+`seo_lint.py` fails the build if anyone does.  The GA4 tag is a real script.
+Its host is an explicit entry in `seo_lint.ALLOWED_SCRIPT_SRC`, and
+`landing/_headers` allows that host plus the Analytics collect endpoints
+for that tag alone.
 """
 
 from __future__ import annotations
@@ -152,6 +157,12 @@ def transform(rel: str, src: str, dates: urlmap.DateSource,
         modified = kept.get("dateModified", modified)
     block = build_block(rel, title, desc, published, modified, meta)
     head = head.rstrip("\n \t") + "\n" + block + "\n"
+
+    # GA4 sits immediately after <head>, which is where Google's install
+    # instructions put the snippet.  Delete then emit, same as the SEO block,
+    # so a second run does not duplicate it.
+    head = seo_head.RE_GA4.sub("", head)
+    head = "\n" + seo_head.ga4_snippet() + "\n" + head.lstrip("\n")
 
     out = src[:m.start()] + open_tag + head + close_tag + src[m.end():]
 
