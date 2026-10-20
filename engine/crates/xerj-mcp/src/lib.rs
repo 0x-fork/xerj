@@ -104,6 +104,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use xerj_common::code_query::{
+    mapped_property_names, numeric_property_names, search_query_body_for_mapping,
+};
 
 /// MCP protocol revision we default to when the client does not request one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -1711,7 +1714,23 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
     };
 
     let result = match name {
-        "xerj_search" => build_search(&args),
+        "xerj_search" => {
+            // #1961: a plain-string query is shaped from the target's mapping,
+            // exactly like `xerj search` (#1602). Without this, a prose corpus
+            // answers HTTP 400 `strict_unknown_fields` because the body names
+            // `defs` and `name`, which it does not map. A DSL object is
+            // forwarded untouched (no mapping read, no rewriting).
+            let mapping = match args.get("query") {
+                Some(Value::String(q)) if !q.trim().is_empty() => {
+                    fetch_mapping(ctx, search_index(&args)).await
+                }
+                _ => None,
+            };
+            match mapping {
+                Some(mapping) => build_search_with_mapping(&args, Some(&mapping)),
+                None => build_search(&args),
+            }
+        }
         "xerj_semantic_search" => build_semantic(&args),
         "xerj_vector_search" => build_vector(&args),
         "xerj_hybrid_search" => build_hybrid(&args),
@@ -2040,17 +2059,31 @@ fn apply_judge(
 }
 
 fn build_search(args: &Value) -> Result<BuiltRequest, String> {
-    // #962: `index` used to be required, but nothing an agent reads said what
-    // to pass — the first real tool call after `xerj autoindex` was an error
-    // until the agent guessed `ax-*`. Default to the prefix autoindex writes
-    // (matching the CLI's `xerj search`, which defaults to "ax"); an explicit
-    // index still wins.
-    let index = args
-        .get("index")
+    build_search_with_mapping(args, None)
+}
+
+/// The index pattern a tool call targets: the CLI's `ax-*` default (#962); an
+/// explicit argument wins.
+fn search_index(args: &Value) -> &str {
+    args.get("index")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("ax-*");
+        .unwrap_or("ax-*")
+}
+
+/// [`build_search`] with the target's `GET /{index}/_mapping` body (#1961).
+///
+/// A plain-string query is shaped by `xerj_common::code_query` — the same
+/// implementation `xerj search` uses (#1601/#1602). On a corpus that maps none
+/// of `name`/`code`/`defs` the code legs are dropped and the prose fields are
+/// searched, instead of the request 400ing on a field the index does not map.
+/// `None` (no readable mapping) keeps the historical #916 shape.
+fn build_search_with_mapping(
+    args: &Value,
+    mapping: Option<&Value>,
+) -> Result<BuiltRequest, String> {
+    let index = search_index(args);
     let mut body = serde_json::Map::new();
     let mut plain_string = false;
     match args.get("query") {
@@ -2061,26 +2094,15 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
         // untouched for structured queries.
         Some(Value::String(q)) if !q.trim().is_empty() => {
             plain_string = true;
-            let shaped = xerj_common::code_query::normalize_code_search_query(q);
-            let mut should = vec![
-                json!({ "multi_match": {
-                    "query": shaped,
-                    "fields": ["name^4", "code^2", "body", "defs^3", "title"],
-                    "type": "most_fields"
-                }}),
-                json!({ "match_phrase": { "defs": { "query": shaped, "boost": 8 } } }),
-                json!({ "term": { "name": { "value": q.trim(), "boost": 10 } } }),
-            ];
-            // Same exact-phrase leg as `xerj search`: a pasted error string
-            // must rank the file that contains it, not a `defs` list that
-            // shares two of its words.
-            if let Some(phrase) = xerj_common::code_query::exact_phrase_query(q) {
-                should.push(json!({ "match_phrase": { "body": {
-                    "query": phrase,
-                    "boost": xerj_common::code_query::EXACT_PHRASE_BOOST
-                } } }));
-            }
-            body.insert("query".into(), json!({ "bool": { "should": should } }));
+            // #1961: the mapping-aware body the CLI builds (#1601/#1602),
+            // including the #1759 exact-phrase leg. A prose corpus drops the
+            // `defs`/`name` clauses instead of 400ing on them; a code corpus
+            // (or an unreadable mapping) keeps the historical shape. `10`
+            // only fills the discarded `size` member.
+            let mapped = mapping.and_then(mapped_property_names);
+            let numeric = mapping.map(numeric_property_names);
+            let built = search_query_body_for_mapping(q, 10, mapped.as_ref(), numeric.as_ref());
+            body.insert("query".into(), built["query"].clone());
         }
         Some(q) if !q.is_null() => {
             body.insert("query".into(), q.clone());
@@ -2582,6 +2604,26 @@ fn code_root() -> std::path::PathBuf {
 /// to that token budget by [`token_budget::budget_json_response`]. Errors are
 /// never budgeted — a refusal the agent cannot read end-to-end is worse than
 /// a long response, and refusals are small anyway.
+/// `GET /{index}/_mapping` for a plain-string `xerj_search` (#1961).
+///
+/// `None` when the node cannot answer or the body is not JSON: the caller
+/// then keeps the historical code-shaped query, exactly like the CLI does
+/// when the mapping read fails (#1601). Read on every plain-string call, not
+/// cached: `xerj autoindex` can add a dataset (and a field) between two tool
+/// calls, and a stale mapping is the failure this exists to prevent.
+async fn fetch_mapping(ctx: &Ctx, index: &str) -> Option<Value> {
+    let url = format!("{}/{index}/_mapping", ctx.base_url.trim_end_matches('/'));
+    let mut req = ctx.client.get(&url);
+    if let Some(auth) = &ctx.auth {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
+}
+
 async fn engine_request(
     ctx: &Ctx,
     method: Method,
@@ -2765,6 +2807,135 @@ mod tests {
         assert_eq!(path, "/ax-*/_search");
         let (_, path, _) = built(build_search(&json!({ "index": "docs" })));
         assert_eq!(path, "/docs/_search");
+    }
+
+    /// #1961: a plain-string query on a prose corpus must not name the code
+    /// legs. Autoindex indices are created `strict_unknown_fields`, so the
+    /// old body (`match_phrase` on `defs`, `term` on `name`) was an HTTP 400
+    /// on any corpus that maps neither — the MCP path never got #1602's fix.
+    #[test]
+    fn plain_string_query_drops_unmapped_code_legs_on_a_prose_mapping() {
+        let mapping = json!({
+            "ax-docs": { "mappings": { "properties": {
+                "body": {"type": "text"},
+                "title": {"type": "text"},
+                "text": {"type": "text"},
+                "impl": {"type": "text"},
+                "message": {"type": "text"}
+            }}}
+        });
+        let (_, _, body) = built(build_search_with_mapping(
+            &json!({"query": "how does the retry work"}),
+            Some(&mapping),
+        ));
+        let should = body["query"]["bool"]["should"]
+            .as_array()
+            .expect("should clauses");
+        let fields: Vec<String> = should
+            .iter()
+            .find_map(|c| c.get("multi_match"))
+            .and_then(|m| m.get("fields"))
+            .and_then(Value::as_array)
+            .expect("multi_match fields")
+            .iter()
+            .map(|f| f.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            fields
+                .iter()
+                .all(|f| !matches!(f.split('^').next().unwrap(), "name" | "code" | "defs")),
+            "a prose corpus must not be queried with code legs: {fields:?}"
+        );
+        for expected in ["body", "title", "text", "impl", "message"] {
+            assert!(
+                fields.iter().any(|f| f.split('^').next() == Some(expected)),
+                "`{expected}` is mapped and must be searched: {fields:?}"
+            );
+        }
+        for clause in should {
+            if let Some(phrase) = clause.get("match_phrase").and_then(Value::as_object) {
+                let field = phrase.keys().next().expect("phrase field");
+                assert_ne!(
+                    field, "defs",
+                    "an unmapped `defs` phrase was sent: {should:?}"
+                );
+            }
+            assert!(
+                clause.get("term").is_none(),
+                "an unmapped `name` term was sent: {should:?}"
+            );
+        }
+    }
+
+    /// On a code corpus the mapping-aware body is exactly the historical
+    /// #916 shape: the builder only removes legs the target cannot answer.
+    #[test]
+    fn plain_string_query_keeps_the_code_shape_on_a_code_mapping() {
+        let mapping = json!({
+            "ax-rust": { "mappings": { "properties": {
+                "name": {"type": "keyword"},
+                "code": {"type": "text"},
+                "body": {"type": "text"},
+                "defs": {"type": "text"},
+                "title": {"type": "text"},
+                "line": {"type": "long"}
+            }}}
+        });
+        let (_, _, with) = built(build_search_with_mapping(
+            &json!({"query": "flush the tree"}),
+            Some(&mapping),
+        ));
+        let (_, _, without) = built(build_search(&json!({"query": "flush the tree"})));
+        assert_eq!(
+            with["query"], without["query"],
+            "a code corpus must keep the #916 query"
+        );
+    }
+
+    /// A numeric mapping of a code field drops that leg (#1284 via #1601):
+    /// naming it fails the whole wildcard request with `For input string`.
+    #[test]
+    fn plain_string_query_drops_a_numeric_code_leg() {
+        let mapping = json!({
+            "ax-mixed": { "mappings": { "properties": {
+                "name": {"type": "long"},
+                "code": {"type": "text"},
+                "body": {"type": "text"},
+                "defs": {"type": "text"}
+            }}}
+        });
+        let (_, _, body) = built(build_search_with_mapping(
+            &json!({"query": "flush"}),
+            Some(&mapping),
+        ));
+        let should = body["query"]["bool"]["should"].as_array().unwrap();
+        assert!(
+            should.iter().all(|c| c.get("term").is_none()),
+            "a numeric `name` must not get a `term`: {should:?}"
+        );
+        let fields: Vec<&str> = should
+            .iter()
+            .find_map(|c| c.get("multi_match"))
+            .and_then(|m| m.get("fields"))
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        assert!(!fields.iter().any(|f| f.starts_with("name")), "{fields:?}");
+    }
+
+    /// An unreadable mapping must not narrow the query: dropping clauses with
+    /// no evidence would change the #916 ranking (the CLI's #1601 rule).
+    #[test]
+    fn unreadable_mapping_keeps_the_historical_shape() {
+        let mapping = json!({"error": {"reason": "no such index"}});
+        let (_, _, with) = built(build_search_with_mapping(
+            &json!({"query": "flush the tree"}),
+            Some(&mapping),
+        ));
+        let (_, _, without) = built(build_search(&json!({"query": "flush the tree"})));
+        assert_eq!(with["query"], without["query"]);
     }
 
     #[test]
@@ -3639,6 +3810,105 @@ mod tests {
         );
         let _ = sock.write_all(response.as_bytes());
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Serve exactly two requests — a mapping read, then the search — and
+    /// return the SECOND request (headers + body). Proves `xerj_search` reads
+    /// the mapping before shaping a plain-string query (#1961) and never
+    /// sends a code leg the mapping does not have.
+    fn serve_mapping_then_search(
+        listener: std::net::TcpListener,
+        mapping_body: &str,
+        search_body: &str,
+    ) -> String {
+        use std::io::{Read, Write};
+        let mut last = String::new();
+        for body in [mapping_body, search_body] {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..header_end]);
+                            let length = headers.lines().find_map(|line| {
+                                let rest = line
+                                    .split_once(':')
+                                    .filter(|(name, _)| {
+                                        name.eq_ignore_ascii_case("content-length")
+                                    })?
+                                    .1;
+                                rest.trim().parse::<usize>().ok()
+                            });
+                            let body_at = header_end + 4;
+                            if let Some(length) = length {
+                                while buf.len() < body_at + length {
+                                    match sock.read(&mut tmp) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            last = String::from_utf8_lossy(&buf).into_owned();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes());
+        }
+        last
+    }
+
+    /// #1961 end to end: the tool reads `GET /{index}/_mapping` first, so the
+    /// search body it posts on a prose corpus names no unmapped code field —
+    /// the HTTP 400 `strict_unknown_fields` the field report hit.
+    #[test]
+    fn search_tool_reads_the_mapping_before_a_plain_string_query() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mapping = r#"{"ax-docs":{"mappings":{"properties":{"body":{"type":"text"},"title":{"type":"text"},"text":{"type":"text"}}}}}"#;
+        let hits = r#"{"took":1,"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","_source":{"ax_path":"guide.md"}}]}}"#;
+        let server = std::thread::spawn(move || serve_mapping_then_search(listener, mapping, hits));
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": { "name": "xerj_search", "arguments": {
+                "query": "how does the retry policy work"
+            } }
+        });
+        let res = block_on(call_tool(&ctx, &msg));
+        let request = server.join().expect("fake node thread");
+        assert_eq!(res["isError"], false, "{res}");
+        assert!(
+            request.starts_with("POST /ax-*/_search HTTP/1.1"),
+            "the SECOND request must be the search: {request}"
+        );
+        assert!(
+            !request.contains("\"defs\""),
+            "an unmapped `defs` leg was sent (HTTP 400 on a prose index): {request}"
+        );
+        assert!(
+            !request.contains("\"name\""),
+            "an unmapped `name` leg was sent (HTTP 400 on a prose index): {request}"
+        );
+        assert!(
+            request.contains("\"text\""),
+            "the mapped prose field was not searched: {request}"
+        );
     }
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
