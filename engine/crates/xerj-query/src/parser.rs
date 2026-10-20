@@ -2769,11 +2769,7 @@ fn parse_simple_query_string(params: &Value) -> Result<QueryNode> {
             filter,
             minimum_should_match: auto_mm,
         }) => {
-            let final_mm = if mm.is_some() {
-                mm
-            } else {
-                auto_mm
-            };
+            let final_mm = if mm.is_some() { mm } else { auto_mm };
             QueryNode::Bool {
                 must,
                 should,
@@ -2790,7 +2786,12 @@ fn parse_simple_query_string(params: &Value) -> Result<QueryNode> {
 }
 
 /// Build a Match, MatchPhrase, or MultiMatch node for a term in a simple_query_string.
-fn make_simple_query_node(term: &str, is_phrase: bool, fields: &[String], lenient: bool) -> QueryNode {
+fn make_simple_query_node(
+    term: &str,
+    is_phrase: bool,
+    fields: &[String],
+    lenient: bool,
+) -> QueryNode {
     if is_phrase {
         if fields.len() == 1 {
             QueryNode::MatchPhrase {
@@ -7112,8 +7113,16 @@ mod tests {
             }
         }));
         match node {
-            QueryNode::Bool { should, must, minimum_should_match, .. } => {
-                assert!(must.is_empty(), "must be empty under OR conjunction: {must:?}");
+            QueryNode::Bool {
+                should,
+                must,
+                minimum_should_match,
+                ..
+            } => {
+                assert!(
+                    must.is_empty(),
+                    "must be empty under OR conjunction: {must:?}"
+                );
                 assert_eq!(should.len(), 2);
                 assert_eq!(minimum_should_match, Some(MinShouldMatch::Fixed(1)));
             }
@@ -7147,8 +7156,12 @@ mod tests {
             QueryNode::Bool { should, must, .. } => {
                 assert!(must.is_empty());
                 assert_eq!(should.len(), 2);
-                assert!(matches!(&should[0], QueryNode::MatchPhrase { ref query, .. } if query == "quick brown"));
-                assert!(matches!(&should[1], QueryNode::Match { ref query, .. } if query == "bear"));
+                assert!(
+                    matches!(&should[0], QueryNode::MatchPhrase { ref query, .. } if query == "quick brown")
+                );
+                assert!(
+                    matches!(&should[1], QueryNode::Match { ref query, .. } if query == "bear")
+                );
             }
             other => panic!("expected Bool, got {other:?}"),
         }
@@ -7164,7 +7177,9 @@ mod tests {
         match node {
             QueryNode::Bool { must, .. } => {
                 assert_eq!(must.len(), 2);
-                assert!(matches!(&must[0], QueryNode::Bool { ref should, .. } if should.len() == 2));
+                assert!(
+                    matches!(&must[0], QueryNode::Bool { ref should, .. } if should.len() == 2)
+                );
                 assert!(matches!(&must[1], QueryNode::Match { ref query, .. } if query == "brown"));
             }
             other => panic!("expected Bool, got {other:?}"),
