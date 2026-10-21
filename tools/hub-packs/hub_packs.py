@@ -528,10 +528,10 @@ def apply_proposals(
             open_prs = _gh_json(
                 gh, ["pr", "list", "--state", "open", "--limit", "200", "--json", "number,headRefName"], repo_root
             ) or []
-            mine = f"{BRANCH_PREFIX}{p.slug}-"
+            mine = re.compile(re.escape(f"{BRANCH_PREFIX}{p.slug}-") + r"[0-9a-f]{8}")
             for other in open_prs:
                 head = other["headRefName"]
-                if head.startswith(mine) and head != p.branch:
+                if mine.fullmatch(head) and head != p.branch:
                     _run(
                         [gh, "pr", "close", str(other["number"]), "--delete-branch", "--comment", f"Superseded by {url}"],
                         cwd=repo_root,

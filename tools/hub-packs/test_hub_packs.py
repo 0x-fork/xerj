@@ -512,6 +512,24 @@ class ApplyTests(unittest.TestCase):
         open_heads = [p["headRefName"] for p in self.gh_state()["prs"] if p["state"] == "OPEN"]
         self.assertEqual(open_heads, [new.branch])
 
+    def test_superseding_a_corpus_preserves_longer_slug_branches(self):
+        (proposal,) = self.proposals(["feed"])
+        st = self.gh_state()
+        st["prs"] = [
+            {"number": 91, "state": "OPEN", "headRefName": "hub-repin/feed-12345678"},
+            {"number": 92, "state": "OPEN", "headRefName": "hub-repin/feed-extra-12345678"},
+            {"number": 93, "state": "OPEN", "headRefName": "hub-repin/feed-manual-review"},
+        ]
+        self.state.write_text(json.dumps(st))
+        _, failures = self.apply([proposal])
+        self.assertEqual(failures, 0)
+        by_number = {p["number"]: p["state"] for p in self.gh_state()["prs"]}
+        self.assertEqual(by_number[91], "CLOSED", "an older exact-corpus proposal is superseded")
+        self.assertEqual(by_number[92], "OPEN", "a longer corpus slug is independently owned")
+        self.assertEqual(by_number[93], "OPEN", "non-generated branch suffixes are not ours")
+        closes = [c[2] for c in self.gh_state()["calls"] if c[:2] == ["pr", "close"]]
+        self.assertEqual(closes, ["91"])
+
     def test_one_failure_does_not_stop_the_rest(self):
         first, second = self.proposals()
         st = self.gh_state()
