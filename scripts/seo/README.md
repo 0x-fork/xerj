@@ -14,6 +14,14 @@ repository root is always the invocation.
 
 ---
 
+The dependency-free playground state regressions run the committed browser
+bundle with controlled browser state: `node --test scripts/landing/test_*.cjs`
+(Node 22, also run by the SEO job). To regenerate the playground bundle, run
+`esbuild playground/src/app.js --bundle --outfile=playground/app.bundle.js`
+from `landing/`. Custom dashboards inherit their template's data and render
+functions while keeping their own layout overrides. Clones can themselves be
+cloned; missing or cyclic template references produce the blank fallback.
+
 ## 1. Architecture
 
 ```
