@@ -62,10 +62,16 @@ pub fn extract_prose(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "untitled".into())
         });
+    // #1941: a prose section's record must carry the file line it starts on,
+    // or a hit has no line to cite (`guide.md:1` for a passage at line 245).
+    // `body` below is `text.trim()`, so shift by the newlines the trim removed.
+    let leading = &text[..text.len() - text.trim_start().len()];
+    let base_line = 1 + leading.bytes().filter(|b| *b == b'\n').count() as u64;
     emit_document(
         &title,
         &[],
         text.trim(),
+        Some(base_line),
         MAX_RECORDS_PER_FILE,
         sink,
         &mut stats,
@@ -288,5 +294,48 @@ mod chunk_tests {
             out[0].2, 5,
             "end_line must be the real file line of `gamma`"
         );
+    }
+
+    /// #1941: a prose section carries the FILE line it starts on, so a hit can
+    /// cite `guide.md:4`, not the record-relative `:1`. The source is the
+    /// oracle — a section can start mid-line after a hard cut.
+    #[test]
+    fn prose_sections_carry_their_file_start_line() {
+        let paragraph = "word ".repeat(700); // 3500 chars: forces section cuts
+        let text = format!("\n\n\n{paragraph}\n\n{paragraph}\n\n{paragraph}\n");
+        let dir = std::env::temp_dir().join(format!("xerj-prose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("guide.md");
+        std::fs::write(&p, &text).unwrap();
+        let mut got: Vec<(u64, String)> = Vec::new();
+        {
+            let mut sink = |r: RawRecord| {
+                got.push((
+                    r.fields["start_line"]
+                        .as_u64()
+                        .expect("every prose section carries start_line"),
+                    r.fields["body"].as_str().unwrap().to_string(),
+                ));
+                true
+            };
+            extract_prose(&p, false, &mut sink).unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(got.len() > 1, "3500-char paragraphs must split");
+        assert_eq!(
+            got[0].0, 4,
+            "three leading blank lines put the body on line 4"
+        );
+        for (line, body) in &got {
+            let first = body.lines().next().unwrap_or("");
+            let source = lines
+                .get(*line as usize - 1)
+                .unwrap_or_else(|| panic!("start_line {line} is past the file"));
+            assert!(
+                source.ends_with(first),
+                "start_line {line} does not hold the section start: {first:?} vs {source:?}"
+            );
+        }
     }
 }

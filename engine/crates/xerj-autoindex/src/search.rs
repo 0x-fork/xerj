@@ -1110,6 +1110,25 @@ mod tests {
         );
     }
 
+    /// #1941: a prose section record carries `start_line` (the file line the
+    /// section starts on), so the header cites that line instead of the
+    /// record-relative `ordinal + 1` — the `guide.md:1` this issue reported
+    /// for a passage at line 245.
+    #[test]
+    fn a_prose_section_is_cited_at_its_file_start_line() {
+        let hit = json!({
+            "_source": {
+                "ax_path": "guide.md",
+                "ax_locator": "s2",
+                "ax_format": "txt-prose",
+                "section": 2,
+                "start_line": 169
+            },
+            "fields": { "_passage": [{ "field": "body", "ordinal": 0 }] }
+        });
+        assert_eq!(hit_location(&hit), "guide.md:169");
+    }
+
     /// #1934: two JSONL rows both printed as `xerj-prs.jsonl:1` because the
     /// passage ordinal counts lines inside the row's own `body`. A data row
     /// is cited by its locator; whole files, code and sections keep lines.

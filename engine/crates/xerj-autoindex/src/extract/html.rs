@@ -103,6 +103,7 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
         &title,
         &doc.headings,
         doc.body.trim(),
+        None,
         MAX_RECORDS_PER_FILE,
         sink,
         &mut stats,

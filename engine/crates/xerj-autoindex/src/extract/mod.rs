@@ -194,6 +194,7 @@ pub fn extract_as_document_with_name(
         &title,
         &[],
         text.trim(),
+        None,
         MAX_RECORDS_PER_FILE,
         sink,
         &mut stats,
@@ -674,15 +675,41 @@ fn fill_window(cur: &mut String, rest: &mut &str, want: usize) {
 /// that never exceeds `2 * SECTION_CHARS + 4` bytes, and the paragraph itself
 /// stays borrowed from `text`.
 pub fn for_each_section(text: &str, emit: &mut dyn FnMut(String) -> bool) -> bool {
+    for_each_section_lined(text, &mut |section, _| emit(section))
+}
+
+/// [`for_each_section`] with the 1-based line of each section's first byte
+/// (#1941).
+///
+/// The paragraphs are the source's own `"\n\n"`-separated slices, and the
+/// builder re-joins them with the same two newlines, so counting the newlines
+/// in the emitted prefix gives the section's line exactly. A section that
+/// starts with the overlap carry starts inside the previous section; its line
+/// is the carry's own line, which is the first line a reader sees printed.
+pub fn for_each_section_lined(text: &str, emit: &mut dyn FnMut(String, u64) -> bool) -> bool {
     if text.len() <= SECTION_CHARS {
-        return emit(text.to_string());
+        return emit(text.to_string(), 1);
     }
     // One byte past the largest section the loop below will ever hold, so a
     // full window always trips the hard-split condition.
     let window = 2 * SECTION_CHARS + 1;
     let mut cur = String::new();
+    // The line `cur`'s first byte sits on; re-derived from the paragraph
+    // whenever `cur` is empty at a paragraph boundary (a section start).
+    let mut cur_line: u64 = 1;
+    let mut pos = 0usize;
+    let mut line_at_pos: u64 = 1;
 
-    for para in text.split("\n\n") {
+    // A manual split: `split("\n\n")` yields no offsets, and rescanning for
+    // each paragraph would make the walk quadratic on a large body.
+    while pos <= text.len() {
+        let (para, next) = match text[pos..].find("\n\n") {
+            Some(rel) => (&text[pos..pos + rel], Some(pos + rel + 2)),
+            None => (&text[pos..], None),
+        };
+        if cur.is_empty() {
+            cur_line = line_at_pos;
+        }
         // `cur.len() > SECTION_OVERLAP`: a shorter section would be carried
         // WHOLE into the next as its overlap, so emitting it adds a record
         // with no text of its own (a heading before a long first paragraph).
@@ -690,12 +717,17 @@ pub fn for_each_section(text: &str, emit: &mut dyn FnMut(String) -> bool) -> boo
         if !cur.is_empty() && cur.len() + para.len() > SECTION_CHARS && cur.len() > SECTION_OVERLAP
         {
             let done = std::mem::take(&mut cur);
-            let carry = tail(&done, SECTION_OVERLAP);
-            if !emit(done) {
+            let carry_at = done.len() - tail(&done, SECTION_OVERLAP).len();
+            let carry_line =
+                cur_line + done[..carry_at].bytes().filter(|b| *b == b'\n').count() as u64;
+            let carried = done[carry_at..].to_string();
+            let done_line = cur_line;
+            if !emit(done, done_line) {
                 return false;
             }
-            if !carry.is_empty() {
-                cur.push_str(&carry);
+            if !carried.is_empty() {
+                cur.push_str(&carried);
+                cur_line = carry_line;
             }
         }
         if !cur.is_empty() {
@@ -713,14 +745,20 @@ pub fn for_each_section(text: &str, emit: &mut dyn FnMut(String) -> bool) -> boo
             }
             let cut = ceil_boundary(&cur, SECTION_CHARS);
             let section = cur[..cut].to_string();
+            let section_line = cur_line;
             cur.drain(..cut);
-            if !emit(section) {
+            cur_line += section.bytes().filter(|b| *b == b'\n').count() as u64;
+            if !emit(section, section_line) {
                 return false;
             }
         }
+        let Some(next) = next else { break };
+        // The two newlines the join adds are the two of the delimiter.
+        line_at_pos += para.bytes().filter(|b| *b == b'\n').count() as u64 + 2;
+        pos = next;
     }
     if !cur.trim().is_empty() {
-        return emit(cur);
+        return emit(cur, cur_line);
     }
     true
 }
@@ -742,6 +780,7 @@ fn section_record(
     i: usize,
     multi: bool,
     section: String,
+    start_line: Option<u64>,
 ) -> RawRecord {
     let mut fields = Map::new();
     fields.insert("title".into(), Value::String(title.to_string()));
@@ -753,6 +792,13 @@ fn section_record(
     }
     if multi {
         fields.insert("section".into(), Value::Number((i as u64).into()));
+    }
+    // #1941: the line this section starts on in the source file. Without it a
+    // prose hit has no line to cite and the CLI fell back to `ordinal + 1`
+    // (`guide.md:1` for a passage at line 245). Only formats where a line
+    // means something pass a base; DOCX/HTML sections carry none.
+    if let Some(line) = start_line {
+        fields.insert("start_line".into(), Value::Number(line.into()));
     }
     fields.insert("body".into(), Value::String(section));
     RawRecord {
@@ -769,10 +815,15 @@ fn section_record(
 ///
 /// Streams: sections are cut one at a time, so a sink that stops early (phase-A
 /// `--sample`) stops the split too instead of paying for the whole body first.
+///
+/// `base_line` is the 1-based source line of `body`'s first byte when the
+/// format has real file lines (plain text/prose, #1941); the records then carry
+/// `start_line`. `None` for formats where a line is meaningless (DOCX, HTML).
 pub fn emit_document(
     title: &str,
     headings: &[String],
     body: &str,
+    base_line: Option<u64>,
     max_records: usize,
     sink: Sink,
     stats: &mut ExtractStats,
@@ -780,10 +831,15 @@ pub fn emit_document(
     // One section of lookahead: the `section` field is only present when the
     // document actually splits, which is not known until a second one arrives.
     let mut pending: Option<String> = None;
+    // The lookahead's line travels with it: `for_each_section_lined` reports
+    // the section it hands over, and we emit the PREVIOUS one.
+    let mut pending_line: u64 = 1;
     let mut next: usize = 0;
     let mut alive = true;
-    for_each_section(body, &mut |sec| {
+    let line_of = |section_line: u64| base_line.map(|base| base + section_line - 1);
+    for_each_section_lined(body, &mut |sec, line| {
         let Some(prev) = pending.replace(sec) else {
+            pending_line = line;
             return true;
         };
         // #381: bound noise from a misclassified payload. Stopping the split
@@ -795,7 +851,15 @@ pub fn emit_document(
         let i = next;
         next += 1;
         stats.records += 1;
-        alive = sink(section_record(title, headings, i, true, prev));
+        alive = sink(section_record(
+            title,
+            headings,
+            i,
+            true,
+            prev,
+            line_of(pending_line),
+        ));
+        pending_line = line;
         alive
     });
     // A sink that stopped early (sampling) sets `alive = false`; the cap leaves
@@ -814,7 +878,14 @@ pub fn emit_document(
                 return true;
             }
             stats.records += 1;
-            sink(section_record(title, headings, next, next > 0, last))
+            sink(section_record(
+                title,
+                headings,
+                next,
+                next > 0,
+                last,
+                line_of(pending_line),
+            ))
         }
         None => true,
     }
@@ -1256,6 +1327,7 @@ mod section_tests {
                 "t",
                 &[],
                 body,
+                None,
                 MAX_RECORDS_PER_FILE,
                 &mut sink,
                 &mut stats
@@ -1289,6 +1361,7 @@ mod section_tests {
             "t",
             &[],
             &doc(60, 300),
+            None,
             MAX_RECORDS_PER_FILE,
             &mut sink,
             &mut stats
@@ -1312,6 +1385,7 @@ mod section_tests {
             "t",
             &[],
             &doc(60, 300),
+            None,
             3,
             &mut sink,
             &mut stats
@@ -1335,6 +1409,7 @@ mod section_tests {
             "t",
             &[],
             &body,
+            None,
             MAX_RECORDS_PER_FILE,
             &mut sink,
             &mut stats
@@ -1364,7 +1439,15 @@ mod section_tests {
             at += 1;
             true
         };
-        assert!(emit_document("t", &[], &body, total, &mut sink, &mut stats));
+        assert!(emit_document(
+            "t",
+            &[],
+            &body,
+            None,
+            total,
+            &mut sink,
+            &mut stats
+        ));
         assert_eq!(at, total, "N==cap must emit every section");
         assert!(!stats.truncated, "N==cap must NOT set truncated");
 
@@ -1379,12 +1462,74 @@ mod section_tests {
             "t",
             &[],
             &body,
+            None,
             total - 1,
             &mut sink2,
             &mut stats2
         ));
         assert_eq!(over, total - 1, "N>cap must emit exactly the cap");
         assert!(stats2.truncated, "N>cap must set truncated");
+    }
+
+    /// #1941: `base_line` shifts every section's `start_line`, and each record
+    /// must point at the line its first printed text starts on. The source
+    /// itself is the oracle: a section that starts mid-line (an overlap carry
+    /// or a hard cut) starts with a SUFFIX of that source line.
+    #[test]
+    fn emit_document_stamps_section_start_lines() {
+        let body = doc(60, 300);
+        let mut got: Vec<(u64, String)> = Vec::new();
+        let mut stats = ExtractStats::default();
+        let mut sink = |r: RawRecord| {
+            got.push((
+                r.fields["start_line"]
+                    .as_u64()
+                    .expect("a line-bearing document stamps start_line"),
+                r.fields["body"].as_str().unwrap().to_string(),
+            ));
+            true
+        };
+        assert!(emit_document(
+            "t",
+            &[],
+            &body,
+            Some(10),
+            MAX_RECORDS_PER_FILE,
+            &mut sink,
+            &mut stats
+        ));
+        assert!(got.len() > 1, "the fixture must split");
+        assert_eq!(got[0].0, 10, "the first section starts at base_line");
+        let lines: Vec<&str> = body.lines().collect();
+        for (line, section) in &got {
+            let first = section.lines().next().unwrap_or("");
+            let source = lines
+                .get(*line as usize - 10)
+                .unwrap_or_else(|| panic!("start_line {line} is past the body"));
+            assert!(
+                source.ends_with(first),
+                "start_line {line} does not hold the section start: {first:?} vs {source:?}"
+            );
+        }
+
+        // `None` (DOCX/HTML) stamps no line at all.
+        let mut none_stats = ExtractStats::default();
+        let mut none_sink = |r: RawRecord| {
+            assert!(
+                r.fields.get("start_line").is_none(),
+                "a line-less format must not invent one"
+            );
+            true
+        };
+        assert!(emit_document(
+            "t",
+            &[],
+            "short body",
+            None,
+            MAX_RECORDS_PER_FILE,
+            &mut none_sink,
+            &mut none_stats
+        ));
     }
 }
 
