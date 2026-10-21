@@ -8,6 +8,7 @@
 //!
 //! Endpoints (mounted on the ES-compat router):
 //! ```text
+//! GET    /_memory?from&size              list_ns — {count, namespaces:[{namespace, count, graph}], from, size, next}
 //! POST   /_memory/{namespace}            store   — {text, metadata?, vector?, id?, dedup?, dedup_threshold?} → {id, created} | {id, created:false, deduplicated:true}
 //! POST   /_memory/{namespace}/_recall    recall  — {query?, vector?, semantic?, hybrid?, fusion?, k?, filter?, recency_weight?} → {hits:[…]}
 //! GET    /_memory/{namespace}?from&size  list    — {count, entries:[…], next} (paged, recent first)
@@ -1346,6 +1347,97 @@ pub async fn list(
     .into_response()
 }
 
+/// `GET /_memory` — list agent-memory namespaces.
+///
+/// Enumerates all memory namespaces (indices named `.xerj-memory-{namespace}`),
+/// returning their active document count and whether a corresponding graph
+/// edges index (`.xerj-memory-{namespace}-edges`) exists.
+///
+/// Filtered to only the namespaces the calling principal holds
+/// `Privilege::ReadIndex` on.
+pub async fn list_namespaces(
+    State(state): State<AppState>,
+    principal: Principal,
+    axum::extract::Query(params): axum::extract::Query<ListParams>,
+) -> Response {
+    let from = params.from.or(params.after).unwrap_or(0);
+    let size = params.size.unwrap_or(LIST_LIMIT).clamp(1, MAX_LIST_SIZE);
+
+    let all_indices = state.engine.list_indices().await;
+
+    // Collect all edges indices so we can flag `graph: true` in O(1).
+    let mut edges = std::collections::HashSet::new();
+    for idx in &all_indices {
+        if let Some(rest) = idx.name.strip_prefix(MEMORY_PREFIX) {
+            if let Some(brain) = rest.strip_suffix("-edges") {
+                edges.insert(brain.to_string());
+            }
+        }
+    }
+
+    let mut namespaces = Vec::new();
+    for idx in &all_indices {
+        if let Some(ns) = idx.name.strip_prefix(MEMORY_PREFIX) {
+            // Edges indices are graph metadata, not memory namespaces.
+            if ns.ends_with("-edges") {
+                continue;
+            }
+            if validate_namespace(ns).is_err() {
+                continue;
+            }
+            if authz::authorize_memory_namespace(&principal, ns, Privilege::ReadIndex).is_err() {
+                continue;
+            }
+            let has_graph = edges.contains(ns);
+            namespaces.push(json!({
+                "namespace": ns,
+                "count": idx.doc_count,
+                "graph": has_graph,
+            }));
+        }
+    }
+
+    // Sort deterministically by namespace name.
+    namespaces.sort_by(|a, b| {
+        let a_ns = a.get("namespace").and_then(Value::as_str).unwrap_or("");
+        let b_ns = b.get("namespace").and_then(Value::as_str).unwrap_or("");
+        a_ns.cmp(b_ns)
+    });
+
+    let total = namespaces.len();
+    let paged: Vec<Value> = namespaces.into_iter().skip(from).take(size).collect();
+    let next = if from + paged.len() < total {
+        json!({ "from": from + paged.len(), "size": size })
+    } else {
+        Value::Null
+    };
+
+    Json(json!({
+        "count": total,
+        "namespaces": paged,
+        "from": from,
+        "size": size,
+        "next": next,
+    }))
+    .into_response()
+}
+
+/// JSON `405` for unsupported mutating verbs on bare `/_memory`.
+pub async fn unsupported_memory_bare() -> Response {
+    let reason = "/_memory only supports GET to list namespaces. \
+                  Specify a namespace in the path (e.g. POST /_memory/{namespace}) \
+                  to store, recall, list, or drop memories.";
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, HeaderValue::from_static("GET"))],
+        Json(json!({
+            "error": { "type": "memory_error", "reason": reason },
+            "status": 405,
+        })),
+    )
+        .into_response()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Forget
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2436,5 +2528,118 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["forgotten"], false);
         assert_eq!(body["id"], "_doc");
+    }
+
+    #[tokio::test]
+    async fn list_namespaces_empty_and_populated() {
+        let state = test_state();
+
+        // 1. Initially empty: no memory namespaces exist.
+        let resp = list_namespaces(
+            State(state.clone()),
+            Principal::Superuser,
+            axum::extract::Query(ListParams::default()),
+        )
+        .await;
+        let (s, body) = drain_json(resp).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["namespaces"].as_array().unwrap().len(), 0);
+        assert!(body["next"].is_null());
+
+        // 2. Populate two namespaces: `agent-a` (2 docs) and `support-bot` (1 doc).
+        store_mem(&state, "agent-a", json!({"text":"first memory"})).await;
+        store_mem(&state, "agent-a", json!({"text":"second memory"})).await;
+        store_mem(&state, "support-bot", json!({"text":"bot memory"})).await;
+
+        // Add a graph edge for `support-bot` using graph_api::link.
+        let link_body: crate::graph_api::LinkBody = serde_json::from_value(json!({
+            "src": "m1",
+            "dst": "m2",
+            "type": "relates_to",
+        }))
+        .unwrap();
+        let link_resp = crate::graph_api::link(
+            State(state.clone()),
+            Path("support-bot".to_string()),
+            Principal::Superuser,
+            OptionalJson(Some(link_body)),
+        )
+        .await;
+        assert_eq!(link_resp.into_response().status(), StatusCode::CREATED);
+
+        // 3. List namespaces: should return both sorted alphabetically.
+        let resp = list_namespaces(
+            State(state.clone()),
+            Principal::Superuser,
+            axum::extract::Query(ListParams::default()),
+        )
+        .await;
+        let (s, body) = drain_json(resp).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["count"], 2);
+        let list = body["namespaces"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+
+        // `agent-a`: count=2, graph=false
+        assert_eq!(list[0]["namespace"], "agent-a");
+        assert_eq!(list[0]["count"], 2);
+        assert_eq!(list[0]["graph"], false);
+
+        // `support-bot`: count=1, graph=true
+        assert_eq!(list[1]["namespace"], "support-bot");
+        assert_eq!(list[1]["count"], 1);
+        assert_eq!(list[1]["graph"], true);
+
+        // 4. Pagination: from=0, size=1 -> returns agent-a, next={from:1, size:1}
+        let resp = list_namespaces(
+            State(state.clone()),
+            Principal::Superuser,
+            axum::extract::Query(ListParams {
+                from: Some(0),
+                size: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let (_, p1) = drain_json(resp).await;
+        assert_eq!(p1["count"], 2);
+        assert_eq!(p1["namespaces"].as_array().unwrap().len(), 1);
+        assert_eq!(p1["namespaces"][0]["namespace"], "agent-a");
+        assert_eq!(p1["next"], json!({ "from": 1, "size": 1 }));
+
+        // Page 2: from=1, size=1 -> returns support-bot, next=null
+        let resp = list_namespaces(
+            State(state.clone()),
+            Principal::Superuser,
+            axum::extract::Query(ListParams {
+                from: Some(1),
+                size: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let (_, p2) = drain_json(resp).await;
+        assert_eq!(p2["count"], 2);
+        assert_eq!(p2["namespaces"].as_array().unwrap().len(), 1);
+        assert_eq!(p2["namespaces"][0]["namespace"], "support-bot");
+        assert!(p2["next"].is_null());
+    }
+
+    #[tokio::test]
+    async fn bare_memory_unsupported_verbs() {
+        let resp = unsupported_memory_bare().await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+            Some("GET")
+        );
+        let (_, body) = drain_json(resp).await;
+        assert_eq!(body["status"], 405);
+        assert_eq!(body["error"]["type"], "memory_error");
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("/_memory only supports GET"));
     }
 }

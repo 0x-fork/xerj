@@ -927,6 +927,13 @@ pub fn build_es_compat_router_with_hub(
         // `.xerj-memory-{namespace}` indices (reuses the doc/dense_vector/BM25
         // machinery). See `memory_api.rs`.
         .route(
+            "/_memory",
+            get(memory_api::list_namespaces)
+                .post(memory_api::unsupported_memory_bare)
+                .delete(memory_api::unsupported_memory_bare)
+                .put(memory_api::unsupported_memory_bare),
+        )
+        .route(
             "/_memory/:namespace",
             post(memory_api::store)
                 .get(memory_api::list)
