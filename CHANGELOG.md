@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denied or the legacy copy command fails, and retain their original label
   after repeated clicks. A failed copy can be retried.
 
+- Playground PNG exports preserve computed SVG paint and text styles, including
+  the embedding query crosshair whose CSS-variable stroke disappeared when
+  rasterized outside the page stylesheet. The live chart is left unchanged.
+
 - `xerj search` and a plain-string `xerj_search` rank a file that contains
   the query as an exact phrase (a pasted error message or log line) at the
   top. The bag-of-words leg alone let a short `defs` list sharing two of the

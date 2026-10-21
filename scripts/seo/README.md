@@ -29,6 +29,20 @@ The temporary feedback restores the original button label. Run the interaction
 regressions with `node --test scripts/landing/test_interact.cjs` (Node 18+; no
 packages are required).
 
+Dependency-free landing interaction tests run with
+`node --test scripts/landing/test_*.cjs` (Node 22) in the SEO job. Playground
+PNG export snapshots computed SVG paint styles before rasterization, since a
+detached SVG image cannot inherit the page stylesheet or its custom properties.
+For the real-browser pixel check, serve the repository root with
+`python3 -m http.server 8857 --bind 127.0.0.1`, open
+`http://127.0.0.1:8857/scripts/landing/png_export_fixture.html`, and click the
+export button. The live query stroke and exported PNG must retain the yellow
+crosshair (nonzero yellow pixels and a crosshair pixel distinct from the white
+background). The click downloads one PNG for inspection. This is a static
+fixture; it does not run XERJ or contact external services.
+Regenerate its committed bundle from `landing/` using
+`esbuild playground/src/app.js --bundle --outfile=playground/app.bundle.js`.
+
 ## 1. Architecture
 
 ```

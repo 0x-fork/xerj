@@ -5048,6 +5048,31 @@ borrows the accent color.`
     clone.setAttribute("height", String(h));
     const cs = getComputedStyle(svgEl);
     clone.setAttribute("color", cs.color);
+    const properties = [
+      "color",
+      "fill",
+      "fill-opacity",
+      "stroke",
+      "stroke-width",
+      "stroke-opacity",
+      "stroke-dasharray",
+      "opacity",
+      "font-family",
+      "font-size",
+      "font-weight",
+      "letter-spacing",
+      "text-anchor",
+      "dominant-baseline"
+    ];
+    const originals = [svgEl, ...svgEl.querySelectorAll("*")];
+    const copies = [clone, ...clone.querySelectorAll("*")];
+    originals.forEach((element, index) => {
+      const computed = getComputedStyle(element);
+      for (const property of properties) {
+        const value = computed.getPropertyValue(property);
+        if (value) copies[index].style.setProperty(property, value);
+      }
+    });
     if (!clone.getAttribute("xmlns")) {
       clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
     }
