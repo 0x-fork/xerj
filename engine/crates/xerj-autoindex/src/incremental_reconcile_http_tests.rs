@@ -973,6 +973,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         max_index_bytes: None,
         budget_plan: None,
         dry_run: false,
+        walk_only: false,
         json: false,
         quiet: true,
         progress: crate::progress::ProgressMode::None,

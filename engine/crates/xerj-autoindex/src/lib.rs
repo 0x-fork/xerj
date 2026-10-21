@@ -3524,6 +3524,7 @@ mod phase_a_grouping_tests {
             max_index_bytes: None,
             budget_plan: None,
             dry_run: true,
+            walk_only: false,
             json: false,
             quiet: true,
             progress: crate::progress::ProgressMode::None,
@@ -6978,6 +6979,43 @@ fn run_index_report_inner(
     // named, not just the totals (#276).
     for line in ignore_report.summary_lines() {
         pr.note(&format!("autoindex: {line}"));
+    }
+    // `--walk-only` (#1912) is the map of a tree that has not been indexed yet.
+    // The walk above is the same one `--dry-run` runs, and `summary_lines` is
+    // the same ignore report. Hashing is the next step, and it reads every
+    // admitted byte — on a large drive that is the day-long part. Return
+    // before it. `walk_only` implies `dry_run`, so a pending generation or an
+    // object download already returned above without writing.
+    if cfg.walk_only {
+        let summary = walk::summarise_walk_only(&root_str, &discovered_files, &ignore_report);
+        if cfg.json {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            print!("{}", summary.render());
+        }
+        pr.note(
+            "(walk-only — stopped before hashing; file contents were not hashed and nothing was indexed)",
+        );
+        pr.finish_with_flags(
+            true,
+            0,
+            "walk-only",
+            &[
+                ("files", summary.files),
+                ("bytes", summary.bytes),
+                ("ignored_files", ignore_report.files_skipped),
+                ("ignored_dirs", ignore_report.dirs_pruned),
+                (
+                    "ignored_files_in_pruned_dirs",
+                    ignore_report.files_inside_pruned_dirs,
+                ),
+            ],
+            &[(
+                "ignored_files_in_pruned_dirs_exact",
+                ignore_report.files_inside_pruned_dirs_is_exact(),
+            )],
+        );
+        return Ok((0, None));
     }
     // An empty folder is only "nothing to do" when there is also no durable
     // state: with a journal present, zero files is a deletion of the whole

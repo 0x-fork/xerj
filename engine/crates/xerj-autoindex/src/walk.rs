@@ -9,6 +9,8 @@
 
 use crate::ignore_rules::{is_hidden_name, IgnoreOptions, IgnoreReport, IgnoreStack};
 use anyhow::{Context, Result};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -368,7 +370,7 @@ fn walk_impl(
         // hard-linked package stores all produce that shape without an attacker.
         if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
             stack.note_hidden_reinclude(entry.path(), is_dir);
-            stack.record_hidden(is_dir);
+            stack.record_hidden(entry.path(), is_dir);
             if is_dir {
                 it.skip_current_dir();
             }
@@ -423,28 +425,28 @@ fn walk_impl(
                     resolved = Some(real);
                 }
                 Err(SymlinkVerdict::HiddenOutsideRoot) => {
-                    stack.record_symlink_hidden_escape(is_dir);
+                    stack.record_symlink_hidden_escape(entry.path(), is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
                     continue;
                 }
                 Err(SymlinkVerdict::OutsideRoot(_)) => {
-                    stack.record_symlink_escape(is_dir);
+                    stack.record_symlink_escape(entry.path(), is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
                     continue;
                 }
                 Err(SymlinkVerdict::HiddenTarget) => {
-                    stack.record_hidden(is_dir);
+                    stack.record_hidden(entry.path(), is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
                     continue;
                 }
                 Err(SymlinkVerdict::Unresolvable) => {
-                    stack.record_symlink_unresolved(is_dir);
+                    stack.record_symlink_unresolved(entry.path(), is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
@@ -491,7 +493,7 @@ fn walk_impl(
             // with no report made a tree of links look empty: neither the
             // file list nor the ignore summary mentioned them.
             if !follow_symlinks && entry.path_is_symlink() {
-                stack.record_symlink_not_followed();
+                stack.record_symlink_not_followed(entry.path());
             }
             continue;
         }
@@ -505,7 +507,7 @@ fn walk_impl(
         if marker_defaults {
             if let Some(label) = takeout_noise(entry.path()) {
                 if !stack.is_reincluded(entry.path(), false) {
-                    stack.record_marker_file(label);
+                    stack.record_marker_file(entry.path(), label);
                     continue;
                 }
             }
@@ -573,6 +575,218 @@ fn stable_path_id(path: &Path) -> String {
 #[cfg(not(any(unix, windows)))]
 fn stable_path_id(path: &Path) -> String {
     format!("other:{}", path.to_string_lossy())
+}
+
+/// One top-level folder in a [`WalkOnlySummary`].
+///
+/// `folder` is `(root)` for files that sit directly in the indexed directory
+/// and `name/` for everything else. `files` and `bytes` count only what the
+/// walk admitted (metadata sizes — the file was not opened). `rules` is the
+/// ignore report's per-folder slice of the same discards [`IgnoreReport::summary_lines`]
+/// describes globally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalkOnlyFolder {
+    pub folder: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub rules: Vec<WalkOnlyRule>,
+}
+
+/// One ignore rule's discards inside a top-level folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalkOnlyRule {
+    pub rule: String,
+    pub files: u64,
+    pub dirs: u64,
+    pub files_inside_pruned_dirs: u64,
+}
+
+/// The `--walk-only` result: admitted files grouped by top-level folder, plus
+/// the ignore summary every run already prints.
+///
+/// Built from the walk's [`FileEntry`] list and [`IgnoreReport`]. It does not
+/// open a file. `--dry-run` keeps hashing after this point; `--walk-only` prints
+/// this and returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalkOnlySummary {
+    pub root: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub folders: Vec<WalkOnlyFolder>,
+    pub ignored_files: u64,
+    pub ignored_dirs: u64,
+    pub files_inside_pruned_dirs: u64,
+    pub files_inside_pruned_dirs_exact: bool,
+    /// [`IgnoreReport::summary_lines`], unchanged.
+    pub ignore_summary: Vec<String>,
+}
+
+/// Folder key for an admitted file's portable relative path. Matches
+/// [`crate::ignore_rules::folder_key`]: a root-level file is `"."`, and
+/// `docs/a.txt` is `docs`.
+fn admitted_folder_key(rel: &str) -> &str {
+    match rel.split_once('/') {
+        Some((dir, rest)) if !dir.is_empty() && !rest.is_empty() => dir,
+        _ => ".",
+    }
+}
+
+fn folder_label(key: &str) -> String {
+    if key == "." {
+        "(root)".to_string()
+    } else {
+        format!("{key}/")
+    }
+}
+
+fn plural_s(n: u64) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Per-folder file counts and sizes, and the ignore-rule summary, from a walk
+/// that has already finished.
+///
+/// `root_display` is the path the run prints (the canonical folder, or an
+/// object-source identity). `files` are the admitted entries — callers that
+/// drop `exclude_rels` pass the filtered list, the same list hashing would
+/// have seen. `report` is that walk's ignore report, including its per-folder
+/// `by_top` breakdown.
+pub fn summarise_walk_only(
+    root_display: &str,
+    files: &[FileEntry],
+    report: &IgnoreReport,
+) -> WalkOnlySummary {
+    let mut by_folder: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut bytes = 0u64;
+    for file in files {
+        let key = admitted_folder_key(&file.rel).to_string();
+        let row = by_folder.entry(key).or_insert((0, 0));
+        row.0 += 1;
+        row.1 += file.size;
+        bytes += file.size;
+    }
+
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    keys.extend(by_folder.keys().cloned());
+    keys.extend(report.by_top.keys().cloned());
+
+    let mut folders = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (folder_files, folder_bytes) = by_folder.get(&key).copied().unwrap_or((0, 0));
+        let mut rules = Vec::new();
+        if let Some(by_rule) = report.by_top.get(&key) {
+            for (rule, count) in by_rule {
+                rules.push(WalkOnlyRule {
+                    rule: rule.clone(),
+                    files: count.files,
+                    dirs: count.dirs,
+                    files_inside_pruned_dirs: count.files_inside_pruned_dirs,
+                });
+            }
+            rules.sort_by(|a, b| a.rule.cmp(&b.rule));
+        }
+        folders.push(WalkOnlyFolder {
+            folder: folder_label(&key),
+            files: folder_files,
+            bytes: folder_bytes,
+            rules,
+        });
+    }
+
+    WalkOnlySummary {
+        root: root_display.to_string(),
+        files: files.len() as u64,
+        bytes,
+        folders,
+        ignored_files: report.files_skipped,
+        ignored_dirs: report.dirs_pruned,
+        files_inside_pruned_dirs: report.files_inside_pruned_dirs,
+        files_inside_pruned_dirs_exact: report.files_inside_pruned_dirs_is_exact(),
+        ignore_summary: report.summary_lines(),
+    }
+}
+
+impl WalkOnlySummary {
+    /// Human-readable result. Stdout of `xerj autoindex <folder> --walk-only`.
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "walk-only: {} file{}, {} byte{} under {}\n",
+            self.files,
+            plural_s(self.files),
+            self.bytes,
+            plural_s(self.bytes),
+            self.root
+        );
+        if self.folders.is_empty() {
+            out.push_str("  (no files)\n");
+        }
+        for folder in &self.folders {
+            out.push_str(&format!(
+                "  {}  {} file{}, {} byte{}\n",
+                folder.folder,
+                folder.files,
+                plural_s(folder.files),
+                folder.bytes,
+                plural_s(folder.bytes)
+            ));
+            for rule in &folder.rules {
+                out.push_str(&format!("    {}\n", self.rule_line(rule)));
+            }
+        }
+        for line in &self.ignore_summary {
+            out.push_str(line);
+            out.push('\n');
+        }
+        let dirs = if self.ignored_dirs == 1 { "y" } else { "ies" };
+        out.push_str(&format!(
+            "total: {} file{}, {} byte{}; ignored {} file{}, {} director{}\n",
+            self.files,
+            plural_s(self.files),
+            self.bytes,
+            plural_s(self.bytes),
+            self.ignored_files,
+            plural_s(self.ignored_files),
+            self.ignored_dirs,
+            dirs
+        ));
+        out
+    }
+
+    fn rule_line(&self, rule: &WalkOnlyRule) -> String {
+        let mut parts = Vec::new();
+        if rule.files > 0 {
+            parts.push(format!("{} file{}", rule.files, plural_s(rule.files)));
+        }
+        if rule.dirs > 0 {
+            let inside = if rule.files_inside_pruned_dirs > 0 {
+                format!(
+                    " ({}{} non-hidden file{} inside)",
+                    if self.files_inside_pruned_dirs_exact {
+                        ""
+                    } else {
+                        "at least "
+                    },
+                    rule.files_inside_pruned_dirs,
+                    plural_s(rule.files_inside_pruned_dirs)
+                )
+            } else {
+                String::new()
+            };
+            parts.push(format!(
+                "{} director{} pruned{inside}",
+                rule.dirs,
+                if rule.dirs == 1 { "y" } else { "ies" }
+            ));
+        }
+        if parts.is_empty() {
+            parts.push("nothing counted".to_string());
+        }
+        format!("{} — {}", rule.rule, parts.join(", "))
+    }
 }
 
 #[cfg(test)]
@@ -1348,5 +1562,275 @@ mod portable_rel_tests {
             "{rels:?}"
         );
         assert!(rels.contains(&"src/utils/paths.rs"), "{rels:?}");
+    }
+}
+
+#[cfg(test)]
+mod walk_only_tests {
+    use super::{summarise_walk_only, walk_reporting};
+    use crate::ignore_rules::IgnoreOptions;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn folder<'a>(summary: &'a super::WalkOnlySummary, name: &str) -> &'a super::WalkOnlyFolder {
+        summary
+            .folders
+            .iter()
+            .find(|f| f.folder == name)
+            .unwrap_or_else(|| panic!("missing folder {name} in {summary:?}"))
+    }
+
+    /// `--walk-only` is this function: the same walk `--dry-run` already runs,
+    /// then a summary, and no content hash. The payloads are watched for
+    /// `open`/`read`. Ignore files are not watched — the walk has always read
+    /// `.gitignore` to apply the rules.
+    #[test]
+    fn walk_only_summarises_without_opening_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let readme = b"PAYLOAD-README";
+        let docs_a = b"PAYLOAD-DOCS-A";
+        let docs_b = b"PAYLOAD-DOCS-B";
+        let main_rs = b"PAYLOAD-MAIN-RS";
+        let skipped = b"PAYLOAD-IGNORED-LOG";
+        let pruned = b"PAYLOAD-INSIDE-PRUNED";
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("README.md"), readme).unwrap();
+        fs::create_dir(root.join("docs")).unwrap();
+        fs::write(root.join("docs/a.txt"), docs_a).unwrap();
+        fs::write(root.join("docs/b.txt"), docs_b).unwrap();
+        fs::write(root.join("docs/skip.log"), skipped).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), main_rs).unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/huge.bin"), pruned).unwrap();
+
+        let watched = [
+            root.join("README.md"),
+            root.join("docs/a.txt"),
+            root.join("docs/b.txt"),
+            root.join("docs/skip.log"),
+            root.join("src/main.rs"),
+            root.join("target/huge.bin"),
+        ];
+        let summary = {
+            let _guard = OpenWatch::arm(&watched);
+            let (files, report) =
+                walk_reporting(root, false, IgnoreOptions::default().with_deep_count(true))
+                    .unwrap();
+            let summary = summarise_walk_only(&root.display().to_string(), &files, &report);
+            let top_files: u64 = report
+                .by_top
+                .values()
+                .flat_map(|rules| rules.values())
+                .map(|c| c.files)
+                .sum();
+            let top_dirs: u64 = report
+                .by_top
+                .values()
+                .flat_map(|rules| rules.values())
+                .map(|c| c.dirs)
+                .sum();
+            assert_eq!(top_files, report.files_skipped, "{report:?}");
+            assert_eq!(top_dirs, report.dirs_pruned, "{report:?}");
+            summary
+        };
+
+        let rendered = summary.render();
+        for marker in [
+            "PAYLOAD-README",
+            "PAYLOAD-DOCS-A",
+            "PAYLOAD-DOCS-B",
+            "PAYLOAD-MAIN-RS",
+            "PAYLOAD-IGNORED-LOG",
+            "PAYLOAD-INSIDE-PRUNED",
+        ] {
+            assert!(
+                !rendered.contains(marker),
+                "walk-only echoed file contents ({marker}): {rendered}"
+            );
+        }
+
+        assert_eq!(summary.files, 4, "{rendered}");
+        assert_eq!(
+            summary.bytes,
+            (readme.len() + docs_a.len() + docs_b.len() + main_rs.len()) as u64,
+            "{rendered}"
+        );
+        let root_row = folder(&summary, "(root)");
+        assert_eq!(root_row.files, 1);
+        assert_eq!(root_row.bytes, readme.len() as u64);
+        assert!(
+            root_row
+                .rules
+                .iter()
+                .any(|r| r.rule == "hidden:dotfile" && r.files == 1),
+            "{root_row:?}"
+        );
+
+        let docs = folder(&summary, "docs/");
+        assert_eq!(docs.files, 2);
+        assert_eq!(docs.bytes, (docs_a.len() + docs_b.len()) as u64);
+        assert!(
+            docs.rules
+                .iter()
+                .any(|r| r.rule == ".gitignore:*.log" && r.files == 1),
+            "{docs:?}"
+        );
+
+        let src = folder(&summary, "src/");
+        assert_eq!(src.files, 1);
+        assert_eq!(src.bytes, main_rs.len() as u64);
+        assert!(src.rules.is_empty(), "{src:?}");
+
+        let target = folder(&summary, "target/");
+        assert_eq!(target.files, 0);
+        assert_eq!(target.bytes, 0);
+        let pruned_rule = target
+            .rules
+            .iter()
+            .find(|r| r.rule == "<built-in>:target/")
+            .unwrap_or_else(|| panic!("target rule missing: {target:?}"));
+        assert_eq!(pruned_rule.dirs, 1);
+        assert_eq!(pruned_rule.files_inside_pruned_dirs, 1);
+        assert!(summary.files_inside_pruned_dirs_exact);
+
+        assert!(rendered.contains("docs/  2 files,"), "{rendered}");
+        assert!(rendered.contains(".gitignore:*.log — 1 file"), "{rendered}");
+        assert!(
+            rendered.contains("<built-in>:target/ — 1 directory pruned (1 non-hidden file inside)"),
+            "{rendered}"
+        );
+        assert!(
+            summary
+                .ignore_summary
+                .iter()
+                .any(|l| l.contains("ignore rules:")),
+            "the existing ignore summary must be reused: {:?}",
+            summary.ignore_summary
+        );
+        assert!(rendered.contains("total: 4 files,"), "{rendered}");
+        assert_eq!(summary.ignored_files, 2, "{rendered}");
+        assert_eq!(summary.ignored_dirs, 1, "{rendered}");
+    }
+
+    /// Watches payload paths for `open` and `read` across a closure.
+    /// Events queued while the watches were installed are discarded first.
+    struct OpenWatch {
+        fd: i32,
+        wds: Vec<(i32, PathBuf)>,
+    }
+
+    impl OpenWatch {
+        fn arm(paths: &[PathBuf]) -> Self {
+            #[cfg(target_os = "linux")]
+            {
+                Self::arm_linux(paths)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = paths;
+                Self {
+                    fd: -1,
+                    wds: Vec::new(),
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn arm_linux(paths: &[PathBuf]) -> Self {
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(
+                fd >= 0,
+                "inotify_init1: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut wds = Vec::new();
+            for path in paths {
+                let c = std::ffi::CString::new(path.to_str().expect("utf-8 fixture path")).unwrap();
+                let wd = unsafe {
+                    libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS)
+                };
+                assert!(
+                    wd >= 0,
+                    "inotify_add_watch {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+                wds.push((wd, path.clone()));
+            }
+            // Installing a watch can itself queue IN_OPEN. Drop that, then
+            // anything still queued after the walk was the walk.
+            let _ = read_events(fd);
+            Self { fd, wds }
+        }
+    }
+
+    impl Drop for OpenWatch {
+        fn drop(&mut self) {
+            #[cfg(target_os = "linux")]
+            {
+                if self.fd < 0 {
+                    return;
+                }
+                let events = read_events(self.fd);
+                let names: Vec<String> = events
+                    .iter()
+                    .map(|(wd, mask)| {
+                        let path = self
+                            .wds
+                            .iter()
+                            .find(|(id, _)| id == wd)
+                            .map(|(_, p)| p.display().to_string())
+                            .unwrap_or_else(|| format!("wd {wd}"));
+                        format!("{path} mask={mask:#x}")
+                    })
+                    .collect();
+                for (wd, _) in &self.wds {
+                    unsafe {
+                        libc::inotify_rm_watch(self.fd, *wd);
+                    }
+                }
+                unsafe {
+                    libc::close(self.fd);
+                }
+                assert!(
+                    names.is_empty(),
+                    "walk-only opened or read file contents: {names:?}"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (self.fd, &self.wds);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_events(fd: i32) -> Vec<(i32, u32)> {
+        #[repr(align(8))]
+        struct Buf([u8; 4096]);
+        let mut buf = Buf([0u8; 4096]);
+        let mut out = Vec::new();
+        loop {
+            let n = unsafe { libc::read(fd, buf.0.as_mut_ptr().cast(), buf.0.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                }
+                panic!("inotify read: {err}");
+            }
+            if n == 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off < n as usize {
+                let ev = unsafe { &*buf.0.as_ptr().add(off).cast::<libc::inotify_event>() };
+                out.push((ev.wd, ev.mask));
+                off += std::mem::size_of::<libc::inotify_event>() + ev.len as usize;
+            }
+        }
+        out
     }
 }

@@ -243,6 +243,13 @@ pub struct RuleCount {
 pub struct IgnoreReport {
     /// rule label → what it discarded.
     pub by_rule: BTreeMap<String, RuleCount>,
+    /// The same discards as [`Self::by_rule`], split by top-level folder.
+    ///
+    /// `"."` is a file that sits directly in the indexed root. A pruned
+    /// directory is charged to itself when it is top-level, and to the
+    /// top-level directory that contains it otherwise. [`crate::walk`] turns
+    /// this into the `--walk-only` per-folder summary; it is not a second walk.
+    pub by_top: BTreeMap<String, BTreeMap<String, RuleCount>>,
     pub files_skipped: u64,
     pub dirs_pruned: u64,
     /// Non-hidden files inside the pruned directories — see
@@ -274,6 +281,7 @@ impl Default for IgnoreReport {
     fn default() -> Self {
         Self {
             by_rule: BTreeMap::new(),
+            by_top: BTreeMap::new(),
             files_skipped: 0,
             dirs_pruned: 0,
             files_inside_pruned_dirs: 0,
@@ -406,6 +414,24 @@ fn plural(n: u64) -> &'static str {
         ""
     } else {
         "s"
+    }
+}
+
+/// Top-level folder of `path` relative to the canonical walk root.
+///
+/// A file with no parent under the root — `README.md` — is `"."`. A directory
+/// the walk prunes at the root — `target/` — is that directory's own name, so
+/// the folder summary can say the directory itself was dropped.
+pub(crate) fn folder_key(root: &Path, path: &Path, is_dir: bool) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let mut comps = rel.components();
+    let Some(first) = comps.next() else {
+        return ".".to_string();
+    };
+    if comps.next().is_none() && !is_dir {
+        ".".to_string()
+    } else {
+        first.as_os_str().to_string_lossy().into_owned()
     }
 }
 
@@ -717,7 +743,7 @@ impl IgnoreStack {
         if !ignored {
             return None;
         }
-        self.record_file(&label);
+        self.record_file(path, &label);
         Some(label)
     }
 
@@ -732,7 +758,7 @@ impl IgnoreStack {
     /// [`IgnoreReport::files_inside_pruned_dirs`] with work that no run was
     /// ever going to do. On this repository that inflation was 97,731 files
     /// against a real exclusion of 273,441 (#279).
-    pub fn record_hidden(&mut self, is_dir: bool) {
+    pub fn record_hidden(&mut self, path: &Path, is_dir: bool) {
         if is_dir {
             self.report.dirs_pruned += 1;
             self.report
@@ -740,8 +766,9 @@ impl IgnoreStack {
                 .entry(HIDDEN_RULE.to_string())
                 .or_default()
                 .dirs += 1;
+            self.note_top(path, true, HIDDEN_RULE, |count| count.dirs += 1);
         } else {
-            self.record_file(HIDDEN_RULE);
+            self.record_file(path, HIDDEN_RULE);
         }
     }
 
@@ -781,7 +808,7 @@ impl IgnoreStack {
     /// A symlink target outside the indexed root, also decided by the walker
     /// (it needs the canonical root, which this stack does not carry) and
     /// reported through the same accounting. See [`ESCAPED_ROOT_RULE`].
-    pub fn record_symlink_escape(&mut self, is_dir: bool) {
+    pub fn record_symlink_escape(&mut self, path: &Path, is_dir: bool) {
         if is_dir {
             self.report.dirs_pruned += 1;
             self.report
@@ -789,14 +816,15 @@ impl IgnoreStack {
                 .entry(ESCAPED_ROOT_RULE.to_string())
                 .or_default()
                 .dirs += 1;
+            self.note_top(path, true, ESCAPED_ROOT_RULE, |count| count.dirs += 1);
         } else {
-            self.record_file(ESCAPED_ROOT_RULE);
+            self.record_file(path, ESCAPED_ROOT_RULE);
         }
     }
 
     /// A followed link that left the root through a dotted component.
     /// See [`HIDDEN_OUTSIDE_ROOT_RULE`].
-    pub fn record_symlink_hidden_escape(&mut self, is_dir: bool) {
+    pub fn record_symlink_hidden_escape(&mut self, path: &Path, is_dir: bool) {
         if is_dir {
             self.report.dirs_pruned += 1;
             self.report
@@ -804,14 +832,17 @@ impl IgnoreStack {
                 .entry(HIDDEN_OUTSIDE_ROOT_RULE.to_string())
                 .or_default()
                 .dirs += 1;
+            self.note_top(path, true, HIDDEN_OUTSIDE_ROOT_RULE, |count| {
+                count.dirs += 1;
+            });
         } else {
-            self.record_file(HIDDEN_OUTSIDE_ROOT_RULE);
+            self.record_file(path, HIDDEN_OUTSIDE_ROOT_RULE);
         }
     }
 
     /// A symlink left unfollowed. See [`NOT_FOLLOWED_RULE`]. The warning is
     /// once per walk: the rule count already says how many links.
-    pub fn record_symlink_not_followed(&mut self) {
+    pub fn record_symlink_not_followed(&mut self, path: &Path) {
         if !self.report.by_rule.contains_key(NOT_FOLLOWED_RULE) {
             self.warn(
                 "symlink: not followed (pass --follow-symlinks to index a target inside \
@@ -819,11 +850,11 @@ impl IgnoreStack {
                     .into(),
             );
         }
-        self.record_file(NOT_FOLLOWED_RULE);
+        self.record_file(path, NOT_FOLLOWED_RULE);
     }
 
     /// A followed entry that could not be resolved. See [`UNRESOLVED_LINK_RULE`].
-    pub fn record_symlink_unresolved(&mut self, is_dir: bool) {
+    pub fn record_symlink_unresolved(&mut self, path: &Path, is_dir: bool) {
         if is_dir {
             self.report.dirs_pruned += 1;
             self.report
@@ -831,8 +862,9 @@ impl IgnoreStack {
                 .entry(UNRESOLVED_LINK_RULE.to_string())
                 .or_default()
                 .dirs += 1;
+            self.note_top(path, true, UNRESOLVED_LINK_RULE, |count| count.dirs += 1);
         } else {
-            self.record_file(UNRESOLVED_LINK_RULE);
+            self.record_file(path, UNRESOLVED_LINK_RULE);
         }
     }
 
@@ -847,8 +879,8 @@ impl IgnoreStack {
     /// The file-level twin of [`Self::record_marker_dir`]: a built-in rule the
     /// walker decided (it needs a SIBLING or PARENT marker, which the matcher
     /// stack cannot see), reported through the same accounting.
-    pub fn record_marker_file(&mut self, label: &str) {
-        self.record_file(label);
+    pub fn record_marker_file(&mut self, path: &Path, label: &str) {
+        self.record_file(path, label);
     }
 
     /// Did an ignore file explicitly RE-INCLUDE this path (`!name`)? A
@@ -859,25 +891,53 @@ impl IgnoreStack {
         matches!(self.lookup(path, is_dir), Some((false, _)))
     }
 
-    fn record_file(&mut self, label: &str) {
+    fn record_file(&mut self, path: &Path, label: &str) {
         self.report.files_skipped += 1;
         self.report
             .by_rule
             .entry(label.to_string())
             .or_default()
             .files += 1;
+        self.note_top(path, false, label, |count| count.files += 1);
     }
 
     fn record_dir(&mut self, path: &Path, label: &str) {
         let inside = self.count_inside(path);
+        let deep = self.opts.deep_count;
         let entry = self.report.by_rule.entry(label.to_string()).or_default();
         entry.dirs += 1;
         entry.files_inside_pruned_dirs += inside;
-        if self.opts.deep_count {
+        if deep {
             entry.dirs_deep_counted += 1;
         }
         self.report.dirs_pruned += 1;
         self.report.files_inside_pruned_dirs += inside;
+        self.note_top(path, true, label, |count| {
+            count.dirs += 1;
+            count.files_inside_pruned_dirs += inside;
+            if deep {
+                count.dirs_deep_counted += 1;
+            }
+        });
+    }
+
+    /// Charge one discard to the top-level folder [`folder_key`] names.
+    fn note_top(
+        &mut self,
+        path: &Path,
+        is_dir: bool,
+        label: &str,
+        update: impl FnOnce(&mut RuleCount),
+    ) {
+        let key = folder_key(&self.root, path, is_dir);
+        let count = self
+            .report
+            .by_top
+            .entry(key)
+            .or_default()
+            .entry(label.to_string())
+            .or_default();
+        update(count);
     }
 
     /// Only under `--dry-run`. Symlinks are never followed here whatever the
@@ -944,7 +1004,7 @@ mod tests {
             let Ok(entry) = next else { continue };
             let is_dir = entry.file_type().is_dir();
             if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
-                stack.record_hidden(is_dir);
+                stack.record_hidden(entry.path(), is_dir);
                 if is_dir {
                     it.skip_current_dir();
                 }

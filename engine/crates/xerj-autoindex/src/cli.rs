@@ -86,7 +86,8 @@ pub struct IndexCfg {
     /// existence-only name card, contents never opened.
     pub stub_globs: Vec<String>,
     /// `.gitignore` / `.xerjignore` / built-in build-output rules (#276).
-    /// `deep_count` is set from `--dry-run`.
+    /// `deep_count` is set from `--dry-run` (and from `--walk-only`, which
+    /// implies it).
     pub ignore: IgnoreOptions,
     /// Whole-file size cap in BYTES for non-streaming families (JSON, HTML,
     /// prose, PDF, …). Streaming families are never capped. Set on the CLI by
@@ -105,6 +106,10 @@ pub struct IndexCfg {
     /// Disable edge detection entirely (no `.xerj-memory-*-edges` writes).
     pub no_graph: bool,
     pub dry_run: bool,
+    /// `--walk-only`: print the per-folder walk summary and return before
+    /// hashing. The parser also sets [`Self::dry_run`], so nothing is indexed.
+    /// `--dry-run` without this flag still hashes, sniffs and prints the plan.
+    pub walk_only: bool,
     /// Stop and ask before indexing when phase A's measured estimate exceeds
     /// this many minutes. `0` disables the gate outright.
     pub max_minutes: u64,
@@ -401,6 +406,13 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20when the estimate says it does not fit (warned).\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20See DISK BUDGET.\n\
          \x20\x20\x20\x20--dry-run            walk+sniff+infer, print the plan, index nothing\n\
+         \x20\x20\x20\x20--walk-only          stop after the walk. Prints each top-level folder's\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20file count and size, what the ignore rules would drop\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20and which rule, and the totals. Stops before hashing:\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20no digest, no sniff, nothing indexed. Ignore files are\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20still read, as on every walk. The node is still\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20contacted, as with --dry-run. --dry-run itself still\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20hashes, sniffs and prints the plan\n\
          \x20\x20\x20\x20--label <FILE>       label each document at ingest through POST /_decide\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(#1062): the question-set file's noul/choice questions\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20are rendered against each record's fields and the vote\n\
@@ -454,7 +466,7 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20preference should not silently decide what is in your index.\n\
          \x20\x20\x20\x20A directory the rules reject is never descended, so nothing inside it is\n\
          \x20\x20\x20\x20stat-ed, hashed or sent. Every run prints what was dropped and by which\n\
-         \x20\x20\x20\x20rule; --dry-run additionally counts the non-hidden files inside each\n\
+         \x20\x20\x20\x20rule; --dry-run and --walk-only additionally count the non-hidden files inside each\n\
          \x20\x20\x20\x20pruned directory (bounded — past the budget the count is reported as\n\
          \x20\x20\x20\x20`at least N`, and xerj-done carries\n\
          \x20\x20\x20\x20ignored_files_in_pruned_dirs_exact=false to say so).\n\
@@ -859,6 +871,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut watch = false;
     let mut debounce_ms: Option<u64> = None;
     let mut dry_run = false;
+    let mut walk_only = false;
     let mut max_minutes = DEFAULT_MAX_MINUTES;
     let mut max_minutes_explicit = false;
     let mut approve: Option<Approval> = None;
@@ -1122,6 +1135,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 approve_explicit = true;
             }
             "--dry-run" => dry_run = true,
+            "--walk-only" => walk_only = true,
             "--json" => json = true,
             "--md" => json = false,
             "--code-analyzer" => {
@@ -1361,6 +1375,28 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     if approve == Some(Approval::Fast) {
         no_semantic = true;
         no_graph = true;
+    }
+    // `--walk-only` is a dry run that returns after the walk. Implying
+    // `dry_run` here, before the contradiction checks and the object-watch
+    // router, keeps every "index nothing" guard armed. `--dry-run` alone
+    // leaves `walk_only` false, so that path still hashes and prints the plan.
+    if walk_only && watch {
+        return Err(
+            "--walk-only and --watch contradict each other: a walk-only run stops after the \
+             folder walk and indexes nothing, and a watcher exists to index changes as they \
+             land. Drop one of the two"
+                .into(),
+        );
+    }
+    if walk_only && (max_minutes_explicit || approve_explicit) {
+        return Err(
+            "--max-minutes/--approve/--yes are the indexing decision gate, which --walk-only \
+             never reaches: it stops after the walk and does not sniff or index. Drop them"
+                .into(),
+        );
+    }
+    if walk_only {
+        dry_run = true;
     }
     if approve == Some(Approval::Cancel) && dry_run {
         return Err(
@@ -1670,6 +1706,11 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     }
 
     match (sub.as_deref(), folder) {
+        (Some("map"), _) | (Some("status"), _) if walk_only => Err(format!(
+            "--walk-only summarises a folder walk and does not apply to `autoindex {}`: that \
+             subcommand never walks a tree. Drop it",
+            sub.as_deref().unwrap_or_default()
+        )),
         (Some("map"), _) | (Some("status"), _)
             if max_minutes_explicit
                 || approve_explicit
@@ -1761,6 +1802,13 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                         .into(),
                 );
             }
+            if walk_only && label.is_some() {
+                return Err(
+                    "--walk-only and --label contradict each other: a walk-only run indexes \
+                     nothing, so there is nowhere for the decide labels to go. Drop one of the two"
+                        .into(),
+                );
+            }
             if dry_run && label.is_some() {
                 return Err(
                     "--dry-run and --label contradict each other: a dry run indexes nothing, so \
@@ -1801,8 +1849,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 ignore: IgnoreOptions {
                     enabled: !no_ignore,
                     defaults: !no_ignore && !no_default_ignores,
-                    // Only --dry-run pays for counting what is inside a pruned
-                    // directory; a real run's whole point is not touching it.
+                    // Only --dry-run and --walk-only (which implies --dry-run)
+                    // pay for counting what is inside a pruned directory; a
+                    // real run's whole point is not touching it.
                     deep_count: dry_run,
                 },
                 max_file_bytes: max_file_bytes.unwrap_or(2u64 << 30),
@@ -1812,6 +1861,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain,
                 no_graph,
                 dry_run,
+                walk_only,
                 max_minutes,
                 approve,
                 max_index_bytes,
@@ -2667,6 +2717,58 @@ mod tests {
         assert!(refused.contains("subdirectory"), "{refused}");
         assert!(err(&["data", "--approve", "maybe"]).contains("proceed, fast, cancel"));
         assert!(err(&["data", "--approve"]).contains("--approve"));
+    }
+
+    /// `--walk-only` is the folder map that stops before hashing. `--dry-run`
+    /// stays the plan preview: it still hashes. The two together are the
+    /// walk-only run, because that is the stricter "index nothing".
+    #[test]
+    fn walk_only_is_accepted_and_dry_run_still_hashes() {
+        let help = super::help_text();
+        assert!(
+            help.contains("--walk-only"),
+            "the flag must be in `xerj autoindex --help`"
+        );
+        assert!(
+            help.contains("Stops before hashing") && help.contains("no digest, no sniff"),
+            "help must say the walk does not hash or sniff file contents: {help}"
+        );
+        assert!(
+            help.contains("Ignore files are"),
+            "help must not claim ignore files are unread; the walk has always read them"
+        );
+        assert!(
+            help.contains("--dry-run itself still"),
+            "help must keep --dry-run's hash-and-plan behaviour distinct"
+        );
+
+        let plain = index(&["data"]);
+        assert!(!plain.dry_run && !plain.walk_only);
+        assert!(!plain.ignore.deep_count);
+
+        let dry = index(&["data", "--dry-run"]);
+        assert!(dry.dry_run);
+        assert!(!dry.walk_only, "--dry-run must not become walk-only");
+        assert!(dry.ignore.deep_count);
+
+        let walk = index(&["data", "--walk-only"]);
+        assert!(walk.walk_only);
+        assert!(
+            walk.dry_run,
+            "walk-only indexes nothing, so the dry-run guards have to be armed"
+        );
+        assert!(walk.ignore.deep_count);
+
+        let both = index(&["data", "--dry-run", "--walk-only"]);
+        assert!(both.dry_run && both.walk_only);
+
+        assert!(err(&["data", "--watch", "--no-graph", "--walk-only"]).contains("--watch"));
+        assert!(err(&["s3://b/", "--watch", "--walk-only"]).contains("--watch"));
+        assert!(err(&["map", "--walk-only"]).contains("autoindex map"));
+        assert!(err(&["status", "--walk-only"]).contains("autoindex status"));
+        assert!(err(&["data", "--walk-only", "--max-minutes", "1"]).contains("--max-minutes"));
+        assert!(err(&["data", "--walk-only", "--yes"]).contains("--approve"));
+        assert!(err(&["data", "--walk-only", "--label", "q.json"]).contains("--label"));
     }
 
     #[test]

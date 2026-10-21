@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token lineage is stored: the only insert of a new API token row refuses
   bearer auth before it writes, so a revoked token has no descendants.
 
+### Added
+
+- `xerj autoindex --walk-only` stops after the walk. It prints each top-level
+  folder's file count and size, what the ignore rules would drop and which
+  rule, and the totals. It does not hash or sniff file contents. `--dry-run`
+  still hashes, sniffs and prints the plan (#1912).
+
 ### Fixed
 
 - A bare hub question that names a language or a technology
