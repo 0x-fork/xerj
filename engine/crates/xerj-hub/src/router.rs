@@ -2,13 +2,25 @@
 //! step 5, "Router").
 //!
 //! Given a question, the working directory and the signed [`Catalogue`], decide
-//! which corpus answers it — **before** anything is downloaded. Three kinds of
-//! evidence are gathered, each on its own scale, then merged per slug:
+//! which corpus answers it — **before** anything is downloaded.
 //!
-//! 1. **Project dependencies** (score `1.0`). The strongest signal: if the
-//!    project the agent is standing in declares a dependency a corpus is built
-//!    for, that corpus almost certainly holds the answer. Dependency names are
-//!    read from the lockfiles found walking from `cwd` up to the git root
+//! A question that names a language or a technology is decided from the
+//! catalogue entry itself: the slug (its name), topics (its tags), a language
+//! word in the description, and the rest of the description. An explicit name
+//! such as "Swift" outweighs generic words ("use", "type", "map"). When one
+//! corpus or a tight group of at most [`GROUP_MAX`] share that name, they are
+//! the answer ([`Routing::Confident`] or [`Routing::Group`]) and are searched
+//! together. The Bloom sketch is not consulted for that decision: on a large
+//! catalogue its false positives make unrelated corpora tie with the one the
+//! question named.
+//!
+//! Otherwise three other kinds of evidence are gathered, each on its own scale,
+//! then merged per slug:
+//!
+//! 1. **Project dependencies** (score `1.0`). If the project the agent is
+//!    standing in declares a dependency a corpus is built for, that corpus
+//!    almost certainly holds the answer. Dependency names are read from the
+//!    lockfiles found walking from `cwd` up to the git root
 //!    ([`parse_project_deps`]).
 //! 2. **Hosted federated search** (score `0.9 × hit/top`). When the hosted node
 //!    is consulted, its ranked hits are normalised to the best one so a strong
@@ -22,10 +34,12 @@
 //!
 //! The merged scores decide: a dominant, high-scoring corpus is
 //! [`Routing::Confident`]; a cluster of plausible ones is
-//! [`Routing::Ambiguous`] (best-first, for the caller to disambiguate with
-//! `--corpus`); nothing credible is [`Routing::NoCorpus`]. A corpus already
-//! cached locally gets a small nudge so a tie breaks toward the pack the agent
-//! already has.
+//! [`Routing::Ambiguous`] (best-first; the ask path shows at most
+//! [`AMBIGUOUS_SHOWN`] after symbol evidence, and the caller disambiguates
+//! with `--corpus`); nothing credible is
+//! [`Routing::NoCorpus`]. A corpus already cached locally gets a small nudge so
+//! a tie breaks toward the pack the agent already has. A corpus the question
+//! names by slug still decides outright, ahead of the identity score.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -60,12 +74,17 @@ pub struct Evidence {
     pub source: EvidenceSource,
 }
 
-/// The routing verdict. `Ambiguous` holds the candidate slugs best-first.
+/// The routing verdict. `Ambiguous` and `Group` hold slugs best-first.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Routing {
     /// One corpus clearly wins; answer from it.
     Confident(String),
-    /// Several corpora are plausible (best-first); the caller must pick one.
+    /// A tight group of two or three corpora that share the question's
+    /// distinctive name (best-first). Search them together.
+    Group(Vec<String>),
+    /// Several corpora are plausible (best-first). The ask path shows at most
+    /// [`AMBIGUOUS_SHOWN`] after symbol evidence has had a chance to narrow
+    /// the list; the caller must pick one.
     Ambiguous(Vec<String>),
     /// Nothing credible matched.
     NoCorpus,
@@ -102,6 +121,26 @@ const NAMED_SCORE: f32 = 1.0;
 /// Slugs shorter than this are never matched as a name (too likely to be a
 /// stray word or abbreviation).
 const NAMED_MIN_LEN: usize = 2;
+/// How many corpora an ambiguous verdict names. The rest stay in the ranked
+/// list a caller can still inspect; the asker is not shown a flat tie of dozens.
+pub const AMBIGUOUS_SHOWN: usize = 5;
+/// A name match (slug or language) is weighted this many times the token's idf.
+const IDENTITY_NAME_WEIGHT: f32 = 4.0;
+/// A topic / tag match.
+const IDENTITY_TAG_WEIGHT: f32 = 3.0;
+/// Any other description word. Generic words stay on this scale, so a name
+/// match dominates them.
+const IDENTITY_DESC_WEIGHT: f32 = 1.0;
+/// At most this many corpora are searched together when they share the winning
+/// name. More than this is a genuine ambiguity: the asker picks.
+const GROUP_MAX: usize = 3;
+/// Identity tokens shorter than this are dropped (`in`, `of`). A two-letter
+/// slug is still matched by [`named_slugs`].
+const IDENTITY_MIN_LEN: usize = 3;
+/// A token seen in more than `max(DISTINCTIVE_FLOOR, ceil(this × N))` corpora
+/// is common vocabulary and cannot by itself pick a corpus.
+const DISTINCTIVE_FRACTION: f32 = 0.02;
+const DISTINCTIVE_FLOOR: usize = 3;
 
 /// Route a question to a corpus.
 ///
@@ -239,18 +278,283 @@ pub fn route_ranked(
     }
 
     let (routing, ranked) = decide(evidence, cached);
+    // A slug the question spells out decides before identity scoring. "lz4 or
+    // zstd?" is the asker choosing, not a group to search together.
     match named.len() {
-        0 => (routing, ranked),
-        1 => (Routing::Confident(named[0].clone()), ranked),
-        _ => {
+        1 => return (Routing::Confident(named[0].clone()), ranked),
+        n if n > 1 => {
             let in_order: Vec<String> = ranked
                 .iter()
                 .filter(|(slug, _)| named.contains(slug))
                 .map(|(slug, _)| slug.clone())
                 .collect();
-            (Routing::Ambiguous(in_order), ranked)
+            return (Routing::Ambiguous(in_order), ranked);
+        }
+        _ => {}
+    }
+    if let Some(identity) = identity_route(question, cat) {
+        return identity;
+    }
+    (routing, ranked)
+}
+
+/// Shorten an [`Routing::Ambiguous`] list to [`AMBIGUOUS_SHOWN`], best first.
+/// Other verdicts pass through. Applied after symbol evidence, so a definition
+/// that lives in one of the candidates can still narrow the full list.
+pub fn cap_ambiguous(routing: Routing) -> Routing {
+    match routing {
+        Routing::Ambiguous(slugs) if slugs.len() > AMBIGUOUS_SHOWN => {
+            Routing::Ambiguous(slugs.into_iter().take(AMBIGUOUS_SHOWN).collect())
+        }
+        other => other,
+    }
+}
+
+/// One corpus scored against the question's identity terms.
+struct IdentityScore {
+    slug: String,
+    score: f32,
+    /// Distinctive slug, tag, or language tokens, `(token, contribution)`.
+    identity: Vec<(String, f32)>,
+}
+
+/// Route from the catalogue entry itself: slug, topics, language, description.
+///
+/// `None` means no distinctive name matched, and the sketch / dependency /
+/// hosted evidence should decide. A match returns the verdict and every
+/// corpus that scored, best first.
+fn identity_route(question: &str, cat: &Catalogue) -> Option<(Routing, Vec<(String, f32)>)> {
+    let tokens = identity_query_tokens(question);
+    if tokens.is_empty() || cat.corpora.is_empty() {
+        return None;
+    }
+    let n = cat.corpora.len();
+    let profiles: Vec<IdentityProfile> = cat
+        .corpora
+        .iter()
+        .map(IdentityProfile::from_entry)
+        .collect();
+
+    let mut df: HashMap<String, usize> = HashMap::new();
+    for profile in &profiles {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for token in profile
+            .slug
+            .iter()
+            .chain(profile.tags.iter())
+            .chain(profile.desc.iter())
+        {
+            if seen.insert(token.as_str()) {
+                *df.entry(token.clone()).or_default() += 1;
+            }
         }
     }
+
+    let mut scored: Vec<IdentityScore> = Vec::new();
+    for (entry, profile) in cat.corpora.iter().zip(&profiles) {
+        let mut score = 0.0;
+        let mut identity: Vec<(String, f32)> = Vec::new();
+        for token in &tokens {
+            let Some(&docs) = df.get(token) else {
+                continue;
+            };
+            let idf = ((n as f32 + 1.0) / (docs as f32 + 1.0)).ln();
+            let (weight, is_name) = if profile.slug.contains(token) {
+                (IDENTITY_NAME_WEIGHT, true)
+            } else if profile.tags.contains(token) {
+                (IDENTITY_TAG_WEIGHT, true)
+            } else if profile.desc.contains(token) && is_language(token) {
+                (IDENTITY_NAME_WEIGHT, true)
+            } else if profile.desc.contains(token) {
+                (IDENTITY_DESC_WEIGHT, false)
+            } else {
+                continue;
+            };
+            let contribution = weight * idf;
+            score += contribution;
+            if is_name && distinctive(docs, n) {
+                identity.push((token.clone(), contribution));
+            }
+        }
+        if score > 0.0 {
+            scored.push(IdentityScore {
+                slug: entry.slug.clone(),
+                score,
+                identity,
+            });
+        }
+    }
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
+    let ranked: Vec<(String, f32)> = scored.iter().map(|s| (s.slug.clone(), s.score)).collect();
+
+    // The winning term is the strongest distinctive name anywhere, not the
+    // highest total: a rare description word must not outvote "Swift".
+    let mut best_term: Option<(&str, f32)> = None;
+    for row in &scored {
+        for (token, contribution) in &row.identity {
+            let replace = match best_term {
+                None => true,
+                Some((prev, prev_score)) => match contribution.partial_cmp(&prev_score) {
+                    Some(std::cmp::Ordering::Greater) => true,
+                    Some(std::cmp::Ordering::Equal) => token.as_str() < prev,
+                    _ => false,
+                },
+            };
+            if replace {
+                best_term = Some((token.as_str(), *contribution));
+            }
+        }
+    }
+    let (term, _) = best_term?;
+    let term = term.to_string();
+    let peers: Vec<&IdentityScore> = scored
+        .iter()
+        .filter(|row| row.identity.iter().any(|(token, _)| token == &term))
+        .collect();
+    if peers.is_empty() {
+        return None;
+    }
+    if peers.len() > GROUP_MAX {
+        let slugs = peers
+            .into_iter()
+            .take(AMBIGUOUS_SHOWN)
+            .map(|row| row.slug.clone())
+            .collect();
+        return Some((Routing::Ambiguous(slugs), ranked));
+    }
+    if peers.len() == 1 {
+        return Some((Routing::Confident(peers[0].slug.clone()), ranked));
+    }
+    let slugs = peers.into_iter().map(|row| row.slug.clone()).collect();
+    Some((Routing::Group(slugs), ranked))
+}
+
+struct IdentityProfile {
+    slug: HashSet<String>,
+    tags: HashSet<String>,
+    desc: HashSet<String>,
+}
+
+impl IdentityProfile {
+    fn from_entry(entry: &xerj_common::hub::CatalogueEntry) -> Self {
+        let mut slug = HashSet::new();
+        let whole = entry.slug.to_ascii_lowercase();
+        if whole.len() >= IDENTITY_MIN_LEN {
+            slug.insert(whole);
+        }
+        for part in entry.slug.split(|c: char| !c.is_ascii_alphanumeric()) {
+            let part = part.to_ascii_lowercase();
+            if part.len() >= IDENTITY_MIN_LEN {
+                slug.insert(part);
+            }
+        }
+        let mut tags = HashSet::new();
+        for topic in &entry.topics {
+            tags.extend(identity_text_words(topic));
+        }
+        IdentityProfile {
+            slug,
+            tags,
+            desc: identity_text_words(&entry.ask_for),
+        }
+    }
+}
+
+fn identity_text_words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= IDENTITY_MIN_LEN)
+        .map(|word| word.to_ascii_lowercase())
+        .collect()
+}
+
+fn identity_query_tokens(question: &str) -> Vec<String> {
+    let lower = question.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for word in lower.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    {
+        let word = word.trim_matches(|c| c == '.' || c == '-');
+        if word.len() < IDENTITY_MIN_LEN || is_identity_stopword(word) {
+            continue;
+        }
+        if seen.insert(word.to_string()) {
+            out.push(word.to_string());
+        }
+    }
+    out
+}
+
+fn distinctive(docs: usize, corpora: usize) -> bool {
+    let cap = ((DISTINCTIVE_FRACTION * corpora as f32).ceil() as usize).max(DISTINCTIVE_FLOOR);
+    docs > 0 && docs <= cap
+}
+
+fn is_language(word: &str) -> bool {
+    // Sorted. A language named in the description is the corpus's identity,
+    // the same way the slug is: "writing Swift" is not a generic word.
+    const LANGUAGES: &[&str] = &[
+        "bash",
+        "clojure",
+        "cpp",
+        "csharp",
+        "css",
+        "dart",
+        "elixir",
+        "elm",
+        "erlang",
+        "fortran",
+        "fsharp",
+        "golang",
+        "groovy",
+        "haskell",
+        "html",
+        "java",
+        "javascript",
+        "julia",
+        "kotlin",
+        "lisp",
+        "lua",
+        "nim",
+        "ocaml",
+        "perl",
+        "php",
+        "prolog",
+        "python",
+        "ruby",
+        "rust",
+        "scala",
+        "scheme",
+        "solidity",
+        "sql",
+        "swift",
+        "typescript",
+        "wasm",
+        "zig",
+    ];
+    LANGUAGES.binary_search(&word).is_ok()
+}
+
+fn is_identity_stopword(word: &str) -> bool {
+    // Sorted. Function words of a how-to question. Technical words (`async`,
+    // `let`, `map`, `result`, `type`) are not here: idf and the name-channel
+    // weight are what keep them from outvoting "Swift".
+    const STOP: &[&str] = &[
+        "about", "all", "also", "and", "any", "are", "but", "can", "could", "did", "does", "each",
+        "for", "from", "had", "has", "have", "how", "into", "its", "just", "may", "might", "more",
+        "most", "must", "not", "off", "only", "other", "our", "out", "over", "per", "same",
+        "shall", "should", "some", "such", "than", "that", "the", "their", "them", "then", "they",
+        "this", "too", "under", "use", "used", "using", "very", "via", "was", "were", "what",
+        "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+    ];
+    STOP.binary_search(&word).is_ok()
 }
 
 /// The catalogue slugs `question` names as a whole word, case-insensitively,
@@ -897,5 +1201,110 @@ mod tests {
         // "a" and "64" are too short / not identifier-starting → dropped.
         assert!(!toks.iter().any(|t| t == "a"));
         assert!(!toks.iter().any(|t| t == "64"));
+    }
+
+    /// Every corpus's sketch reports every token of both Swift questions, which
+    /// is the failure mode of a saturated Bloom filter: the sketch ties
+    /// unrelated corpora with swift-book. The slug and the description still
+    /// name Swift, so those two are the group and the others are not.
+    #[test]
+    fn a_language_term_picks_its_corpora_despite_sketch_false_positives() {
+        const POISON: &[&str] = &[
+            "how", "use", "async", "let", "swift", "Swift", "result", "Result", "type", "map",
+        ];
+        let ask = [
+            (
+                "swift-book",
+                "An agent writing Swift queries this for The Swift Programming Language book: syntax and semantics of concurrency (async/await, async let, actors), generics, optionals, error handling and the language reference grammar.",
+            ),
+            (
+                "swift-evolution",
+                "An agent writing Swift queries this for the accepted Swift Evolution proposals (SE-NNNN): the motivation, exact semantics and API of language and standard-library features such as Result, async let, typed throws and macros.",
+            ),
+            (
+                "qwik",
+                "An agent minimising client JS queries this for Qwik's resumability model and code-splitting/lazy-loading of event handlers.",
+            ),
+            (
+                "docker-docs",
+                "An agent writing Dockerfiles and compose files queries this for the canonical Docker CLI, build and Compose reference docs.",
+            ),
+            (
+                "harper",
+                "An agent building a fast local grammar/style checker in Rust queries this for its rule engine, lint rules and curated dictionary (no cloud, no LLM).",
+            ),
+            (
+                "oss-review-toolkit",
+                "An agent building a dependency license-compliance pipeline (SBOM, policy, attribution) queries this for a production OSS Review Toolkit implementation.",
+            ),
+        ];
+        let cat = catalogue(
+            ask.into_iter()
+                .map(|(slug, ask_for)| {
+                    let mut terms: Vec<String> = ask_for
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .filter(|w| w.len() >= 3)
+                        .map(|w| w.to_ascii_lowercase())
+                        .collect();
+                    terms.extend(POISON.iter().map(|s| (*s).to_string()));
+                    let mut e = entry(slug, &[], &[]);
+                    e.ask_for = ask_for.to_string();
+                    e.term_sketch = sketch::build(terms);
+                    e
+                })
+                .collect(),
+        );
+        let proj = empty_project();
+        let group = |q| match route(q, proj.path(), &cat, None, &[]) {
+            Routing::Group(slugs) => slugs,
+            other => panic!("{q} expected a group, got {other:?}"),
+        };
+        assert_eq!(
+            group("how do I use async let in Swift"),
+            vec!["swift-book".to_string(), "swift-evolution".to_string()]
+        );
+        assert_eq!(
+            group("Swift Result type map"),
+            vec!["swift-evolution".to_string(), "swift-book".to_string()]
+        );
+
+        // An unrelated dependency must not steal a question that names Swift.
+        fs::write(
+            proj.path().join("Cargo.lock"),
+            "[[package]]\nname = \"zstd\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let mut with_dep = cat.clone();
+        // The zstd corpus is not in this catalogue; the dependency only matters
+        // when a corpus lists it. Add one whose sketch is equally poisoned.
+        let mut zstd = entry("zstd", &["zstd"], &[]);
+        zstd.ask_for = "an agent tuning compression queries this for frame formats".to_string();
+        zstd.term_sketch = sketch::build(POISON.iter().map(|s| (*s).to_string()));
+        with_dep.corpora.push(zstd);
+        assert_eq!(
+            group_of("how do I use async let in Swift", &with_dep, proj.path()),
+            vec!["swift-book".to_string(), "swift-evolution".to_string()]
+        );
+    }
+
+    fn group_of(q: &str, cat: &Catalogue, cwd: &std::path::Path) -> Vec<String> {
+        match route(q, cwd, cat, None, &[]) {
+            Routing::Group(slugs) => slugs,
+            other => panic!("{q} expected a group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_ambiguous_keeps_the_best_few_in_order() {
+        let slugs: Vec<String> = (0..8).map(|i| format!("c{i}")).collect();
+        let capped = cap_ambiguous(Routing::Ambiguous(slugs.clone()));
+        assert_eq!(
+            capped,
+            Routing::Ambiguous(slugs.into_iter().take(AMBIGUOUS_SHOWN).collect())
+        );
+        assert_eq!(
+            cap_ambiguous(Routing::Confident("only".into())),
+            Routing::Confident("only".into())
+        );
     }
 }

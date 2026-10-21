@@ -1375,7 +1375,8 @@ options:
 
 exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
 unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
-(candidates are printed; re-run with --corpus <slug>); 5 this build has no hub
+and none clearly wins (a few candidates are printed, best first; re-run with
+--corpus <slug>); 5 this build has no hub
 public key, so no pack can be verified (nothing was downloaded); 6 the hub
 catalogue could not be loaded (hub unreachable, no signed catalogue served, or
 --offline with none cached): a hub problem, not an answer about any corpus";

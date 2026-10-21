@@ -9,7 +9,10 @@
 //!    anything else is [`AnswerMode::How`]; `--files` forces
 //!    [`AnswerMode::Files`] ([`detect_mode`]).
 //! 2. **Route** ([`crate::router::route`]). `--corpus` skips routing.
-//!    Ambiguous → the candidates are printed and the exit code is **4**;
+//!    A question that names a language or technology is answered from that
+//!    corpus, or from a tight group of at most three which are searched
+//!    together; the answer's first line names them (`using: slug, slug`).
+//!    Genuinely ambiguous → a few candidates, best first, and exit code **4**;
 //!    nothing credible → exit **1** with the llms.txt pointer.
 //! 3. **Cached pack** → answer locally ([`AnsweredFrom::LocalPack`]); the
 //!    network is not touched.
@@ -70,7 +73,7 @@ use xerj_common::xccode::{self, licence, passage, state, CodeParams, XcHttp};
 
 use crate::catalogue::load_catalogue;
 use crate::node::{self, HubNode, NodeLauncher, ResolvedNode};
-use crate::router::{route_ranked, HostedSearch, Routing};
+use crate::router::{cap_ambiguous, route_ranked, HostedSearch, Routing};
 use crate::{cli, def, lockfile, sketch};
 
 /// Answered with at least one hit.
@@ -556,10 +559,28 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
         }
     };
 
-    // Step 2: route.
-    let Some(slug) = select_corpus(args, deps, hosted, symbol.as_deref(), &mut out) else {
+    // Step 2: route. One corpus keeps the single-corpus path. A tight group is
+    // searched together; each member is answered the same way one corpus would
+    // be (local pack, else hosted, else a pull under the auto-pull cap).
+    let Some(slugs) = select_corpus(args, deps, hosted, symbol.as_deref(), &mut out) else {
         return out;
     };
+    if slugs.len() == 1 {
+        return answer_known_slug(args, deps, hosted, &slugs[0], mode, symbol.as_deref(), out);
+    }
+    answer_group(args, deps, hosted, &slugs, mode, symbol.as_deref(), out)
+}
+
+/// Answer `slug`. `out` already carries notices from resolving the hosted switch.
+fn answer_known_slug(
+    args: &AskArgs,
+    deps: &AskDeps<'_>,
+    hosted: Option<&dyn HostedHub>,
+    slug: &str,
+    mode: AnswerMode,
+    symbol: Option<&str>,
+    mut out: AskOutcome,
+) -> AskOutcome {
     let entry = deps.catalogue.corpora.iter().find(|e| e.slug == slug);
     // An excluded licence class is never served — not from a pack that happens to
     // be on disk (pulled before a reclassification, or copied in by hand), and not
@@ -569,23 +590,23 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
     if let Some(e) = entry.filter(|e| e.licence_class == LicenceClass::Excluded) {
         out.stderr.push(format!(
             "'{}' has an excluded licence class ({}) and is never served or pulled",
-            printable(&slug),
+            printable(slug),
             printable(&e.licence_spdx)
         ));
         out.exit = EXIT_NO_ANSWER;
         return out;
     }
     let req = Request {
-        slug: &slug,
+        slug,
         question: &args.question,
         mode,
-        symbol: symbol.as_deref(),
+        symbol,
         max_tokens: args.max_tokens,
         k: args.k,
     };
 
     // Step 3: a pack on this machine answers locally, with no network.
-    match deps.backend.local_pack_ready(&slug) {
+    match deps.backend.local_pack_ready(slug) {
         Ok(true) => return answer_locally(args, deps, &req, entry, out),
         Ok(false) => {}
         Err(e) => out.stderr.push(format!("local pack unavailable: {e}")),
@@ -594,13 +615,13 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
     // Step 4: hosted answers now; the pull happens behind it.
     if let Some(h) = hosted {
         match h.answer(&req) {
-            Ok(answer) => return finish_hosted(args, deps, &slug, entry, answer, out),
+            Ok(answer) => return finish_hosted(args, deps, slug, entry, answer, out),
             Err(e) => out.stderr.push(format!("hosted answer failed: {e:#}")),
         }
     }
 
     // Step 5: neither a pack nor a hosted answer.
-    let shown = printable(&slug);
+    let shown = printable(slug);
     let Some(entry) = entry else {
         out.stderr.push(format!(
             "corpus '{shown}' is not in the catalogue, so it cannot be pulled, and no hosted \
@@ -664,6 +685,77 @@ pub fn ask(args: &AskArgs, deps: &AskDeps<'_>) -> AskOutcome {
     }
 }
 
+/// Search a tight group and merge what came back. Each member is answered on
+/// its own (a local pack, a hosted call, or a pull under the cap). A member
+/// that cannot be answered is skipped; the `using:` line names the corpora
+/// that produced an answer. The line is the whole of the group contract: one
+/// line, the slugs that were actually searched.
+fn answer_group(
+    args: &AskArgs,
+    deps: &AskDeps<'_>,
+    hosted: Option<&dyn HostedHub>,
+    slugs: &[String],
+    mode: AnswerMode,
+    symbol: Option<&str>,
+    mut out: AskOutcome,
+) -> AskOutcome {
+    let mut answers: Vec<Answer> = Vec::new();
+    let mut last_fail = EXIT_NO_ANSWER;
+    for slug in slugs {
+        let outcome = answer_known_slug(
+            args,
+            deps,
+            hosted,
+            slug,
+            mode,
+            symbol,
+            AskOutcome::default(),
+        );
+        out.stderr.extend(outcome.stderr);
+        if let Some(answer) = outcome.answer {
+            answers.push(answer);
+        } else {
+            last_fail = outcome.exit;
+        }
+    }
+    if answers.is_empty() {
+        out.exit = last_fail;
+        return out;
+    }
+    let names: Vec<String> = answers.iter().map(|a| a.corpus.clone()).collect();
+    let using = format!(
+        "using: {}",
+        names
+            .iter()
+            .map(|s| printable(s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let any_hits = answers.iter().any(|a| !a.hits.is_empty());
+    let mut merged = answers[0].clone();
+    for extra in answers.iter().skip(1) {
+        merged.hits.extend(extra.hits.iter().cloned());
+        for warning in &extra.warnings {
+            push_unique(&mut merged.warnings, warning.clone());
+        }
+    }
+    merged.hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.corpus = names.join(",");
+    out.stdout = if args.json {
+        serde_json::to_string(&merged).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    } else {
+        let body = answers.iter().map(render).collect::<Vec<_>>().join("\n");
+        format!("{using}\n{body}")
+    };
+    out.exit = if any_hits { EXIT_OK } else { EXIT_NO_ANSWER };
+    out.answer = Some(merged);
+    out
+}
+
 /// A definition name found in the term sketches of more corpora than this names no
 /// one corpus (`main`, `init`, `NULL`): it is not evidence, and listing every
 /// corpus that defines it would only be noise.
@@ -709,6 +801,9 @@ fn with_symbol_evidence(routing: Routing, hits: &[String]) -> Routing {
     };
     match routing {
         Routing::Confident(slug) => Routing::Confident(slug),
+        // The identity group already decided. A symbol defined in one of them
+        // must not drop the others, and one defined elsewhere must not widen it.
+        Routing::Group(slugs) => Routing::Group(slugs),
         Routing::Ambiguous(slugs) => {
             let both: Vec<String> = slugs.iter().filter(|s| hits.contains(s)).cloned().collect();
             pick(both).unwrap_or(Routing::Ambiguous(slugs))
@@ -751,17 +846,18 @@ fn printable_slug(s: &str) -> String {
 }
 
 /// Step 2. `None` means `out` already holds the verdict (an exit code and its
-/// message / candidate lines).
+/// message / candidate lines). A tight group comes back as two or three slugs,
+/// best first; one confident corpus comes back as a one-element list.
 fn select_corpus(
     args: &AskArgs,
     deps: &AskDeps<'_>,
     hosted: Option<&dyn HostedHub>,
     symbol: Option<&str>,
     out: &mut AskOutcome,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     if let Some(c) = &args.corpus {
         if deps.catalogue.corpora.iter().any(|e| &e.slug == c) {
-            return Some(c.clone());
+            return Some(vec![c.clone()]);
         }
         out.stderr.push(format!(
             "unknown corpus '{}' (catalogue generated {})",
@@ -786,7 +882,7 @@ fn select_corpus(
     // the machine.
     let (routing, mut ranked) = route_ranked(&args.question, deps.cwd, catalogue, None, &cached);
     let mut routing = with_symbol_evidence(routing, &by_symbol);
-    if !matches!(routing, Routing::Confident(_)) {
+    if !matches!(routing, Routing::Confident(_) | Routing::Group(_)) {
         if let Some(h) = hosted {
             let (hosted_routing, hosted_ranked) = route_ranked(
                 &args.question,
@@ -812,6 +908,14 @@ fn select_corpus(
     let known = |s: &String| catalogue.corpora.iter().any(|e| &e.slug == s);
     let routing = match routing {
         Routing::Confident(slug) if excluded(&slug) => Routing::NoCorpus,
+        Routing::Group(slugs) => {
+            let kept: Vec<String> = slugs.into_iter().filter(|s| !excluded(s)).collect();
+            match kept.len() {
+                0 => Routing::NoCorpus,
+                1 => Routing::Confident(kept.into_iter().next().expect("len 1")),
+                _ => Routing::Group(kept),
+            }
+        }
         Routing::Ambiguous(slugs) => {
             let kept: Vec<String> = slugs.into_iter().filter(|s| !excluded(s)).collect();
             // One left is still not a confident pick: the asker decides.
@@ -823,8 +927,10 @@ fn select_corpus(
         }
         other => other,
     };
+    let routing = cap_ambiguous(routing);
     match routing {
-        Routing::Confident(slug) => Some(slug),
+        Routing::Confident(slug) => Some(vec![slug]),
+        Routing::Group(slugs) => Some(slugs),
         Routing::Ambiguous(slugs) => {
             let lines: Vec<String> = slugs
                 .iter()
@@ -1665,9 +1771,11 @@ pub const FIND_MAX_K: usize = 10;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FoundCorpus {
     pub slug: String,
-    /// The router's merged evidence score (dependency 1.0, sketch ≤ 0.8, +0.05
-    /// when cached); 0 for a corpus proposed only because its definitions hold
-    /// the exact symbol the question names.
+    /// The router's score for this corpus. Identity matches (a slug, tag, or
+    /// language word) are on their own scale, above the sketch's 0.8 ceiling;
+    /// dependency evidence is 1.0, a sketch is at most 0.8, and a cached pack
+    /// adds 0.05 on the sketch path. 0 for a corpus proposed only because its
+    /// definitions hold the exact symbol the question names.
     pub score: f32,
     pub cached: bool,
     pub ask_for: String,
@@ -1689,10 +1797,11 @@ pub struct FindOutcome {
 
 /// Which corpora could answer `question` — the routing half of [`ask`], with
 /// nothing answered and nothing pulled. The evidence is exactly what
-/// [`ask`]'s corpus selection uses before it consults a hosted node: the
-/// project's dependencies (from `cwd`), the catalogue's term sketches, the
-/// exact-symbol evidence for a definition question, and the cached-pack bonus.
-/// An `excluded` corpus is never listed (it is never served either).
+/// [`ask`]'s corpus selection uses before it consults a hosted node: identity
+/// (slug, topics, language, description), the project's dependencies (from
+/// `cwd`), the catalogue's term sketches, the exact-symbol evidence for a
+/// definition question, and the cached-pack bonus. An `excluded` corpus is
+/// never listed (it is never served either).
 pub fn find(
     question: &str,
     k: usize,
@@ -1708,12 +1817,13 @@ pub fn find(
         .map(|s| symbol_hits(catalogue, s.trim()))
         .unwrap_or_default();
     let (routing, ranked) = route_ranked(question, cwd, catalogue, None, &cached);
-    let routing = with_symbol_evidence(routing, &by_symbol);
-    // The verdict's own order first (a confident pick, or the ambiguous list),
-    // then everything else the router ranked, then symbol-only candidates.
+    let routing = cap_ambiguous(with_symbol_evidence(routing, &by_symbol));
+    // The verdict's own order first (a confident pick, the group, or the
+    // ambiguous list), then everything else the router ranked, then
+    // symbol-only candidates.
     let mut order: Vec<String> = match &routing {
         Routing::Confident(slug) => vec![slug.clone()],
-        Routing::Ambiguous(slugs) => slugs.clone(),
+        Routing::Group(slugs) | Routing::Ambiguous(slugs) => slugs.clone(),
         Routing::NoCorpus => Vec::new(),
     };
     for slug in ranked.iter().map(|(s, _)| s).chain(by_symbol.iter()) {
@@ -1748,7 +1858,7 @@ pub fn find(
         .collect();
     FindOutcome {
         routing: match routing {
-            Routing::Confident(_) => "confident",
+            Routing::Confident(_) | Routing::Group(_) => "confident",
             Routing::Ambiguous(_) => "ambiguous",
             Routing::NoCorpus => "no_corpus",
         },
@@ -2261,6 +2371,104 @@ mod tests {
         assert!(lines[1].starts_with("beta — "), "{}", lines[1]);
         assert!(out.stderr.iter().any(|l| l.contains("--corpus")));
         assert!(backend.calls().is_empty(), "nothing is answered or pulled");
+    }
+
+    /// The two Swift questions that exit 4 on the live hub. Every sketch contains
+    /// every query token, so a sketch tie would list qwik and docker-docs with
+    /// the Swift corpora. Identity searches the Swift pair and says so.
+    #[test]
+    fn a_swift_question_searches_the_swift_corpora_and_names_them() {
+        let rig = Rig::new();
+        let poison = [
+            "how", "use", "async", "let", "swift", "Swift", "result", "Result", "type", "map",
+        ];
+        let rows = [
+            (
+                "swift-book",
+                "An agent writing Swift queries this for The Swift Programming Language book: syntax and semantics of concurrency (async/await, async let, actors), generics, optionals, error handling and the language reference grammar.",
+            ),
+            (
+                "swift-evolution",
+                "An agent writing Swift queries this for the accepted Swift Evolution proposals (SE-NNNN): the motivation, exact semantics and API of language and standard-library features such as Result, async let, typed throws and macros.",
+            ),
+            (
+                "qwik",
+                "An agent minimising client JS queries this for Qwik's resumability model and code-splitting/lazy-loading of event handlers.",
+            ),
+            (
+                "docker-docs",
+                "An agent writing Dockerfiles and compose files queries this for the canonical Docker CLI, build and Compose reference docs.",
+            ),
+            (
+                "harper",
+                "An agent building a fast local grammar/style checker in Rust queries this for its rule engine, lint rules and curated dictionary.",
+            ),
+            (
+                "oss-review-toolkit",
+                "An agent building a dependency license-compliance pipeline queries this for a production OSS Review Toolkit implementation.",
+            ),
+        ];
+        let cat = catalogue(
+            rows.into_iter()
+                .map(|(slug, ask_for)| {
+                    let mut terms: Vec<String> = ask_for
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .filter(|w| w.len() >= 3)
+                        .map(|w| w.to_ascii_lowercase())
+                        .collect();
+                    terms.extend(poison.iter().map(|s| (*s).to_string()));
+                    let mut e = entry(slug, 1024, LicenceClass::AdaptWithAttribution, &[]);
+                    e.ask_for = ask_for.to_string();
+                    e.term_sketch = sketch(&terms.iter().map(String::as_str).collect::<Vec<_>>());
+                    e
+                })
+                .collect(),
+        );
+        let backend = FakeBackend::new(true);
+        let out = rig.run(
+            &args("how do I use async let in Swift", None),
+            &cat,
+            None,
+            &backend,
+        );
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert!(
+            out.stdout
+                .starts_with("using: swift-book, swift-evolution\n"),
+            "{}",
+            out.stdout
+        );
+        assert!(out.stdout.contains("swift-book  pin "), "{}", out.stdout);
+        assert!(
+            out.stdout.contains("swift-evolution  pin "),
+            "{}",
+            out.stdout
+        );
+        assert!(!out.stdout.contains("qwik  pin "), "{}", out.stdout);
+        assert!(!out.stdout.contains("docker-docs  pin "), "{}", out.stdout);
+        assert_eq!(
+            backend.calls(),
+            [
+                "ready:swift-book",
+                "answer_local:swift-book",
+                "ready:swift-evolution",
+                "answer_local:swift-evolution",
+            ]
+        );
+
+        let backend = FakeBackend::new(true);
+        let out = rig.run(&args("Swift Result type map", None), &cat, None, &backend);
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert!(
+            out.stdout
+                .starts_with("using: swift-evolution, swift-book\n"),
+            "{}",
+            out.stdout
+        );
+        assert_eq!(
+            out.answer.as_ref().unwrap().corpus,
+            "swift-evolution,swift-book"
+        );
     }
 
     #[test]

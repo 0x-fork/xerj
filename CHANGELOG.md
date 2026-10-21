@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A bare hub question that names a language or a technology
+  (`xerj "how do I use async let in Swift"`, `xerj "Swift Result type map"`)
+  routes from the catalogue entry — slug, topics, a language word in the
+  description, then the rest of the description — instead of the term sketch.
+  On the 468-corpus hub the sketch's false positives tied swift-book with
+  unrelated corpora (qwik, docker-docs, harper, oss-review-toolkit) and both
+  questions exited 4. One clear winner is searched on its own. Two or three
+  corpora that share the winning name are searched together and named on one
+  `using:` line. Exit 4 stays for a genuine tie and lists at most five
+  candidates, best first.
+
 - An MCP tool call that cannot connect to `XERJ_URL` now says that no XERJ
   node is listening there, that `xerj mcp` does not start one, and prints
   `xerj --insecure --data-dir ~/xerj-data`. A bare connection error was the

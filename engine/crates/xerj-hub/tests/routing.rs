@@ -253,7 +253,10 @@ fn project_dir(deps: &[String]) -> tempfile::TempDir {
 fn top1_ok(routing: &Routing, expected: &str) -> bool {
     match routing {
         Routing::Confident(slug) => slug == expected,
-        Routing::Ambiguous(slugs) => slugs.first().map(|s| s == expected).unwrap_or(false),
+        // A tight group counts when the expected corpus is the one it leads with.
+        Routing::Group(slugs) | Routing::Ambiguous(slugs) => {
+            slugs.first().map(|s| s == expected).unwrap_or(false)
+        }
         Routing::NoCorpus => false,
     }
 }

@@ -392,6 +392,12 @@ Order and scoring, exactly:
    (or no second). `Ambiguous` if two or more are ≥ 0.3. Else `NoCorpus`.
    `--corpus` skips routing. Corpora already cached (`cached`) get +0.05.
 
+   A question that names a language or a technology is decided before those four
+   steps, from the catalogue entry itself (slug, topics, a language word in
+   `ask_for`, then the rest of `ask_for`). An exact slug the question spells
+   out still wins first. The sketch path above still decides when no distinctive
+   name matches. See `xerj_hub::router`.
+
 **Answer flow** (`xerj_hub::ask`):
 
 1. If the question names a symbol (`--def`, or the whole question is one identifier,
