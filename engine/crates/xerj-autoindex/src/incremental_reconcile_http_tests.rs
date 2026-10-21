@@ -32,6 +32,9 @@ struct HttpState {
     /// executor now, so the shape has to be proven here too.
     partially_apply_next_data_bulk: bool,
     fail_embedding_identity: bool,
+    /// #1971: answer semantic `exists` read-backs with no matches while
+    /// retaining the published records and catalog for refusal/resume checks.
+    hide_semantic_matches: bool,
     stop: bool,
     embedding_identity_sha256: String,
     saw_dataset_mapping_update: bool,
@@ -810,7 +813,9 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
                             .get("exists")
                             .and_then(|exists| exists.get("field"))
                             .and_then(Value::as_str)
-                            .is_none_or(|field| doc.get(field).is_some())
+                            .is_none_or(|field| {
+                                !locked.hide_semantic_matches && doc.get(field).is_some()
+                            })
                 })
                 && exists.map(|field| doc.get(field).is_some()).unwrap_or(true)
                 && must_not_exists
@@ -1941,6 +1946,66 @@ fn no_graph_committed_corpus_is_refused_on_the_graph_path_with_a_clear_message()
         1,
         "no second generation may be committed by the refused cross-path re-run"
     );
+}
+
+#[test]
+fn semantic_count_mismatch_reports_counts_and_datasets_and_resumes() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("report.rs"),
+        "pub fn quarterly_report() -> &'static str { \"Durable subscription revenue and operating income\" }\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    endpoint.state.lock().unwrap().hide_semantic_matches = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, true);
+
+    let error = run_index(config.clone()).expect_err("semantic read-back must refuse the run");
+    let message = format!("{error:#}");
+    let journal = fs::read_to_string(state_dir.path().join("journal.ndjson")).unwrap();
+    let begin: Value = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "sync_begin")
+        .unwrap();
+    let desired: crate::sync::GenerationManifest =
+        serde_json::from_value(begin["desired"].clone()).unwrap();
+    assert_eq!(desired.groups.len(), 1);
+    let group = &desired.groups[0];
+    assert!(group.expected_passages > 0);
+    assert!(group.expected_vectors > 0);
+    assert!(!group.dataset_slugs.is_empty());
+    for expected in [
+        format!(
+            "live semantic count disagrees with desired group {}",
+            group.group_id
+        ),
+        "live_semantic_records=0".into(),
+        format!("expected_passages={}", group.expected_passages),
+        format!("expected_vectors={}", group.expected_vectors),
+        format!("datasets={:?}", group.dataset_slugs),
+    ] {
+        assert!(
+            message.contains(&expected),
+            "missing {expected:?}: {message}"
+        );
+    }
+    assert_eq!(journal_events(state_dir.path(), "sync_validated"), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 0);
+    let published = endpoint.data_docs();
+    assert!(
+        !published.is_empty(),
+        "the mismatch happens after publication"
+    );
+
+    // Restore truthful read-backs: the same durable generation must resume
+    // without duplicating or changing the documents it already published.
+    endpoint.state.lock().unwrap().hide_semantic_matches = false;
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(endpoint.data_docs(), published);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
 }
 
 #[test]

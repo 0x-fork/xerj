@@ -1824,8 +1824,13 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             }
             anyhow::ensure!(
                 semantic == group.expected_passages && semantic == group.expected_vectors,
-                "live semantic count disagrees with desired group {}",
-                group.group_id
+                "live semantic count disagrees with desired group {}: \
+                 live_semantic_records={}, expected_passages={}, expected_vectors={}, datasets={:?}",
+                group.group_id,
+                semantic,
+                group.expected_passages,
+                group.expected_vectors,
+                group.dataset_slugs
             );
             anyhow::ensure!(
                 catalog_counts[&group.content_id] == 1 + group.aliases.len() as u64,
