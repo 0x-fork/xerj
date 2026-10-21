@@ -43,6 +43,10 @@ fixture; it does not run XERJ or contact external services.
 Regenerate its committed bundle from `landing/` using
 `esbuild playground/src/app.js --bundle --outfile=playground/app.bundle.js`.
 
+Playground saved views restore the saved time range, cluster and filters;
+custom views also save their FROM/TO endpoints. Legacy saved views without
+endpoints retain the current custom endpoints.
+
 ## 1. Architecture
 
 ```

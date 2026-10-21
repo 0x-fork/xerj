@@ -277,6 +277,7 @@ function saveCurrentView() {
     name,
     dashId,
     time: state.time,
+    timeCustom: state.time === 'CUSTOM' ? { ...state.timeCustom } : null,
     cluster: state.cluster,
     filters: currentFilters(),
     savedAt: new Date().toISOString(),
@@ -290,11 +291,22 @@ function applyView(id) {
   const v = loadViews().find((x) => x.id === id);
   if (!v) return;
   state.time = v.time;
+  if (v.timeCustom) {
+    state.timeCustom = { ...v.timeCustom };
+    localStorage.setItem('xerj.timeFrom', state.timeCustom.from || '');
+    localStorage.setItem('xerj.timeTo', state.timeCustom.to || '');
+  }
   state.cluster = v.cluster || state.cluster;
   state.filters[v.dashId] = { ...(v.filters || {}) };
   saveFilters(v.dashId);
   localStorage.setItem(LS.time, state.time);
-  location.hash = '#/dashboards/' + v.dashId;
+  // Publish the restored context before hashchange reads the URL again.
+  state.section = 'dashboards';
+  state.route = v.dashId;
+  writeUrlState();
+  const hash = '#/dashboards/' + v.dashId;
+  if (location.hash === hash) render();
+  else location.hash = hash;
 }
 
 function relTime(iso) {
