@@ -113,15 +113,22 @@ def load_manifest(path: pathlib.Path, refresh: str = "pinned") -> Corpus:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         raise RegistryError(f"{path.name}: unreadable ({e})") from e
+    if not isinstance(data, dict):
+        raise RegistryError(f"{path.name}: manifest must be an object")
     slug = data.get("corpus")
     if slug != path.stem or not isinstance(slug, str) or not SLUG_RE.match(slug):
         raise RegistryError(f"{path.name}: corpus {slug!r} must equal the file name")
     repos = []
-    for i, r in enumerate(data.get("repos") or []):
+    raw_repos = data.get("repos", [])
+    if not isinstance(raw_repos, list):
+        raise RegistryError(f"{path.name}: repos must be an array")
+    for i, r in enumerate(raw_repos):
+        if not isinstance(r, dict):
+            raise RegistryError(f"{path.name}: repos[{i}] must be an object")
         sha = r.get("sha", "")
-        if not SHA_RE.match(sha):
+        if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
             raise RegistryError(f"{path.name}: repos[{i}].sha is not a 40-hex commit")
-        if not r.get("url") or not r.get("repo"):
+        if any(not isinstance(r.get(key), str) or not r[key] for key in ("url", "repo")):
             raise RegistryError(f"{path.name}: repos[{i}] lacks repo/url")
         repos.append(Repo(r["repo"], r["url"], sha))
     if not repos:

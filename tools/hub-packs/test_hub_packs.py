@@ -131,6 +131,33 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(len(warnings), 2)
 
 
+    def test_invalid_manifest_shapes_warn_without_losing_healthy_corpora(self):
+        good = json.loads(manifest_text("broken", [("r", "https://x.test/r", SHA_A)]))
+        cases = [[], None, "manifest", {"corpus": "broken", "repos": "repos"},
+                 {"corpus": "broken", "repos": [None]},
+                 {"corpus": "broken", "repos": [{"sha": None}]},
+                 {"corpus": "broken", "repos": [{"sha": 123}]},
+                 {"corpus": "broken", "repos": [{"sha": SHA_A, "repo": ["r"], "url": "https://x.test/r"}]},
+                 {"corpus": "broken", "repos": [{"sha": SHA_A, "repo": "r", "url": {"url": "https://x.test/r"}}]}]
+        for invalid in cases:
+            with self.subTest(manifest=invalid), tempfile.TemporaryDirectory() as t:
+                reg, backlog = write_registry(pathlib.Path(t), [row("good"), row("broken")], {
+                    "good": manifest_text("good", [("g", "https://x.test/g", SHA_A)]),
+                    "broken": json.dumps(invalid),
+                })
+                before = (reg / "broken.json").read_bytes()
+                corpora, warnings = hp.load_live(reg, backlog)
+                self.assertEqual([c.slug for c in corpora], ["good"])
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("broken.json", warnings[0])
+                self.assertEqual((reg / "broken.json").read_bytes(), before)
+                # A corrected manifest recovers on the next run without other changes.
+                (reg / "broken.json").write_text(json.dumps(good))
+                recovered, warnings = hp.load_live(reg, backlog)
+                self.assertEqual([c.slug for c in recovered], ["broken", "good"])
+                self.assertEqual(warnings, [])
+
+
 class PlanTests(unittest.TestCase):
     def corpora(self, t: str, slugs: list[tuple[str, str, str]]):
         rows = [row(s, refresh=r) for s, _, r in slugs]

@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Debian Rust coverage reports now include valid zero-overlap measurements instead
   of exiting before printing counts. Empty source indexes remain an error.
 
+- Hub pack planning reports malformed manifest JSON shapes as per-corpus warnings
+  and continues planning healthy corpora, rather than crashing on an invalid entry.
+
 - `xerj search` and a plain-string `xerj_search` rank a file that contains
   the query as an exact phrase (a pasted error message or log line) at the
   top. The bag-of-words leg alone let a short `defs` list sharing two of the
