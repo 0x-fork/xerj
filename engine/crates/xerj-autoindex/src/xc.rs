@@ -235,7 +235,7 @@ const CORPUS_USAGE: &str =
        xerj corpus build <name> [--recipe <path>] [--fresh]
        xerj corpus sign <pack-dir> --key <seed-file>
        xerj corpus keygen --out <prefix>
-       xerj corpus index <name> [--fresh] [--url URL]
+       xerj corpus index <name> [--fresh] [--url URL] [--include-data]
          (can outlive an agent tool timeout; stopping is safe, re-run to resume)
        xerj corpus list [--url URL]
 
@@ -250,7 +250,10 @@ refuses the pack on failure (for a pack.zip, the sig cannot travel inside
 is where the lookup falls back to); build harvests recipe sources into a
 deterministic pack under builds/<name>/ (see tools/xerj-code/); sign/keygen
 are the publish step (ed25519 over SHA256SUMS);
-index builds/verifies/switches the corpus (exit 3 skips junk — normal);
+index builds/verifies/switches the corpus (exit 3 skips junk — normal); it
+skips CSV/HDF/simulation output by default (reference corpora are code and
+docs, and a test-output folder can out-record the whole corpus) —
+--include-data indexes those files too, reporting how many were left out;
 list shows what is loaded on this node.";
 
 pub(crate) fn git(dir: Option<&Path>, args: &[&str]) -> Result<(i32, String)> {
@@ -1405,44 +1408,64 @@ pub(crate) fn corpus_index_duration_note() -> &'static str {
      background and wait for the xerj-done line."
 }
 
-fn run_corpus_index(args: &[String]) -> i32 {
-    let mut name: Option<String> = None;
-    let mut fresh = false;
-    let mut url: Option<String> = None;
+/// Parsed `xerj corpus index` arguments, separated from the run so the flag
+/// set (including #1985's `--include-data`) is testable without a node.
+#[derive(Debug, Default, PartialEq)]
+struct CorpusIndexArgs {
+    name: Option<String>,
+    fresh: bool,
+    include_data: bool,
+    url: Option<String>,
+    help: bool,
+}
+
+fn parse_corpus_index_args(args: &[String]) -> Result<CorpusIndexArgs, String> {
+    let mut out = CorpusIndexArgs::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                println!("{CORPUS_USAGE}");
-                return 0;
+                out.help = true;
+                return Ok(out);
             }
-            "--fresh" => fresh = true,
+            "--fresh" => out.fresh = true,
+            // #1985: CSV/HDF/simulation output is skipped by default in a
+            // reference corpus; this flag indexes it anyway.
+            "--include-data" => out.include_data = true,
             "--url" => match args.get(i + 1) {
                 Some(v) => {
-                    url = Some(v.clone());
+                    out.url = Some(v.clone());
                     i += 1;
                 }
-                None => {
-                    eprintln!("xerj corpus index: --url needs a value\n\n{CORPUS_USAGE}");
-                    return 2;
-                }
+                None => return Err("--url needs a value".into()),
             },
-            a if a.starts_with('-') => {
-                eprintln!("xerj corpus index: unknown flag '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
-            }
-            a if name.is_none() => name = Some(a.to_string()),
-            a => {
-                eprintln!("xerj corpus index: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
-            }
+            a if a.starts_with('-') => return Err(format!("unknown flag '{a}'")),
+            a if out.name.is_none() => out.name = Some(a.to_string()),
+            a => return Err(format!("unexpected argument '{a}'")),
         }
         i += 1;
     }
-    let Some(name) = name else {
+    Ok(out)
+}
+
+fn run_corpus_index(args: &[String]) -> i32 {
+    let parsed = match parse_corpus_index_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("xerj corpus index: {e}\n\n{CORPUS_USAGE}");
+            return 2;
+        }
+    };
+    if parsed.help {
+        println!("{CORPUS_USAGE}");
+        return 0;
+    }
+    let Some(name) = parsed.name else {
         eprintln!("xerj corpus index: <name> is required\n\n{CORPUS_USAGE}");
         return 2;
     };
+    let fresh = parsed.fresh;
+    let include_data = parsed.include_data;
     if let Err(e) = xccode::pathgate::valid_corpus_name(&name) {
         eprintln!("xerj corpus index: {e}");
         return 2;
@@ -1457,7 +1480,7 @@ fn run_corpus_index(args: &[String]) -> i32 {
         return 2;
     }
     eprintln!("{}", corpus_index_duration_note());
-    let url = resolve_url(url.as_deref());
+    let url = resolve_url(parsed.url.as_deref());
     let es = match build_es(&url, None) {
         Ok(es) => es,
         Err(e) => {
@@ -1467,7 +1490,9 @@ fn run_corpus_index(args: &[String]) -> i32 {
     };
     corpus_index_flow(
         &es,
-        &|prefix, state_dir| crate::run_with_options(&dir, &url, prefix, state_dir, true),
+        &|prefix, state_dir| {
+            crate::run_with_options(&dir, &url, prefix, state_dir, true, include_data)
+        },
         &stamp_secs,
         &root,
         &url,
@@ -2169,6 +2194,30 @@ mod tests {
         // ("unknown subcommand"). `--help` is the verb; it must run.
         let code = run_corpus_cli(&["--url".into(), "http://127.0.0.1:9".into(), "--help".into()]);
         assert_eq!(code, 0);
+    }
+
+    /// #1985: `--include-data` is the opt-out of the corpus data-file gate.
+    /// Parsing is separated from the run so this needs no node.
+    #[test]
+    fn corpus_index_parses_include_data() {
+        let p = parse_corpus_index_args(&["--include-data".into(), "repo".into()]).unwrap();
+        assert!(p.include_data && !p.fresh && !p.help);
+        assert_eq!(p.name.as_deref(), Some("repo"));
+
+        let p = parse_corpus_index_args(&[
+            "--fresh".into(),
+            "repo".into(),
+            "--url".into(),
+            "http://127.0.0.1:9200".into(),
+        ])
+        .unwrap();
+        assert!(p.fresh && !p.include_data);
+        assert_eq!(p.url.as_deref(), Some("http://127.0.0.1:9200"));
+
+        assert!(parse_corpus_index_args(&["--nope".into()]).is_err());
+        assert!(parse_corpus_index_args(&["repo".into(), "extra".into()]).is_err());
+        assert!(parse_corpus_index_args(&["--url".into()]).is_err());
+        assert!(parse_corpus_index_args(&["--help".into()]).unwrap().help);
     }
 
     #[test]

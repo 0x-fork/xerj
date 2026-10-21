@@ -823,6 +823,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         label: None,
         debounce: std::time::Duration::from_millis(0),
         exclude_rels: Vec::new(),
+        skip_corpus_data: false,
     }
 }
 

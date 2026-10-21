@@ -133,6 +133,11 @@ pub struct IndexCfg {
     /// `xerj autoindex <folder>`. `xerj corpus index` sets `corpus.json` so
     /// the hub manifest is not indexed as a document dataset.
     pub exclude_rels: Vec<String>,
+    /// `xerj corpus index` only (#1985): skip data files (CSV/HDF/simulation
+    /// output — see [`crate::CORPUS_DATA_EXTS`]) instead of indexing them as
+    /// records. `--include-data` turns it off. Never set by
+    /// `xerj autoindex <folder>`: a user's own project may want its data.
+    pub skip_corpus_data: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1738,6 +1743,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     debounce_ms.unwrap_or(crate::watch::DEFAULT_DEBOUNCE_MS),
                 ),
                 exclude_rels: Vec::new(),
+                skip_corpus_data: false,
             })))
         }
         // No folder and no subcommand. This used to print the full help and

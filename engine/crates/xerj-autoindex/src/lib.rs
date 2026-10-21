@@ -1848,6 +1848,56 @@ fn without_excluded_rels(
     (kept, dropped)
 }
 
+/// Extensions that are DATA in a cloned reference repo, not reference material
+/// (#1985): `xerj corpus index` exists to retrieve code and docs, and one
+/// simulation/test-output folder in the field report produced 636,724 records
+/// — more than the rest of that corpus together. The gate is by FAMILY, not by
+/// size: the cost came from many files, so a size floor would let most of them
+/// through. `xerj corpus index --include-data` indexes them anyway.
+pub const CORPUS_DATA_EXTS: &[&str] = &[
+    // Tabular / columnar dumps.
+    "csv", "tsv", "parquet", "arrow", "feather", "orc", "avro",
+    // Scientific arrays and dataframes.
+    "h5", "hdf5", "hdf", "nc", "npy", "npz", "mat", "sav", "dta", "rds", "fits",
+    // Simulation / capture output.
+    "out", "sim", "vtk", "pcap", "pcapng",
+    // Embedded databases and serialized models.
+    "sqlite", "sqlite3", "db", "pkl", "pickle",
+];
+
+/// True when `file` carries a [`CORPUS_DATA_EXTS`] extension (case-insensitive).
+fn is_corpus_data_file(file: &walk::FileEntry) -> bool {
+    file.path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            CORPUS_DATA_EXTS
+                .iter()
+                .any(|data| ext.eq_ignore_ascii_case(data))
+        })
+}
+
+/// Drop [`is_corpus_data_file`] entries from a corpus inventory. Returns the
+/// kept files plus the skipped count and bytes so the run can say what it left
+/// out (#1985) instead of silently indexing less than the folder holds.
+fn without_corpus_data_files(files: Vec<walk::FileEntry>) -> (Vec<walk::FileEntry>, usize, u64) {
+    let before = files.len();
+    let mut skipped_bytes = 0u64;
+    let kept: Vec<walk::FileEntry> = files
+        .into_iter()
+        .filter(|file| {
+            if is_corpus_data_file(file) {
+                skipped_bytes += file.size;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped, skipped_bytes)
+}
+
 #[cfg(test)]
 mod generation_preflight_tests {
     use super::*;
@@ -1984,6 +2034,59 @@ mod exclude_rels_tests {
     }
 }
 
+#[cfg(test)]
+mod corpus_data_skip_tests {
+    use super::*;
+
+    fn entry(rel: &str, size: u64) -> walk::FileEntry {
+        walk::FileEntry {
+            path: std::path::PathBuf::from(rel),
+            rel: rel.to_string(),
+            rel_id: rel.to_string(),
+            is_symlink: false,
+            size,
+        }
+    }
+
+    /// #1985: the data families a cloned reference repo ships are dropped —
+    /// case-insensitively — while source, docs, logs and records stay. The
+    /// skipped bytes are reported so the run can say what it left out.
+    #[test]
+    fn data_families_are_skipped_and_counted_but_source_docs_logs_and_records_stay() {
+        let files = vec![
+            entry("src/main.rs", 10),
+            entry("docs/GUIDE.md", 20),
+            entry("logs/app.log", 30),
+            entry("records.jsonl", 40),
+            entry("tests/fixtures/data.CSV", 1_000),
+            entry("sim/run1.h5", 2_000),
+            entry("sim/out.vtk", 3_000),
+            entry("db/cache.sqlite3", 4_000),
+        ];
+        let (kept, count, bytes) = without_corpus_data_files(files);
+        let rels: Vec<&str> = kept.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            [
+                "src/main.rs",
+                "docs/GUIDE.md",
+                "logs/app.log",
+                "records.jsonl"
+            ],
+            "the data families are skipped; code/docs/logs/records are not"
+        );
+        assert_eq!(count, 4);
+        assert_eq!(bytes, 1_000 + 2_000 + 3_000 + 4_000);
+    }
+
+    /// A file with no extension (a Makefile, a script) is not data by family.
+    #[test]
+    fn a_file_without_an_extension_is_kept() {
+        let (kept, count, bytes) = without_corpus_data_files(vec![entry("Makefile", 1)]);
+        assert_eq!((kept.len(), count, bytes), (1, 0, 0));
+    }
+}
+
 /// In-process autoindex for the `xerj corpus` lifecycle (issue #977): builds
 /// the same argv the wrapper script passed and routes it through the same
 /// parse → run → error-route path as `run_cli`, so there is exactly ONE
@@ -1999,6 +2102,7 @@ pub fn run_with_options(
     prefix: &str,
     state_dir: Option<&std::path::Path>,
     no_graph: bool,
+    include_data: bool,
 ) -> i32 {
     let mut args = vec![
         dir.to_string_lossy().to_string(),
@@ -2028,6 +2132,9 @@ pub fn run_with_options(
             // so a project that happens to contain `corpus.json` still indexes it.
             let mut cfg = *cfg;
             cfg.exclude_rels = vec![CORPUS_MANIFEST_REL.to_string()];
+            // #1985: a cloned reference repo ships test outputs and datasets;
+            // index code + docs unless the operator asked for the data too.
+            cfg.skip_corpus_data = !include_data;
             run_index(cfg)
         }
         _ => return 2,
@@ -3364,6 +3471,7 @@ mod phase_a_grouping_tests {
             label: None,
             debounce: std::time::Duration::from_millis(0),
             exclude_rels: Vec::new(),
+            skip_corpus_data: false,
         }
     }
 
@@ -6664,6 +6772,22 @@ fn run_index_report_inner(
         pr.note(&format!(
             "autoindex: left out {excluded} path(s) ({}) — not part of this corpus index",
             cfg.exclude_rels.join(", ")
+        ));
+    }
+    let (discovered_files, data_files, data_bytes) = if cfg.skip_corpus_data {
+        without_corpus_data_files(discovered_files)
+    } else {
+        (discovered_files, 0, 0)
+    };
+    if data_files > 0 {
+        let size = if data_bytes >= 1 << 20 {
+            format!("{:.1} MB", data_bytes as f64 / (1u64 << 20) as f64)
+        } else {
+            format!("{} KB", data_bytes.div_ceil(1024))
+        };
+        pr.note(&format!(
+            "autoindex: left out {data_files} data file(s) ({size}): CSV/HDF/simulation output \
+             is data, not reference code — pass --include-data to index them"
         ));
     }
     let discovered_bytes: u64 = discovered_files.iter().map(|f| f.size).sum();
