@@ -34,8 +34,8 @@ def sh(cmd, cwd=None, timeout=None, env=None):
 
 
 def clone_at(repo, base_commit, dest):
-    sh(["git", "clone", "--quiet", f"https://github.com/{repo}", dest])
-    sh(["git", "checkout", "--quiet", base_commit], cwd=dest)
+    sh(["git", "clone", "--quiet", f"https://github.com/{repo}", dest]).check_returncode()
+    sh(["git", "checkout", "--quiet", base_commit], cwd=dest).check_returncode()
 
 
 def retrieve_context(repo_dir, instance_id, problem, k=6, chars=8000):
