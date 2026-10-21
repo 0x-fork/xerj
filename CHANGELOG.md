@@ -54,6 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and includes them
   ([#2076](https://github.com/xerj-org/xerj/issues/2076)).
 
+- `xerj autoindex` checks the node's data volume against the disk
+  flood-stage watermark before walking or hashing. A volume already at or
+  over the watermark (default 95%) used to fail only at the first write,
+  after the prepare. The run now stops immediately and reports the free
+  space, the threshold, and `limits.disk_flood_stage_percent`. The probe
+  reads the node (`GET /_cat/allocation?format=json`), not the client's
+  disk. A node that does not report the threshold is unchanged, and
+  `--dry-run` (which writes nothing) is never refused for disk.
+
 - Playground user dashboards resolve their inherited template for chart data
   and panel editing. Cloning a user dashboard retains the underlying template;
   missing or cyclic template references keep the blank fallback. Custom

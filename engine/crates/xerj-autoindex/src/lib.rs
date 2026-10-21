@@ -15,6 +15,7 @@ pub mod esclient;
 pub mod estimate;
 pub mod extract;
 pub mod feedback;
+mod flood;
 pub mod gain;
 pub mod gate;
 mod generation_catalog;
@@ -6473,6 +6474,21 @@ fn run_index_report_inner(
     if let Err(e) = es.ping() {
         anyhow::bail!("{}", node_ping_failure(&cfg.url, &e));
     }
+    // #2077: the flood-stage write block used to surface only when the first
+    // bulk was rejected, after walk/hash/scan/prepare (~10 minutes on the
+    // report). The watermark is the node's data volume, which may not be
+    // this client's disk, so the probe reads the node. A node that does not
+    // report the threshold is left alone — a hard-coded 95 would refuse the
+    // `limits.disk_flood_stage_percent = 99` workaround and a disabled
+    // watermark. Nothing has been walked or written yet, so bailing here
+    // leaves no journal and no remote mutation.
+    // A dry run writes nothing, so a full volume is not a reason to refuse
+    // it: the plan (and its size) is exactly what a user short on disk needs.
+    if !cfg.dry_run {
+        if let Some(message) = flood::refusal(&es) {
+            anyhow::bail!("{message}");
+        }
+    }
 
     // `--label <question-set>` (#1062): every record's payload goes through
     // the node's /_decide at ingest and the answers are stamped on as
@@ -6533,9 +6549,10 @@ fn run_index_report_inner(
     // A journal that already binds this state dir to this root, url, and
     // prefix is a resume or an incremental re-run of the same folder,
     // including one the local plan / `--fresh` gates are about to refuse.
-    // Those refusals promise the only remote call is the readiness GET, so
-    // this guard must not search the catalog on that path. A different
-    // folder has no such journal and still hits the check.
+    // Those refusals promise no catalog search and no remote mutation. The
+    // only remote calls on that path are the readiness GET and the read-only
+    // flood-stage probe (#2077), so this guard must not search the catalog
+    // there. A different folder has no such journal and still hits the check.
     if !state::journal_continues_folder(&state_dir, &root_str, &cfg.url, &cfg.prefix) {
         let foreign_roots = catalog::foreign_prefix_roots(
             &catalog_runs_for_prefix(&es, &cfg.prefix)?,

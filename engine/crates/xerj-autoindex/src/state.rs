@@ -816,10 +816,10 @@ pub fn default_state_dir(root: &str, url: &str, prefix: &str) -> PathBuf {
 /// `--fresh` all re-enter through that journal. The prefix-collision guard
 /// must not query the catalog on that path: those refusals are local, and
 /// the HTTP fixtures require that a refused attempt perform only the
-/// readiness GET. A different folder does not satisfy this — the default
-/// state directory includes the root, and an explicit state directory
-/// recorded for another root or prefix compares unequal — so the catalog
-/// check still runs for it.
+/// readiness GET and the read-only flood-stage probe (#2077). A different
+/// folder does not satisfy this — the default state directory includes the
+/// root, and an explicit state directory recorded for another root or
+/// prefix compares unequal — so the catalog check still runs for it.
 ///
 /// An absent, unreadable, or corrupt journal is not a continuation, and
 /// neither is a journal whose `run` record names something else. This reads

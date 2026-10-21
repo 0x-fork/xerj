@@ -2111,8 +2111,11 @@ fn fresh_cannot_destroy_a_committed_generation() {
     let attempted = endpoint.state.lock().unwrap().requests[requests_before..].to_vec();
     assert_eq!(
         attempted,
-        [("GET".to_owned(), "/".to_owned())],
-        "a refused --fresh may perform only the endpoint-readiness GET"
+        [
+            ("GET".to_owned(), "/".to_owned()),
+            ("GET".to_owned(), "/_cat/allocation?format=json".to_owned(),),
+        ],
+        "a refused --fresh may perform only the readiness GET and the read-only flood-stage probe"
     );
 
     // The surviving authority still reconciles the real folder change.
@@ -2219,8 +2222,11 @@ fn fresh_cannot_destroy_a_pending_generation() {
     let attempted = endpoint.state.lock().unwrap().requests[requests_before..].to_vec();
     assert_eq!(
         attempted,
-        [("GET".to_owned(), "/".to_owned())],
-        "a refused --fresh may perform only the endpoint-readiness GET"
+        [
+            ("GET".to_owned(), "/".to_owned()),
+            ("GET".to_owned(), "/_cat/allocation?format=json".to_owned(),),
+        ],
+        "a refused --fresh may perform only the readiness GET and the read-only flood-stage probe"
     );
 
     // The pending transaction is still resumable from its sealed source.

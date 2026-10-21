@@ -894,8 +894,11 @@ fn assert_unsupported_delta_without_remote_mutation(
     let attempted_requests = endpoint.state.lock().unwrap().requests[request_start..].to_vec();
     assert_eq!(
         attempted_requests,
-        [("GET".to_owned(), "/".to_owned())],
-        "a refused attempt may perform only the endpoint-readiness GET"
+        [
+            ("GET".to_owned(), "/".to_owned()),
+            ("GET".to_owned(), "/_cat/allocation?format=json".to_owned(),),
+        ],
+        "a refused attempt may perform only the readiness GET and the read-only flood-stage probe"
     );
     assert_eq!(
         fs::read(journal_path).unwrap(),
@@ -1478,7 +1481,10 @@ fn completed_plan_rejects_mixed_membership_delta_in_stable_order() {
     let error = run_index(config).unwrap_err();
     assert_eq!(
         endpoint.state.lock().unwrap().requests[request_start..],
-        [("GET".to_owned(), "/".to_owned())]
+        [
+            ("GET".to_owned(), "/".to_owned()),
+            ("GET".to_owned(), "/_cat/allocation?format=json".to_owned(),),
+        ]
     );
 
     let typed = error

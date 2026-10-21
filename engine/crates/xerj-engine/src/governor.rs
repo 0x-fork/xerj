@@ -236,6 +236,23 @@ impl ResourceGovernor {
         Ok(())
     }
 
+    /// Effective flood-stage gate for `/_cat/allocation` (#2077).
+    ///
+    /// `flood_pct` is `limits.disk_flood_stage_percent` after a live
+    /// `cluster.routing.allocation.disk.watermark.flood_stage` override.
+    /// `0` means the watermark is off. `threshold_enabled` mirrors
+    /// `cluster.routing.allocation.disk.threshold_enabled` (default true).
+    /// `blocked` is the latched write block, including the 1% release
+    /// hysteresis, so a volume that has dipped just under the threshold
+    /// still reports that writes will be refused.
+    pub fn disk_flood_admission(&self) -> DiskFloodAdmission {
+        DiskFloodAdmission {
+            flood_pct: self.disk_flood_pct.load(Ordering::Relaxed),
+            threshold_enabled: self.disk_threshold_enabled.load(Ordering::Relaxed),
+            blocked: self.disk_blocked.load(Ordering::Relaxed),
+        }
+    }
+
     /// Applies (or clears) a runtime override of the disk flood-stage
     /// percent, read each sampler tick from the
     /// `cluster.routing.allocation.disk.watermark.flood_stage` persistent
@@ -537,6 +554,14 @@ impl Drop for SearchPermit {
     fn drop(&mut self) {
         self.inflight.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// The disk flood-stage gate `/_cat/allocation` reports to clients (#2077).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskFloodAdmission {
+    pub flood_pct: u8,
+    pub threshold_enabled: bool,
+    pub blocked: bool,
 }
 
 /// A cheap, `Copy`-able snapshot of governor state.
@@ -1953,8 +1978,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.limits.disk_flood_stage_percent = 95;
         let g = build(&cfg);
+        let gate = g.disk_flood_admission();
+        assert_eq!(gate.flood_pct, 95);
+        assert!(gate.threshold_enabled);
+        assert!(!gate.blocked);
         assert!(g.check_disk_block("i").is_ok());
         g.refresh(0, 0, 96); // over flood stage
+        assert!(g.disk_flood_admission().blocked);
         assert!(g.check_disk_block("i").is_err());
         g.refresh(0, 0, 95); // still within release hysteresis (>= 94)
         assert!(g.check_disk_block("i").is_err());
@@ -1996,6 +2026,8 @@ mod tests {
         // sample and keeps it off however full the disk gets.
         g.set_disk_threshold_enabled(Some(false));
         g.refresh(0, 0, 97);
+        assert!(!g.disk_flood_admission().threshold_enabled);
+        assert!(!g.disk_flood_admission().blocked);
         assert!(g.check_disk_block("i").is_ok());
         g.refresh(0, 0, 100);
         assert!(g.check_disk_block("i").is_ok());

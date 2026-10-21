@@ -34683,14 +34683,20 @@ pub async fn cat_allocation(
     let (disk_total, disk_avail) = read_disk_stats(&state.config.server.data_dir)
         .unwrap_or((10 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024));
     let disk_used_bytes = disk_total.saturating_sub(disk_avail);
-    let disk_percent = ((disk_total - disk_avail) * 100)
-        .checked_div(disk_total)
-        .unwrap_or(0);
+    // Same integer percent the governor admits on (`used * 100 / total` in
+    // u128). The previous u64 multiply overflows on a volume larger than
+    // `u64::MAX / 100`, which would report a low percent while the write
+    // block used the real one. Realistic disks are unchanged.
+    let disk_percent = if disk_total == 0 {
+        0
+    } else {
+        ((disk_used_bytes as u128 * 100) / disk_total as u128) as u64
+    };
 
     let shards = health.index_count;
 
     if params.format.as_deref() == Some("json") {
-        return Json(vec![json!({
+        let mut row = json!({
             "shards": shards.to_string(),
             "disk.indices": format!("{indices_bytes}b"),
             "disk.used": format!("{disk_used_bytes}b"),
@@ -34700,8 +34706,18 @@ pub async fn cat_allocation(
             "host": "127.0.0.1",
             "ip": "127.0.0.1",
             "node": "xerj-node-1",
-        })])
-        .into_response();
+        });
+        // #2077: effective flood-stage gate, so autoindex can refuse before
+        // it walks. Not cat columns — the text table below is unchanged.
+        // Omitted when no governor is installed; the client then does not
+        // guess a threshold.
+        if let Some(governor) = xerj_engine::governor::global() {
+            let gate = governor.disk_flood_admission();
+            row["disk.flood_stage"] = json!(gate.flood_pct.to_string());
+            row["disk.threshold_enabled"] = json!(gate.threshold_enabled.to_string());
+            row["disk.flood_blocked"] = json!(gate.blocked.to_string());
+        }
+        return Json(vec![row]).into_response();
     }
 
     let body = format!(
