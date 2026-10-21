@@ -520,7 +520,7 @@ pub struct JunkFile {
     pub file_key: String,
     pub rel: String,
     pub format: String,
-    pub status: String, // junk | skipped
+    pub status: String, // junk | skipped | stale-plan
     pub reason: String,
     pub bytes: u64,
 }

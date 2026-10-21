@@ -1189,16 +1189,17 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
     assert_eq!(run_index(config.clone()).unwrap(), 0);
 
     fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
-    // 3 = completed-with-junk: the added file is reported as skipped, not
-    // indexed, because the frozen plan cannot absorb it.
+    // 3 = stale-resume-plan: the added file is reported as skipped, not
+    // indexed, because the frozen plan cannot absorb it. It is not junk.
     let (code, report) = run_index_report(config.clone()).unwrap();
     assert_eq!(code, 3);
     let report = report.unwrap();
-    assert_eq!(report["files_junk"], 1, "{report}");
-    // #346: the file that appeared after the plan was frozen is surfaced
-    // DISTINCTLY as `skipped_appeared`, not just folded into `files_junk`, so a
-    // "make the index match the tree" re-run can see the index is incomplete
-    // instead of reading as an ordinary completed-with-junk success.
+    assert_eq!(
+        report["files_junk"], 0,
+        "a post-plan file is not junk: {report}"
+    );
+    // #346 / #2076: the file that appeared after the plan was frozen is
+    // `skipped_appeared`, and it is not folded into `files_junk`.
     assert_eq!(report["skipped_appeared"], 1, "{report}");
     // `records_total` is the live server-side count (#195), so it still reports
     // the record the first run published. What must be zero is the run-local
@@ -1236,6 +1237,117 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
         .collect();
     assert!(indexed.contains("first.csv"), "{indexed:?}");
     assert!(indexed.contains("second.csv"), "{indexed:?}");
+}
+
+/// #2076: a resume whose journaled plan predates files now on disk used to
+/// record those files as junk and finish `reason=completed-with-junk`. That is
+/// the everyday "some input was unusable" success, so an agent treats the
+/// corpus as searchable and the new files never land. The frozen graph plan
+/// still cannot absorb them (clustering and graph identity stay put;
+/// `--no-graph` is the route that reconciles additions). The resume must say
+/// the plan is stale, name `--fresh`, and keep the files out of `files_junk`.
+#[test]
+fn a_resume_whose_plan_predates_new_files_reports_a_stale_plan_not_junk() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("planned.csv"), "id,value\n1,planned\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    // Seven is the field-report shape; two is enough to prove the count is
+    // not folded into junk and survives a second resume.
+    fs::write(corpus.path().join("added-a.md"), "# added a\n").unwrap();
+    fs::write(corpus.path().join("added-b.md"), "# added b\n").unwrap();
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+
+    let resume = |config: &IndexCfg| {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let (code, report) = {
+            let _sink = crate::progress::install_test_sink(&buffer);
+            run_index_report(config.clone()).unwrap()
+        };
+        let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        (code, report, stream)
+    };
+
+    let (code, report, stream) = resume(&config);
+    assert_eq!(code, 3, "a stale plan is recorded, never fatal");
+    let report = report.unwrap();
+    assert_eq!(
+        report["files_junk"], 0,
+        "post-plan files are not junk: {report}"
+    );
+    assert_eq!(report["skipped_appeared"], 2, "{report}");
+    assert!(
+        stream.contains("skipped because the resumed plan is stale"),
+        "{stream}"
+    );
+    assert!(
+        stream.contains("--fresh"),
+        "the note must name the flag that includes them: {stream}"
+    );
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("{stream}"));
+    assert!(
+        done.contains("reason=stale-resume-plan"),
+        "not completed-with-junk: {done}"
+    );
+    assert!(
+        done.contains("junk_files=0") && done.contains("skipped_appeared=2"),
+        "{done}"
+    );
+    assert!(!done.contains("reason=completed-with-junk"), "{done}");
+    {
+        let locked = endpoint.state.lock().unwrap();
+        let live: Vec<&str> = locked
+            .docs
+            .values()
+            .filter_map(|doc| doc["ax_path"].as_str())
+            .collect();
+        assert!(
+            live.iter().all(|path| *path == "planned.csv"),
+            "the frozen plan still publishes nothing for the new files: {live:?}"
+        );
+    }
+
+    // A second resume must not quietly reclassify the same files as junk.
+    let (again, report, stream) = resume(&config);
+    assert_eq!(again, 3);
+    let report = report.unwrap();
+    assert_eq!(report["files_junk"], 0, "{report}");
+    assert_eq!(report["skipped_appeared"], 2, "{report}");
+    let done = stream
+        .lines()
+        .find(|line| line.starts_with("xerj-done "))
+        .unwrap_or_else(|| panic!("{stream}"));
+    assert!(done.contains("reason=stale-resume-plan"), "{done}");
+
+    config.fresh = true;
+    config.quiet = true;
+    config.progress = crate::progress::ProgressMode::None;
+    assert_eq!(run_index(config).unwrap(), 0);
+    let locked = endpoint.state.lock().unwrap();
+    let indexed: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(indexed.contains("planned.csv"), "{indexed:?}");
+    assert!(indexed.contains("added-a.md"), "{indexed:?}");
+    assert!(indexed.contains("added-b.md"), "{indexed:?}");
 }
 
 /// #1911: one file that changed between phase A's digest and phase B's read
@@ -1494,8 +1606,9 @@ fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
 
     fs::write(corpus.path().join("first.csv"), "id,value\n1,after\n").unwrap();
     fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
-    // 3 = completed-with-junk: the frozen plan cannot absorb the added file,
-    // so the rerun reports it as skipped rather than refusing.
+    // 3 = stale-resume-plan: the frozen plan cannot absorb the added file,
+    // so the rerun reports it as skipped rather than refusing, and does not
+    // count it as junk.
     assert_eq!(run_index(config.clone()).unwrap(), 3);
 
     config.fresh = true;
@@ -2826,7 +2939,7 @@ fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
             .iter()
             .find(|(_, doc)| doc["path"].as_str() == Some("added.csv"))
             .expect("a file skipped for being post-freeze is reported in the catalog");
-        assert_eq!(doc["status"].as_str(), Some("skipped"));
+        assert_eq!(doc["status"].as_str(), Some("stale-plan"));
         assert_eq!(doc["doc_kind"].as_str(), Some("file"));
         id.clone()
     };

@@ -31,6 +31,12 @@ is worth stating exactly what it means:
   | a file was **added** | 3.32 s, **exit 3**, `1 file(s) appeared after the resume plan was frozen and were NOT indexed`; the new file stays unsearchable until `--fresh` |
   | a file was **deleted** | **exit 1, aborted in 0.24 s** — "removing files from an indexed folder is not reconciled yet". Its documents stay live, and every later re-run aborts the same way until the corpus is rebuilt |
 
+A current graph-path resume still does not index a file the frozen plan
+predates. It reports `reason=stale-resume-plan` and `skipped_appeared=N`,
+leaves `junk_files` for unusable input, and names `--fresh` as the flag that
+rebuilds the plan in place. The 3.32 s row above is that measurement; the
+capture's reason was `completed-with-junk`.
+
 So the limitation is **additions and deletions**, not edits. A watcher on the
 graph path would serve a folder that goes stale on the first new file and stops
 reindexing entirely on the first deletion — worse than no watcher at all. That is

@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` on the graph path no longer counts files that appeared
+  after the resume plan was frozen as junk. A resume whose plan predates
+  files now on disk still cannot re-cluster that plan — dataset identity and
+  graph anchors stay put, and the `--no-graph` route is what reconciles
+  additions. The resume finishes `reason=stale-resume-plan` (exit 3, recorded,
+  not a failure), leaves `junk_files` for unusable input, sets
+  `skipped_appeared` to the count on every resume while those files are
+  unindexed, and names `--fresh` as the flag that rebuilds the plan in place
+  and includes them
+  ([#2076](https://github.com/xerj-org/xerj/issues/2076)).
+
 - Playground user dashboards resolve their inherited template for chart data
   and panel editing. Cloning a user dashboard retains the underlying template;
   missing or cyclic template references keep the blank fallback. Custom

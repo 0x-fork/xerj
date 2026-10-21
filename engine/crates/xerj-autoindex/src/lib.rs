@@ -1327,6 +1327,34 @@ fn stranded_alias_notes(stranded: &[String]) -> Vec<String> {
 /// must be able to tell them apart.
 const ALIAS_SWEEP_FAILED_REASON: &str = "catalog-alias-sweep-failed";
 
+/// `xerj-done` reason when a graph-path resume kept a frozen plan and files
+/// now on disk are not in it (#2076).
+///
+/// Distinct from `completed-with-junk`. Those files are content the plan
+/// predates, not unusable input, and counting them as junk made a resume look
+/// like an ordinary successful-with-junk run. The graph path does not
+/// re-cluster a frozen plan (dataset identity and graph anchors stay put);
+/// `--no-graph` is the route that reconciles additions. `--fresh` rebuilds
+/// this plan in place and includes the files.
+const STALE_RESUME_PLAN_REASON: &str = "stale-resume-plan";
+
+/// Catalog / plan status for a file the frozen resume plan does not cover.
+const STALE_RESUME_PLAN_STATUS: &str = "stale-plan";
+
+/// Durable reason stored on the plan and therefore in the catalog.
+///
+/// The phrase `not in the frozen resume plan` is the legacy marker: journals
+/// written before #2076 used status `skipped` and this sentence, and a later
+/// resume still has to recognise them.
+const STALE_RESUME_PLAN_FILE_REASON: &str =
+    "skipped because the resumed plan is stale: not in the frozen resume plan, so nothing was \
+     published for it. Re-run with --fresh to rebuild the plan in place and include it (ids stay \
+     idempotent), or index it under a new --state-dir and --prefix";
+
+fn is_stale_resume_skip(junk: &JunkFile) -> bool {
+    junk.status == STALE_RESUME_PLAN_STATUS || junk.reason.contains("not in the frozen resume plan")
+}
+
 /// What a run says when the duplicate-alias sweep failed but the corpus is
 /// indexed.
 ///
@@ -1414,9 +1442,38 @@ pub(crate) fn outcome_headline(
     junk_files: u64,
     junk_records: u64,
     alias_sweep_failed: bool,
+    stale_plan_files: u64,
 ) -> String {
     if code != 3 {
         return format!("ok: indexed and searchable (exit {code}, completed)");
+    }
+    if stale_plan_files > 0 {
+        let files = estimate::count_phrase(stale_plan_files, "file", "files");
+        let mut line = format!(
+            "ok: indexed and searchable — exit 3 ({STALE_RESUME_PLAN_REASON}): {files} skipped \
+             because the resumed plan is stale and were not indexed. Re-run with --fresh to \
+             rebuild the plan in place and include them (ids stay idempotent)"
+        );
+        if junk_files > 0 || junk_records > 0 {
+            let mut recorded = Vec::new();
+            if junk_files > 0 {
+                recorded.push(estimate::count_phrase(junk_files, "file", "files"));
+            }
+            if junk_records > 0 {
+                recorded.push(estimate::count_phrase(junk_records, "record", "records"));
+            }
+            line.push_str(&format!(
+                ". Also recorded as junk: {}",
+                recorded.join(" and ")
+            ));
+        }
+        if alias_sweep_failed {
+            line.push_str(
+                ". The catalog's duplicate-alias cleanup could not run; rerun the same command \
+                 once the server condition clears",
+            );
+        }
+        return line;
     }
     if alias_sweep_failed {
         return format!(
@@ -5373,6 +5430,7 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
                 count("files_junk"),
                 count("junk_records_total"),
                 false,
+                0,
             )
         );
         println!(
@@ -7842,6 +7900,15 @@ fn run_index_report_inner(
                 .unwrap_or("unknown"),
         )?;
     }
+    // #2076: journals written before the stale-plan status stored post-plan
+    // files as status "skipped" inside `junk_files`. Promote them once so a
+    // later resume keeps reporting a stale plan instead of ordinary junk.
+    for junk in &mut plan.junk_files {
+        if junk.status != STALE_RESUME_PLAN_STATUS && is_stale_resume_skip(junk) {
+            junk.status = STALE_RESUME_PLAN_STATUS.to_string();
+            plan_changed = true;
+        }
+    }
     // Persist only an effective plan change. Repeating the full plan on every
     // no-op resume caused journal growth proportional to plan_size × runs.
     if plan_changed {
@@ -7885,21 +7952,34 @@ fn run_index_report_inner(
             continue;
         }
         if !plan.files.contains_key(&keys[i]) && !planned_junk.contains(keys[i].as_str()) {
-            // file appeared after the plan was frozen — recorded, not fatal
+            // File appeared after the plan was frozen. Recorded so a later
+            // deletion can sweep the catalog row (#238), but not as junk:
+            // counting it there made the resume look like completed-with-junk
+            // (#2076). The frozen graph plan cannot absorb it; `--fresh`
+            // rebuilds the plan in place.
             new_unplanned.push(JunkFile {
                 file_key: keys[i].clone(),
                 rel: files[i].rel.clone(),
                 format: "unknown".into(),
-                status: "skipped".into(),
-                reason: "not in the frozen resume plan, so nothing was published for it. Re-run \
-                         with --fresh to rebuild the plan in place and include it (ids stay \
-                         idempotent), or index it under a new --state-dir and --prefix"
-                    .into(),
+                status: STALE_RESUME_PLAN_STATUS.into(),
+                reason: STALE_RESUME_PLAN_FILE_REASON.into(),
                 bytes: files[i].size,
             });
         }
     }
-    if !new_unplanned.is_empty() {
+    // Previously recorded stale-plan files are already in `plan.junk_files`,
+    // so a second resume would otherwise say nothing. List every one still on
+    // disk, new and remembered.
+    let live_keys_now: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let mut stale_rels: Vec<&str> = new_unplanned.iter().map(|jf| jf.rel.as_str()).collect();
+    for junk in &plan.junk_files {
+        if is_stale_resume_skip(junk) && live_keys_now.contains(junk.file_key.as_str()) {
+            stale_rels.push(junk.rel.as_str());
+        }
+    }
+    stale_rels.sort_unstable();
+    stale_rels.dedup();
+    if !stale_rels.is_empty() {
         // The frozen plan cannot absorb files discovered after it was written.
         // Say so on stderr rather than leaving it to the catalog: a rerun that
         // quietly ignores new files is the bug this gate exists to surface.
@@ -7907,31 +7987,22 @@ fn run_index_report_inner(
         // eprintln! here would break `--progress json`'s single parseable
         // stream, and `--quiet` already selects `--progress none`.
         pr.note(&format!(
-            "autoindex: {} file(s) appeared after the resume plan was frozen and were NOT \
-             indexed:",
-            new_unplanned.len()
+            "autoindex: {} file(s) were skipped because the resumed plan is stale: they \
+             appeared after the resume plan was frozen and were NOT indexed:",
+            stale_rels.len()
         ));
-        for jf in new_unplanned.iter().take(REFUSAL_LIST_CAP) {
-            pr.note(&format!("  not in plan, skipped: {}", jf.rel));
+        for rel in stale_rels.iter().take(REFUSAL_LIST_CAP) {
+            pr.note(&format!("  not in plan, skipped: {rel}"));
         }
-        let remaining = new_unplanned.len().saturating_sub(REFUSAL_LIST_CAP);
+        let remaining = stale_rels.len().saturating_sub(REFUSAL_LIST_CAP);
         if remaining > 0 {
             pr.note(&format!("  … and {remaining} more"));
         }
         pr.note(
-            "autoindex: re-run with --fresh to rebuild the plan in place and index them (ids \
+            "autoindex: re-run with --fresh to rebuild the plan in place and include them (ids \
              stay idempotent)",
         );
     }
-    // #346: the count of files that appeared after the resume plan was frozen
-    // (and so were skipped, never indexed) is surfaced DISTINCTLY below — in the
-    // run summary and the terminal `xerj-done` line — not just as a mid-stream
-    // note folded into the generic `junk_files` total. Folding it in leaves a
-    // "make the index match the tree" re-run reading as an ordinary
-    // completed-with-junk success while the index is in fact incomplete, which
-    // is the below-the-noise-floor reporting #346 is about. Captured here before
-    // `new_unplanned` is drained into `plan.junk_files`.
-    let skipped_appeared = new_unplanned.len();
     if resumed_with_plan {
         // Legacy journals predate intent-before-publication and may have live
         // partial records without either file_done or file_replace_start.
@@ -9500,7 +9571,16 @@ fn run_index_report_inner(
     // Counted now: every later reader of this number outlives the borrows
     // `all_junk` holds on `plan` and `new_unplanned`, which the durable
     // junk-plan update below mutates.
-    let junk_file_count = all_junk.len();
+    //
+    // #2076 / #346: files the frozen plan predates stay in this list so the
+    // catalog row can be swept when they leave the folder (#238), but they are
+    // not junk. `files_junk` is unusable input only; `skipped_appeared` is the
+    // stale-plan count, on the first resume and on every resume after it.
+    let skipped_appeared = all_junk
+        .iter()
+        .filter(|jf| is_stale_resume_skip(jf))
+        .count();
+    let junk_file_count = all_junk.len() - skipped_appeared;
     let unextracted_archives = unextracted_archive_lines(&all_junk);
     for jf in &all_junk {
         code_coverage.observe(&jf.format, 0);
@@ -9802,7 +9882,11 @@ fn run_index_report_inner(
     // recorded rather than fatal" (`cli.rs` EXIT CODES), and inventing a fourth
     // success code would break every caller that already branches on 0/3. The
     // `reason` is what tells the two apart.
-    let code = if junk_total_records > 0 || junk_file_count > 0 || alias_sweep_error.is_some() {
+    let code = if junk_total_records > 0
+        || junk_file_count > 0
+        || alias_sweep_error.is_some()
+        || skipped_appeared > 0
+    {
         3
     } else {
         0
@@ -9817,6 +9901,7 @@ fn run_index_report_inner(
                 junk_file_count as u64,
                 junk_total_records,
                 alias_sweep_error.is_some(),
+                skipped_appeared as u64,
             )
         );
         println!(
@@ -9962,9 +10047,13 @@ fn run_index_report_inner(
     pr.finish(
         true,
         code,
-        // The sweep failure wins the `reason` when both are true: junk is the
-        // everyday state and this one needs an operator.
-        if alias_sweep_error.is_some() {
+        // A stale plan wins the `reason` when files on disk were not indexed:
+        // junk is the everyday state, and `completed-with-junk` is what hid
+        // those files (#2076). The alias-sweep failure is next: it needs an
+        // operator, and junk does not.
+        if skipped_appeared > 0 {
+            STALE_RESUME_PLAN_REASON
+        } else if alias_sweep_error.is_some() {
             ALIAS_SWEEP_FAILED_REASON
         } else if code == 3 {
             "completed-with-junk"
@@ -11888,11 +11977,11 @@ mod generation_contract_identity_tests {
     /// what was recorded instead of hiding it.
     #[test]
     fn a_finished_run_leads_with_an_ok_line_that_spells_out_exit_3() {
-        let clean = outcome_headline(0, 0, 0, false);
+        let clean = outcome_headline(0, 0, 0, false, 0);
         assert!(clean.starts_with("ok: indexed and searchable"), "{clean}");
         assert!(clean.contains("exit 0"), "{clean}");
 
-        let junk = outcome_headline(3, 1, 0, false);
+        let junk = outcome_headline(3, 1, 0, false, 0);
         assert!(junk.starts_with("ok: indexed and searchable"), "{junk}");
         assert!(
             junk.contains("exit 3 (completed-with-junk) is SUCCESS, not an error"),
@@ -11902,10 +11991,28 @@ mod generation_contract_identity_tests {
         assert!(junk.contains("xerj autoindex"), "{junk}");
         assert!(!junk.contains('\n'), "one line: {junk}");
 
-        let both = outcome_headline(3, 2, 5, false);
+        let both = outcome_headline(3, 2, 5, false, 0);
         assert!(both.contains("2 files and 5 records"), "{both}");
 
-        let sweep = outcome_headline(3, 4, 0, true);
+        let stale = outcome_headline(3, 0, 0, false, 2);
+        assert!(stale.contains("exit 3 (stale-resume-plan)"), "{stale}");
+        assert!(
+            stale.contains("2 files skipped because the resumed plan is stale"),
+            "{stale}"
+        );
+        assert!(stale.contains("--fresh"), "{stale}");
+        assert!(
+            !stale.contains("recorded as junk"),
+            "a stale plan is not junk: {stale}"
+        );
+        assert!(!stale.contains('\n'), "one line: {stale}");
+        let stale_and_junk = outcome_headline(3, 1, 0, false, 2);
+        assert!(
+            stale_and_junk.contains("Also recorded as junk: 1 file"),
+            "{stale_and_junk}"
+        );
+
+        let sweep = outcome_headline(3, 4, 0, true, 0);
         assert!(sweep.starts_with("ok: indexed and searchable"), "{sweep}");
         assert!(sweep.contains(ALIAS_SWEEP_FAILED_REASON), "{sweep}");
         assert!(sweep.contains("rerun the same command"), "{sweep}");
