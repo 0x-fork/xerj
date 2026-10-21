@@ -22,6 +22,13 @@ from `landing/`. Custom dashboards inherit their template's data and render
 functions while keeping their own layout overrides. Clones can themselves be
 cloned; missing or cyclic template references produce the blank fallback.
 
+The shared marketing-page copy controls in `landing/interact.js` display
+`COPIED` only after the clipboard API or legacy copy command succeeds. A denied
+copy displays `COPY FAILED`; visitors can retry or select the command manually.
+The temporary feedback restores the original button label. Run the interaction
+regressions with `node --test scripts/landing/test_interact.cjs` (Node 18+; no
+packages are required).
+
 ## 1. Architecture
 
 ```
