@@ -543,7 +543,7 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
                 )
             }
         }
-        Err(e) => tool_text(format!("request to {url} failed: {e}"), true),
+        Err(e) => tool_text(crate::transport_failure_text(&ctx.base_url, &url, &e), true),
     }
 }
 
@@ -969,9 +969,10 @@ mod tests {
         }
     }
 
-    /// Transport failure reaches the agent as isError with the URL named —
-    /// the same honesty as every other proxied tool. A silently empty map
-    /// here would be the worst failure mode: it reads as "no data".
+    /// Transport failure reaches the agent as isError, not as an empty map.
+    /// A silently empty map would be the worst failure mode: it reads as
+    /// "no data". Connection refused names the URL and the start command
+    /// (#2079); the catalog index is not the thing that is missing.
     #[tokio::test]
     async fn an_unreachable_node_is_an_error_not_an_empty_map() {
         let ctx = disconnected_ctx();
@@ -979,7 +980,15 @@ mod tests {
         let res = crate::call_tool(&ctx, &msg).await;
         assert_eq!(res["isError"], true);
         let text = res["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("request to"), "{text}");
-        assert!(text.contains(CATALOG_INDEX), "{text}");
+        assert!(
+            text.contains("no XERJ node is listening at http://127.0.0.1:1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("xerj --insecure --data-dir ~/xerj-data"),
+            "{text}"
+        );
+        assert!(text.contains("xerj mcp does not start a node"), "{text}");
+        assert!(!text.contains("\"indexes\""), "{text}");
     }
 }

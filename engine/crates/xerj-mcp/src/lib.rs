@@ -113,6 +113,11 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Default XERJ ES-compatible endpoint.
 const DEFAULT_XERJ_URL: &str = "http://localhost:9200";
 
+/// How to start the node `xerj mcp` proxies to. The flags are the local-dev
+/// start in llms.txt ("Start here", step 1), the README, and the `xerj mcp`
+/// CLI reference. `xerj mcp` does not start a node itself.
+const START_LOCAL_NODE: &str = "xerj --insecure --data-dir ~/xerj-data";
+
 /// Shared per-process state: the HTTP client + where to proxy to.
 /// The MCP client's `clientInfo` (name, version) from `initialize`: the agent
 /// family on reviews this server sends. The tool's name only, nothing personal.
@@ -2637,6 +2642,84 @@ async fn fetch_mapping(ctx: &Ctx, index: &str) -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+/// Tool text for a proxy request that never got an HTTP response.
+///
+/// A connect failure means nothing accepted a connection at `XERJ_URL`
+/// (#2079). The raw client error does not say so, and agents then drop xerj
+/// for the session. HTTP statuses never reach here: a 401 is a response and
+/// stays `XERJ returned HTTP 401: …`.
+pub(crate) fn transport_failure_text(
+    base_url: &str,
+    request_url: &str,
+    err: &reqwest::Error,
+) -> String {
+    if node_unreachable(err) {
+        node_not_listening(base_url, &error_detail(err))
+    } else {
+        format!("request to {request_url} failed: {err}")
+    }
+}
+
+/// `true` when the failure is "nothing is listening / the host cannot be
+/// reached", not a timeout, a TLS failure after connect, or a builder error.
+fn node_unreachable(err: &reqwest::Error) -> bool {
+    if err.is_connect() {
+        return true;
+    }
+    let mut source = std::error::Error::source(err);
+    while let Some(cur) = source {
+        if let Some(io) = cur.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::AddrNotAvailable
+            );
+        }
+        let text = cur.to_string().to_ascii_lowercase();
+        if text.contains("connection refused")
+            || text.contains("network is unreachable")
+            || text.contains("host is unreachable")
+            || text.contains("no route to host")
+            || text.contains("failed to lookup address")
+            || text.contains("name or service not known")
+            || text.contains("nodename nor servname")
+        {
+            return true;
+        }
+        source = cur.source();
+    }
+    false
+}
+
+/// The sentence an agent can act on. `err` is the client detail, kept so the
+/// refusal is still diagnosable.
+fn node_not_listening(base_url: &str, err: &dyn std::fmt::Display) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!(
+        "no XERJ node is listening at {base}. xerj mcp does not start a node. \
+         Start one with:\n  {START_LOCAL_NODE}\n\
+         then retry this tool. ({err})"
+    )
+}
+
+/// reqwest's `Display` often stops at "error sending request"; the OS reason
+/// (`Connection refused`) is on the source chain.
+fn error_detail(err: &reqwest::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cur) = source {
+        let next = cur.to_string();
+        if !out.contains(&next) {
+            out.push_str(": ");
+            out.push_str(&next);
+        }
+        source = cur.source();
+    }
+    out
+}
+
 async fn engine_request(
     ctx: &Ctx,
     method: Method,
@@ -2672,7 +2755,7 @@ async fn engine_request(
                 tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
             }
         }
-        Err(e) => tool_text(format!("request to {url} failed: {e}"), true),
+        Err(e) => tool_text(transport_failure_text(&ctx.base_url, &url, &e), true),
     }
 }
 
@@ -2687,6 +2770,114 @@ mod tests {
     fn built(r: Result<BuiltRequest, String>) -> (Method, String, Value) {
         let (m, p, b) = r.unwrap();
         (m, p, b.expect("builder should carry a body"))
+    }
+
+    /// #2079: the sentence itself, with no network. The connect-vs-HTTP split
+    /// is covered by the tests below.
+    #[test]
+    fn node_not_listening_names_the_url_and_the_documented_start_command() {
+        let msg = node_not_listening(
+            "http://localhost:9200/",
+            &"tcp connect error: Connection refused (os error 111)",
+        );
+        assert!(
+            msg.contains("no XERJ node is listening at http://localhost:9200. xerj mcp"),
+            "{msg}"
+        );
+        assert!(msg.contains("xerj mcp does not start a node"), "{msg}");
+        assert!(
+            msg.contains("\n  xerj --insecure --data-dir ~/xerj-data\n"),
+            "{msg}"
+        );
+        assert!(msg.contains("Connection refused (os error 111)"), "{msg}");
+        assert!(!msg.contains("HTTP "), "{msg}");
+        assert!(!msg.contains("-d "), "do not invent a short flag: {msg}");
+    }
+
+    /// The path an agent actually hits: `xerj_search` against a closed port.
+    #[tokio::test]
+    async fn a_refused_connection_on_xerj_search_tells_the_agent_to_start_the_node() {
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            auth: None,
+        };
+        let msg = json!({
+            "params": { "name": "xerj_search", "arguments": { "index": "docs" } }
+        });
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("no XERJ node is listening at http://127.0.0.1:1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("xerj --insecure --data-dir ~/xerj-data"),
+            "{text}"
+        );
+        assert!(text.contains("xerj mcp does not start a node"), "{text}");
+        assert!(
+            !text.contains("XERJ returned HTTP"),
+            "a connect failure is not an HTTP status: {text}"
+        );
+    }
+
+    /// A request that never becomes a connect attempt keeps the old text.
+    /// Builder failures are not "no node".
+    #[tokio::test]
+    async fn a_non_connect_transport_error_keeps_the_request_failed_text() {
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: "not a url".to_string(),
+            auth: None,
+        };
+        let msg = json!({
+            "params": { "name": "xerj_search", "arguments": { "index": "docs" } }
+        });
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("request to not a url/docs/_search failed:"),
+            "{text}"
+        );
+        assert!(!text.contains("no XERJ node is listening"), "{text}");
+        assert!(!text.contains("xerj --insecure"), "{text}");
+    }
+
+    /// 401 is a response from a node that is up. It must not grow a start recipe.
+    #[tokio::test]
+    async fn an_http_401_is_not_rewritten_as_node_down() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let resp = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\nConnection: close\r\n\r\nunauthorized\n";
+            let _ = sock.write_all(resp).await;
+        });
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": { "name": "xerj_search", "arguments": { "index": "docs" } }
+        });
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("XERJ returned HTTP 401 Unauthorized"),
+            "{text}"
+        );
+        assert!(text.contains("unauthorized"), "{text}");
+        assert!(!text.contains("no XERJ node is listening"), "{text}");
+        assert!(!text.contains("xerj --insecure"), "{text}");
     }
 
     #[test]
