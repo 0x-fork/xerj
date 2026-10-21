@@ -89,4 +89,6 @@ alongside the **token/cost delta** from the `--tokens-out` logs.
 ## Files
 
 - `gen_predictions.py` — generates the `native`/`xerj` prediction JSONLs (+ token logs).
+  Patches compare with the original task base and include staged, committed and
+  new non-ignored files, including binary changes; ignored artifacts stay out.
 - scoring — the official `swebench.harness.run_evaluation` (not vendored here on purpose).
