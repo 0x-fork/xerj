@@ -29,7 +29,46 @@
 // fragmentation actively and madvise()'s freed regions back.
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOC: ReportingJemalloc = ReportingJemalloc;
+
+/// Jemalloc plus a FATAL line when an allocation returns null.
+///
+/// `handle_alloc_error` still runs afterwards and aborts, which raises
+/// SIGABRT. The line is written first, with `write(2)`, because the heap
+/// is the thing that just failed. SIGKILL cannot be reported.
+#[cfg(not(target_env = "msvc"))]
+struct ReportingJemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+unsafe impl std::alloc::GlobalAlloc for ReportingJemalloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = tikv_jemallocator::Jemalloc.alloc(layout);
+        if ptr.is_null() {
+            note_alloc_failure(layout.size(), layout.align());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = tikv_jemallocator::Jemalloc.alloc_zeroed(layout);
+        if ptr.is_null() {
+            note_alloc_failure(layout.size(), layout.align());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        tikv_jemallocator::Jemalloc.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let ptr = tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size);
+        if ptr.is_null() {
+            note_alloc_failure(new_size, layout.align());
+        }
+        ptr
+    }
+}
 
 // jemalloc runtime config (read at process start via the `_rjem_malloc_conf`
 // symbol — tikv-jemalloc is built with the `_rjem_` prefix, so plain
@@ -2268,9 +2307,252 @@ mod nofile_tests {
     }
 }
 
+#[cfg(test)]
+mod fatal_reporter_tests {
+    use super::{format_alloc_failure, format_fatal_signal};
+
+    #[test]
+    fn alloc_failure_line_names_size_and_align() {
+        let mut buf = [0u8; 128];
+        let n = format_alloc_failure(&mut buf, 4096, 8);
+        let line = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(line.starts_with("FATAL:"));
+        assert!(line.contains("allocation"));
+        assert!(line.contains("4096"));
+        assert!(line.contains("align 8"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fatal_signal_line_names_sigabrt_without_installing_a_handler() {
+        let mut buf = [0u8; 128];
+        let n = format_fatal_signal(&mut buf, libc::SIGABRT);
+        let line = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(line.starts_with("FATAL:"));
+        assert!(line.contains("SIGABRT"));
+        assert!(line.contains(&libc::SIGABRT.to_string()));
+        assert!(line.ends_with('\n'));
+    }
+}
+
+/// `{data_dir}/crash.log`, opened once the data directory exists. `-1`
+/// until then. Fatal signal and allocation-failure hooks write this fd
+/// with `write(2)` and never allocate.
+static CRASH_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn append_bytes(out: &mut [u8], mut at: usize, bytes: &[u8]) -> usize {
+    for &b in bytes {
+        if at >= out.len() {
+            break;
+        }
+        out[at] = b;
+        at += 1;
+    }
+    at
+}
+
+fn append_usize(out: &mut [u8], at: usize, mut value: usize) -> usize {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if value == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    } else {
+        while value > 0 {
+            i -= 1;
+            buf[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    append_bytes(out, at, &buf[i..])
+}
+
+/// Allocation-failure line. Replaces the default
+/// "memory allocation of N bytes failed" message, so the size and
+/// alignment have to be in the line. No heap use: the alloc hook runs
+/// because the heap just failed.
+fn format_alloc_failure(out: &mut [u8], size: usize, align: usize) -> usize {
+    let mut at = append_bytes(out, 0, b"FATAL: memory allocation of ");
+    at = append_usize(out, at, size);
+    at = append_bytes(out, at, b" bytes failed (align ");
+    at = append_usize(out, at, align);
+    append_bytes(out, at, b")\n")
+}
+
+fn format_fatal_signal(out: &mut [u8], sig: i32) -> usize {
+    let name: &[u8] = match sig {
+        #[cfg(unix)]
+        x if x == libc::SIGABRT => b"SIGABRT",
+        #[cfg(unix)]
+        x if x == libc::SIGSEGV => b"SIGSEGV",
+        #[cfg(unix)]
+        x if x == libc::SIGBUS => b"SIGBUS",
+        #[cfg(unix)]
+        x if x == libc::SIGILL => b"SIGILL",
+        _ => b"signal",
+    };
+    let mut at = append_bytes(out, 0, b"FATAL: xerj received ");
+    at = append_bytes(out, at, name);
+    at = append_bytes(out, at, b" (");
+    at = append_usize(out, at, sig.max(0) as usize);
+    at = append_bytes(out, at, b") and is aborting\n");
+    at
+}
+
+#[cfg(unix)]
+fn write_fd(fd: i32, bytes: &[u8]) {
+    if fd < 0 || bytes.is_empty() {
+        return;
+    }
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        off += n as usize;
+    }
+}
+
+#[cfg(unix)]
+fn report_fatal(bytes: &[u8]) {
+    write_fd(libc::STDERR_FILENO, bytes);
+    let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 && fd != libc::STDERR_FILENO {
+        write_fd(fd, bytes);
+    }
+}
+
+#[cfg(not(unix))]
+fn report_fatal(bytes: &[u8]) {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), bytes);
+}
+
+#[cfg(not(target_env = "msvc"))]
+fn note_alloc_failure(size: usize, align: usize) {
+    let mut buf = [0u8; 128];
+    let n = format_alloc_failure(&mut buf, size, align);
+    report_fatal(&buf[..n]);
+}
+
+/// The disposition each fatal signal had before [`install_fatal_reporter`]
+/// replaced it. Written once at startup, before the handler can run, and
+/// only read inside the handler.
+#[cfg(unix)]
+static mut PREVIOUS_FATAL_ACTIONS: [Option<libc::sigaction>; 4] = [None; 4];
+
+#[cfg(unix)]
+const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL];
+
+/// Async-signal-safe. Writes a line, puts back the disposition the signal
+/// had before (the Rust runtime's guard-page handler for SIGSEGV/SIGBUS,
+/// which prints "has overflowed its stack"; the default elsewhere), and
+/// returns. A fault re-executes and reaches that handler with its real
+/// `siginfo`; `abort()` re-raises SIGABRT after a handler returns; so the
+/// process still dies with the original signal. SIGKILL cannot be caught.
+/// SIGTERM is left to the server's shutdown path.
+#[cfg(unix)]
+extern "C" fn fatal_signal(sig: libc::c_int) {
+    let mut buf = [0u8; 128];
+    let n = format_fatal_signal(&mut buf, sig);
+    report_fatal(&buf[..n]);
+    unsafe {
+        let previous = std::ptr::addr_of!(PREVIOUS_FATAL_ACTIONS).read();
+        let slot = FATAL_SIGNALS.iter().position(|s| *s == sig);
+        match slot.and_then(|i| previous[i]) {
+            Some(action) => {
+                libc::sigaction(sig, &action, std::ptr::null_mut());
+            }
+            None => {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+        if sig != libc::SIGSEGV && sig != libc::SIGBUS && sig != libc::SIGILL {
+            // A raised signal (not a fault) does not re-execute.
+            libc::raise(sig);
+        }
+    }
+}
+
+fn install_fatal_reporter() {
+    // Chain to the hook that was installed before: it prints the thread
+    // name, the location and (with RUST_BACKTRACE) the backtrace. A panic
+    // can be caught and the node keep serving, so the crash.log line says
+    // "panicked", not FATAL; a panic that ends the process is followed by
+    // the abort or exit that does.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        #[cfg(unix)]
+        {
+            let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+            if fd >= 0 {
+                let thread = std::thread::current();
+                let line = format!(
+                    "xerj panicked on thread {}: {info}\n",
+                    thread.name().unwrap_or("<unnamed>")
+                );
+                write_fd(fd, line.as_bytes());
+            }
+        }
+        previous(info);
+    }));
+    #[cfg(unix)]
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = fatal_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        // SA_ONSTACK: a stack overflow faults with no stack left, so the
+        // handler must run on the alternate stack the Rust runtime sets up
+        // per thread.
+        action.sa_flags = libc::SA_ONSTACK;
+        let mut previous: [Option<libc::sigaction>; 4] = [None; 4];
+        for (i, sig) in FATAL_SIGNALS.iter().enumerate() {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(*sig, std::ptr::null(), &mut old) == 0 {
+                previous[i] = Some(old);
+            }
+        }
+        std::ptr::addr_of_mut!(PREVIOUS_FATAL_ACTIONS).write(previous);
+        for sig in FATAL_SIGNALS {
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_crash_log(data_dir: &Path) {
+    let path = data_dir.join("crash.log");
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        )
+    };
+    if fd >= 0 {
+        CRASH_LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(unix))]
+fn open_crash_log(_data_dir: &Path) {}
+
 fn main() -> Result<()> {
     // Before anything can write to stdout, including the `--help`/`--version`
-    // fast paths inside `parse_args`.
+    // fast paths inside `parse_args`. A node that dies must say so: the
+    // allocation hook, the panic hook, and SIGABRT/SIGSEGV/SIGBUS/SIGILL
+    // each write a FATAL line. SIGKILL still cannot be reported.
+    install_fatal_reporter();
     #[cfg(unix)]
     restore_default_sigpipe();
 
@@ -3407,6 +3689,7 @@ async fn async_main() -> Result<()> {
     // 4. Data directory
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir))?;
+    open_crash_log(Path::new(&cfg.server.data_dir));
 
     // 5. Admin key (first-run)
     ensure_admin_key(&mut cfg)?;

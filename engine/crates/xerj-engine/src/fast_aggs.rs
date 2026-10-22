@@ -65,7 +65,7 @@ use crate::aggs::{
 use crate::memtable::MemBoolPred;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn};
+use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn, PresenceColumn};
 
 /// Compile the top-level agg filter JSON (the restricted shape
 /// `query_node_to_agg_filter` emits: `term`/`range`/`bool{must,filter}`) into a
@@ -599,6 +599,10 @@ impl<'a> FastCtx<'a> {
 enum ColKind {
     Numeric,
     Keyword,
+    /// `doc_values: false` field. The column records which rows have a
+    /// value, not the value. Term and metric executors must not read it
+    /// as a dictionary or a number.
+    Presence,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1038,6 +1042,7 @@ impl<'a> FastCtx<'a> {
             let k = match s.col(field) {
                 Some(Column::Numeric(_)) => ColKind::Numeric,
                 Some(Column::Keyword(_)) => ColKind::Keyword,
+                Some(Column::Presence(_)) => ColKind::Presence,
                 None => continue,
             };
             match kind {
@@ -1745,6 +1750,9 @@ impl<'a> FastCtx<'a> {
                     // Only reachable for value_count.
                     acc.count += (k.doc_count as u64).saturating_sub(k.null_bitmap.len());
                 }
+                // Text presence is not a value_count of tokens. Bail so the
+                // brute extractor answers.
+                Some(Column::Presence(_)) => return None,
                 None => {}
             }
         }
@@ -1831,7 +1839,7 @@ impl<'a> FastCtx<'a> {
                         }
                     }
                 },
-                Some(Column::Keyword(_)) => return None,
+                Some(Column::Keyword(_)) | Some(Column::Presence(_)) => return None,
                 None => {}
             }
         }
@@ -1927,7 +1935,7 @@ impl<'a> FastCtx<'a> {
                         }
                     }
                 }
-                Some(Column::Keyword(_)) => return None,
+                Some(Column::Keyword(_)) | Some(Column::Presence(_)) => return None,
                 None => {}
             }
         }
@@ -2146,6 +2154,13 @@ impl<'a> FastCtx<'a> {
             match seg.col(field) {
                 Some(Column::Numeric(n)) => missing += n.null_bitmap.len(),
                 Some(Column::Keyword(k)) => missing += k.null_bitmap.len(),
+                // Complement of `exists`: the bitmap is `value_present`.
+                Some(Column::Presence(p)) => {
+                    if p.doc_count != seg.docs {
+                        return None;
+                    }
+                    missing += (seg.docs as u64).saturating_sub(p.count());
+                }
                 // Field absent from this segment's columns → every row missing.
                 None => missing += seg.docs as u64,
             }
@@ -2347,6 +2362,7 @@ impl<'a> FastCtx<'a> {
                         any = true;
                     }
                 }
+                Some(Column::Presence(_)) => return None,
                 Some(Column::Keyword(k)) => {
                     let ord_ms = self.date_ord_index(seg, field)?;
                     for (ord, &ms) in ord_ms.iter().enumerate() {
@@ -2433,6 +2449,12 @@ impl<'a> FastCtx<'a> {
             )?),
             None => None,
         };
+        // A terms window that names no ordinal in this segment resolves to
+        // `Never` before any row is visited. Zero-hit finalize probes stop
+        // here instead of walking the segment.
+        if matches!(top_sp, Some(SegPred::Never)) {
+            return Some(());
+        }
         // Resolve metric columns once.
         let mut num_cols: Vec<Option<&NumericColumn>> = Vec::with_capacity(plan.metrics.len());
         let mut kw_cols: Vec<Option<&KeywordColumn>> = Vec::with_capacity(plan.metrics.len());
@@ -2449,6 +2471,7 @@ impl<'a> FastCtx<'a> {
                     num_cols.push(None);
                     kw_cols.push(Some(k));
                 }
+                Some(Column::Presence(_)) => return None,
                 None => {
                     num_cols.push(None);
                     kw_cols.push(None);
@@ -4099,9 +4122,12 @@ impl<'a> FastCtx<'a> {
                 Ok(Some(ColKind::Keyword)) | Ok(None) => Some(()),
                 _ => None,
             },
-            // Either column kind can answer "row is non-null".
+            // Keyword, numeric, and presence columns can answer "row is non-null".
             Pred::Exists { field } => match self.seg_field_kind(field) {
-                Ok(Some(ColKind::Keyword)) | Ok(Some(ColKind::Numeric)) | Ok(None) => Some(()),
+                Ok(Some(ColKind::Keyword))
+                | Ok(Some(ColKind::Numeric))
+                | Ok(Some(ColKind::Presence))
+                | Ok(None) => Some(()),
                 _ => None,
             },
             Pred::And(subs) => {
@@ -5596,6 +5622,9 @@ enum SegPred<'a> {
     /// `exists` — the row carries a non-null keyword / numeric value.
     KwExists(&'a KeywordColumn),
     NumExists(&'a NumericColumn),
+    /// `exists` on a `doc_values: false` field. The bitmap is the set of
+    /// rows `value_present` accepted at flush.
+    PresExists(&'a PresenceColumn),
     /// Conjunction — every sub-predicate must match the row.
     And(Vec<SegPred<'a>>),
 }
@@ -5626,7 +5655,7 @@ fn resolve_pred<'a>(
                 Some(ord) => SegPred::KwEq(k, ord, k.null_bitmap.is_empty()),
                 None => SegPred::Never,
             },
-            Some(Column::Numeric(_)) => return None,
+            Some(Column::Numeric(_)) | Some(Column::Presence(_)) => return None,
             None => miss_is_genuinely_empty(field, segs, mapped_fields)?,
         },
         Pred::TermsKw { field, values } => match dv_col(cols, field) {
@@ -5638,7 +5667,7 @@ fn resolve_pred<'a>(
                     SegPred::KwIn(k, ords, k.null_bitmap.is_empty())
                 }
             }
-            Some(Column::Numeric(_)) => return None,
+            Some(Column::Numeric(_)) | Some(Column::Presence(_)) => return None,
             None => miss_is_genuinely_empty(field, segs, mapped_fields)?,
         },
         Pred::RangeKw {
@@ -5698,7 +5727,7 @@ fn resolve_pred<'a>(
                     SegPred::KwRange(k, lo_ord, hi_ord, k.null_bitmap.is_empty())
                 }
             }
-            Some(Column::Numeric(_)) => return None,
+            Some(Column::Numeric(_)) | Some(Column::Presence(_)) => return None,
             None => miss_is_genuinely_empty(field, segs, mapped_fields)?,
         },
         Pred::RangeNum {
@@ -5711,12 +5740,13 @@ fn resolve_pred<'a>(
             Some(Column::Numeric(n)) => {
                 SegPred::Num(n, *lo, *lo_incl, *hi, *hi_incl, n.null_bitmap.is_empty())
             }
-            Some(Column::Keyword(_)) => return None,
+            Some(Column::Keyword(_)) | Some(Column::Presence(_)) => return None,
             None => miss_is_genuinely_empty(field, segs, mapped_fields)?,
         },
         Pred::Exists { field } => match dv_col(cols, field) {
             Some(Column::Keyword(k)) => SegPred::KwExists(k),
             Some(Column::Numeric(n)) => SegPred::NumExists(n),
+            Some(Column::Presence(p)) => SegPred::PresExists(p),
             None => miss_is_genuinely_empty(field, segs, mapped_fields)?,
         },
         Pred::And(subs) => {
@@ -5778,6 +5808,7 @@ fn seg_pred_matches(sp: &SegPred<'_>, row: u32) -> bool {
         }
         SegPred::KwExists(k) => k.ord_for(row).is_some(),
         SegPred::NumExists(n) => !n.null_bitmap.contains(row),
+        SegPred::PresExists(p) => p.contains(row),
         SegPred::And(subs) => subs.iter().all(|s| seg_pred_matches(s, row)),
     }
 }
@@ -5804,6 +5835,9 @@ fn seg_pred_count(sp: &SegPred<'_>, docs: u32) -> u64 {
         // the numeric column's own precomputed non-null count.
         SegPred::KwExists(k) => k.per_ord_count.iter().map(|c| *c as u64).sum(),
         SegPred::NumExists(n) => n.live_count,
+        // Exact for any density. Delete-blind, like the other O(1) arms;
+        // dirty segments row-scan via `seg_pred_matches` instead.
+        SegPred::PresExists(p) => p.count(),
         // Conjunction has no O(1) form — count matching rows directly.  Only
         // reached from the top-level filter count (compile_pred, used by the
         // filter/filters executors, never yields `And`).

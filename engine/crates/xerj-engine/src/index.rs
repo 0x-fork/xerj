@@ -564,6 +564,60 @@ mod collection_publication_fail_closed_tests {
         );
     }
 
+    /// `doc_values: false` fields (text, semantic_text) record presence, not
+    /// values. The bit must follow `value_present`: empty string and a
+    /// non-null array element are present; null, `[]`, and `[null]` are not.
+    /// An all-absent field still ships a column so `exists` can answer
+    /// "no" without a source scan.
+    #[test]
+    fn build_doc_value_columns_presence_matches_value_present() {
+        use xerj_storage::doc_values::Column;
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("msg".to_string());
+        skip.insert("never".to_string());
+        let docs = [
+            json!({"ax_file": "a"}),
+            json!({"ax_file": "a", "msg": null}),
+            json!({"ax_file": "a", "msg": []}),
+            json!({"ax_file": "a", "msg": ""}),
+            json!({"ax_file": "a", "msg": [null]}),
+            json!({"ax_file": "a", "msg": "hello"}),
+            json!({"ax_file": "a", "msg": [null, "x"]}),
+        ];
+        let cols = super::build_doc_value_columns(docs.iter().map(Some), &skip);
+        let Some(Column::Presence(msg)) = cols.get("msg") else {
+            panic!("msg must be a presence column, got {:?}", cols.get("msg"));
+        };
+        assert_eq!(msg.doc_count, 7);
+        assert!(!msg.contains(0) && !msg.contains(1) && !msg.contains(2) && !msg.contains(4));
+        assert!(msg.contains(3) && msg.contains(5) && msg.contains(6));
+        assert_eq!(msg.count(), 3);
+        let Some(Column::Presence(never)) = cols.get("never") else {
+            panic!("an all-absent skipped field must still ship a presence column");
+        };
+        assert_eq!(never.doc_count, 7);
+        assert_eq!(never.count(), 0);
+        assert!(matches!(cols.get("ax_file"), Some(Column::Keyword(_))));
+    }
+
+    /// A dotted mapping name is an object sub-field. The builder only walks
+    /// top-level `_source` keys, so it cannot see `user.bio` inside
+    /// `{"user": {"bio": ..}}`. It must ship no presence column for it (the
+    /// reader then scans source) rather than an empty one that says no row
+    /// has the field.
+    #[test]
+    fn build_doc_value_columns_ships_no_presence_for_a_dotted_text_field() {
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("user.bio".to_string());
+        let docs = [json!({"user": {"bio": "hello"}}), json!({"user": {}})];
+        let cols = super::build_doc_value_columns(docs.iter().map(Some), &skip);
+        assert!(
+            !cols.contains_key("user.bio"),
+            "a dotted field must not get a presence column: {:?}",
+            cols.get("user.bio")
+        );
+    }
+
     async fn assert_flush_freeze_keeps_readers_live_then_finishes(inject_error: bool) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -25204,6 +25258,7 @@ impl Index {
                         )));
                     }
                 };
+                let mut segment_hydrated: u64 = 0;
                 for d in arr.iter() {
                     // Skip tombstoned docs.
                     let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
@@ -25228,7 +25283,9 @@ impl Index {
                         }
                     }
                     docs.push(src);
+                    segment_hydrated = segment_hydrated.saturating_add(1);
                 }
+                crate::aggs::note_corpus_hydration(segment_hydrated);
             }
             // Enrich corpus docs with hit-level metadata so score/seq-sensitive
             // sub-aggs reproduce ES semantics: `top_hits` default-sorts by
@@ -27221,13 +27278,29 @@ fn build_doc_value_columns<'a>(
     skip: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, xerj_storage::doc_values::Column> {
     use std::collections::BTreeMap;
-    use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn};
+    use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn, PresenceColumn};
 
     // Collect per-field per-doc raw values.  We materialise into vectors
     // so we can decide column-type once we've seen all values.  This is
     // O(docs × fields) memory but much smaller than the segment itself.
     let mut numeric: BTreeMap<String, Vec<Option<i64>>> = BTreeMap::new();
     let mut keyword: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+    // `doc_values: false` fields (text, semantic_text) get a presence
+    // bitmap instead of a value column. Pre-seed every skipped name so a
+    // segment where the field is absent still has a column: `exists` then
+    // answers "no row" without parsing source, and a missing column stays
+    // reserved for segments written before this bitmap existed.
+    //
+    // Only top-level names. The loop below sees `_source`'s top-level keys,
+    // so a dotted mapping name (`user.bio`, an object sub-field) never gets a
+    // bit set; seeding it would ship an all-absent bitmap and `exists` would
+    // answer "no row" for documents that have the field. Those fields get
+    // no column and keep the source scan.
+    let mut presence: BTreeMap<String, PresenceColumn> = skip
+        .iter()
+        .filter(|name| !name.contains('.'))
+        .map(|name| (name.clone(), PresenceColumn::empty()))
+        .collect();
     // Fields that carry an ARRAY value in ANY doc of this segment.  The
     // one-slot-per-row column cannot represent a multi-valued doc, and
     // filing it as null makes the column LIE: every consumer (count
@@ -27255,9 +27328,15 @@ fn build_doc_value_columns<'a>(
             if field.starts_with('_') {
                 continue;
             }
-            // Honour the declared mapping. Checked before any allocation so a
-            // skipped field costs nothing per doc.
+            // Honour the declared mapping. A skipped field records presence
+            // only — one bit, not the value — so `exists` does not need the
+            // stored JSON. Checked before any value allocation.
             if skip.contains(field.as_str()) {
+                if value_present(val) {
+                    if let Some(bits) = presence.get_mut(field.as_str()) {
+                        bits.insert(doc_idx as u32);
+                    }
+                }
                 continue;
             }
             // Lookup-first (`get_mut` before `entry`) so the common case
@@ -27359,6 +27438,10 @@ fn build_doc_value_columns<'a>(
                 tracing::warn!("doc-values keyword build failed for one field: {e}");
             }
         }
+    }
+    for (name, mut present) in presence {
+        present.set_doc_count(total_docs as u32);
+        out.insert(name, Column::Presence(present));
     }
     out
 }
@@ -27997,7 +28080,8 @@ impl Index {
                                     n.null_bitmap.is_empty(),
                                 ));
                             }
-                            None => {
+                            // Presence answers `exists`, not term equality.
+                            Some(xerj_storage::doc_values::Column::Presence(_)) | None => {
                                 abandoned = true;
                                 break;
                             }
@@ -28283,7 +28367,8 @@ impl Index {
                             shadow, slo, shi, slo_incl, shi_incl,
                         ));
                     }
-                    None => return None, // abandon — field absent in this segment
+                    // A presence bitmap has no numeric or date values.
+                    Some(xerj_storage::doc_values::Column::Presence(_)) | None => return None,
                 }
             }
 
@@ -28468,19 +28553,22 @@ impl Index {
                             }
                         }
                     }
-                    None => return None, // no dv column → can't count safely
+                    // Presence is not a term dictionary.
+                    Some(Column::Presence(_)) | None => return None,
                 }
             }
             return Some(seg_matches);
         }
 
-        // `exists` — provable only for the DENSE case: a field whose column
-        // has no nulls and covers every doc means every doc has a scalar value
-        // (arrays / objects / json-null leave the null bitmap non-empty), so
-        // all docs match.  Any null / partial coverage / missing column, or a
-        // non-empty memtable, abandons to the scan — which resolves
-        // `get_field_value(...).is_some()` exactly (incl. arrays, dotted
-        // paths).  Meta fields are always present.
+        // `exists` — keyword and numeric columns answer only the DENSE case:
+        // no nulls and full coverage means every doc has a scalar value
+        // (arrays poison the column, so a present column has no hidden
+        // multi-values). A presence bitmap answers any density, because it
+        // records `value_present` per row — the same predicate the source
+        // scan uses — including empty strings and excluding null / `[]` /
+        // `[null]`. A missing column, a column that does not cover the
+        // segment, or a non-empty memtable abandons to the scan. Meta
+        // fields are always present.
         if let QueryNode::Exists { field } = query {
             use xerj_storage::doc_values::Column;
             if self.store.version_map.ghost_events() > 0 || self.memtable.doc_count() > 0 {
@@ -28499,15 +28587,28 @@ impl Index {
                     continue;
                 }
                 let cols = self.dv_columns_for(&segments_dir, &meta.id)?;
-                let (null_empty, dcount) = match cols.get(field.as_str()) {
-                    Some(Column::Keyword(k)) => (k.null_bitmap.is_empty(), k.doc_count as u64),
-                    Some(Column::Numeric(n)) => (n.null_bitmap.is_empty(), n.doc_count as u64),
-                    None => return None, // can't prove presence → scan
+                let add = match cols.get(field.as_str()) {
+                    Some(Column::Keyword(k)) => {
+                        if !k.null_bitmap.is_empty() || k.doc_count as u64 != meta.doc_count {
+                            return None;
+                        }
+                        meta.doc_count
+                    }
+                    Some(Column::Numeric(n)) => {
+                        if !n.null_bitmap.is_empty() || n.doc_count as u64 != meta.doc_count {
+                            return None;
+                        }
+                        meta.doc_count
+                    }
+                    Some(Column::Presence(p)) => {
+                        if p.doc_count as u64 != meta.doc_count {
+                            return None;
+                        }
+                        p.count()
+                    }
+                    None => return None,
                 };
-                if !null_empty || dcount != meta.doc_count {
-                    return None; // sparse / partial → scan (may still match arrays)
-                }
-                seg_matches = seg_matches.saturating_add(meta.doc_count);
+                seg_matches = seg_matches.saturating_add(add);
             }
             return Some(seg_matches);
         }
@@ -28640,7 +28741,11 @@ impl Index {
                             served_by_dv = true;
                         }
                     }
-                    None => {}
+                    // Presence is not a term dictionary. Leave `served_by_dv`
+                    // false so the caller abandons to the source scan (#362):
+                    // a `term` on text must agree with `_search`, which
+                    // compares the whole source value, not a bit.
+                    Some(xerj_storage::doc_values::Column::Presence(_)) | None => {}
                 }
             }
 
@@ -30184,6 +30289,17 @@ impl Index {
                         });
                     }
                     ScoredFilterLeaf::SourceExists { field } => {
+                        // A presence bitmap answers `exists` without parsing
+                        // stored JSON. Segments written before the bitmap
+                        // existed still fall through to the source slices.
+                        if let Some(xerj_storage::doc_values::Column::Presence(p)) =
+                            cols.get(field.as_str())
+                        {
+                            if p.doc_count == meta.doc_count as u32 {
+                                fev.push(FilterEval::Presence { col: p });
+                                continue;
+                            }
+                        }
                         // Cache-backed stored slices for this segment; the
                         // `?` bails the whole columnar path (brute answers).
                         let slices = self.stored_slices_for(meta.id.as_str(), meta.doc_count)?;
@@ -30818,6 +30934,15 @@ impl Index {
         Some((hits, total, from_applied))
     }
 
+    /// Stored sections this index currently holds decoded: the decompressed
+    /// byte cache, the per-doc slice cache, and the parsed-document cache.
+    /// A presence-backed `exists` leaves all three untouched.
+    pub fn stored_sections_cached(&self) -> usize {
+        self.decoded_stored_cache.len()
+            + self.stored_slices_cache.len()
+            + self.stored_value_cache.len()
+    }
+
     /// Cache-backed reader for a segment's parsed stored section.
     ///
     /// First call for a segment opens the segment, decodes the Stored
@@ -31173,7 +31298,7 @@ impl Index {
                 }
                 shadow_range_positions(shadow, slo, shi, slo_incl, shi_incl)
             }
-            None => return None,
+            Some(Column::Presence(_)) | None => return None,
         };
         let built: Arc<PrefilterSet> = Arc::new(PrefilterSet::from_vec(matching));
         if self.range_prefilter_cache.len() >= 32 {
@@ -31269,6 +31394,8 @@ impl Index {
                 }
                 Some(Arc::new(PrefilterSet::from_set(set)))
             }
+            // No ordinals to enumerate. A full scan stays correct.
+            Column::Presence(_) => None,
         }
     }
 
@@ -31915,6 +32042,7 @@ impl Index {
                     },
                 )
             }
+            Column::Presence(_) => None,
         }
     }
 
@@ -49690,6 +49818,7 @@ fn seg_term_positions(
             }
             Some(set)
         }
+        Column::Presence(_) => None,
     }
 }
 
@@ -49855,7 +49984,7 @@ fn build_sort_shadow(
             });
             Some(Arc::new(sorted))
         }
-        None => None,
+        Some(Column::Presence(_)) | None => None,
     }
 }
 
@@ -53221,9 +53350,16 @@ enum FilterEval<'a> {
     /// presence from the segment's cached stored slices, using the SAME
     /// `get_field_value` + `value_present` predicate as the brute scan.
     /// Owned `Resident` so the eval outlives the segment iteration.
+    /// Reached only when the segment has no presence bitmap.
     Source {
         field: String,
         slices: Resident<StoredSlices>,
+    },
+    /// `exists` answered from the segment's presence bitmap. No stored
+    /// bytes are decoded. `col.doc_count` was checked against the segment
+    /// length before this leaf was built.
+    Presence {
+        col: &'a xerj_storage::doc_values::PresenceColumn,
     },
 }
 impl FilterEval<'_> {
@@ -53272,6 +53408,7 @@ impl FilterEval<'_> {
                 let source = doc.get("_source").unwrap_or(&doc);
                 get_field_value(source, field).is_some_and(|v| value_present(&v))
             }
+            FilterEval::Presence { col } => col.contains(row),
         }
     }
 
@@ -53321,6 +53458,10 @@ impl FilterEval<'_> {
             FilterEval::Source { .. } => {
                 unreachable!("source-backed exists has no closed-form count")
             }
+            // Bitmap cardinality. Ghosts are excluded by the caller that
+            // walks rows; `constant_plan` still refuses SourceExists, so
+            // this arm is the exhaustive match, not the closed-form lane.
+            FilterEval::Presence { col } => col.count(),
         }
     }
 }
@@ -53536,21 +53677,14 @@ enum ScoredFilterLeaf {
         min_inc: bool,
         max_inc: bool,
     },
-    /// `exists` on a field with NO doc-values column (text /
-    /// semantic_text): per-row presence is only observable in the stored
-    /// source.  Evaluated from the segment's cached stored slices — the
-    /// SAME `get_field_value` + `value_present` predicate the brute scan
-    /// applies, so the hit set cannot drift — but only reached on rows
-    /// that already passed every cheaper conjunct in the same loop (each
-    /// row walk short-circuits in fev order), which is what turns
-    /// `bool.filter: [term, exists]` from a whole-index source scan into
-    /// a term-column walk plus a handful of source parses.  #1183's
-    /// finalize-verify query (`term: ax_file` + `exists: <semantic
-    /// field>`) measured took=9638ms / 0 hits on a 91k-doc segment
-    /// because `exists` in a bool forced the brute path; this leaf makes
-    /// it columnar.  Keyword/numeric `exists` does NOT come here — those
-    /// lower to the empty-prefix dictionary range / unbounded window
-    /// above and never touch the source.
+    /// `exists` on a field with no value column (text / semantic_text,
+    /// `doc_values: false`). A segment that carries a presence bitmap
+    /// answers from that bitmap. Older segments fall back to the cached
+    /// stored slices and the SAME `get_field_value` + `value_present`
+    /// predicate the brute scan applies. The leaf is only reached on rows
+    /// that already passed every cheaper conjunct in the same loop.
+    /// Keyword/numeric `exists` does NOT come here — those lower to the
+    /// empty-prefix dictionary range / unbounded window above.
     SourceExists { field: String },
 }
 

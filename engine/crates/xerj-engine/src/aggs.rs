@@ -383,6 +383,25 @@ pub(crate) fn note_fast_path_agg() {
     FAST_PATH_AGGS_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Documents cloned out of segment stored sections into the brute
+/// aggregation corpus. Memtable docs are not counted: that buffer is
+/// flush-bounded. A verify query that stays on the columnar path leaves
+/// this unchanged no matter how many documents the index holds.
+static CORPUS_DOCS_HYDRATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Segment documents copied into an owned aggregation corpus since process
+/// start. Read two of these around a search to see whether that search
+/// materialised stored documents.
+pub fn corpus_docs_hydrated() -> u64 {
+    CORPUS_DOCS_HYDRATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn note_corpus_hydration(n: u64) {
+    if n > 0 {
+        CORPUS_DOCS_HYDRATED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Per-call aggregation limits. Passed to [`run_aggs_with_limits`] by callers
 /// that need a limit other than the node-wide default (a per-request
 /// `search.max_buckets` override, or a test pinning the cap for one call).

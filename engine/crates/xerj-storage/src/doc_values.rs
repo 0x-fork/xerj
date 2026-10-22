@@ -8,7 +8,7 @@
 //!
 //! ## What we store
 //!
-//! Two column kinds:
+//! Three column kinds:
 //!
 //! 1. **`NumericColumn`** — a per-doc `Option<i64>` array.  The natural
 //!    home for `Long`, `Integer`, `Date`, and `Boolean` (as 0/1).
@@ -19,6 +19,11 @@
 //!    a sorted terms dictionary.  The dictionary is stored as an `fst::Map`
 //!    so lookups are O(log |terms|) and the cardinality footprint is
 //!    near-Lucene.
+//!
+//! 3. **`PresenceColumn`** — a roaring bitmap of rows whose source field
+//!    is present (non-null).  Written for fields that deliberately have no
+//!    value column (`text`, `semantic_text`: `doc_values: false`) so
+//!    `exists` can be answered without parsing stored JSON.
 //!
 //! Both columns track a `RoaringBitmap` of "doc has no value" so a missing
 //! field doesn't waste a slot.
@@ -42,8 +47,8 @@
 //!     u32   magic = 0x44_56_30_31  ("DV01")
 //!     u32   num_columns
 //!     for each column:
-//!         u8    kind (0 = numeric, 1 = keyword; 0x80 bit = zstd payload,
-//!                    clear = legacy LZ4 — see KIND_FLAG_ZSTD)
+//!         u8    kind (0 = numeric, 1 = keyword, 2 = presence; 0x80 bit =
+//!                    zstd payload, clear = legacy LZ4 — see KIND_FLAG_ZSTD)
 //!         u32   field_name_len
 //!         bytes field_name
 //!         u64   payload_len
@@ -87,6 +92,7 @@ use std::io::{Cursor, Read};
 const MAGIC: u32 = 0x44_56_30_31; // "DV01"
 const KIND_NUMERIC: u8 = 0;
 const KIND_KEYWORD: u8 = 1;
+const KIND_PRESENCE: u8 = 2;
 
 /// Per-doc numeric column.  `None` = no value for that doc.
 ///
@@ -847,11 +853,76 @@ impl KeywordColumn {
     }
 }
 
+/// Per-row presence of a field that has no value column.
+///
+/// `text` and `semantic_text` ship no doc-values *values* (`doc_values:
+/// false` — a value column would be a second copy of the source). `exists`
+/// only needs to know which rows have a non-null value. The bitmap is that
+/// answer: one bit per present row, not the field bytes. `present` holds
+/// row ids in `0..doc_count`. A row absent from the bitmap has no value
+/// (null, `[]`, and `[null]` are absent).
+#[derive(Debug, Clone)]
+pub struct PresenceColumn {
+    pub doc_count: u32,
+    /// Rows whose field is present.
+    pub present: RoaringBitmap,
+}
+
+impl PresenceColumn {
+    /// Empty bitmap. `doc_count` is filled in once the segment length is known.
+    pub fn empty() -> Self {
+        Self {
+            doc_count: 0,
+            present: RoaringBitmap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, row: u32) {
+        self.present.insert(row);
+    }
+
+    pub fn set_doc_count(&mut self, doc_count: u32) {
+        self.doc_count = doc_count;
+    }
+
+    pub fn contains(&self, row: u32) -> bool {
+        row < self.doc_count && self.present.contains(row)
+    }
+
+    pub fn count(&self) -> u64 {
+        self.present.len()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bitmap_buf = Vec::new();
+        self.present.serialize_into(&mut bitmap_buf).unwrap();
+        let mut out = Vec::with_capacity(8 + bitmap_buf.len());
+        out.write_u32::<LittleEndian>(self.doc_count).unwrap();
+        out.write_u32::<LittleEndian>(bitmap_buf.len() as u32)
+            .unwrap();
+        out.extend_from_slice(&bitmap_buf);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut cur = Cursor::new(bytes);
+        let doc_count = cur.read_u32::<LittleEndian>().map_err(io_to_storage)?;
+        let bitmap_len = cur.read_u32::<LittleEndian>().map_err(io_to_storage)? as usize;
+        let mut bitmap_bytes = vec![0u8; bitmap_len];
+        cur.read_exact(&mut bitmap_bytes).map_err(io_to_storage)?;
+        let present = RoaringBitmap::deserialize_from(&bitmap_bytes[..])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("dv presence bitmap: {e}")))?;
+        Ok(Self { doc_count, present })
+    }
+}
+
 /// One column of any kind.
 #[derive(Debug, Clone)]
 pub enum Column {
     Numeric(NumericColumn),
     Keyword(KeywordColumn),
+    /// Field presence only — no values. See [`PresenceColumn`].
+    Presence(PresenceColumn),
 }
 
 impl Column {
@@ -859,6 +930,7 @@ impl Column {
         match self {
             Column::Numeric(n) => n.doc_count,
             Column::Keyword(k) => k.doc_count,
+            Column::Presence(p) => p.doc_count,
         }
     }
 
@@ -882,6 +954,7 @@ impl Column {
                     .saturating_add(capacity_bytes::<u32>(column.per_ord_count.capacity()))
                     .saturating_add(roaring_retained_bytes(&column.null_bitmap))
             }
+            Column::Presence(column) => roaring_retained_bytes(&column.present),
         }
     }
 }
@@ -943,6 +1016,7 @@ pub fn encode_columns_at_level(columns: &BTreeMap<String, Column>, level: i32) -
         let kind = match col {
             Column::Numeric(_) => KIND_NUMERIC,
             Column::Keyword(_) => KIND_KEYWORD,
+            Column::Presence(_) => KIND_PRESENCE,
         };
         // `level` is DV_ZSTD_LEVEL (3) on flush — fast encode
         // (~250 MB/s/core), reverted from level 19 because the flush path
@@ -987,6 +1061,7 @@ pub fn encode_columns_at_level(columns: &BTreeMap<String, Column>, level: i32) -
                 }
             }
             Column::Keyword(k) => compress(&k.encode()),
+            Column::Presence(p) => compress(&p.encode()),
         };
         out.write_u8(kind | KIND_FLAG_ZSTD).unwrap();
         out.write_u32::<LittleEndian>(name.len() as u32).unwrap();
@@ -1029,15 +1104,17 @@ pub fn decode_columns(bytes: &[u8]) -> Result<BTreeMap<String, Column>> {
                 .map_err(|e| StorageError::Other(anyhow::anyhow!("dv lz4 decompress: {e}")))?
         };
         let column = match kind {
-            KIND_NUMERIC => Column::Numeric(NumericColumn::decode(&payload)?),
-            KIND_KEYWORD => Column::Keyword(KeywordColumn::decode(&payload)?),
-            _ => {
-                return Err(StorageError::Other(anyhow::anyhow!(
-                    "unknown doc-values kind {kind}"
-                )))
-            }
+            KIND_NUMERIC => Some(Column::Numeric(NumericColumn::decode(&payload)?)),
+            KIND_KEYWORD => Some(Column::Keyword(KeywordColumn::decode(&payload)?)),
+            KIND_PRESENCE => Some(Column::Presence(PresenceColumn::decode(&payload)?)),
+            // A kind this build does not know is skipped, not fatal: failing
+            // the whole sidecar would drop every keyword and numeric column
+            // beside it. The unknown field falls through to the source scan.
+            _ => None,
         };
-        out.insert(name, column);
+        if let Some(column) = column {
+            out.insert(name, column);
+        }
     }
     Ok(out)
 }
@@ -1391,5 +1468,58 @@ mod tests {
             + keyword_column.ords.capacity() * std::mem::size_of::<u32>()
             + keyword_column.per_ord_count.capacity() * std::mem::size_of::<u32>();
         assert!(keyword_estimate >= vector_floor as u64);
+    }
+
+    #[test]
+    fn presence_roundtrip_and_unknown_kind_keeps_sibling_columns() {
+        let mut present = RoaringBitmap::new();
+        present.insert(1);
+        present.insert(4);
+        let col = PresenceColumn {
+            doc_count: 6,
+            present,
+        };
+        assert!(col.contains(1));
+        assert!(!col.contains(0));
+        assert!(!col.contains(6));
+        let back = PresenceColumn::decode(&col.encode()).unwrap();
+        assert_eq!(back.doc_count, 6);
+        assert_eq!(back.count(), 2);
+        assert!(back.contains(4));
+
+        let mut cols = BTreeMap::new();
+        cols.insert("msg".to_string(), Column::Presence(col));
+        cols.insert(
+            "ax_file".to_string(),
+            Column::Keyword(KeywordColumn::from_iter(vec![Some("d".into()), None]).unwrap()),
+        );
+        let bytes = encode_columns(&cols);
+        let decoded = decode_columns(&bytes).unwrap();
+        let Column::Presence(p) = &decoded["msg"] else {
+            panic!("presence column missing");
+        };
+        assert!(p.contains(1) && !p.contains(2));
+        assert!(matches!(decoded.get("ax_file"), Some(Column::Keyword(_))));
+
+        // Kind 7 is not a column this build knows. Splice it in front of
+        // the frame just decoded and confirm the known columns survive.
+        let mut framed = Vec::new();
+        framed.write_u32::<LittleEndian>(0x44_56_30_31).unwrap();
+        framed.write_u32::<LittleEndian>(3).unwrap();
+        framed.write_u8(7 | 0x80).unwrap();
+        framed.write_u32::<LittleEndian>(3).unwrap();
+        framed.extend_from_slice(b"odd");
+        let payload = zstd::encode_all(&b"nope"[..], 1).unwrap();
+        framed
+            .write_u64::<LittleEndian>(payload.len() as u64)
+            .unwrap();
+        framed.extend_from_slice(&payload);
+        // `bytes` is magic + count + columns. Skip the 8-byte header and
+        // keep the two known columns.
+        framed.extend_from_slice(&bytes[8..]);
+        let decoded = decode_columns(&framed).unwrap();
+        assert!(!decoded.contains_key("odd"));
+        assert!(matches!(decoded.get("msg"), Some(Column::Presence(_))));
+        assert!(matches!(decoded.get("ax_file"), Some(Column::Keyword(_))));
     }
 }
