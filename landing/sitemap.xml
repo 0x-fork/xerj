@@ -2,15 +2,15 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://xerj.org/</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-22</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/agent-search/</loc>
-    <lastmod>2026-10-18</lastmod>
+    <lastmod>2026-10-22</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/aise-demo</loc>
-    <lastmod>2026-08-23</lastmod>
+    <lastmod>2026-10-20</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/</loc>
@@ -426,19 +426,19 @@
   </url>
   <url>
     <loc>https://xerj.org/compare/best-grep-alternative-for-ai-coding-agents-2026</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-19</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/best-lightweight-elasticsearch-compatible-server-2026</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-19</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/best-local-full-text-search-jsonl-csv-2026</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-19</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/best-mcp-server-local-code-search-2026</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-19</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-ast-grep</loc>
@@ -506,7 +506,7 @@
   </url>
   <url>
     <loc>https://xerj.org/demo/</loc>
-    <lastmod>2026-10-17</lastmod>
+    <lastmod>2026-10-20</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/</loc>
@@ -518,7 +518,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/agents/endpoints</loc>
-    <lastmod>2026-09-08</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/agents/quickstart</loc>
@@ -546,7 +546,7 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/cli</loc>
-    <lastmod>2026-09-08</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/clustering</loc>
@@ -562,11 +562,11 @@
   </url>
   <url>
     <loc>https://xerj.org/docs/corpus-hub</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/env</loc>
-    <lastmod>2026-09-18</lastmod>
+    <lastmod>2026-10-17</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/ingest</loc>
@@ -694,7 +694,7 @@
   </url>
   <url>
     <loc>https://xerj.org/for-agents</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-22</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/industries/</loc>
