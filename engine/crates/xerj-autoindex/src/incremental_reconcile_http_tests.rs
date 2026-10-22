@@ -1877,6 +1877,143 @@ fn code_file_reindex_does_not_abort_on_absent_symbols_field() {
     );
 }
 
+/// #2139: re-indexing a changed code file must drop documents for symbols that
+/// no longer exist, including when a declaration moves to a new line.
+///
+/// Per-symbol `_id`s are `code:<line>:<name>` (#500). A signature edit that
+/// also shifts the declaration does not overwrite the old symbol document, so
+/// the file-level delete on `ax_file` is what has to remove it. The sibling
+/// code reindex above changes a field type without moving the declaration, so
+/// the same locator is overwritten and a missed delete still looks clean.
+///
+/// `--no-graph` (this module). The graph-enabled twin lives in
+/// `failure_resume_http_tests`.
+#[test]
+fn changed_code_file_reindex_drops_shifted_and_removed_symbols() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let source = corpus.path().join("jobs.rs");
+    fs::write(&source, CODE_V1).unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let first = endpoint.data_docs();
+    assert!(
+        symbol_rows(&first).iter().any(|(name, _, code)| {
+            name == "query_job" && code.contains("group_id") && !code.contains("&self")
+        }),
+        "genesis must index the original query_job symbol: {}",
+        serde_json::to_string(&symbol_rows(&first)).unwrap()
+    );
+    assert!(
+        symbol_rows(&first)
+            .iter()
+            .any(|(name, _, _)| name == "gone_symbol"),
+        "genesis must index gone_symbol: {}",
+        serde_json::to_string(&symbol_rows(&first)).unwrap()
+    );
+
+    fs::write(&source, CODE_V2).unwrap();
+    assert_eq!(
+        run_index(config).unwrap(),
+        0,
+        "an ordinary incremental reindex of an edited code file must succeed"
+    );
+    let live = endpoint.data_docs();
+    assert_code_matches_fresh(&live, "no-graph incremental reindex");
+}
+
+/// A from-scratch index of [`CODE_V2`], the oracle for #2139: the edited file's
+/// live documents must match this, not a superset that still holds v1 symbols.
+fn fresh_code_v2_docs() -> Vec<Value> {
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("jobs.rs"), CODE_V2).unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(config).unwrap(), 0);
+    endpoint.data_docs()
+}
+
+fn assert_code_matches_fresh(live: &[Value], label: &str) {
+    let rendered = serde_json::to_string(live).unwrap();
+    assert!(
+        !rendered.contains("gone_symbol"),
+        "{label}: removed symbol gone_symbol is still indexed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("pub fn query_job(group_id"),
+        "{label}: the pre-edit query_job signature is still indexed: {rendered}"
+    );
+    assert!(
+        rendered.contains("pub fn query_job(&self"),
+        "{label}: the current query_job signature is missing: {rendered}"
+    );
+    let fresh = fresh_code_v2_docs();
+    assert_eq!(
+        symbol_rows(live),
+        symbol_rows(&fresh),
+        "{label}: symbol documents (name, line, code) must match a fresh index of the edited file"
+    );
+    assert_eq!(
+        live.len(),
+        fresh.len(),
+        "{label}: document count must match a fresh index of the edited file\n\
+         live={rendered}\nfresh={}",
+        serde_json::to_string(&fresh).unwrap()
+    );
+}
+
+/// `(name, line, code)` of per-symbol documents, in a stable order.
+fn symbol_rows(docs: &[Value]) -> Vec<(String, u64, String)> {
+    let mut rows: Vec<(String, u64, String)> = docs
+        .iter()
+        .filter(|doc| doc.get("defs").is_none())
+        .filter_map(|doc| {
+            Some((
+                doc.get("name")?.as_str()?.to_string(),
+                doc.get("line")?.as_u64()?,
+                doc.get("code")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// v1: `gone_symbol` plus a two-argument `query_job`.
+const CODE_V1: &str = "\
+struct Jobs;\n\
+\n\
+impl Jobs {\n\
+    pub fn gone_symbol() -> i32 {\n\
+        1\n\
+    }\n\
+\n\
+    pub fn query_job(group_id: &str, raw: &str) -> bool {\n\
+        !raw.is_empty()\n\
+    }\n\
+}\n\
+";
+
+/// v2: `gone_symbol` removed, `query_job` gains `&self` and moves down.
+const CODE_V2: &str = "\
+struct Jobs;\n\
+\n\
+impl Jobs {\n\
+    // the signature gained &self and the declaration moved down\n\
+\n\
+\n\
+    pub fn query_job(&self, group_id: &str, raw: &str) -> bool {\n\
+        !raw.is_empty()\n\
+    }\n\
+}\n\
+";
+
 #[test]
 fn pending_generation_replays_sealed_source_after_live_source_mutates() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());

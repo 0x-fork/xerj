@@ -4756,6 +4756,92 @@ fn build_mapping(specs: &[infer::FieldSpec]) -> Value {
 
 // ─── the main run ────────────────────────────────────────────────────────
 
+/// One file's documents as the previous plan published them.
+///
+/// Kept across `--fresh`, which deletes the journal (and this plan) before
+/// phase B. The new run's content key no longer matches `file_key`, so a
+/// delete keyed only on the key about to be written leaves these documents
+/// live (#2139).
+#[derive(Clone)]
+struct PriorPublication {
+    rel: String,
+    file_key: String,
+    indices: Vec<String>,
+}
+
+fn prior_publications(
+    plan: &Plan,
+) -> (
+    HashMap<String, PriorPublication>,
+    HashMap<String, PriorPublication>,
+) {
+    let index_of: HashMap<&str, &str> = plan
+        .datasets
+        .iter()
+        .map(|dataset| (dataset.slug.as_str(), dataset.index.as_str()))
+        .collect();
+    let mut by_rel = HashMap::new();
+    let mut by_path_id = HashMap::new();
+    for (key, assignment) in &plan.files {
+        let mut indices: Vec<String> = assignment
+            .assignments
+            .iter()
+            .filter_map(|(_, slug)| {
+                index_of
+                    .get(slug.as_str())
+                    .map(|index| (*index).to_string())
+            })
+            .collect();
+        indices.sort();
+        indices.dedup();
+        let published = PriorPublication {
+            rel: assignment.rel.clone(),
+            file_key: key.clone(),
+            indices,
+        };
+        by_rel.insert(assignment.rel.clone(), published.clone());
+        if !assignment.path_id.is_empty() {
+            by_path_id.insert(assignment.path_id.clone(), published);
+        }
+    }
+    (by_rel, by_path_id)
+}
+
+/// Selector for every document a file replacement must remove (#2139).
+///
+/// `ax_file` is the content key this run writes. An ordinary resume keeps the
+/// planned key, so that term removes the previous generation. It does not
+/// remove a generation published under a different key: `--fresh` rebuilds
+/// the key from the new digest, and a later resume only knows the latest
+/// one. Per-symbol ids are `code:<line>:<name>`, so those older documents are
+/// not overwritten when the declaration moves. `ax_path` is the same path
+/// across those keys. `prior` adds the previous key and path when a rename
+/// or a key change means the current pair does not name them.
+fn replacement_purge_query(
+    current_key: &str,
+    current_rel: &str,
+    prior: Option<&PriorPublication>,
+) -> Value {
+    let mut should = vec![
+        json!({"term": {"ax_file": current_key}}),
+        json!({"term": {"ax_path": current_rel}}),
+    ];
+    if let Some(prior) = prior {
+        if prior.file_key != current_key {
+            should.push(json!({"term": {"ax_file": prior.file_key}}));
+        }
+        if prior.rel != current_rel {
+            should.push(json!({"term": {"ax_path": prior.rel}}));
+        }
+    }
+    json!({
+        "bool": {
+            "should": should,
+            "minimum_should_match": 1
+        }
+    })
+}
+
 /// Files phase B still has work for: planned, with a real content key, and
 /// either never finished or finished against different bytes.
 ///
@@ -7709,6 +7795,13 @@ fn run_index_report_inner(
         Some(prior) if graph_edges_index(&cfg).is_some() => plan_anchor_nodes(prior),
         _ => Vec::new(),
     };
+    // Same moment as the anchor snapshot: `--fresh` drops the plan inside
+    // `open_after_preflight`, and phase B needs the previous key to notice
+    // that the documents it is about to supersede are not under the new one.
+    let (prior_by_rel, prior_by_path_id) = match preflight.plan.as_ref() {
+        Some(prior) => prior_publications(prior),
+        None => (HashMap::new(), HashMap::new()),
+    };
     let mut journal = state::Journal::open_after_preflight(
         preflight,
         &root_str,
@@ -8555,6 +8648,26 @@ fn run_index_report_inner(
         // genuinely fresh and skip the delete round trip.
         cleanup_required.extend(todo.iter().map(|&i| keys[i].clone()));
     }
+    // #2139: `--fresh` rebuilds every content key and wipes `journal.done`
+    // first, so the set above is empty. The file is then republished under
+    // the new key and the previous key's symbol documents stay live. A later
+    // ordinary resume only deletes the latest key, which is how one function
+    // ends up indexed at several line numbers. Schedule a purge for every
+    // path whose published key just changed. Unchanged keys are not scheduled:
+    // their ids already overwrite, and a delete per unchanged file is the
+    // refresh cost #1224 removed.
+    let mut superseded: HashMap<String, PriorPublication> = HashMap::new();
+    for (i, file) in files.iter().enumerate() {
+        let prior = prior_by_path_id
+            .get(&file.rel_id)
+            .or_else(|| prior_by_rel.get(&file.rel));
+        if let Some(prior) = prior {
+            if prior.file_key != keys[i] {
+                cleanup_required.insert(keys[i].clone());
+                superseded.insert(file.rel.clone(), prior.clone());
+            }
+        }
+    }
     let todo_set: std::collections::HashSet<usize> = todo.iter().copied().collect();
     for (index, spool) in pdf_spools.iter_mut().enumerate() {
         if spool.is_none() {
@@ -9327,17 +9440,25 @@ fn run_index_report_inner(
             // full-content verification. Delete-before-replace makes
             // a retry clean up any partial prior attempt.
             if send_err.is_none() && cleanup_required.contains(key) {
-                let mut indices: Vec<&str> = fa
+                let prior = superseded.get(&f.rel);
+                let mut indices: Vec<String> = fa
                     .assignments
                     .iter()
-                    .filter_map(|(_, slug)| ds_rt.get(slug).map(|rt| rt.index.as_str()))
+                    .filter_map(|(_, slug)| ds_rt.get(slug).map(|rt| rt.index.clone()))
                     .collect();
-                indices.sort_unstable();
+                if let Some(prior) = prior {
+                    indices.extend(prior.indices.iter().cloned());
+                }
+                indices.sort();
                 indices.dedup();
-                for index in indices {
-                    if let Err(error) =
-                        es.delete_by_query(index, &json!({"term": {"ax_file": key}}))
-                    {
+                // One query: the key this run writes, and the path. The path
+                // term is what removes a previous generation whose key this
+                // run no longer uses (#2139). `prior` adds that generation's
+                // own key and path when either differs (a `--fresh` key
+                // change, or a rename).
+                let query = replacement_purge_query(key, &f.rel, prior);
+                for index in &indices {
+                    if let Err(error) = es.delete_by_query(index, &query) {
                         send_err = Some(format!(
                             "remove prior records for {} before replacement: {error:#}",
                             f.rel

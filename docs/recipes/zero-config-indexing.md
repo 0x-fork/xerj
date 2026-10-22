@@ -229,12 +229,14 @@ live indices at http://localhost:9280:
   autoindex-catalog                                 9 docs
 ```
 
-`--fresh` ignores the resume journal and restarts (ids stay idempotent), which on a
-graph-enabled or pre-generation state directory is how a rerun picks up files added
-since the last one. It never removes stale records from the destination, and it is
-refused once the state directory holds a durable corpus generation — re-run without it
-and the generated `--no-graph` path reconciles additions, changes, deletions, renames
-and no-op reruns incrementally.
+`--fresh` ignores the resume journal and restarts (ids stay idempotent for unchanged
+bytes), which on a graph-enabled or pre-generation state directory is how a rerun picks
+up files added since the last one. A file that is still present and whose content key
+changed is republished, and the documents previously published for that path are
+removed. It does not remove documents for a file that disappeared, and it is refused
+once the state directory holds a durable corpus generation — re-run without it and the
+generated `--no-graph` path reconciles additions, changes, deletions, renames and no-op
+reruns incrementally.
 
 On a graph-enabled or pre-generation journal, a rerun that resumes an existing plan
 indexes changed files and reports added ones as skipped. Deleting a file is refused

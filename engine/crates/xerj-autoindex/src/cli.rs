@@ -273,9 +273,10 @@ pub const MAX_POLL_INTERVAL_SECS: u64 = 86_400;
 
 const FRESH_HELP: &str =
     "ignore an existing resume journal and restart, rebuild the plan in place\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(ids stay idempotent); it never resets destination records,\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20and is refused on a durable corpus generation — see\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20RESUME POLICY";
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(ids stay idempotent for unchanged bytes). A file republished\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20under a new content key drops the documents previously published for that path.\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20It does not remove documents for a file that disappeared, and is refused on a\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20durable corpus generation — see RESUME POLICY";
 const RESUME_POLICY_HELP: &str =
     "generated --no-graph journals reconcile add, change, delete, rename, and no-op runs; \
 a --no-graph state directory written before the generation format must be rebuilt into a new \
@@ -674,11 +675,14 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20Restore the file and rerun, or rebuild — in place by deleting the published\n\
          \x20\x20\x20\x20indices and the state directory, or isolated under a new --state-dir, --prefix\n\
          \x20\x20\x20\x20and --brain (or --no-graph), validated before you switch readers.\n\
-         \x20\x20\x20\x20--fresh is not cleanup and is not destination reconciliation: it never removes\n\
-         \x20\x20\x20\x20stale records from the destination, and it is refused outright once a durable\n\
-         \x20\x20\x20\x20corpus generation exists (re-run without it — the generated path reconciles the\n\
-         \x20\x20\x20\x20change incrementally). For an independent rebuild use a new --state-dir and a\n\
-         \x20\x20\x20\x20new --prefix, plus a new --brain when graph is enabled (or --no-graph).\n\
+         \x20\x20\x20\x20--fresh is not a destination wipe. A file that is still present and whose\n\
+         \x20\x20\x20\x20content key changed is republished, and the documents previously published\n\
+         \x20\x20\x20\x20for that path are removed. A disappeared file is still refused before any\n\
+         \x20\x20\x20\x20remote mutation, and its documents stay. --fresh is refused outright once a\n\
+         \x20\x20\x20\x20durable corpus generation exists (re-run without it — the generated path\n\
+         \x20\x20\x20\x20reconciles the change incrementally). For an independent rebuild use a new\n\
+         \x20\x20\x20\x20--state-dir and a new --prefix, plus a new --brain when graph is enabled\n\
+         \x20\x20\x20\x20(or --no-graph).\n\
          \x20\x20\x20\x20Validate before switching readers; explicitly clean the shared\n\
          \x20\x20\x20\x20autoindex-catalog and old target only after validation.\n\
          \n\
@@ -2750,7 +2754,8 @@ mod tests {
         let help = super::FRESH_HELP;
         assert!(help.contains("ignore an existing resume journal and restart"));
         assert!(help.contains("durable corpus generation"));
-        assert!(help.contains("never resets destination records"));
+        assert!(help.contains("drops the documents previously published for that path"));
+        assert!(help.contains("does not remove documents for a file that disappeared"));
     }
 
     #[test]

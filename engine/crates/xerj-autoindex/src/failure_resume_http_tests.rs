@@ -385,10 +385,34 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
         (200, bulk_response(&body, state))
     } else if method == "POST" && path.contains("/_delete_by_query") {
         let query: Value = serde_json::from_slice(&body).unwrap();
-        let ax_file = query
-            .pointer("/query/term/ax_file")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        // A replacement purge is a `bool.should` of `ax_file` and `ax_path`
+        // (#2139). A lone `term` is the older shape, still sent by sweeps.
+        // Either term matching is enough: the path term is what drops a
+        // generation published under a different content key.
+        let mut file_terms: Vec<(String, String)> = Vec::new();
+        for field in ["ax_file", "ax_path"] {
+            if let Some(value) = query
+                .pointer(&format!("/query/term/{field}"))
+                .and_then(Value::as_str)
+            {
+                file_terms.push((field.to_string(), value.to_string()));
+            }
+        }
+        if let Some(should) = query
+            .pointer("/query/bool/should")
+            .and_then(Value::as_array)
+        {
+            for clause in should {
+                for field in ["ax_file", "ax_path"] {
+                    if let Some(value) = clause
+                        .pointer(&format!("/term/{field}"))
+                        .and_then(Value::as_str)
+                    {
+                        file_terms.push((field.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
         let file_key = query
             .pointer("/query/term/file_key")
             .and_then(Value::as_str)
@@ -409,10 +433,12 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
             .unwrap_or_default();
         let mut locked = state.lock().unwrap();
         locked.delete_calls += 1;
-        if let Some(key) = ax_file {
-            locked
-                .docs
-                .retain(|_, doc| doc.get("ax_file").and_then(Value::as_str) != Some(key.as_str()));
+        if !file_terms.is_empty() {
+            locked.docs.retain(|_, doc| {
+                !file_terms.iter().any(|(field, expected)| {
+                    doc.get(field).and_then(Value::as_str) == Some(expected.as_str())
+                })
+            });
         }
         if let Some(key) = file_key {
             locked
@@ -1548,28 +1574,24 @@ fn fresh_absorbs_an_edited_file_instead_of_calling_it_a_removal() {
         "the new content is live: {:?}",
         locked.docs
     );
-    // Documented, and NOT what this gate is for: `--fresh` rebuilds the plan,
-    // it does not reconcile the destination. Document ids derive from the
-    // content key (`ids::doc_id`), so the pre-edit record stays live beside
-    // the new one — the same outcome `--fresh` has always had. An ordinary
-    // rerun is the clean route for an edit: it keeps the planned key and runs
-    // a delete-before-replace transaction on it. What must never happen is
-    // this run being REFUSED by a message claiming a file that is sitting in
-    // the folder has vanished.
+    // What must never happen is this run being REFUSED by a message claiming a
+    // file that is sitting in the folder has vanished. The previous content
+    // key is not the one `--fresh` writes, so the purge is by path (#2139):
+    // the pre-edit row must not stay live beside the new one.
     assert!(
         locked
             .docs
             .values()
-            .any(|doc| doc["value"].as_str() == Some("before")),
-        "known --fresh gap: superseded records are not deleted: {:?}",
+            .all(|doc| doc["value"].as_str() != Some("before")),
+        "--fresh must drop the pre-edit row: {:?}",
         locked.docs
     );
 }
 
-/// The clean route for the same edit: an ordinary rerun keeps the planned key
-/// and replaces its records, so nothing is stranded. This is the contrast that
-/// makes the `--fresh` gap above a documented trade-off rather than a silent
-/// one.
+/// An ordinary rerun keeps the planned key and replaces its records, so
+/// nothing is stranded. `--fresh` of the same edit now purges by path as well
+/// ([`fresh_absorbs_an_edited_file_instead_of_calling_it_a_removal`]); this
+/// test is the path that does not need a new key to get there.
 #[test]
 fn an_ordinary_rerun_replaces_an_edited_file_without_stranding_records() {
     let _guard = FAILPOINT_TEST_LOCK
@@ -1595,6 +1617,211 @@ fn an_ordinary_rerun_replaces_an_edited_file_without_stranding_records() {
         .collect();
     assert_eq!(values, ["after"], "the superseded record is replaced");
 }
+
+/// #2139: graph resume must drop symbol documents whose declaration moved or
+/// disappeared. CSV row locators (`r0`) stay put when a cell changes, so
+/// [`an_ordinary_rerun_replaces_an_edited_file_without_stranding_records`]
+/// still passes when the file-level `ax_file` delete is a no-op. Per-symbol
+/// ids are `code:<line>:<name>` and do not.
+#[test]
+fn graph_resume_drops_shifted_and_removed_symbols() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("jobs.rs"), GRAPH_CODE_V1).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    {
+        let locked = endpoint.state.lock().unwrap();
+        let rows = graph_symbol_rows(&locked);
+        assert!(
+            rows.iter().any(|(name, _, code)| {
+                name == "query_job" && code.contains("group_id") && !code.contains("&self")
+            }),
+            "genesis must index the original query_job symbol: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(name, _, _)| name == "gone_symbol"),
+            "genesis must index gone_symbol: {rows:?}"
+        );
+    }
+
+    // A previous generation under a different content key (what `--fresh`, or
+    // an earlier key change, leaves behind). Ordinary resume keeps the planned
+    // key and used to delete only that key, so this document survived.
+    endpoint.state.lock().unwrap().docs.insert(
+        "stale-generation".to_string(),
+        json!({
+            "ax_path": "jobs.rs",
+            "ax_file": "stale-generation-key",
+            "ax_locator": "code:1:query_job",
+            "name": "query_job",
+            "line": 1,
+            "code": "pub fn query_job(group_id: &str, raw: &str) -> bool"
+        }),
+    );
+
+    fs::write(corpus.path().join("jobs.rs"), GRAPH_CODE_V2).unwrap();
+    assert_eq!(
+        run_index(config).unwrap(),
+        0,
+        "graph resume of an edited code file must succeed"
+    );
+    let locked = endpoint.state.lock().unwrap();
+    let live = graph_symbol_rows(&locked);
+    let rendered = serde_json::to_string(&locked.docs).unwrap();
+    assert!(
+        !rendered.contains("gone_symbol"),
+        "removed symbol gone_symbol is still indexed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("pub fn query_job(group_id"),
+        "the pre-edit query_job signature is still indexed: {rendered}"
+    );
+    assert!(
+        rendered.contains("pub fn query_job(&self"),
+        "the current query_job signature is missing: {rendered}"
+    );
+    drop(locked);
+
+    let fresh_corpus = tempfile::tempdir().unwrap();
+    let fresh_state = tempfile::tempdir().unwrap();
+    fs::write(fresh_corpus.path().join("jobs.rs"), GRAPH_CODE_V2).unwrap();
+    let fresh = MockEndpoint::start(usize::MAX);
+    let fresh_config = cfg(fresh_corpus.path(), fresh_state.path(), &fresh.url);
+    assert_eq!(run_index(fresh_config).unwrap(), 0);
+    let fresh_locked = fresh.state.lock().unwrap();
+    let fresh_rows = graph_symbol_rows(&fresh_locked);
+    assert_eq!(
+        live, fresh_rows,
+        "symbol documents (name, line, code) must match a fresh graph index of the edited file"
+    );
+    let live_docs = endpoint.state.lock().unwrap().docs.len();
+    assert_eq!(
+        live_docs,
+        fresh_locked.docs.len(),
+        "document count must match a fresh graph index of the edited file\n\
+         live={}\nfresh={}",
+        serde_json::to_string(&endpoint.state.lock().unwrap().docs).unwrap(),
+        serde_json::to_string(&fresh_locked.docs).unwrap()
+    );
+}
+
+/// #2139: `--fresh` gives the edited file a new content key and used to skip
+/// the delete, so the previous symbol documents stayed searchable. A second
+/// edit then resumes on that new key and must not bring the first generation
+/// back either.
+#[test]
+fn fresh_then_resume_drops_every_previous_symbol_generation() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("jobs.rs"), GRAPH_CODE_V1).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+
+    fs::write(corpus.path().join("jobs.rs"), GRAPH_CODE_V2).unwrap();
+    config.fresh = true;
+    assert_eq!(run_index(config.clone()).unwrap(), 0, "--fresh of an edit");
+    {
+        let rendered = serde_json::to_string(&endpoint.state.lock().unwrap().docs).unwrap();
+        assert!(
+            !rendered.contains("gone_symbol"),
+            "--fresh left the removed symbol: {rendered}"
+        );
+        assert!(
+            !rendered.contains("pub fn query_job(group_id"),
+            "--fresh left the pre-edit signature: {rendered}"
+        );
+        assert!(
+            rendered.contains("pub fn query_job(&self"),
+            "--fresh did not index the current signature: {rendered}"
+        );
+    }
+
+    fs::write(corpus.path().join("jobs.rs"), GRAPH_CODE_V3).unwrap();
+    config.fresh = false;
+    assert_eq!(run_index(config).unwrap(), 0, "resume after --fresh");
+    let rendered = serde_json::to_string(&endpoint.state.lock().unwrap().docs).unwrap();
+    assert!(
+        !rendered.contains("gone_symbol")
+            && !rendered.contains("pub fn query_job(group_id")
+            && !rendered.contains("pub fn query_job(&self, group_id"),
+        "a later resume must not keep either previous generation: {rendered}"
+    );
+    assert!(
+        rendered.contains("pub fn query_job(&self, id: u64)"),
+        "the third signature is missing: {rendered}"
+    );
+}
+
+fn graph_symbol_rows(state: &MockState) -> Vec<(String, u64, String)> {
+    let mut rows: Vec<(String, u64, String)> = state
+        .docs
+        .values()
+        .filter(|doc| doc.get("defs").is_none() && doc["ax_locator"].as_str() != Some("file"))
+        .filter_map(|doc| {
+            Some((
+                doc.get("name")?.as_str()?.to_string(),
+                doc.get("line")?.as_u64()?,
+                doc.get("code")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+const GRAPH_CODE_V1: &str = "\
+struct Jobs;\n\
+\n\
+impl Jobs {\n\
+    pub fn gone_symbol() -> i32 {\n\
+        1\n\
+    }\n\
+\n\
+    pub fn query_job(group_id: &str, raw: &str) -> bool {\n\
+        !raw.is_empty()\n\
+    }\n\
+}\n\
+";
+
+const GRAPH_CODE_V2: &str = "\
+struct Jobs;\n\
+\n\
+impl Jobs {\n\
+    // the signature gained &self and the declaration moved down\n\
+\n\
+\n\
+    pub fn query_job(&self, group_id: &str, raw: &str) -> bool {\n\
+        !raw.is_empty()\n\
+    }\n\
+}\n\
+";
+
+/// Not a substring of [`GRAPH_CODE_V2`], so a search of the indexed text can
+/// tell the third generation from the second.
+const GRAPH_CODE_V3: &str = "\
+struct Jobs;\n\
+\n\
+impl Jobs {\n\
+    pub fn query_job(&self, id: u64) -> bool {\n\
+        id > 0\n\
+    }\n\
+}\n\
+";
 
 /// The composite workflow the run's own stderr recommends: index, then add one
 /// file and edit another, rerun (added file reported and skipped by the frozen

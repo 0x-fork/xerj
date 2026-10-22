@@ -163,15 +163,43 @@ fn handle(stream: TcpStream, docs: &Arc<Mutex<Docs>>) {
     if method == "POST" && path.contains("/_delete_by_query") {
         let index = path.trim_start_matches('/').split('/').next().unwrap_or("");
         let query: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let key = query
-            .pointer("/query/term/ax_file")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        // A replacement purge is a `bool.should` of `ax_file` and `ax_path`
+        // (#2139). A lone `term` is the older shape, still sent by sweeps.
+        // Either matching term is enough: the path term drops a generation
+        // published under a different content key.
+        let mut terms: Vec<(String, String)> = Vec::new();
+        for field in ["ax_file", "ax_path"] {
+            if let Some(value) = query
+                .pointer(&format!("/query/term/{field}"))
+                .and_then(Value::as_str)
+            {
+                terms.push((field.to_string(), value.to_string()));
+            }
+            if let Some(should) = query
+                .pointer("/query/bool/should")
+                .and_then(Value::as_array)
+            {
+                for clause in should {
+                    if let Some(value) = clause
+                        .pointer(&format!("/term/{field}"))
+                        .and_then(Value::as_str)
+                    {
+                        terms.push((field.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
         let mut deleted = 0u64;
-        if let (Some(key), Some(store)) = (key, docs.lock().unwrap().get_mut(index)) {
-            let before = store.len();
-            store.retain(|_, d| d.get("ax_file").and_then(Value::as_str) != Some(key.as_str()));
-            deleted = (before - store.len()) as u64;
+        if let Some(store) = docs.lock().unwrap().get_mut(index) {
+            if !terms.is_empty() {
+                let before = store.len();
+                store.retain(|_, doc| {
+                    !terms.iter().any(|(field, expected)| {
+                        doc.get(field).and_then(Value::as_str) == Some(expected.as_str())
+                    })
+                });
+                deleted = (before - store.len()) as u64;
+            }
         }
         return respond(stream, 200, &json!({"deleted": deleted, "failures": []}));
     }

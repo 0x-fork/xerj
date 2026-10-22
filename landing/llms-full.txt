@@ -462,12 +462,15 @@ after any --no-graph/--approve fast run over code,
   POST /<prefix>-*/_count  {"query":{"exists":{"field":"language"}}}
 must be > 0 for a tree that contains source. If it is 0, re-run without --no-graph.
 
---fresh ignores the resume journal and restarts (ids stay idempotent); on a
-graph-enabled or pre-generation state directory that is how you pick up files
-added since the last run. It never removes stale destination records, and it is
-refused once the state directory holds a durable corpus generation — re-run
-without it and the generated --no-graph path reconciles additions, changes,
-deletions, renames and no-op reruns incrementally.
+--fresh ignores the resume journal and restarts (ids stay idempotent for
+unchanged bytes); on a graph-enabled or pre-generation state directory that is
+how you pick up files added since the last run. A file that is still present
+and whose content key changed is republished, and the documents previously
+published for that path are removed. It does not remove documents for a file
+that disappeared, and it is refused once the state directory holds a durable
+corpus generation — re-run without it and the generated --no-graph path
+reconciles additions, changes, deletions, renames and no-op reruns
+incrementally.
 
 On a graph-enabled or pre-generation journal, a rerun that resumes an existing
 plan indexes changed files and reports added ones as skipped. Deleting an
