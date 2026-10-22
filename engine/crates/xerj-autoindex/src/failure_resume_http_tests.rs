@@ -816,6 +816,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         approve: None,
         max_index_bytes: None,
         budget_plan: None,
+        drop_indexed: false,
         dry_run: false,
         walk_only: false,
         json: false,

@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` no longer deletes an existing index when a later run uses
+  a reduced disk-budget plan (`--plan code-and-docs`, or `--yes` when the
+  default plan does not fit). The plan's keep-set was applied to the walk
+  before reconcile, so files the plan left out looked removed: the
+  `--no-graph` generation emitted `Delete` for their groups, and the graph
+  path swept them as exclusions. A re-run that would drop already-indexed
+  files now exits 4 and lists those files and the datasets that would be
+  left empty. `--drop-indexed` is the confirmation that deletes them.
+  `--plan` and `--yes` choose what to index; they do not agree to the
+  deletion.
+
 - A bare hub question that names a language or a technology
   (`xerj "how do I use async let in Swift"`, `xerj "Swift Result type map"`)
   routes from the catalogue entry — slug, topics, a language word in the

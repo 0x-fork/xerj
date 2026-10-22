@@ -3523,6 +3523,7 @@ mod phase_a_grouping_tests {
             approve: None,
             max_index_bytes: None,
             budget_plan: None,
+            drop_indexed: false,
             dry_run: true,
             walk_only: false,
             json: false,
@@ -6417,6 +6418,9 @@ fn legacy_rebuild_argv(cfg: &IndexCfg, state_dir: &Path, prefix: &str) -> Vec<St
         argv.push("--plan".to_owned());
         argv.push(plan.clone());
     }
+    if cfg.drop_indexed {
+        argv.push("--drop-indexed".to_owned());
+    }
     if cfg.follow_symlinks {
         argv.push("--follow-symlinks".to_owned());
     }
@@ -7081,9 +7085,59 @@ fn run_index_report_inner(
                 keep,
                 no_semantic,
                 note,
+                plan_name,
             } => {
                 if no_semantic {
                     cfg.no_semantic = true;
+                }
+                // A reduced plan filters the walk before hashing and before
+                // either reconcile. Files it leaves out are then absent from
+                // the inventory: the `--no-graph` generation emits Delete for
+                // their groups, and the graph path classifies them as
+                // exclusions and sweeps their documents. Both are silent
+                // deletions of data that is still in the folder. Stop and
+                // list them unless `--drop-indexed` is the explicit yes.
+                // `--plan` and `--yes` choose what to index; they do not
+                // agree to delete what is already indexed.
+                if let Some(keep_rels) = keep.as_ref() {
+                    let mut plans: Vec<&Plan> = Vec::new();
+                    if let Some(manifest) = preflight.committed_manifest.as_ref() {
+                        plans.push(&manifest.plan);
+                    }
+                    if let Some(plan) = preflight.plan.as_ref() {
+                        plans.push(plan);
+                    }
+                    let name = plan_name.as_deref().unwrap_or("reduced");
+                    if let Some(body) =
+                        budget::removal_decision(name, &plans, &discovered_files, keep_rels)
+                    {
+                        if !cfg.drop_indexed {
+                            println!("{}", serde_json::to_string(&body)?);
+                            pr.note(&format!(
+                                "autoindex: {}",
+                                body["accept"]
+                                    .as_str()
+                                    .unwrap_or("a reduced plan would delete already-indexed files")
+                            ));
+                            pr.finish(false, gate::EXIT_NEEDS_DECISION, "needs-decision", &[]);
+                            return Ok((gate::EXIT_NEEDS_DECISION, None));
+                        }
+                        pr.note(&format!(
+                            "autoindex: --drop-indexed: removing {} already-indexed file(s) this \
+                             plan leaves out",
+                            body["would_remove_total"].as_u64().unwrap_or(0)
+                        ));
+                    } else if cfg.drop_indexed {
+                        pr.note(
+                            "autoindex: --drop-indexed: this plan leaves out no already-indexed \
+                             file",
+                        );
+                    }
+                } else if cfg.drop_indexed {
+                    pr.note(
+                        "autoindex: --drop-indexed confirms removal of files a reduced plan \
+                         leaves out, and this run keeps every walked file",
+                    );
                 }
                 if let Some(keep) = keep {
                     let keep: std::collections::HashSet<String> = keep.into_iter().collect();
@@ -13479,6 +13533,8 @@ mod legacy_rebuild_argv_tests {
         assert_eq!(rebuilt.sample, cfg.sample);
         assert_eq!(rebuilt.workers, cfg.workers);
         assert_eq!(rebuilt.bulk_mb, cfg.bulk_mb);
+        assert_eq!(rebuilt.budget_plan, cfg.budget_plan, "{argv:?}");
+        assert_eq!(rebuilt.drop_indexed, cfg.drop_indexed, "{argv:?}");
     }
 
     #[test]
@@ -13506,6 +13562,13 @@ mod legacy_rebuild_argv_tests {
         assert_round_trip(&["data", "--no-graph", "--max-file-mb", "10"]);
         assert_round_trip(&["data", "--no-graph", "--max-file-bytes", "4096"]);
         assert_round_trip(&["data", "--no-graph", "--max-file-gb", "3"]);
+        assert_round_trip(&[
+            "data",
+            "--no-graph",
+            "--plan",
+            "code-and-docs",
+            "--drop-indexed",
+        ]);
     }
 
     /// #1233: the "skipped: oversized" note renders the byte cap in the

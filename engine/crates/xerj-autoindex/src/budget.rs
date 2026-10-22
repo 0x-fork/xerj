@@ -388,6 +388,9 @@ pub enum Outcome {
         keep: Option<Vec<String>>,
         no_semantic: bool,
         note: String,
+        /// Set when a named plan (or `--yes`) produced `keep`. `None` on the
+        /// default plan, which does not filter the walk.
+        plan_name: Option<String>,
     },
     /// `body` is `Null` for a cancel, which prints no JSON.
     Stop { code: i32, body: Value },
@@ -619,6 +622,7 @@ pub fn resolve(assessment: &Assessment, choice: Choice) -> Outcome {
             keep: None,
             no_semantic: false,
             note: assessment.note.clone(),
+            plan_name: None,
         };
     };
     match assessment.plans.iter().find(|p| p.name == name) {
@@ -642,6 +646,7 @@ pub fn resolve(assessment: &Assessment, choice: Choice) -> Outcome {
             } else {
                 assessment.note.clone()
             },
+            plan_name: Some(plan.name.to_string()),
         },
         None => {
             let mut body = assessment.body.clone();
@@ -656,6 +661,151 @@ pub fn resolve(assessment: &Assessment, choice: Choice) -> Outcome {
             }
         }
     }
+}
+
+/// How many plan-excluded paths the decision JSON lists before it counts the rest.
+const REMOVAL_LIST_CAP: usize = 20;
+
+/// Files a reduced plan would drop that are already published and still in the walk.
+///
+/// The budget keep-set is applied to the walk *before* reconcile. On the
+/// `--no-graph` path those files are absent from the inventory, so
+/// `plan_operations` emits `Delete` for their groups. On the graph path they
+/// are still on disk, so they are classified as exclusions and
+/// `sweep_excluded_groups` deletes their documents. Either way a smaller plan
+/// silently unindexes data the folder still has. This is the list that refusal
+/// prints, and that `--drop-indexed` agrees to remove.
+///
+/// A file that is in a prior plan but no longer in the walk is a real deletion
+/// or an ignore-rule exclusion, not this decision, and is left out of the list.
+pub(crate) fn removal_decision(
+    plan_name: &str,
+    plans: &[&crate::state::Plan],
+    discovered: &[FileEntry],
+    keep: &[String],
+) -> Option<Value> {
+    let keep: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+    let walked: std::collections::HashSet<&str> =
+        discovered.iter().map(|file| file.rel.as_str()).collect();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut drops: Vec<Removal> = Vec::new();
+    for prior in plans {
+        for (key, assignment) in &prior.files {
+            if !walked.contains(assignment.rel.as_str()) || keep.contains(assignment.rel.as_str()) {
+                continue;
+            }
+            if !seen.insert((key.clone(), assignment.rel.clone())) {
+                continue;
+            }
+            let mut datasets: Vec<String> = assignment
+                .assignments
+                .iter()
+                .map(|(_, slug)| slug.clone())
+                .collect();
+            datasets.sort();
+            datasets.dedup();
+            drops.push(Removal {
+                path: assignment.rel.clone(),
+                file_key: key.clone(),
+                datasets,
+            });
+        }
+    }
+    if drops.is_empty() {
+        return None;
+    }
+    drops.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.file_key.cmp(&right.file_key))
+    });
+    let total = drops.len();
+    let listed = drops.len().min(REMOVAL_LIST_CAP);
+    let dropped_keys: std::collections::HashSet<&str> = drops
+        .iter()
+        .map(|removed| removed.file_key.as_str())
+        .collect();
+    let datasets = emptied_datasets(plans, &walked, &keep, &dropped_keys);
+    let listed_paths = drops
+        .iter()
+        .take(listed)
+        .map(|removed| removed.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if total > listed {
+        format!(" (and {} more)", total - listed)
+    } else {
+        String::new()
+    };
+    let dataset_phrase = if datasets.is_empty() {
+        String::new()
+    } else {
+        format!(" Dataset(s) left with no files: {}.", datasets.join(", "))
+    };
+    let would_remove: Vec<Value> = drops
+        .iter()
+        .take(listed)
+        .map(|removed| {
+            json!({
+                "path": removed.path,
+                "file_key": removed.file_key,
+                "datasets": removed.datasets,
+            })
+        })
+        .collect();
+    Some(json!({
+        "xerj": "autoindex-plan-removal",
+        "decision_required": true,
+        "exit_code": crate::gate::EXIT_NEEDS_DECISION,
+        "plan": plan_name,
+        "would_remove": would_remove,
+        "would_remove_total": total,
+        "would_remove_truncated": total > listed,
+        "datasets": datasets,
+        "accept": format!(
+            "plan {plan_name} leaves out {total} already-indexed file(s) still in the folder: \
+             {listed_paths}{more}.{dataset_phrase} A reconcile would delete them. Nothing was \
+             changed. Re-run the same command with --drop-indexed to delete them, or drop \
+             --plan to keep the full index. --yes and --plan do not agree to this deletion"
+        ),
+    }))
+}
+
+struct Removal {
+    path: String,
+    file_key: String,
+    datasets: Vec<String>,
+}
+
+/// A dataset the plan would empty: at least one of its published files is in
+/// the drop list, and none of its published files are both still walked and kept.
+fn emptied_datasets(
+    plans: &[&crate::state::Plan],
+    walked: &std::collections::HashSet<&str>,
+    keep: &std::collections::HashSet<&str>,
+    dropped_keys: &std::collections::HashSet<&str>,
+) -> Vec<String> {
+    let mut survivor: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut touched: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for prior in plans {
+        for (key, assignment) in &prior.files {
+            let survives =
+                walked.contains(assignment.rel.as_str()) && keep.contains(assignment.rel.as_str());
+            for (_, slug) in &assignment.assignments {
+                if survives {
+                    survivor.insert(slug.as_str());
+                }
+                if dropped_keys.contains(key.as_str()) {
+                    touched.insert(slug.as_str());
+                }
+            }
+        }
+    }
+    touched
+        .into_iter()
+        .filter(|slug| !survivor.contains(slug))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn budget_bytes_of(body: &Value) -> Option<u64> {
@@ -1549,5 +1699,142 @@ mod tests {
         );
         let mut input = std::io::Cursor::new("cancel\n");
         assert_eq!(read_choice(&mut input, &names, |_| {}), Choice::Cancel);
+    }
+
+    fn assignment(rel: &str, datasets: &[&str]) -> crate::state::FileAssignment {
+        crate::state::FileAssignment {
+            rel: rel.to_string(),
+            path_id: format!("unix:{rel}"),
+            is_symlink: Some(false),
+            family: "text".into(),
+            gzip: false,
+            content_digest: None,
+            assignments: datasets
+                .iter()
+                .map(|slug| (None, (*slug).to_string()))
+                .collect(),
+            as_document: false,
+        }
+    }
+
+    fn walked(rel: &str) -> FileEntry {
+        FileEntry {
+            path: std::path::PathBuf::from(rel),
+            rel: rel.to_string(),
+            rel_id: format!("unix:{rel}"),
+            is_symlink: false,
+            size: 8,
+        }
+    }
+
+    fn plan_with(files: Vec<(&str, &str, &[&str])>) -> crate::state::Plan {
+        let mut plan = crate::state::Plan::default();
+        for (key, rel, datasets) in files {
+            plan.files
+                .insert(key.to_string(), assignment(rel, datasets));
+        }
+        plan
+    }
+
+    #[test]
+    fn a_reduced_plan_lists_indexed_files_it_would_drop_and_the_datasets_it_empties() {
+        let prior = plan_with(vec![
+            ("key-rs", "main.rs", &["code"]),
+            ("key-md", "notes.md", &["docs"]),
+            ("key-csv", "rows.csv", &["rows"]),
+            ("key-gone", "old.csv", &["rows"]),
+        ]);
+        let discovered = vec![walked("main.rs"), walked("notes.md"), walked("rows.csv")];
+        let body = removal_decision(
+            "code-and-docs",
+            &[&prior],
+            &discovered,
+            &["main.rs".into(), "notes.md".into()],
+        )
+        .expect("rows.csv is indexed and the plan leaves it out");
+        assert_eq!(body["xerj"], "autoindex-plan-removal");
+        assert_eq!(body["exit_code"], crate::gate::EXIT_NEEDS_DECISION);
+        assert_eq!(body["decision_required"], true);
+        assert_eq!(body["plan"], "code-and-docs");
+        assert_eq!(body["would_remove_total"], 1);
+        assert_eq!(body["would_remove_truncated"], false);
+        assert_eq!(body["would_remove"][0]["path"], "rows.csv");
+        assert_eq!(body["would_remove"][0]["file_key"], "key-csv");
+        assert_eq!(body["would_remove"][0]["datasets"][0], "rows");
+        // old.csv is not in the walk: a real deletion, not this decision.
+        // rows.csv is the only remaining rows file, so the dataset would be empty.
+        assert_eq!(body["datasets"][0], "rows");
+        assert_eq!(body["datasets"].as_array().map(Vec::len), Some(1));
+        let accept = body["accept"].as_str().unwrap();
+        assert!(accept.contains("rows.csv"), "{accept}");
+        assert!(accept.contains("rows"), "{accept}");
+        assert!(accept.contains("--drop-indexed"), "{accept}");
+        assert!(
+            !accept.contains("old.csv"),
+            "a file already gone from the folder is not a plan removal: {accept}"
+        );
+    }
+
+    #[test]
+    fn a_kept_sibling_keeps_the_dataset_off_the_emptied_list() {
+        let prior = plan_with(vec![
+            ("key-a", "keep.csv", &["tables"]),
+            ("key-b", "drop.csv", &["tables"]),
+        ]);
+        let discovered = vec![walked("keep.csv"), walked("drop.csv")];
+        let body = removal_decision("skip-data", &[&prior], &discovered, &["keep.csv".into()])
+            .expect("drop.csv would be removed");
+        assert_eq!(body["would_remove"][0]["path"], "drop.csv");
+        assert!(
+            body["datasets"].as_array().unwrap().is_empty(),
+            "tables still has keep.csv: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn a_plan_that_keeps_every_indexed_file_has_nothing_to_confirm() {
+        let prior = plan_with(vec![("key-rs", "main.rs", &["code"])]);
+        let discovered = vec![walked("main.rs"), walked("new.rs")];
+        assert!(removal_decision(
+            "code-and-docs",
+            &[&prior],
+            &discovered,
+            &["main.rs".into(), "new.rs".into()],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_removal_list_is_capped_and_the_total_is_not() {
+        let mut plan = crate::state::Plan::default();
+        let mut discovered = Vec::new();
+        for i in 0..(REMOVAL_LIST_CAP + 3) {
+            let rel = format!("f{i:02}.csv");
+            plan.files
+                .insert(format!("key-{i}"), assignment(&rel, &["tables"]));
+            discovered.push(walked(&rel));
+        }
+        let body = removal_decision("skip-data", &[&plan], &discovered, &[])
+            .expect("every csv is indexed and the plan keeps none");
+        assert_eq!(body["would_remove_total"], REMOVAL_LIST_CAP + 3);
+        assert_eq!(body["would_remove_truncated"], true);
+        assert_eq!(
+            body["would_remove"].as_array().map(Vec::len),
+            Some(REMOVAL_LIST_CAP)
+        );
+        assert_eq!(body["would_remove"][0]["path"], "f00.csv");
+        assert_eq!(body["datasets"][0], "tables");
+        let accept = body["accept"].as_str().unwrap();
+        assert!(accept.contains("and 3 more"), "{accept}");
+    }
+
+    #[test]
+    fn the_same_file_in_two_plans_is_listed_once() {
+        let prior = plan_with(vec![("key-csv", "rows.csv", &["rows"])]);
+        let discovered = vec![walked("rows.csv")];
+        let body = removal_decision("code-and-docs", &[&prior, &prior], &discovered, &[])
+            .expect("one file");
+        assert_eq!(body["would_remove_total"], 1);
     }
 }
