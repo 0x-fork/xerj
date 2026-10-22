@@ -125,20 +125,51 @@ fn note_line(note: &str, meatl: bool) -> String {
 }
 
 /// `file:line` when the record or a lexical `_passage` carries one.
-/// Otherwise `file (line unknown)` — a bare path reads as a finished
-/// citation, and a semantic chunk ordinal is not a line.
+/// Otherwise a line-unknown header that says why and how to get a line —
+/// a bare path reads as a finished citation, and a semantic chunk ordinal
+/// is not a line.
 #[cfg(test)]
 fn citation(hit: &Value, lexical_lines: bool) -> String {
-    citation_in(hit, lexical_lines, None)
+    citation_in(hit, lexical_lines, None, "")
 }
 
-/// [`citation`] with the corpus checkout. A prose section record (it has a
-/// `section` field, or an `s<N>` locator) never turns its passage ordinal into a
-/// file line: that ordinal counts lines of the re-flowed section, so every
-/// Markdown hit used to read `file:1` or `file (line unknown)` (issue #1892).
-/// With the checkout, the passage's first distinctive line is looked up in the
-/// file and its real line number is cited.
-fn citation_in(hit: &Value, lexical_lines: bool, checkout: Option<&std::path::Path>) -> String {
+/// Why a header has no line, and the command that puts one there.
+///
+/// A pack built before file lines were stored (no `line` / `start_line`, no
+/// `symbols[].line`, no `code:<line>:<name>` locator) and with no checkout
+/// to search used to print a bare `(line unknown)`. The footer still asks
+/// the agent to cite file:line, so the header names the gap and the fix.
+const LINE_UNKNOWN_HINT: &str = "no file line on this record or in the corpus checkout; re-pull the pack or rebuild with xerj corpus index <name> --fresh";
+
+fn line_unknown(path: &str, explain: bool) -> String {
+    if explain {
+        format!("{path} (line unknown — {LINE_UNKNOWN_HINT})")
+    } else {
+        format!("{path} (line unknown)")
+    }
+}
+
+/// [`citation`] with the corpus checkout and the query that selected the hit.
+///
+/// A prose section record (it has a `section` field, or an `s<N>` locator)
+/// never turns its passage ordinal into a file line: that ordinal counts
+/// lines of the re-flowed section, so every Markdown hit used to read
+/// `file:1` or `file (line unknown)` (issue #1892). With the checkout, the
+/// passage's first distinctive line is looked up in the file.
+///
+/// A whole-file code record (Python `.py`, locator `code`) has no top-level
+/// line. Its matching line is the lexical `_passage` ordinal when that
+/// passage is the source text. When the winning passage is the synthetic
+/// `defs` / `title` / `name` list — the usual case for a long module whose
+/// symbol names pack the query into one short field — that ordinal is not a
+/// file line (issue #2195). The same record's `symbols[].line`, or the
+/// passage text located in the checkout, is.
+fn citation_in(
+    hit: &Value,
+    lexical_lines: bool,
+    checkout: Option<&std::path::Path>,
+    query: &str,
+) -> String {
     let src = hit.get("_source").unwrap_or(&Value::Null);
     let path = ["ax_path", "ax_file", "path", "file"]
         .iter()
@@ -148,17 +179,113 @@ fn citation_in(hit: &Value, lexical_lines: bool, checkout: Option<&std::path::Pa
         .iter()
         .find_map(|k| src.get(*k).and_then(Value::as_u64))
         .filter(|n| *n != 0);
-    let line = stored.or_else(|| {
+    let line = stored.or_else(|| line_from_code_locator(src)).or_else(|| {
         if is_prose_section(src) {
             checkout.and_then(|dir| line_in_checkout(hit, src, dir, path))
         } else {
             lexical_passage_line(hit, lexical_lines)
+                .or_else(|| symbol_file_line(src, query))
+                .or_else(|| {
+                    checkout.and_then(|dir| source_passage_line_in_checkout(hit, dir, path))
+                })
+                .or_else(|| symbol_named_in_passage(src, hit))
         }
     });
     match line {
         Some(n) => format!("{path}:{n}"),
-        None => format!("{path} (line unknown)"),
+        // A path that would leave the checkout is never opened, and it is
+        // not a pack that a rebuild would fix.
+        None => line_unknown(path, rel_stays_in_checkout(path)),
     }
+}
+
+/// `code:<line>:<name>` — the per-declaration locator. The line is the
+/// file line even when the `line` field itself was not stored.
+fn line_from_code_locator(src: &Value) -> Option<u64> {
+    let loc = src.get("ax_locator").and_then(Value::as_str)?;
+    let rest = loc.strip_prefix("code:")?;
+    let (num, _) = rest.split_once(':')?;
+    let n: u64 = num.parse().ok()?;
+    (n != 0).then_some(n)
+}
+
+/// File line of the definition [`super::passage::symbol_passage`] would
+/// show for `query`. That is the line on `symbols[].line`, which a
+/// whole-file code record stores even when the header's passage came from
+/// the `defs` list. The label format is `{kind} {name} @ line {start}`.
+fn symbol_file_line(src: &Value, query: &str) -> Option<u64> {
+    if query.is_empty() {
+        return None;
+    }
+    let body = src
+        .get("body")
+        .and_then(Value::as_str)
+        .or_else(|| src.get("text").and_then(Value::as_str))
+        .unwrap_or("");
+    if body.is_empty() {
+        return None;
+    }
+    let (_, label) = symbol_passage(body, src, query, usize::MAX)?;
+    let n = label.rsplit_once("@ line ")?.1.parse::<u64>().ok()?;
+    (n != 0).then_some(n)
+}
+
+/// A `symbols[].line` whose name occurs in the passage text. Used when the
+/// body is not on the hit (so [`symbol_file_line`] cannot score a span) and
+/// the checkout does not hold the file. The earliest name in the passage
+/// wins; equal positions keep the earlier symbol, which the extractor emits
+/// in source order.
+fn symbol_named_in_passage(src: &Value, hit: &Value) -> Option<u64> {
+    let text = hit
+        .pointer("/fields/_passage/0/text")
+        .and_then(Value::as_str)?;
+    let syms = src.get("symbols").and_then(Value::as_array)?;
+    let mut found: Option<(usize, u64)> = None;
+    for s in syms {
+        let Some(name) = s.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(line) = s.get("line").and_then(Value::as_u64).filter(|n| *n != 0) else {
+            continue;
+        };
+        if name.chars().count() < 3 {
+            continue;
+        }
+        // Whole identifier only: `per` must not match inside `get_permissions`.
+        if let Some(pos) = identifier_at(text, name) {
+            if found.is_none_or(|(at, _)| pos < at) {
+                found = Some((pos, line));
+            }
+        }
+    }
+    found.map(|(_, line)| line)
+}
+
+/// Byte index of `name` in `text` where both sides are identifier boundaries
+/// (start/end, or a character that is not ASCII alphanumeric or `_`).
+fn identifier_at(text: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let abs = from + pos;
+        let end = abs + name.len();
+        // `find` returns a char boundary and the match is exactly `name`, so
+        // `end` is a char boundary too.
+        let before_ok = abs == 0 || !is_ident_byte(bytes[abs - 1]);
+        let after_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return Some(abs);
+        }
+        from = end;
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// A record cut from prose by the document extractor: `section` is stamped on
@@ -179,18 +306,32 @@ fn distinctive_line(text: &str) -> Option<&str> {
         .find(|l| l.chars().filter(|c| !c.is_whitespace()).count() >= 12)
 }
 
+/// True when `rel` is a relative path with only normal components, so joining
+/// it onto the checkout cannot escape that directory.
+fn rel_stays_in_checkout(rel: &str) -> bool {
+    let rel_path = std::path::Path::new(rel);
+    !rel_path.is_absolute()
+        && rel_path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// 1-based line of `needle` in the checked-out file. `None` when the path
+/// would leave the checkout, the file is not there, or the text is absent.
+fn line_of_needle(dir: &std::path::Path, rel: &str, needle: &str) -> Option<u64> {
+    if !rel_stays_in_checkout(rel) {
+        return None;
+    }
+    let file = std::fs::read_to_string(dir.join(rel)).ok()?;
+    file.lines()
+        .position(|l| l.contains(needle))
+        .map(|i| i as u64 + 1)
+}
+
 /// 1-based line of the passage (or, without one, of the section start) in the
 /// checked-out file. `None` when the file is not there, the path would leave
 /// the checkout, or the text is not found verbatim.
 fn line_in_checkout(hit: &Value, src: &Value, dir: &std::path::Path, rel: &str) -> Option<u64> {
-    let rel_path = std::path::Path::new(rel);
-    if rel_path.is_absolute()
-        || rel_path
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
     let passage = hit
         .pointer("/fields/_passage/0/text")
         .and_then(Value::as_str)
@@ -200,16 +341,33 @@ fn line_in_checkout(hit: &Value, src: &Value, dir: &std::path::Path, rel: &str) 
         .and_then(Value::as_str)
         .and_then(distinctive_line);
     let needle = passage.or(section)?;
-    let file = std::fs::read_to_string(dir.join(rel_path)).ok()?;
-    file.lines()
-        .position(|l| l.contains(needle))
-        .map(|i| i as u64 + 1)
+    line_of_needle(dir, rel, needle)
+}
+
+/// Locate a code passage in the checkout. Only a passage taken from source
+/// text (`body`, `text`, `code`, `impl`, or an unnamed field) is searched:
+/// a `defs` / `title` / `name` passage is a synthetic list and is not a line
+/// of the file. The whole `body` is not searched either — its first line is
+/// the file head, not the match.
+fn source_passage_line_in_checkout(hit: &Value, dir: &std::path::Path, rel: &str) -> Option<u64> {
+    let field = hit
+        .pointer("/fields/_passage/0/field")
+        .and_then(Value::as_str);
+    if matches!(field, Some("defs" | "title" | "name" | "defs_expanded")) {
+        return None;
+    }
+    let needle = hit
+        .pointer("/fields/_passage/0/text")
+        .and_then(Value::as_str)
+        .and_then(distinctive_line)?;
+    line_of_needle(dir, rel, needle)
 }
 
 /// 1-based file line from a lexical passage. `ordinal` is a chunk index
 /// on a semantic hit, so this stays `None` unless the caller set
-/// `lexical_lines`. `defs` / `title` / `name` ordinals are not file lines,
-/// and a passage without `start_offset` has no window to cite.
+/// `lexical_lines`. `defs` / `defs_expanded` / `title` / `name` ordinals are
+/// lines of a synthetic list, not of the file, and a passage without
+/// `start_offset` has no window to cite.
 fn lexical_passage_line(hit: &Value, lexical_lines: bool) -> Option<u64> {
     if !lexical_lines {
         return None;
@@ -217,7 +375,7 @@ fn lexical_passage_line(hit: &Value, lexical_lines: bool) -> Option<u64> {
     let first = hit.pointer("/fields/_passage/0")?.as_object()?;
     if matches!(
         first.get("field").and_then(Value::as_str),
-        Some("defs" | "title" | "name")
+        Some("defs" | "title" | "name" | "defs_expanded")
     ) {
         return None;
     }
@@ -227,7 +385,7 @@ fn lexical_passage_line(hit: &Value, lexical_lines: bool) -> Option<u64> {
 
 fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) -> String {
     let src = h.get("_source").cloned().unwrap_or(Value::Null);
-    let loc = citation_in(h, opts.lexical_lines, opts.checkout);
+    let loc = citation_in(h, opts.lexical_lines, opts.checkout, opts.query);
     let score = h.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
     let lic = licences
         .get(locator_repo(&loc))
@@ -834,7 +992,7 @@ mod tests {
         );
 
         let bare = json!({ "_source": { "ax_path": "readme.md", "body": "hello" } });
-        assert_eq!(citation(&bare, true), "readme.md (line unknown)");
+        assert_eq!(citation(&bare, true), line_unknown("readme.md", true));
 
         // A semantic chunk ordinal is not a file line, even with start_offset.
         let semantic = json!({
@@ -846,7 +1004,7 @@ mod tests {
                 "text": "chunk"
             }]}
         });
-        assert_eq!(citation(&semantic, false), "readme.md (line unknown)");
+        assert_eq!(citation(&semantic, false), line_unknown("readme.md", true));
 
         let defs = json!({
             "_source": { "ax_path": "a.rs" },
@@ -857,7 +1015,7 @@ mod tests {
                 "text": "fn commit"
             }]}
         });
-        assert_eq!(citation(&defs, true), "a.rs (line unknown)");
+        assert_eq!(citation(&defs, true), line_unknown("a.rs", true));
     }
 
     #[test]
@@ -878,11 +1036,14 @@ mod tests {
             "fields": { "_passage": [{ "field": "body", "ordinal": 0, "start_offset": 18,
                          "text": "async let firstPhoto = downloadPhoto(named: photoNames[0])" }]}
         });
-        assert_eq!(citation_in(&hit, true, Some(&dir)), "book/Concurrency.md:6");
+        assert_eq!(
+            citation_in(&hit, true, Some(&dir), ""),
+            "book/Concurrency.md:6"
+        );
         // without the checkout a section-relative ordinal is never passed off as a line
         assert_eq!(
-            citation_in(&hit, true, None),
-            "book/Concurrency.md (line unknown)"
+            citation_in(&hit, true, None, ""),
+            line_unknown("book/Concurrency.md", true)
         );
         // a single-section file (locator s0, no `section` field) is prose too
         let single = json!({
@@ -890,13 +1051,14 @@ mod tests {
             "fields": { "_passage": [{ "field": "body", "ordinal": 0, "start_offset": 0, "text": "Intro paragraph." }]}
         });
         assert_eq!(
-            citation_in(&single, true, Some(&dir)),
+            citation_in(&single, true, Some(&dir), ""),
             "book/Concurrency.md:3"
         );
-        // a path that would leave the checkout is not opened
+        // a path that would leave the checkout is not opened, and the header
+        // does not suggest rebuilding to cite it
         let escape = json!({ "_source": { "ax_path": "../etc/passwd", "ax_locator": "s0", "body": "root:x:0:0:root:/root" } });
         assert_eq!(
-            citation_in(&escape, true, Some(&dir)),
+            citation_in(&escape, true, Some(&dir), ""),
             "../etc/passwd (line unknown)"
         );
         // code records keep the lexical ordinal line
@@ -904,7 +1066,142 @@ mod tests {
             "_source": { "ax_path": "a.rs", "ax_locator": "code" },
             "fields": { "_passage": [{ "field": "body", "ordinal": 41, "start_offset": 9, "text": "fn x()" }]}
         });
-        assert_eq!(citation_in(&code, true, Some(&dir)), "a.rs:42");
+        assert_eq!(citation_in(&code, true, Some(&dir), ""), "a.rs:42");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// issue #2195: a hub-corpus Python hit whose winning passage is the
+    /// synthetic `defs` list printed `(line unknown)` even though the same
+    /// record stores `symbols[].line` and the checkout holds the source.
+    #[test]
+    fn python_passage_cites_a_real_start_line() {
+        let body =
+            "class EC2:\n    pass\n\ndef get_permissions(self):\n    return ['ec2:Describe']\n";
+        let defs_hit = json!({
+            "_source": {
+                "ax_path": "c7n/resources/ec2.py",
+                "ax_locator": "code",
+                "language": "python",
+                "defs": "class EC2\nfunction get_permissions",
+                "body": body,
+                "symbols": [
+                    {"name": "EC2", "kind": "class", "line": 1, "end_line": 2},
+                    {"name": "get_permissions", "kind": "function", "line": 4, "end_line": 5}
+                ]
+            },
+            "fields": { "_passage": [{
+                "field": "defs",
+                "ordinal": 1,
+                "start_offset": 10,
+                "text": "function get_permissions"
+            }]}
+        });
+        assert_eq!(
+            citation_in(&defs_hit, true, None, "get_permissions webhook"),
+            "c7n/resources/ec2.py:4"
+        );
+        // A body passage line stays the passage start, not the symbol the
+        // query names. ordinal 3 is the `def` line.
+        let precise = json!({
+            "_source": {
+                "ax_path": "c7n/resources/ec2.py",
+                "ax_locator": "code",
+                "language": "python",
+                "body": body,
+                "symbols": [{"name": "EC2", "kind": "class", "line": 1, "end_line": 2}]
+            },
+            "fields": { "_passage": [{
+                "field": "body",
+                "ordinal": 3,
+                "start_offset": 18,
+                "text": "def get_permissions(self):"
+            }]}
+        });
+        assert_eq!(
+            citation_in(&precise, true, None, "EC2"),
+            "c7n/resources/ec2.py:4"
+        );
+        // No symbol table: a semantic ordinal is not a line, but the passage
+        // text is in the checkout.
+        let dir = std::env::temp_dir().join(format!("xc-py-lines-{}", std::process::id()));
+        let file = dir.join("c7n/resources/ec2.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, body).unwrap();
+        let semantic = json!({
+            "_source": {
+                "ax_path": "c7n/resources/ec2.py",
+                "ax_locator": "code",
+                "language": "python",
+                "body": body
+            },
+            "fields": { "_passage": [{
+                "field": "body",
+                "ordinal": 0,
+                "start_offset": 20,
+                "text": "def get_permissions(self):"
+            }]}
+        });
+        assert_eq!(
+            citation_in(&semantic, false, Some(&dir), "get_permissions"),
+            "c7n/resources/ec2.py:4"
+        );
+        // A declaration record whose `line` field was dropped still cites the
+        // line baked into `code:<line>:<name>`.
+        let located = json!({
+            "_source": {
+                "ax_path": "c7n/resources/ec2.py",
+                "ax_locator": "code:4:get_permissions",
+                "language": "python",
+                "name": "get_permissions",
+                "kind": "function"
+            }
+        });
+        assert_eq!(
+            citation_in(&located, true, None, ""),
+            "c7n/resources/ec2.py:4"
+        );
+        // Body omitted from the hit: the defs passage still names the symbol,
+        // and that symbol's stored line is the file line.
+        let no_body = json!({
+            "_source": {
+                "ax_path": "c7n/resources/ec2.py",
+                "ax_locator": "code",
+                "symbols": [
+                    {"name": "per", "kind": "function", "line": 9},
+                    {"name": "get_permissions", "kind": "function", "line": 4}
+                ]
+            },
+            "fields": { "_passage": [{
+                "field": "defs",
+                "ordinal": 1,
+                "start_offset": 10,
+                "text": "helper get_permissions"
+            }]}
+        });
+        assert_eq!(
+            citation_in(&no_body, true, None, ""),
+            "c7n/resources/ec2.py:4"
+        );
+        // Genuinely no line anywhere: say so, and how to get one.
+        let old = json!({
+            "_source": {
+                "ax_path": "c7n/resources/ec2.py",
+                "ax_locator": "code",
+                "body": "x = 1\n"
+            },
+            "fields": { "_passage": [{
+                "field": "defs",
+                "ordinal": 0,
+                "start_offset": 0,
+                "text": "function missing"
+            }]}
+        });
+        let msg = citation_in(&old, true, None, "missing");
+        assert_eq!(msg, line_unknown("c7n/resources/ec2.py", true), "{msg}");
+        assert!(
+            msg.contains("re-pull") && msg.contains("xerj corpus index"),
+            "{msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
