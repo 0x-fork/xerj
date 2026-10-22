@@ -8,7 +8,7 @@
         "properties": {
           "index": {
             "type": "string",
-            "description": "Index name or pattern to search. Defaults to `ax-*` — the prefix `xerj autoindex` writes — so the common case needs no argument. Pass an explicit name to search anything else."
+            "description": "Index name or pattern to search. Defaults to `ax-*` — the prefix `xerj autoindex` writes — so the common case needs no argument. Pass an explicit name to search anything else. Never DELETE an index you did not create in this session. A shared default prefix is not a reason to delete one: use `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` is the same operation). It lists the indices, catalog rows, doc counts and sizes, deletes nothing without confirmation, and never removes another folder under that prefix."
           },
           "query": {
             "type": [
@@ -506,7 +506,7 @@
     },
     {
       "name": "xerj_map",
-      "description": "Per-index FIELD MAP from this node's autoindex catalog — call it BEFORE writing query DSL, so you stop guessing field names. For each catalogued index: record count, time field and time range, semantic body field, and every field the profiler inferred — name, es_type (keyword|text|long|double|boolean|date|semantic_text), date encoding, semantic tag, cardinality estimate, coverage, up to 5 examples, and the sampled date AND numeric min-max (numeric ranges appear on `long` fields only; fractional `double` ranges are not tracked). Reads the catalog index `autoindex-catalog` that `xerj autoindex <folder>` writes; never-autoindexed indexes are not listed. Honesty: every fact is inferred from a bounded sample taken at autoindex time — cardinality is an estimate (with `cardinality_overflow:true` it means AT LEAST that many), and min/max/coverage describe the sample, not the whole index. Up to 100 indexes per call (`indexes_omitted` reports more). When more than 8 indexes match and you did not pass `index`, the answer is a SUMMARY page (index, records, field names) — pass `index` or `detail: true` with `offset`/`limit` for full fields.",
+      "description": "Per-index FIELD MAP from this node's autoindex catalog — call it BEFORE writing query DSL, so you stop guessing field names. For each catalogued index: record count, time field and time range, semantic body field, and every field the profiler inferred — name, es_type (keyword|text|long|double|boolean|date|semantic_text), date encoding, semantic tag, cardinality estimate, coverage, up to 5 examples, and the sampled date AND numeric min-max (numeric ranges appear on `long` fields only; fractional `double` ranges are not tracked). Reads the catalog index `autoindex-catalog` that `xerj autoindex <folder>` writes; never-autoindexed indexes are not listed. Honesty: every fact is inferred from a bounded sample taken at autoindex time — cardinality is an estimate (with `cardinality_overflow:true` it means AT LEAST that many), and min/max/coverage describe the sample, not the whole index. Up to 100 indexes per call (`indexes_omitted` reports more). When more than 8 indexes match and you did not pass `index`, the answer is a SUMMARY page (index, records, field names) — pass `index` or `detail: true` with `offset`/`limit` for full fields. Never DELETE an index you did not create in this session. A shared default prefix is not a reason to delete one: use `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` is the same operation). It lists the indices, catalog rows, doc counts and sizes, deletes nothing without confirmation, and never removes another folder under that prefix.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -539,7 +539,7 @@
     },
     {
       "name": "xerj_index_budget",
-      "description": "Count a folder and estimate the index BEFORE xerj autoindex hashes or embeds anything. Returns file and byte counts by kind (code, prose, pdf, data, binary, other — by extension, before content sniff) and by top-level folder, the free-space budget from the node's flood-stage watermark (the same GET /_cat/allocation row autoindex uses; a node that omits disk.flood_stage is not guessed at), and one or more plans with what each drops. This tool does not index. When decision_required is true, show the plans to the user and re-run `xerj autoindex` with --plan <name> or --yes for the recommended plan that fits. Do not start a run that does not fit. Default embeddings in the estimate are the server's lexical feature-hash vectors unless that node was started with --embed-mode neural. Kinds without a measured calibration are unmeasured and do not refuse the run.",
+      "description": "Count a folder and estimate the index BEFORE xerj autoindex hashes or embeds anything. Returns file and byte counts by kind (code, prose, pdf, data, binary, other — by extension, before content sniff) and by top-level folder, the free-space budget from the node's flood-stage watermark (the same GET /_cat/allocation row autoindex uses; a node that omits disk.flood_stage is not guessed at), and one or more plans with what each drops. This tool does not index. When decision_required is true, show the plans to the user and re-run `xerj autoindex` with --plan <name> or --yes for the recommended plan that fits. Do not start a run that does not fit. Default embeddings in the estimate are the server's lexical feature-hash vectors unless that node was started with --embed-mode neural. Kinds without a measured calibration are unmeasured and do not refuse the run. Never DELETE an index you did not create in this session. A shared default prefix is not a reason to delete one: use `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` is the same operation). It lists the indices, catalog rows, doc counts and sizes, deletes nothing without confirmation, and never removes another folder under that prefix.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -563,6 +563,30 @@
         },
         "required": [
           "path"
+        ]
+      }
+    },
+    {
+      "name": "xerj_autoindex_remove",
+      "description": "Delete one autoindexed folder. Reads the autoindex catalog and returns exactly the indices, catalog rows, doc counts and sizes that belong to `prefix` (and to `root`, when the prefix holds more than one folder). Pass `confirm: true` only after you have read that plan. Without it nothing is deleted and the result is an error, so a caller cannot mistake the preview for a completed delete. An index another folder under the same prefix still names is left in place. `autoindex-catalog` is never deleted. This does not walk or index a folder. Never DELETE an index you did not create in this session. A shared default prefix is not a reason to delete one: use `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` is the same operation). It lists the indices, catalog rows, doc counts and sizes, deletes nothing without confirmation, and never removes another folder under that prefix.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prefix": {
+            "type": "string",
+            "description": "The prefix the folder was indexed with. Required. The shared default `ax` is not assumed."
+          },
+          "root": {
+            "type": "string",
+            "description": "The folder to drop, when `prefix` holds more than one. Omit it only when the plan lists a single root."
+          },
+          "confirm": {
+            "type": "boolean",
+            "description": "Delete what the plan lists. false, or omitted, prints the plan and deletes nothing."
+          }
+        },
+        "required": [
+          "prefix"
         ]
       }
     },

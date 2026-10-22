@@ -719,11 +719,12 @@ pub fn prefix_reuse_message(
              earlier datasets."
         )
     } else {
-        "Nothing was written. Pass --replace-prefix to retire those datasets on purpose, or use \
-         one --prefix per source folder. --dry-run does not bypass this check."
+        "Nothing was written. The command above is the first remedy: one --prefix per source \
+         folder. --replace-prefix retires those datasets on purpose; it is not the first option. \
+         --dry-run does not bypass this check."
             .to_string()
     };
-    format!(
+    let body = format!(
         "autoindex: --prefix {prefix} already indexes a different folder.\n\
          this run: {root}\n\
          already indexed from:\n\
@@ -735,7 +736,81 @@ pub fn prefix_reuse_message(
          {prefix}-docs (catalog id ds:{prefix}:docs). Index the parent folder that contains \
          the repositories, or pass a distinct --prefix per repository.\n\
          {ending}"
+    );
+    if replacing {
+        return body;
+    }
+    let suggested = suggested_prefix(root, prefix);
+    let command_root = root.replace(['\n', '\r'], " ");
+    let command = format!(
+        "xerj autoindex {} --prefix {}",
+        shell_quote(&command_root),
+        shell_quote(&suggested)
+    );
+    format!(
+        "autoindex: this folder needs its own --prefix. Do not delete the other folder's indices.\n\
+         Ready to copy:\n  {command}\n{body}"
     )
+}
+
+/// A prefix for `root` that is not `taken` and can name an index.
+fn suggested_prefix(root: &str, taken: &str) -> String {
+    let path = std::path::Path::new(root.trim());
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut raw = Vec::new();
+    if !name.is_empty() {
+        raw.push(name.clone());
+        if !parent.is_empty() {
+            raw.push(format!("{parent}-{name}"));
+        }
+        raw.push(format!("{name}-2"));
+        raw.push(format!("p{name}"));
+    }
+    raw.push(format!("p{taken}"));
+    raw.push(format!("{taken}-2"));
+    for candidate in raw {
+        let sanitized = crate::dataset::sanitize_prefix(&candidate);
+        if prefix_is_usable(&sanitized, taken) {
+            return sanitized;
+        }
+    }
+    for n in 3..64 {
+        let sanitized = crate::dataset::sanitize_prefix(&format!("{taken}-{n}"));
+        if prefix_is_usable(&sanitized, taken) {
+            return sanitized;
+        }
+    }
+    "folder".to_string()
+}
+
+fn prefix_is_usable(prefix: &str, taken: &str) -> bool {
+    !prefix.is_empty() && prefix != taken && crate::dataset::index_prefix_error(prefix).is_none()
+}
+
+/// Quote a path for a shell command an agent can copy. Unquoted when every
+/// character is safe; otherwise single quotes, with `'` written as `'\''`.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let safe = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '\\'));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// How many dataset detail sections the default map prints before it asks
@@ -1593,9 +1668,43 @@ mod prefix_reuse_tests {
         assert!(message.contains("ds:ref:docs"), "{message}");
         assert!(message.contains("Nothing was written"), "{message}");
         assert!(message.contains("--replace-prefix"), "{message}");
+        assert!(message.contains("Do not delete"), "{message}");
+        let copy_at = message
+            .find("--prefix lucaschess")
+            .expect("the ready-to-copy command names a distinct prefix");
+        let taken_at = message
+            .find("--prefix ref already")
+            .expect("the taken prefix is still named");
+        let replace_at = message.find("--replace-prefix").expect("flag");
+        assert!(
+            copy_at < taken_at && copy_at < replace_at,
+            "a distinct --prefix is the first remedy:\n{message}"
+        );
+        assert!(
+            message.contains("xerj autoindex /data/lucaschess --prefix lucaschess"),
+            "{message}"
+        );
         assert!(
             !message.contains("/data/elsewhere"),
             "a sibling prefix is not this corpus: {message}"
+        );
+    }
+
+    #[test]
+    fn the_suggested_prefix_is_not_the_taken_one_and_the_path_is_quoted() {
+        let message = prefix_reuse_message("ref", "/data/my folder", &["/data/old".into()], false);
+        assert!(
+            message.contains("xerj autoindex '/data/my folder' --prefix my-folder"),
+            "{message}"
+        );
+        let digit = prefix_reuse_message("ref", "/data/2024", &["/data/old".into()], false);
+        assert!(
+            digit.contains("--prefix data-2024"),
+            "a digit-leading folder name cannot be an index prefix, so the parent is used: {digit}"
+        );
+        assert!(
+            !digit.contains("--prefix 2024\n") && !digit.contains("--prefix 2024 "),
+            "{digit}"
         );
     }
 
@@ -1661,5 +1770,9 @@ mod prefix_reuse_tests {
         assert!(message.contains("--replace-prefix is set"), "{message}");
         assert!(message.contains("this run continues"), "{message}");
         assert!(!message.contains("Nothing was written"), "{message}");
+        assert!(
+            !message.contains("Ready to copy"),
+            "the opt-in warning is not the refusal's first remedy: {message}"
+        );
     }
 }

@@ -42,6 +42,7 @@ pub mod order;
 pub mod pool;
 pub mod progress;
 mod reconcile_plan;
+pub mod remove;
 pub mod resources;
 pub mod search;
 pub mod sniff;
@@ -1868,6 +1869,7 @@ pub fn run_cli() -> i32 {
         Cmd::Index(cfg) => run_index(*cfg),
         Cmd::Map(cfg) => run_map(cfg),
         Cmd::Status(cfg) => run_status(cfg),
+        Cmd::Remove(cfg) => run_remove(cfg),
         Cmd::Watch(cfg) => objwatch::run::run(*cfg),
     };
     match res {
@@ -10452,6 +10454,34 @@ mod node_ping_failure_tests {
         assert!(!msg.contains("no XERJ node reachable"), "{msg}");
         assert!(!msg.contains("xerj --insecure"), "{msg}");
     }
+}
+
+fn run_remove(cfg: cli::RemoveCfg) -> Result<i32> {
+    if let Some(note) = &cfg.xerj_url_note {
+        eprintln!("autoindex: {note}");
+    }
+    // `--quiet` is the indexing gate's "do not prompt" switch. The same rule
+    // here: a silenced terminal must not ask a question nobody will see.
+    let prompt = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && !cfg.quiet
+    };
+    let report = remove::execute(remove::RemoveRequest {
+        url: cfg.url,
+        api_key: cfg.api_key,
+        prefix: cfg.prefix,
+        root: cfg.root,
+        yes: cfg.yes,
+        prompt,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report.body).unwrap_or_else(|_| report.body.to_string())
+    );
+    if !cfg.quiet {
+        eprintln!("{}", report.summary);
+    }
+    Ok(report.exit_code)
 }
 
 fn run_map(cfg: MapCfg) -> Result<i32> {

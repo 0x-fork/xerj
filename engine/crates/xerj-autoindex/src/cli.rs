@@ -188,6 +188,25 @@ pub struct StatusCfg {
     pub xerj_url_note: Option<String>,
 }
 
+/// `xerj autoindex remove --prefix P [--root DIR]`.
+///
+/// Deletes one autoindexed folder after printing the plan. `--prefix` is
+/// required: the default name `ax` is shared, and guessing it is how an agent
+/// deletes another project's index. `--yes` confirms. It does not choose a
+/// folder when the prefix holds more than one.
+#[derive(Debug, Clone)]
+pub struct RemoveCfg {
+    pub url: String,
+    pub api_key: Option<String>,
+    pub prefix: String,
+    pub root: Option<String>,
+    pub yes: bool,
+    /// Accepted. Stdout is the JSON plan either way.
+    pub json: bool,
+    pub quiet: bool,
+    pub xerj_url_note: Option<String>,
+}
+
 /// `xerj autoindex s3://bucket/prefix --watch`: poll a bucket and emit a change
 /// feed. Deliberately its own config rather than fields on [`IndexCfg`]: the
 /// watch path shares no phase-A/phase-B machinery with folder indexing, and
@@ -234,6 +253,7 @@ pub enum Cmd {
     Index(Box<IndexCfg>),
     Map(MapCfg),
     Status(StatusCfg),
+    Remove(RemoveCfg),
     /// Boxed for the same reason as `Index`.
     Watch(Box<WatchCfg>),
     Help,
@@ -284,6 +304,11 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20discover + index objects in a bucket\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(r2:// too; see OBJECT STORAGE)\n\
          \x20\x20\x20\x20xerj autoindex map [OPTIONS]          print the discovered data map\n\
+         \x20\x20\x20\x20xerj autoindex remove --prefix <P> [--root <DIR>] [--yes]\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20list one folder's indices and catalog rows,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20then delete them. Nothing is deleted without\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20--yes or a terminal y. Another folder under\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20the same prefix is left in place\n\
          \x20\x20\x20\x20xerj autoindex status [OPTIONS]       resume-journal + index progress view\n\
          \x20\x20\x20\x20xerj autoindex s3://bucket/prefix --watch [OPTIONS]\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20poll object storage and emit a change feed\n\
@@ -401,6 +426,12 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20recommended plan that does fit. It does not index a\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20plan that is over budget. It does not delete indexed\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20files a smaller plan leaves out; that is --drop-indexed.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20On `autoindex remove` it is the confirmation: without\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20it a non-terminal run prints the plan and exits 4.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20It does not choose a folder.\n\
+         \x20\x20\x20\x20--root <DIR>         (`autoindex remove`) the one folder to drop when\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20--prefix holds more than one. Refused on any other\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20command\n\
          \x20\x20\x20\x20--max-index-size <N> cap the estimated index (bytes, or a KB/MB/GB suffix).\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20The disk budget is the free space under the node's\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20flood-stage watermark; this flag lowers that cap.\n\
@@ -892,6 +923,12 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut max_minutes_explicit = false;
     let mut approve: Option<Approval> = None;
     let mut approve_explicit = false;
+    // Set only by `--yes`/`-y`. `--approve proceed` is the indexing gate and
+    // is not a confirmation for `autoindex remove`.
+    let mut yes_flag = false;
+    let mut remove_root: Option<String> = None;
+    let mut markdown = false;
+    let mut code_analyzer_explicit = false;
     let mut max_index_bytes: Option<u64> = None;
     let mut max_index_explicit = false;
     let mut budget_plan: Option<String> = None;
@@ -1156,16 +1193,30 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 }
                 approve = Some(Approval::Proceed);
                 approve_explicit = true;
+                yes_flag = true;
             }
             "--dry-run" => dry_run = true,
             "--walk-only" => walk_only = true,
             "--json" => json = true,
-            "--md" => json = false,
+            "--md" => {
+                json = false;
+                markdown = true;
+            }
             "--code-analyzer" => {
                 let raw = it
                     .next()
                     .ok_or("--code-analyzer needs a value: standard or code")?;
                 code_analyzer = crate::infer::CodeAnalyzer::parse(&raw)?;
+                code_analyzer_explicit = true;
+            }
+            "--root" => {
+                let raw = it
+                    .next()
+                    .ok_or("--root needs a directory: `autoindex remove --root <DIR>`")?;
+                if remove_root.is_some() {
+                    return Err("--root was given twice".into());
+                }
+                remove_root = Some(raw);
             }
             "--progress" => {
                 let raw = it
@@ -1304,6 +1355,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--help" | "-h" => return Ok(Cmd::Help),
             "map" if sub.is_none() && folder.is_none() => sub = Some("map".into()),
             "status" if sub.is_none() && folder.is_none() => sub = Some("status".into()),
+            "remove" if sub.is_none() && folder.is_none() => sub = Some("remove".into()),
             other if !other.starts_with('-') && folder.is_none() && sub.is_none() => {
                 root_raw = Some(other.to_string());
                 folder = Some(PathBuf::from(other))
@@ -1312,6 +1364,12 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             // Say what the command does (one folder per run) and show the
             // two-run form with a distinct --prefix, so an agent that read
             // "unknown argument: repoB" does not conclude repoA was refused.
+            other if !other.starts_with('-') && sub.as_deref() == Some("remove") => {
+                return Err(format!(
+                    "`autoindex remove` takes the folder as --root, not as a positional \
+                     argument. Try: xerj autoindex remove --prefix <P> --root {other}"
+                ));
+            }
             other if !other.starts_with('-') && folder.is_some() && sub.is_none() => {
                 let first = folder
                     .as_ref()
@@ -1365,7 +1423,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     // Only meaningful for a run that walks a folder. On `map`/`status` neither
     // flag does anything at all, and the arm below says so — a message about
     // one flag subsuming the other would imply the pair is otherwise honoured.
-    let sub_walks_a_folder = !matches!(sub.as_deref(), Some("map") | Some("status"));
+    let sub_walks_a_folder = !matches!(
+        sub.as_deref(),
+        Some("map") | Some("status") | Some("remove")
+    );
     if no_ignore && no_default_ignores && sub_walks_a_folder {
         return Err(
             "--no-ignore already turns off the built-in default rules that --no-default-ignores \
@@ -1734,7 +1795,64 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         })));
     }
 
+    if remove_root.is_some() && sub.as_deref() != Some("remove") {
+        return Err(
+            "--root names the folder `autoindex remove` drops. It is only supported with \
+             `autoindex remove --prefix <P> --root <DIR>`."
+                .into(),
+        );
+    }
+
     match (sub.as_deref(), folder) {
+        (Some("remove"), _) => remove_cmd(RemoveParse {
+            cfg: RemoveCfg {
+                url,
+                api_key,
+                prefix,
+                root: remove_root,
+                yes: yes_flag,
+                json,
+                quiet,
+                xerj_url_note,
+            },
+            prefix_explicit,
+            approve_set: approve.is_some(),
+            markdown,
+            reject: RemoveReject {
+                dry_run,
+                replace_prefix,
+                state_dir: state_dir.is_some(),
+                fresh,
+                workers: workers.is_some(),
+                pdf_workers: pdf_workers.is_some(),
+                pdf_timeout: pdf_timeout_secs != 120,
+                bulk_mb: bulk_mb != 8,
+                bulk_timeout: bulk_timeout_explicit,
+                snapshot: snapshot_max_bytes != (64u64 << 30),
+                follow_symlinks,
+                follow_symlinks_outside_root,
+                stubs: !stub_globs.is_empty(),
+                ignore: !ignore_flags_used.is_empty(),
+                max_file: max_file_bytes.is_some(),
+                sample: sample != 500,
+                no_semantic,
+                code_analyzer: code_analyzer_explicit,
+                brain: brain.is_some(),
+                no_graph,
+                watch,
+                debounce: debounce_ms.is_some(),
+                watch_flags: !watch_flags_used.is_empty(),
+                label: label.is_some(),
+                dataset: dataset.is_some(),
+                paging: detail_offset.is_some() || detail_limit.is_some(),
+                progress: progress_explicit,
+                endpoint: endpoint_explicit,
+                max_minutes: max_minutes_explicit,
+                max_index: max_index_explicit,
+                plan: budget_plan.is_some(),
+                walk_only,
+            },
+        }),
         (Some("map"), _) | (Some("status"), _) if walk_only => Err(format!(
             "--walk-only summarises a folder walk and does not apply to `autoindex {}`: that \
              subcommand never walks a tree. Drop it",
@@ -1915,11 +2033,137 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         // `--help` / `-h` still return [`Cmd::Help`] above.
         _ => Err(
             "a folder is required (`xerj autoindex <folder>`), or use \
-             `xerj autoindex map` / `xerj autoindex status`. \
+             `xerj autoindex map`, `xerj autoindex status`, or \
+             `xerj autoindex remove --prefix <P>`. \
              `xerj autoindex --help` prints the full usage"
                 .into(),
         ),
     }
+}
+
+struct RemoveReject {
+    dry_run: bool,
+    replace_prefix: bool,
+    state_dir: bool,
+    fresh: bool,
+    workers: bool,
+    pdf_workers: bool,
+    pdf_timeout: bool,
+    bulk_mb: bool,
+    bulk_timeout: bool,
+    snapshot: bool,
+    follow_symlinks: bool,
+    follow_symlinks_outside_root: bool,
+    stubs: bool,
+    ignore: bool,
+    max_file: bool,
+    sample: bool,
+    no_semantic: bool,
+    code_analyzer: bool,
+    brain: bool,
+    no_graph: bool,
+    watch: bool,
+    debounce: bool,
+    watch_flags: bool,
+    label: bool,
+    dataset: bool,
+    paging: bool,
+    progress: bool,
+    endpoint: bool,
+    max_minutes: bool,
+    max_index: bool,
+    plan: bool,
+    walk_only: bool,
+}
+
+struct RemoveParse {
+    cfg: RemoveCfg,
+    prefix_explicit: bool,
+    approve_set: bool,
+    markdown: bool,
+    reject: RemoveReject,
+}
+
+fn remove_cmd(input: RemoveParse) -> Result<Cmd, String> {
+    let RemoveParse {
+        cfg,
+        prefix_explicit,
+        approve_set,
+        markdown,
+        reject,
+    } = input;
+    if !prefix_explicit {
+        return Err(
+            "autoindex remove requires --prefix. The default name ax is shared across folders, \
+             so this command will not guess it. Pass the prefix you indexed with."
+                .into(),
+        );
+    }
+    if approve_set && !cfg.yes {
+        return Err(
+            "--approve is the indexing decision gate. `autoindex remove` confirms with --yes, \
+             after it has printed what it will delete."
+                .into(),
+        );
+    }
+    if reject.state_dir {
+        return Err(
+            "--state-dir is the local resume journal. `autoindex remove` does not read or delete \
+             it. The journal key includes the folder, so a later index of that folder still \
+             resumes from it. Drop --state-dir."
+                .into(),
+        );
+    }
+    let flags = [
+        ("--dry-run", reject.dry_run),
+        ("--replace-prefix", reject.replace_prefix),
+        ("--fresh", reject.fresh),
+        ("--workers", reject.workers),
+        ("--pdf-workers", reject.pdf_workers),
+        ("--pdf-timeout-secs", reject.pdf_timeout),
+        ("--bulk-mb", reject.bulk_mb),
+        ("--bulk-timeout-secs", reject.bulk_timeout),
+        ("--snapshot-max-gb", reject.snapshot),
+        ("--follow-symlinks", reject.follow_symlinks),
+        (
+            "--follow-symlinks-outside-root",
+            reject.follow_symlinks_outside_root,
+        ),
+        ("--stub", reject.stubs),
+        ("--no-ignore", reject.ignore),
+        ("--max-file-bytes", reject.max_file),
+        ("--sample", reject.sample),
+        ("--no-semantic", reject.no_semantic),
+        ("--code-analyzer", reject.code_analyzer),
+        ("--brain", reject.brain),
+        ("--no-graph", reject.no_graph),
+        ("--watch", reject.watch),
+        ("--debounce", reject.debounce),
+        ("--poll-interval", reject.watch_flags),
+        ("--label", reject.label),
+        ("--dataset", reject.dataset),
+        ("--offset", reject.paging),
+        ("--progress", reject.progress),
+        ("--endpoint-url", reject.endpoint),
+        ("--max-minutes", reject.max_minutes),
+        ("--max-index-size", reject.max_index),
+        ("--plan", reject.plan),
+        ("--walk-only", reject.walk_only),
+        ("--md", markdown),
+    ];
+    let bad: Vec<&str> = flags
+        .iter()
+        .filter(|(_, used)| *used)
+        .map(|(n, _)| *n)
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "{} apply only to indexing, not `autoindex remove`. This command lists one folder's \
+             indices and catalog rows and deletes those. It does not walk or index. Drop them",
+            bad.join(", ")
+        ));
+    }
+    Ok(Cmd::Remove(cfg))
 }
 
 #[cfg(test)]
@@ -2719,6 +2963,37 @@ mod tests {
             index(&["data", "--approve", "cancel"]).approve,
             Some(Approval::Cancel)
         );
+    }
+
+    #[test]
+    fn remove_requires_a_prefix_and_confirms_with_yes() {
+        let missing = err(&["remove"]);
+        assert!(missing.contains("requires --prefix"), "{missing}");
+        let cfg = match parse(
+            ["remove", "--prefix", "proj", "--root", "/tmp/proj", "--yes"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .unwrap()
+        {
+            Cmd::Remove(cfg) => cfg,
+            other => panic!("expected remove, got {other:?}"),
+        };
+        assert_eq!(cfg.prefix, "proj");
+        assert_eq!(cfg.root.as_deref(), Some("/tmp/proj"));
+        assert!(cfg.yes);
+        let refused = err(&["remove", "--prefix", "proj", "--dry-run"]);
+        assert!(refused.contains("--dry-run"), "{refused}");
+        assert!(refused.contains("not `autoindex remove`"), "{refused}");
+        let walk = err(&["remove", "--prefix", "proj", "--walk-only"]);
+        assert!(walk.contains("--walk-only"), "{walk}");
+        assert!(walk.contains("not `autoindex remove`"), "{walk}");
+        let journal = err(&["remove", "--prefix", "proj", "--state-dir", "/tmp/j"]);
+        assert!(journal.contains("resume journal"), "{journal}");
+        assert!(err(&["data", "--root", "/tmp/a"]).contains("only supported with"));
+        assert!(err(&["remove", "--prefix", "proj", "--approve", "proceed"]).contains("--yes"));
+        assert!(super::help_text().contains("autoindex remove"));
     }
 
     #[test]

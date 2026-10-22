@@ -453,7 +453,7 @@ the other direction: it hosts an MCP endpoint other agents connect to, and its s
 their servers from the harness underneath. Grok Bot has no documented local stdio registration; the
 Grok CLI does, which is the `grok` row above.
 
-Nineteen tools are exposed. Eleven are thin proxies over an endpoint XERJ already serves:
+Twenty tools are exposed. Eleven are thin proxies over an endpoint XERJ already serves:
 
 | Tool | What it does |
 |---|---|
@@ -469,7 +469,9 @@ Two more are not plain proxies: `xerj_map` returns the per-index field map from 
 catalog (trimmed to a byte cap, otherwise verbatim), and `xerj_code_search` runs the `xerj code`
 reference-coding pipeline ([`tools/xerj-code/`](tools/xerj-code/)) and returns its rendered text.
 `xerj_index_budget` counts a folder and estimates its index against the node's disk budget
-before `xerj autoindex` hashes anything (it does not index). `xerj_corpus_feedback` rates a hub corpus.
+before `xerj autoindex` hashes anything (it does not index). `xerj_autoindex_remove` drops
+one autoindexed folder after listing it, and deletes nothing unless `confirm` is true.
+`xerj_corpus_feedback` rates a hub corpus.
 `xerj_field_report` files a field report, and `xerj_hub_find`, `xerj_hub_def` and `xerj_hub_ask`
 answer from Corpus Hub packs already on the machine (the `xerj ask` flow).
 

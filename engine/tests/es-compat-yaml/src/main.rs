@@ -173,7 +173,24 @@ fn extract_setup_indices(steps: &[YamlValue]) -> Vec<String> {
 }
 
 fn cleanup_indices(client: &reqwest::blocking::Client, base_url: &str) {
-    let _ = client.delete(format!("{}/_all", base_url)).send();
+    // XERJ defaults `action.destructive_requires_name` to true, matching ES 8,
+    // so a bare `DELETE /_all` is a 400 and would leak indices into the next
+    // file. The suite wipe is an explicit opt-out: turn the guard off, delete,
+    // then put the key back to null so the next file sees the default again.
+    // A teardown that left the setting `false` used to leak the same way.
+    let off = r#"{"persistent":{"action.destructive_requires_name":false}}"#;
+    let clear = r#"{"persistent":{"action.destructive_requires_name":null}}"#;
+    let _ = client
+        .put(format!("{base_url}/_cluster/settings"))
+        .header("content-type", "application/json")
+        .body(off)
+        .send();
+    let _ = client.delete(format!("{base_url}/_all")).send();
+    let _ = client
+        .put(format!("{base_url}/_cluster/settings"))
+        .header("content-type", "application/json")
+        .body(clear)
+        .send();
 }
 
 fn run_file(

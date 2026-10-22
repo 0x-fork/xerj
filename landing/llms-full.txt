@@ -1331,20 +1331,21 @@ POST /_memory/agent-42/_recall  { "query": "what did they ask about security", "
   Case-studies hub (web) .. https://xerj.org/case-studies
   Front door (short) ...... https://xerj.org/llms.txt
 
-Tool schemas (ready to paste into an agent framework; none of them can trigger
-autoindex, which is CLI-only):
+Tool schemas (ready to paste into an agent framework; none of them can start
+`xerj autoindex`, which stays CLI-only — `xerj_autoindex_remove` drops a folder
+already indexed, and does not walk or index):
   MCP ..................... https://xerj.org/docs/agents/schemas/mcp-tools.json
   OpenAI .................. https://xerj.org/docs/agents/schemas/openai-tools.json
   Anthropic ............... https://xerj.org/docs/agents/schemas/anthropic-tools.json
 The OpenAI and Anthropic files carry the six HTTP operations above; the MCP file
-carries nineteen (those six plus xerj_brain_ego / _link / _unlink / _overview,
-xerj_map, xerj_code_search, xerj_plan, xerj_index_budget, xerj_field_report,
+carries twenty (those six plus xerj_brain_ego / _link / _unlink / _overview,
+xerj_map, xerj_code_search, xerj_plan, xerj_index_budget, xerj_autoindex_remove, xerj_field_report,
 xerj_corpus_feedback and the hub tools xerj_hub_find / _def / _ask) and is generated from a real
 tools/list of the server that serves them. A binary with no hub key omits the
-three hub tools and serves sixteen. (v1.0.0-rc.97 predates xerj_corpus_feedback
+three hub tools and serves seventeen of the twenty. (v1.0.0-rc.97 predates xerj_corpus_feedback
 and xerj_index_budget and serves seventeen.)
 The three schema files are therefore NOT interchangeable, and they are not even the same shape: the MCP file
-is an object, so count `.tools` in it (`jq '.tools | length'` → 19) and the bare
+is an object, so count `.tools` in it (`jq '.tools | length'` → 20) and the bare
 array in the other two (`jq 'length'` → 6). `jq 'length'` on the MCP file returns
 1, the object's key count — not a tool count.
 If you can run a process, `xerj mcp` is that stdio server, inside the same binary
@@ -1383,6 +1384,16 @@ wire it once instead of improvising every time.
      arrives (below). Do not paraphrase it into "still working".
   5. CLOSE THE LOOP — wait for the single `xerj-done …` line, then report the MEASURED
      wall time and what landed, and offer `xerj autoindex map` as the briefing.
+
+NEVER DELETE AN INDEX YOU DID NOT CREATE. The default prefix is `ax`. If a second
+folder is refused, the first line is a ready-to-copy `xerj autoindex <folder>
+--prefix <name>`. Do not DELETE the existing index and do not `_delete_by_query`
+the catalog. To drop a folder you indexed: `xerj autoindex remove --prefix <name>
+[--root <dir>]` (MCP: `xerj_autoindex_remove`). It prints the plan and deletes
+nothing unless you pass `--yes` or answer the terminal prompt. Without `--yes`
+on a pipe it exits 4. It never removes another folder that shares the prefix.
+Wildcard and `_all` index deletes are refused unless `action.destructive_requires_name`
+is false.
 
 The decision payload. One JSON document on stdout, so you never scrape prose (the same
 information is also printed as human lines for whoever is at the terminal). The keys

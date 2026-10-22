@@ -285,6 +285,7 @@ fn help_text(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20flagship path for most agents (see xerj\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20autoindex --help)\n\
          \x20\x20\x20\x20xerj autoindex map                  print the discovered data map\n\
+         \x20\x20\x20\x20xerj autoindex remove --prefix <P>  drop one autoindexed folder, after a plan\n\
          \x20\x20\x20\x20xerj code <corpus> \"<query>\"        reference-coding retrieval over a corpus\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20of peer projects (see xerj code --help)\n\
          \x20\x20\x20\x20xerj corpus add|index|list          the corpus lifecycle behind `xerj code`\n\
@@ -2814,14 +2815,14 @@ mod decide_flag_tests {
 
     #[test]
     fn help_counts_the_mcp_tools_actually_served() {
-        // #1443: the help said "exposes 13 tools" while `tools/list` served 16.
-        // `xerj_field_report` is a fourteenth non-hub tool (seventeen with the hub).
+        // The count is `tool_specs()`, the same list `tools/list` returns:
+        // seventeen without a hub key, twenty with the three hub tools.
         let served = super::mcp_tool_count();
         if xerj_common::hub::hub_key_configured() {
-            assert!(served >= 17, "tool_specs() shrank to {served}");
+            assert_eq!(served, 20, "tool_specs() with a hub key: {served}");
         } else {
             assert_eq!(
-                served, 14,
+                served, 17,
                 "a no-key process must not count the hub tools it does not serve"
             );
         }

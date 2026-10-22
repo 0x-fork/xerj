@@ -9,12 +9,14 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as nineteen
-//! tools: sixteen without a hub key, and three Corpus Hub tools
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as twenty
+//! tools: seventeen without a hub key, and three Corpus Hub tools
 //! (`xerj_hub_*`) that run the `xerj ask` flow itself. Thirteen of those
-//! sixteen construct exactly the request the running engine already accepts
+//! seventeen construct exactly the request the running engine already accepts
 //! and forward it to a configurable base URL. `xerj_index_budget` counts a
-//! folder and returns the budget plans; it does not index. `xerj_corpus_feedback` posts an
+//! folder and returns the budget plans; it does not index. `xerj_autoindex_remove`
+//! deletes one autoindexed folder after listing what that folder owns, and only
+//! when the caller passes `confirm: true`. `xerj_corpus_feedback` posts an
 //! agent's review of a hub corpus to hub.xerj.org. `xerj_field_report` does not:
 //! it files a field report, not to the node: a GitHub PR first (through
 //! `xerj feedback --submit --github-only`), and a POST to the web endpoint only
@@ -579,6 +581,14 @@ const BRAIN_HONESTY: &str = " Honesty: links come from deterministic lexical \
      search engine with a graph-shaped index over its own documents, not a \
      graph database.";
 
+/// The rule an agent has to see before it reaches for `DELETE /ax-docs`.
+const NEVER_DELETE_INDEX: &str = " Never DELETE an index you did not create in \
+     this session. A shared default prefix is not a reason to delete one: use \
+     `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` \
+     is the same operation). It lists the indices, catalog rows, doc counts and \
+     sizes, deletes nothing without confirmation, and never removes another \
+     folder under that prefix.";
+
 /// JSON-schema fragment for the optional `rerank` argument, shared by
 /// `xerj_search` and `xerj_hybrid_search` so the two descriptions cannot drift.
 ///
@@ -760,9 +770,11 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                 "properties": {
                     "index": {
                         "type": "string",
-                        "description": "Index name or pattern to search. Defaults to `ax-*` — \
-                         the prefix `xerj autoindex` writes — so the common case needs \
-                         no argument. Pass an explicit name to search anything else."
+                        "description": format!(
+                            "Index name or pattern to search. Defaults to `ax-*` — \
+                             the prefix `xerj autoindex` writes — so the common case needs \
+                             no argument. Pass an explicit name to search anything else.{NEVER_DELETE_INDEX}"
+                        )
                     },
                     "query": {
                         "type": ["object", "string"],
@@ -1068,7 +1080,9 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
         },
         {
             "name": "xerj_map",
-            "description": concat!(
+            "description": format!(
+                "{}{NEVER_DELETE_INDEX}",
+                concat!(
                 "Per-index FIELD MAP from this node's autoindex catalog — call it ",
                 "BEFORE writing query DSL, so you stop guessing field names. For each ",
                 "catalogued index: record count, time field and time range, semantic ",
@@ -1086,7 +1100,7 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                 "reports more). When more than 8 indexes match and you did not pass ",
                 "`index`, the answer is a SUMMARY page (index, records, field names) ",
                 "— pass `index` or `detail: true` with `offset`/`limit` for full fields."
-            ),
+            )),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1133,7 +1147,9 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
         },
         {
             "name": "xerj_index_budget",
-            "description": concat!(
+            "description": format!(
+                "{}{NEVER_DELETE_INDEX}",
+                concat!(
                 "Count a folder and estimate the index BEFORE xerj autoindex hashes or ",
                 "embeds anything. Returns file and byte counts by kind (code, prose, pdf, ",
                 "data, binary, other — by extension, before content sniff) and by top-level ",
@@ -1147,7 +1163,7 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                 "lexical feature-hash vectors unless that node was started with ",
                 "--embed-mode neural. Kinds without a measured calibration are ",
                 "unmeasured and do not refuse the run."
-            ),
+            )),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1170,6 +1186,39 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                     }
                 },
                 "required": ["path"]
+            }
+        },
+        {
+            "name": "xerj_autoindex_remove",
+            "description": format!(
+                "{}{NEVER_DELETE_INDEX}",
+                concat!(
+                "Delete one autoindexed folder. Reads the autoindex catalog and returns ",
+                "exactly the indices, catalog rows, doc counts and sizes that belong to ",
+                "`prefix` (and to `root`, when the prefix holds more than one folder). ",
+                "Pass `confirm: true` only after you have read that plan. Without it ",
+                "nothing is deleted and the result is an error, so a caller cannot ",
+                "mistake the preview for a completed delete. An index another folder ",
+                "under the same prefix still names is left in place. `autoindex-catalog` ",
+                "is never deleted. This does not walk or index a folder."
+            )),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prefix": {
+                        "type": "string",
+                        "description": "The prefix the folder was indexed with. Required. The shared default `ax` is not assumed."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "The folder to drop, when `prefix` holds more than one. Omit it only when the plan lists a single root."
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Delete what the plan lists. false, or omitted, prints the plan and deletes nothing."
+                    }
+                },
+                "required": ["prefix"]
             }
         },
         {
@@ -1842,6 +1891,7 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         // returns a tool result directly instead of a BuiltRequest.
         "xerj_map" => return map::run(ctx, &args).await,
         "xerj_index_budget" => return run_index_budget(ctx, &args).await,
+        "xerj_autoindex_remove" => return run_autoindex_remove(ctx, &args).await,
         "xerj_code_search" => return run_code_search(ctx, &args).await,
         // Corpus Hub v2 (plan §7): the `xerj ask` flow itself, not a proxy.
         hub_tool if hub_tool.starts_with("xerj_hub_") => {
@@ -2683,6 +2733,82 @@ async fn run_index_budget(ctx: &Ctx, args: &Value) -> Value {
         ),
         Ok(Err(err)) => tool_text(format!("xerj_index_budget: {err:#}"), true),
         Err(err) => tool_text(format!("xerj_index_budget: {err}"), true),
+    }
+}
+
+/// `Es` stores the bare token and writes `Authorization: ApiKey <token>`.
+/// `Ctx.auth` is already that header value.
+fn api_key_from_header(auth: Option<String>) -> Option<String> {
+    let raw = auth?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let key = trimmed
+        .strip_prefix("ApiKey ")
+        .or_else(|| trimmed.strip_prefix("ApiKey"))
+        .unwrap_or(trimmed)
+        .trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+/// `xerj_autoindex_remove` — the same operation as `xerj autoindex remove`.
+///
+/// `confirm` is not optional in spirit: missing or false returns the plan and
+/// `isError: true`, so an agent that only looks at the tool result cannot
+/// treat a preview as a finished delete. There is no terminal prompt.
+async fn run_autoindex_remove(ctx: &Ctx, args: &Value) -> Value {
+    let prefix = match args.get("prefix").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            return tool_text(
+                "xerj_autoindex_remove: `prefix` is required. The default name ax is shared \
+                 across folders; pass the prefix you indexed with.",
+                true,
+            )
+        }
+    };
+    let root = match args.get("root") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(_)) => {
+            return tool_text(
+                "xerj_autoindex_remove: `root` must be a non-empty path",
+                true,
+            )
+        }
+        Some(_) => return tool_text("xerj_autoindex_remove: `root` must be a string", true),
+    };
+    let confirm = match args.get("confirm") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return tool_text("xerj_autoindex_remove: `confirm` must be a boolean", true),
+    };
+    let url = ctx.base_url.clone();
+    let api_key = api_key_from_header(ctx.auth.clone());
+    let joined = tokio::task::spawn_blocking(move || {
+        xerj_autoindex::remove::execute(xerj_autoindex::remove::RemoveRequest {
+            url,
+            api_key,
+            prefix,
+            root,
+            yes: confirm,
+            prompt: false,
+        })
+    })
+    .await;
+    match joined {
+        Ok(Ok(report)) => {
+            let plan = serde_json::to_string_pretty(&report.body)
+                .unwrap_or_else(|_| report.body.to_string());
+            tool_text(format!("{}\n{plan}", report.summary), report.exit_code != 0)
+        }
+        Ok(Err(err)) => tool_text(format!("xerj_autoindex_remove: {err:#}"), true),
+        Err(err) => tool_text(format!("xerj_autoindex_remove: {err}"), true),
     }
 }
 
@@ -4689,6 +4815,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn autoindex_remove_validates_before_it_connects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: Some("ApiKey secret".into()),
+        };
+        for args in [json!({}), json!({"prefix": "ax", "confirm": "yes"})] {
+            let result = call_tool(
+                &ctx,
+                &json!({ "params": { "name": "xerj_autoindex_remove", "arguments": args } }),
+            )
+            .await;
+            assert_eq!(result["isError"], true, "{result}");
+            match listener.accept() {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("validation must not open a connection: {other:?}"),
+            }
+        }
+        let specs = tool_specs_with(true);
+        let text = |name: &str| {
+            specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(text("xerj_autoindex_remove").contains("Never DELETE an index you did not create"));
+        assert!(text("xerj_map").contains("Never DELETE an index you did not create"));
+        let search = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "xerj_search")
+            .unwrap();
+        assert!(search["inputSchema"]["properties"]["index"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Never DELETE an index you did not create"));
+    }
+
     #[test]
     fn tools_list_has_all_eighteen() {
         let specs = tool_specs_with(true);
@@ -4698,7 +4872,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         for n in [
             "xerj_search",
             "xerj_semantic_search",
@@ -4713,6 +4887,7 @@ mod tests {
             // #1055: the per-index field map from the autoindex catalog.
             "xerj_map",
             "xerj_index_budget",
+            "xerj_autoindex_remove",
             // #977: reference-coding retrieval, served by the same pipeline
             // as `xerj code`.
             "xerj_code_search",
@@ -4767,12 +4942,20 @@ mod tests {
             ["agent", "used_for", "verdict"]
         );
         // Deliberately NOT exposed: raw traversal, bulk dumps, operator actions.
-        for forbidden in ["graph_expand", "autoindex", "dump"] {
+        for forbidden in ["graph_expand", "dump"] {
             assert!(
                 !names.iter().any(|n| n.contains(forbidden)),
                 "must not expose {forbidden}"
             );
         }
+        // Indexing stays off this list. Remove is the one autoindex operation
+        // an agent is allowed to call, and only with `confirm: true`.
+        let autoindex_tools: Vec<_> = names
+            .iter()
+            .copied()
+            .filter(|n| n.contains("autoindex"))
+            .collect();
+        assert_eq!(autoindex_tools, vec!["xerj_autoindex_remove"]);
     }
 
     /// A process with no hub signing key must not advertise tools that can
@@ -4789,23 +4972,23 @@ mod tests {
                 .collect()
         };
         let without = names(false);
-        assert_eq!(without.len(), 16, "{without:?}");
+        assert_eq!(without.len(), 17, "{without:?}");
         assert!(
             without.iter().all(|n| !n.starts_with("xerj_hub_")),
             "{without:?}"
         );
         let with = names(true);
-        assert_eq!(with.len(), 19, "{with:?}");
+        assert_eq!(with.len(), 20, "{with:?}");
         for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
             assert!(with.iter().any(|name| name == n), "missing {n}");
         }
 
         let help = tools_paragraph(false);
-        assert!(help.contains("proxies 16 tools"), "{help}");
+        assert!(help.contains("proxies 17 tools"), "{help}");
         assert!(!help.contains("xerj_hub_"), "{help}");
         assert!(help.contains("~/xerj-data"), "{help}");
         let help = tools_paragraph(true);
-        assert!(help.contains("proxies 19 tools"), "{help}");
+        assert!(help.contains("proxies 20 tools"), "{help}");
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }

@@ -455,9 +455,14 @@ catalog datasets are keyed `ds:<prefix>:<slug>` and indices are `<prefix>-*`,
 so finalize would overwrite the earlier datasets. Indexing several
 repositories as separate runs under one prefix also collapses them: each
 repo indexed on its own has an empty scope and becomes the single dataset
-`<prefix>-docs`. Index the parent folder once, use one `--prefix` per
-folder, or pass `--replace-prefix` to retire the earlier datasets on
-purpose. `--dry-run` does not bypass the refusal),
+`<prefix>-docs`. The refusal's first remedy is a ready-to-copy
+`xerj autoindex <folder> --prefix <name>`. Do not `DELETE` the existing
+index. Drop a folder you indexed with
+`xerj autoindex remove --prefix <name> [--root <dir>]` — it previews the
+indices and catalog rows and deletes nothing without `--yes`. Index the
+parent folder once, use one `--prefix` per folder, or pass
+`--replace-prefix` to retire the earlier datasets on purpose.
+`--dry-run` does not bypass the refusal),
 `--no-semantic` for pure BM25+keyword without vector fields, `--dry-run` to
 print the inferred plan without indexing anything, `--follow-symlinks`
 (loop-safe — and a followed link is judged by what it resolves to: a target

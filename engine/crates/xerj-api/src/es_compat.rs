@@ -2225,11 +2225,73 @@ pub struct DeleteIndexParams {
     pub allow_no_indices: Option<String>,
 }
 
+/// ES 8 `action.destructive_requires_name`. Absent means true: a `DELETE`
+/// whose selector is `*`, `_all`, or any wildcard is refused. `false` (bool
+/// or the string `"false"`) is the opt-out the ES-YAML suite and the failed-
+/// index recovery tests set explicitly. Transient overrides persistent.
+/// Closing an index stays stricter: [`close_index`] refuses wildcards even
+/// when this setting is false.
+fn destructive_requires_name_enabled(settings: &Value) -> bool {
+    fn as_bool(value: &Value) -> Option<bool> {
+        match value {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let transient = settings
+        .get("transient")
+        .and_then(|s| s.get("action.destructive_requires_name"));
+    let persistent = settings
+        .get("persistent")
+        .and_then(|s| s.get("action.destructive_requires_name"));
+    transient.or(persistent).and_then(as_bool).unwrap_or(true)
+}
+
+/// True when any comma-separated selector is `_all`, `*`, or contains `*` or `?`.
+fn selector_is_destructive(index: &str) -> bool {
+    index
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| part == "_all" || part == "*" || part.contains('*') || part.contains('?'))
+}
+
+fn destructive_delete_refused() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{
+                    "type": "illegal_argument_exception",
+                    "reason": "Wildcard expressions or all indices are not allowed"
+                }],
+                "type": "illegal_argument_exception",
+                "reason": "Wildcard expressions or all indices are not allowed"
+            },
+            "status": 400
+        })),
+    )
+        .into_response()
+}
+
 pub async fn delete_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<DeleteIndexParams>,
 ) -> impl IntoResponse {
+    // Checked before expansion. A wildcard that matches nothing must still
+    // be a 400, and the settings lock is dropped before any delete.
+    {
+        let settings = state.engine.cluster_settings.read().await;
+        if destructive_requires_name_enabled(&settings) && selector_is_destructive(&index) {
+            return destructive_delete_refused();
+        }
+    }
     let ignore_unavailable = params.ignore_unavailable.as_deref() == Some("true");
     let allow_no_indices = params
         .allow_no_indices
@@ -2330,6 +2392,37 @@ pub async fn delete_index(
         state.metrics.prune_index_labels(name);
     }
     Json(EsDeleteIndexResponse::ok()).into_response()
+}
+
+#[cfg(test)]
+mod destructive_requires_name_tests {
+    use super::*;
+
+    #[test]
+    fn the_setting_defaults_to_requiring_a_name() {
+        let empty = json!({"persistent": {}, "transient": {}});
+        assert!(destructive_requires_name_enabled(&empty));
+        let persistent_false = json!({"persistent": {"action.destructive_requires_name": false}});
+        assert!(!destructive_requires_name_enabled(&persistent_false));
+        let persistent_string =
+            json!({"persistent": {"action.destructive_requires_name": "false"}});
+        assert!(!destructive_requires_name_enabled(&persistent_string));
+        let transient_wins = json!({
+            "persistent": {"action.destructive_requires_name": false},
+            "transient": {"action.destructive_requires_name": true}
+        });
+        assert!(destructive_requires_name_enabled(&transient_wins));
+    }
+
+    #[test]
+    fn a_wildcard_or_all_selector_is_destructive_and_a_name_is_not() {
+        for selector in ["_all", "*", "ax-*", "a?", "kept,ax-*", "foo,_all"] {
+            assert!(selector_is_destructive(selector), "{selector}");
+        }
+        for selector in ["ax-docs", "ax-docs,ax-code", ""] {
+            assert!(!selector_is_destructive(selector), "{selector}");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33613,8 +33706,9 @@ pub async fn close_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    // ES 8's `action.destructive_requires_name` defaults to true: closing
-    // by wildcard/_all is refused outright — only concrete names may close.
+    // Closing stays stricter than `action.destructive_requires_name`: a
+    // wildcard or `_all` is refused even when that setting is false. Only
+    // concrete names may close.
     if index == "_all" || index.contains('*') {
         return (
             StatusCode::BAD_REQUEST,
