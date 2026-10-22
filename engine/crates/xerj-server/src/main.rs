@@ -1735,6 +1735,107 @@ fn parse_count(flag: &str, next: Option<String>) -> Result<usize, String> {
         .map_err(|_| format!("{flag} must be a non-negative whole number, got {v:?}"))
 }
 
+/// Validate `xerj index --file` before `run_cli_index` writes any state (#1818).
+///
+/// Without this check a directory reached `memmap2::Mmap::map` and surfaced
+/// `EINVAL` only after the data dir, lock, audit log, and target index had
+/// been committed, leaving an empty phantom index behind.
+///
+/// `fs::metadata` follows symlinks, so a symlink to a directory is caught as
+/// a directory. A missing path returns `Ok(())` so `File::open` can surface
+/// its native ENOENT message. A non-regular file (FIFO, socket, device) is
+/// refused here because `File::open` on a FIFO blocks until a writer appears.
+fn check_index_file_input(path: &Path) -> Result<(), String> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if meta.is_dir() {
+        return Err(format!(
+            "--file {0} is a directory, not an NDJSON file; \
+             run `xerj autoindex {0}` to index a folder",
+            path.display(),
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!("--file {} is not a regular file", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod check_index_file_input_tests {
+    use super::check_index_file_input;
+
+    #[test]
+    fn a_regular_ndjson_file_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("docs.ndjson");
+        std::fs::write(&file, b"{}\n").expect("write ndjson");
+        assert!(check_index_file_input(&file).is_ok());
+    }
+
+    #[test]
+    fn an_empty_regular_file_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("empty.ndjson");
+        std::fs::write(&file, b"").expect("write empty file");
+        assert!(check_index_file_input(&file).is_ok());
+    }
+
+    #[test]
+    fn a_directory_is_refused_and_points_at_autoindex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = check_index_file_input(dir.path()).expect_err("a dir is not NDJSON");
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains("not an NDJSON file"), "{err}");
+        assert!(err.contains("xerj autoindex"), "{err}");
+        assert!(err.contains(&dir.path().display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn a_missing_path_is_passed_through_to_file_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.ndjson");
+        assert!(check_index_file_input(&missing).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_directory_is_refused_as_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real-dir");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link-to-dir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = check_index_file_input(&link).expect_err("symlink to dir is not NDJSON");
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains("xerj autoindex"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_as_not_a_regular_file() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("pipe");
+        let c = CString::new(fifo.as_os_str().as_encoded_bytes()).expect("c-string");
+        // SAFETY: `libc::mkfifo` is a POSIX syscall with no Rust-side invariants;
+        // failure is reported via the return value, which is checked below.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        if rc != 0 {
+            // Some sandboxed filesystems disallow mkfifo; skip rather than fake a pass.
+            eprintln!(
+                "skipping fifo test: mkfifo failed ({})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let err = check_index_file_input(&fifo).expect_err("fifo is not NDJSON");
+        assert!(err.contains("is not a regular file"), "{err}");
+        assert!(err.contains(&fifo.display().to_string()), "{err}");
+    }
+}
+
 fn parse_index_args() -> IndexCmdArgs {
     // Arguments after "index", including a flag that was written before it.
     parse_index_args_from(xerj_common::argv::args_after_subcommand().into_iter()).unwrap_or_else(
@@ -1833,6 +1934,14 @@ fn index_help_text(feedback: bool) -> String {
 async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     use std::sync::Arc as StdArc;
     use tokio::sync::Semaphore;
+
+    // #1818: refuse a wrong-kind-of-path `--file` before any state is written.
+    // Matches the #1586 two-line usage-error shape (exit 2, empty stdout).
+    if let Err(e) = check_index_file_input(&cmd.file) {
+        eprintln!("error: {e}");
+        eprintln!("run `xerj index --help` for usage.");
+        std::process::exit(2);
+    }
 
     // Load config but override to a minimal in-process shape.
     let fake_cli = CliArgs {
