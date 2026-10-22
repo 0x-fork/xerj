@@ -51,6 +51,29 @@ pub fn is_code_ext(ext: &str) -> bool {
     registry().iter().any(|d| d.exts.contains(&e.as_str()))
 }
 
+/// #2205: the `language` a code record carries is the registry row's NAME
+/// (`javascript`, `typescript`, `python` …), so `--lang js` matched nothing
+/// and `xerj code` answered "No passage". Resolve what a user types — a
+/// registry name in any case, or a file extension a row claims (`js`, `ts`,
+/// `py`, `rs` …) — to the stored name. `None` when nothing claims it, so the
+/// caller can pass an unknown value through unchanged.
+pub fn canonical_language(input: &str) -> Option<&'static str> {
+    let wanted = input.trim().trim_start_matches('.').to_ascii_lowercase();
+    let reg = registry();
+    reg.iter()
+        .find(|d| d.name == wanted)
+        .or_else(|| reg.iter().find(|d| d.exts.contains(&wanted.as_str())))
+        .map(|d| d.name)
+}
+
+/// The `--lang` value to filter on: the canonical language name when the
+/// input resolves to one, the input unchanged otherwise.
+pub fn lang_filter_value(input: &str) -> String {
+    canonical_language(input)
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string())
+}
+
 fn def(name: &'static str, exts: &'static [&'static str], lang: Language, q: &str) -> LangDef {
     let query = Query::new(&lang, q).unwrap_or_else(|e| panic!("bad {name} query: {e}"));
     // Text predicates (#eq?/#any-of?/#match?) are NOT applied by the core
@@ -2227,6 +2250,24 @@ const SCHEME_Q: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2205: `--lang js` must filter on the stored `javascript`, not on a
+    /// value no record carries.
+    #[test]
+    fn a_lang_extension_resolves_to_the_stored_language_name() {
+        assert_eq!(lang_filter_value("js"), "javascript");
+        assert_eq!(lang_filter_value(".mjs"), "javascript");
+        assert_eq!(lang_filter_value("JavaScript"), "javascript");
+        assert_eq!(lang_filter_value("ts"), "typescript");
+        assert_eq!(lang_filter_value("py"), "python");
+        assert_eq!(lang_filter_value("python"), "python");
+        // An unknown value passes through unchanged.
+        assert_eq!(lang_filter_value("no-such-lang"), "no-such-lang");
+        // Every resolved name is one a code record can carry.
+        for name in registry().iter().map(|d| d.name) {
+            assert_eq!(canonical_language(name), Some(name));
+        }
+    }
 
     fn syms(lang: &str, src: &str) -> Vec<Symbol> {
         let def = registry().iter().find(|d| d.name == lang).unwrap();

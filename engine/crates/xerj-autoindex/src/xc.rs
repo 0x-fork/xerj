@@ -172,7 +172,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
                     _ => return bad(format!("xerj code: -k must be 1..=50, got '{v}'")),
                 }
             }
-            "--lang" => p.lang = Some(val!("--lang")),
+            "--lang" => p.lang = Some(crate::extract::code::lang_filter_value(&val!("--lang"))),
             "--mode" => {
                 let v = val!("--mode");
                 match Mode::parse(&v) {

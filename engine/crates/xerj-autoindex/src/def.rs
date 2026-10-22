@@ -466,7 +466,11 @@ pub fn run_def_cli() -> i32 {
                 };
             }
             "--kind" => kind = it.next(),
-            "--lang" => lang = it.next(),
+            "--lang" => {
+                lang = it
+                    .next()
+                    .map(|l| crate::extract::code::lang_filter_value(&l))
+            }
             "--json" => as_json = true,
             "--disable-feedback" => {}
             other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
