@@ -19681,31 +19681,7 @@ async fn process_bulk_body(
             status: item.status,
             get,
             error: item.error.map(|e| {
-                // Map common per-item error phrases to their ES exception
-                // type names so clients can match on `error.type`.
-                let error_type = if e.starts_with("if _id is specified")
-                    || e.contains("missing document body")
-                    || e.contains("unknown action type")
-                    || e.contains("no write index is defined")
-                    || e.starts_with("pipeline with id")
-                {
-                    "illegal_argument_exception"
-                } else if e.starts_with("version conflict") {
-                    "version_conflict_engine_exception"
-                } else if e.contains("index not found") || e.starts_with("no such index") {
-                    "index_not_found_exception"
-                } else if e.contains("dynamic template")
-                    || e.contains("failed to parse field")
-                    // Malformed doc-body JSON on a bulk item: ES 8.13
-                    // reports `document_parsing_exception` ("[1:1] failed
-                    // to parse: ..."), not illegal_argument.
-                    || e.contains("invalid document JSON")
-                {
-                    "document_parsing_exception"
-                } else {
-                    "engine_exception"
-                }
-                .to_string();
+                let error_type = bulk_item_error_type(&e).to_string();
                 BulkItemError {
                     error_type,
                     reason: e,
@@ -19850,6 +19826,72 @@ async fn process_bulk_body(
         );
     }
     r
+}
+
+/// Map a per-item `_bulk` error reason to its ES exception type name so
+/// clients can match on `error.type`.
+fn bulk_item_error_type(e: &str) -> &'static str {
+    if e.starts_with("if _id is specified")
+        || e.contains("missing document body")
+        || e.contains("unknown action type")
+        || e.contains("no write index is defined")
+        || e.starts_with("pipeline with id")
+    {
+        "illegal_argument_exception"
+    } else if e.starts_with("version conflict") {
+        "version_conflict_engine_exception"
+    } else if e.contains("index not found") || e.starts_with("no such index") {
+        "index_not_found_exception"
+    } else if e.contains("dynamic template")
+        || e.contains("failed to parse field")
+        // Malformed doc-body JSON on a bulk item: ES 8.13
+        // reports `document_parsing_exception` ("[1:1] failed
+        // to parse: ..."), not illegal_argument.
+        || e.contains("invalid document JSON")
+    {
+        "document_parsing_exception"
+    } else if e.contains("embedding backend returned") && e.contains("mapping requires") {
+        // #2191: the embedding backend's vector width contradicts the
+        // semantic_text mapping. Retrying cannot help, so it is reported as a
+        // mapping error, not a retryable `engine_exception`.
+        "mapper_parsing_exception"
+    } else {
+        "engine_exception"
+    }
+}
+
+#[cfg(test)]
+mod bulk_item_error_type_tests {
+    use super::bulk_item_error_type;
+
+    /// #2191: an embedding width that contradicts the mapping is a
+    /// `mapper_parsing_exception`, while a genuine backend fault stays an
+    /// `engine_exception`.
+    #[test]
+    fn an_embedding_width_mismatch_is_a_mapper_parsing_exception() {
+        assert_eq!(
+            bulk_item_error_type(
+                "invalid mapping: field [body]: embedding backend returned width 4, \
+                 mapping requires 8; the embedding backend's vector width is fixed"
+            ),
+            "mapper_parsing_exception"
+        );
+        assert_eq!(
+            bulk_item_error_type(
+                "invalid mapping: field [body]: embedding backend returned 1 vectors with \
+                 widths {4} for 1 texts; mapping requires width 8"
+            ),
+            "mapper_parsing_exception"
+        );
+        assert_eq!(
+            bulk_item_error_type("semantic_text batch embed failed: connection refused"),
+            "engine_exception"
+        );
+        assert_eq!(
+            bulk_item_error_type("failed to parse field [n]"),
+            "document_parsing_exception"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -17642,6 +17642,11 @@ impl Index {
         let mut outputs: Vec<Option<Vec<Vec<f32>>>> = vec![None; jobs.len()];
         let mut failures = pre_failures;
         let mut admission_rejections = vec![false; sources.len()];
+        // #2191: a backend that answers with the wrong vector WIDTH is a
+        // mapping contradiction, not a transient fault — retrying the same
+        // document can never succeed. Those failures surface as a per-item
+        // 400 (`invalid mapping`) instead of a retryable 500.
+        let mut width_mismatches = vec![false; sources.len()];
 
         let embedder = self.embedder.read().await;
         if embedder.is_active() {
@@ -17730,6 +17735,7 @@ impl Index {
                                 .iter()
                                 .find(|vector| vector.len() != jobs[job_idx].dims)
                             {
+                                width_mismatches[jobs[job_idx].source_idx] = true;
                                 failures[jobs[job_idx].source_idx] = Some(format!(
                                     "field [{}]: embedding backend returned width {}, mapping requires {}",
                                     jobs[job_idx].field,
@@ -17773,6 +17779,10 @@ impl Index {
                                         .iter()
                                         .map(Vec::len)
                                         .collect::<std::collections::BTreeSet<_>>();
+                                    // Only a width error when every text got a
+                                    // vector; a short answer is a backend fault.
+                                    width_mismatches[jobs[job_idx].source_idx] =
+                                        v.len() == jobs[job_idx].texts.len();
                                     failures[jobs[job_idx].source_idx] = Some(format!(
                                         "field [{}]: embedding backend returned {} vectors with widths {:?} for {} texts; mapping requires width {}",
                                         jobs[job_idx].field,
@@ -17783,6 +17793,7 @@ impl Index {
                                     ));
                                 }
                                 Err(e) => {
+                                    width_mismatches[jobs[job_idx].source_idx] = false;
                                     admission_rejections[jobs[job_idx].source_idx] =
                                         is_embedding_admission_rejection(&e);
                                     failures[jobs[job_idx].source_idx] =
@@ -17873,6 +17884,9 @@ impl Index {
                         "semantic_text batch embed rejected before tokenization: {error}"
                     )),
                 )),
+                Some(error) if width_mismatches[idx] => {
+                    Err(EngineError::Common(semantic_width_mismatch_error(&error)))
+                }
                 Some(error) => Err(EngineError::Common(embed_backend_error(
                     anyhow::anyhow!(error),
                     "semantic_text batch embed failed",
@@ -37730,6 +37744,18 @@ fn build_highlight_fragments(
     }
 
     fragments
+}
+
+/// #2191: the embedding backend answered with vectors whose width contradicts
+/// the `semantic_text` field's mapped `dimensions`. The backend's width is
+/// fixed, so a retry cannot succeed: report it as a mapping error (HTTP 400,
+/// `mapper_parsing_exception` on `_bulk`) rather than a retryable backend 500.
+fn semantic_width_mismatch_error(detail: &str) -> xerj_common::XerjError {
+    xerj_common::XerjError::invalid_mapping(format!(
+        "{detail}; the embedding backend's vector width is fixed, so retrying cannot \
+         succeed: set the semantic_text field's `dimensions` to the backend's width, \
+         or point the field at a backend that returns the mapped width"
+    ))
 }
 
 /// Build the effective [`xerj_ai::Embedder`] from `Config.embedding`.
