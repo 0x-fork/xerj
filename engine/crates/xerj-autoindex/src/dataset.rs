@@ -71,7 +71,10 @@ pub(crate) fn small_structured_config(c: &Cluster) -> bool {
         return false;
     }
     let ceiling = (c.members.len() as u64).saturating_mul(DOC_DEMOTE_MAX_RECORDS_PER_FILE);
-    c.records <= ceiling
+    // `population` is the real row count when the extractor knows it (a JSON
+    // array sampled at 500 can still hold 100_000 rows). `records` is only
+    // how many rows the sampler kept.
+    c.population <= ceiling
 }
 
 #[derive(Debug)]
@@ -84,6 +87,9 @@ pub struct Sketch {
     /// `fields`, is the schema-clustering key; empty means "document".
     pub key_fields: HashSet<String>,
     pub records: u64,
+    /// Rows this group actually holds. Equals `records` when the sample saw
+    /// every row; larger when the extractor declared a full array length.
+    pub population: u64,
 }
 
 #[derive(Debug)]
@@ -95,6 +101,9 @@ pub struct Cluster {
     /// Union of the members' `key_fields` — what new sketches are compared to.
     pub key_fields: HashSet<String>,
     pub records: u64,
+    /// Sum of the members' [`Sketch::population`]. The per-scope cap and the
+    /// small-config fold consult this, not the sample count in `records`.
+    pub population: u64,
     pub slug: String,
     /// Repository scope this cluster lives in ("" = the autoindex root).
     pub scope: String,
@@ -138,6 +147,7 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
             fields: HashMap::new(),
             key_fields: HashSet::new(),
             records: 0,
+            population: 0,
             slug: String::new(),
             scope: scope.to_string(),
             is_docs: true,
@@ -152,6 +162,7 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
             let c = docs_cluster(&mut docs, scope);
             c.members.push(sk.file_idx);
             c.records += sk.records;
+            c.population += sk.population;
             for (k, acc) in sk.fields {
                 match c.fields.get_mut(&k) {
                     Some(existing) => existing.merge(&acc),
@@ -181,6 +192,7 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
                 let c = &mut data[ci];
                 c.members.push(sk.file_idx);
                 c.records += sk.records;
+                c.population += sk.population;
                 c.key_fields.extend(sk.key_fields);
                 for (k, acc) in sk.fields {
                     match c.fields.get_mut(&k) {
@@ -198,6 +210,7 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
                 fields: sk.fields,
                 key_fields: sk.key_fields,
                 records: sk.records,
+                population: sk.population,
                 slug: String::new(),
                 scope: scope.to_string(),
                 is_docs: false,
@@ -210,10 +223,20 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
     // YAML/JSON/XML file — to their scope's document dataset. Their sampled
     // fields are dropped — the caller re-samples the demoted files through
     // the document renderer, which is also what indexes them.
+    //
+    // A file that also produced a grouped dataset (a second top-level JSON
+    // array) must not be folded: folding marks the whole file `as_document`
+    // and phase B then drops the grouped rows.
+    let grouped_files: HashSet<usize> = data
+        .iter()
+        .filter(|c| c.group.is_some())
+        .flat_map(|c| c.members.iter().copied())
+        .collect();
     let mut kept: Vec<Cluster> = Vec::with_capacity(data.len());
     let mut capped: BTreeMap<String, Vec<Cluster>> = BTreeMap::new();
     for c in data {
-        if small_structured_config(&c) {
+        let shares_grouped_sibling = c.members.iter().any(|m| grouped_files.contains(m));
+        if small_structured_config(&c) && !shares_grouped_sibling {
             let d = docs_cluster(&mut docs, &c.scope);
             d.members.extend(c.members.iter().copied());
             d.demoted.extend(c.members);
@@ -223,7 +246,8 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
         // group, and not a large collection. Everything else stays.
         if demotable_family(c.family)
             && c.group.is_none()
-            && c.records < DATASET_CAP_PROTECT_RECORDS
+            && c.population < DATASET_CAP_PROTECT_RECORDS
+            && !shares_grouped_sibling
         {
             capped.entry(c.scope.clone()).or_default().push(c);
             continue;
@@ -232,10 +256,12 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
     }
     for (scope, mut group) in capped {
         // Largest collections stay. Ties break toward the earlier file so
-        // the fold does not depend on hash order.
+        // the fold does not depend on hash order. Size is the real row
+        // count, so a file sampled at 500 does not tie with a 100-row file
+        // that happened to fit in the sample.
         group.sort_by(|a, b| {
-            b.records
-                .cmp(&a.records)
+            b.population
+                .cmp(&a.population)
                 .then(b.members.len().cmp(&a.members.len()))
                 .then_with(|| {
                     let am = a.members.iter().copied().min().unwrap_or(usize::MAX);
@@ -575,6 +601,7 @@ mod tests {
             fields,
             key_fields: HashSet::new(),
             records: 1,
+            population: 1,
         }
     }
 
@@ -590,6 +617,7 @@ mod tests {
             fields,
             key_fields: HashSet::new(),
             records: 1,
+            population: 1,
         }
     }
 
@@ -612,6 +640,7 @@ mod tests {
             fields,
             key_fields,
             records,
+            population: records,
         }
     }
 
@@ -941,6 +970,75 @@ mod tests {
             .collect();
         assert_eq!(kept_medium.len(), MAX_STRUCTURED_DATASETS_PER_SCOPE);
         assert!(kept_medium.iter().all(|r| *r >= 40 + 8), "{kept_medium:?}");
+    }
+
+    /// Phase A samples 500 rows. A JSON array of 1024+ rows must still be
+    /// protected when the sampler's count is below the threshold.
+    #[test]
+    fn the_cap_protects_a_sampled_array_by_its_real_length() {
+        let mut sketches = vec![prose_sketch(0)];
+        let mut rels = vec!["README.md".into()];
+        for i in 0..MAX_STRUCTURED_DATASETS_PER_SCOPE + 1 {
+            let idx = i + 1;
+            rels.push(format!("f{idx}.json"));
+            sketches.push(data_sketch_n(idx, Family::Json, &[&format!("k{idx}")], 40));
+        }
+        let big = sketches.len();
+        rels.push("huge.json".into());
+        let mut huge = data_sketch_n(big, Family::Json, &["id"], 500);
+        huge.population = DATASET_CAP_PROTECT_RECORDS;
+        sketches.push(huge);
+        let clusters = cluster(sketches, &rels, &root_scopes(rels.len()));
+        let docs = clusters.iter().find(|c| c.is_docs).expect("docs");
+        assert!(
+            !docs.demoted.contains(&big),
+            "real length {}, sample 500: {docs:#?}",
+            DATASET_CAP_PROTECT_RECORDS
+        );
+        assert!(clusters
+            .iter()
+            .any(|c| !c.is_docs && c.population == DATASET_CAP_PROTECT_RECORDS));
+    }
+
+    /// Folding the primary array of a multi-array file would mark the whole
+    /// file as a document and drop the sibling array's rows.
+    #[test]
+    fn a_grouped_sibling_keeps_its_file_out_of_the_structured_cap() {
+        let mut sketches = vec![prose_sketch(0)];
+        let mut rels = vec!["README.md".into()];
+        let n_medium = MAX_STRUCTURED_DATASETS_PER_SCOPE + 1;
+        for i in 0..n_medium {
+            let idx = i + 1;
+            rels.push(format!("fixtures/f{idx}.json"));
+            sketches.push(data_sketch_n(idx, Family::Json, &[&format!("k{idx}")], 40));
+        }
+        let primary_idx = n_medium + 1;
+        rels.push("config/subsystem_map.json".into());
+        sketches.push(data_sketch_n(
+            primary_idx,
+            Family::Json,
+            &["name", "addr"],
+            40,
+        ));
+        let mut sibling = data_sketch_n(primary_idx, Family::Json, &["label", "start"], 30);
+        sibling.group = Some("runs".into());
+        sketches.push(sibling);
+
+        let clusters = cluster(sketches, &rels, &root_scopes(rels.len()));
+        let docs = clusters.iter().find(|c| c.is_docs).expect("docs");
+        assert!(
+            !docs.demoted.contains(&primary_idx),
+            "the multi-array file must stay extracted as records"
+        );
+        assert!(
+            clusters
+                .iter()
+                .any(|c| { c.group.as_deref() == Some("runs") && c.members == vec![primary_idx] }),
+            "the sibling array stays its own dataset: {clusters:#?}"
+        );
+        assert!(clusters
+            .iter()
+            .any(|c| { c.group.is_none() && !c.is_docs && c.members.contains(&primary_idx) }));
     }
 
     /// Scope is a hard boundary for data schemas too: the same CSV schema in

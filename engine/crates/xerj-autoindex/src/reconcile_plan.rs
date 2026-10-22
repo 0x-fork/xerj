@@ -767,6 +767,7 @@ mod tests {
                 fields,
                 key_fields: std::collections::HashSet::new(),
                 records: 1,
+                population: 1,
             }],
             junk: None,
             // Reconciliation re-samples from the source tree and publishes

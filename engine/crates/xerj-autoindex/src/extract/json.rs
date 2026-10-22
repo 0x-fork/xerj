@@ -1,7 +1,13 @@
 //! Whole-value JSON files (object or array), capped at 64MB.
 //! - array of objects  → one record per element
-//! - object with a dominant top-level array of objects → one record per
+//! - object with one dominant top-level array of objects → one record per
 //!   element, remaining top-level scalars merged in as shared fields
+//! - object with two or more top-level arrays of objects, the largest longer
+//!   than a config document → one dataset per array. The largest keeps the
+//!   ungrouped locators (`{key}:e{i}`); each other array is its own group.
+//!   Sibling arrays are not copied onto each other's rows (#1856, #1978)
+//! - a shared value bigger than [`SHARED_REPLICATE_MAX`] is emitted once,
+//!   not cloned onto every row
 //! - a Google Keep note (Takeout `Keep/*.json`) → a DOCUMENT: `title`/`body`
 //!   plus labels and dates — see [`keep_note`]
 //! - anything else → a single record
@@ -40,13 +46,16 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
     };
     match v {
         Value::Array(arr) => {
+            if !arr.is_empty() {
+                stats.populations.push((None, arr.len() as u64));
+            }
             for (i, el) in arr.into_iter().enumerate() {
                 if !emit(el, &format!("e{i}"), sink, &mut stats) {
                     break;
                 }
             }
         }
-        Value::Object(mut obj) => {
+        Value::Object(obj) => {
             // A Google Keep note is a document, not a row. Tested before the
             // array rule below, which would otherwise explode a checklist
             // note's `listContent` into one record per bullet.
@@ -61,47 +70,7 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
                 );
                 return Ok(stats);
             }
-            // find the largest top-level array-of-objects
-            let mut best: Option<(String, usize)> = None;
-            for (k, vv) in obj.iter() {
-                if let Value::Array(a) = vv {
-                    if a.len() >= 2
-                        && a.iter().all(|e| e.is_object())
-                        && best.as_ref().map(|(_, n)| a.len() > *n).unwrap_or(true)
-                    {
-                        best = Some((k.clone(), a.len()));
-                    }
-                }
-            }
-            match best {
-                Some((key, _)) => {
-                    let Value::Array(arr) = obj.remove(&key).unwrap() else {
-                        unreachable!()
-                    };
-                    let shared = flatten_object(obj);
-                    for (i, el) in arr.into_iter().enumerate() {
-                        if let Value::Object(m) = el {
-                            let mut fields = shared.clone();
-                            for (k, v) in flatten_object(m) {
-                                fields.insert(k, v); // element wins collisions
-                            }
-                            ensure_text_passage(&mut fields);
-                            stats.records += 1;
-                            if !sink(RawRecord {
-                                fields,
-                                locator: format!("{key}:e{i}"),
-                                group: None,
-                                origin: FieldOrigin::Data,
-                            }) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                None => {
-                    emit(Value::Object(obj), "doc", sink, &mut stats);
-                }
-            }
+            extract_object(obj, sink, &mut stats);
         }
         other => {
             let mut m = Map::new();
@@ -255,6 +224,171 @@ pub(crate) fn is_keep_note_file(path: &Path) -> bool {
         Ok(Value::Object(obj)) => keep_note(&obj).is_some(),
         _ => false,
     }
+}
+
+/// A shared value longer than this is not cloned onto every row.
+///
+/// Cloning the compact JSON of one sibling array onto every element of
+/// another is what wedged ingest: `subsystem_map.json` (#1856) copied a
+/// 25 KB `runs` array onto each of 8,589 function rows and then elected
+/// that string as `semantic_text`. A 42 MB file of the same shape (#1978)
+/// multiplied several sibling arrays by ~123,000 rows until the process
+/// ran out of memory. Past this size the value is emitted once, under its
+/// own group.
+const SHARED_REPLICATE_MAX: usize = 4096;
+
+/// Shortest largest-array that is split into one dataset per array.
+///
+/// [`crate::dataset::DOC_DEMOTE_MAX_RECORDS_PER_FILE`] folds a JSON file of
+/// at most 32 records into the document corpus. Splitting a file that
+/// small would turn one config document into several indices. An array of
+/// this length or more is a collection.
+const MULTI_ARRAY_SPLIT_MIN: usize = 33;
+
+/// Top-level arrays of objects (len ≥ 2, every element an object), longest
+/// first. Equal lengths break toward the lexicographically smaller key so
+/// the primary array does not depend on map iteration order.
+fn record_arrays(obj: &Map<String, Value>) -> Vec<(String, usize)> {
+    let mut arrays = Vec::new();
+    for (k, vv) in obj {
+        if let Value::Array(a) = vv {
+            if a.len() >= 2 && a.iter().all(|e| e.is_object()) {
+                arrays.push((k.clone(), a.len()));
+            }
+        }
+    }
+    arrays.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    arrays
+}
+
+fn extract_object(obj: Map<String, Value>, sink: Sink, stats: &mut ExtractStats) {
+    let arrays = record_arrays(&obj);
+    if arrays.len() >= 2 && arrays[0].1 >= MULTI_ARRAY_SPLIT_MIN {
+        extract_split(obj, arrays, sink, stats);
+    } else if let Some((key, _)) = arrays.into_iter().next() {
+        extract_one_array(obj, key, sink, stats);
+    } else {
+        emit(Value::Object(obj), "doc", sink, stats);
+    }
+}
+
+/// One record array. Other arrays stay shared fields, unless one of them
+/// is too big to copy onto every row.
+fn extract_one_array(
+    mut obj: Map<String, Value>,
+    key: String,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) {
+    let Value::Array(arr) = obj.remove(&key).unwrap() else {
+        unreachable!("record_arrays only yields array keys")
+    };
+    stats.populations.push((None, arr.len() as u64));
+    let (shared, sidecars) = partition_shared(obj);
+    for (i, el) in arr.into_iter().enumerate() {
+        let Value::Object(m) = el else { continue };
+        let fields = merge_shared(&shared, m);
+        if !emit_fields(fields, format!("{key}:e{i}"), None, sink, stats) {
+            break;
+        }
+    }
+    emit_sidecars(sidecars, sink, stats);
+}
+
+/// Two or more record arrays. The longest keeps group `None` and the
+/// `{key}:e{i}` locator a single-array file already used, so an existing
+/// document id for that array does not move. Every other array is a group
+/// of its own and is not serialized onto the primary rows.
+fn extract_split(
+    mut obj: Map<String, Value>,
+    arrays: Vec<(String, usize)>,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) {
+    let mut pulled = Vec::with_capacity(arrays.len());
+    for (key, _) in &arrays {
+        let Value::Array(arr) = obj.remove(key).unwrap() else {
+            unreachable!("record_arrays only yields array keys")
+        };
+        pulled.push((key.clone(), arr));
+    }
+    let (shared, sidecars) = partition_shared(obj);
+    for (idx, (key, arr)) in pulled.into_iter().enumerate() {
+        let group = if idx == 0 { None } else { Some(key.clone()) };
+        stats.populations.push((group.clone(), arr.len() as u64));
+        for (i, el) in arr.into_iter().enumerate() {
+            let Value::Object(m) = el else { continue };
+            let fields = merge_shared(&shared, m);
+            // A `false` sink means this group's sample is full. The next
+            // array is a different group and still needs its own sample.
+            if !emit_fields(fields, format!("{key}:e{i}"), group.clone(), sink, stats) {
+                break;
+            }
+        }
+    }
+    emit_sidecars(sidecars, sink, stats);
+}
+
+fn merge_shared(shared: &Map<String, Value>, element: Map<String, Value>) -> Map<String, Value> {
+    let mut fields = shared.clone();
+    for (k, v) in flatten_object(element) {
+        fields.insert(k, v); // element wins collisions
+    }
+    fields
+}
+
+/// Flatten the wrapper left after record arrays are removed, then hold back
+/// any value too large to clone onto every row.
+fn partition_shared(obj: Map<String, Value>) -> (Map<String, Value>, Vec<(String, Value)>) {
+    let flat = flatten_object(obj);
+    let mut small = Map::new();
+    let mut sidecars = Vec::new();
+    for (k, v) in flat {
+        if shared_value_too_big(&v) {
+            sidecars.push((k, v));
+        } else {
+            small.insert(k, v);
+        }
+    }
+    (small, sidecars)
+}
+
+fn shared_value_too_big(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.len() > SHARED_REPLICATE_MAX,
+        Value::Array(a) => serde_json::to_string(a)
+            .map(|s| s.len() > SHARED_REPLICATE_MAX)
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn emit_sidecars(sidecars: Vec<(String, Value)>, sink: Sink, stats: &mut ExtractStats) {
+    for (key, value) in sidecars {
+        stats.populations.push((Some(key.clone()), 1));
+        let mut fields = Map::new();
+        fields.insert(key.clone(), value);
+        // One record. A full sample on an earlier group must not drop it:
+        // the sink's `false` is per group, and this group has not been seen.
+        let _ = emit_fields(fields, format!("{key}:shared"), Some(key), sink, stats);
+    }
+}
+
+fn emit_fields(
+    mut fields: Map<String, Value>,
+    locator: String,
+    group: Option<String>,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> bool {
+    ensure_text_passage(&mut fields);
+    stats.records += 1;
+    sink(RawRecord {
+        fields,
+        locator,
+        group,
+        origin: FieldOrigin::Data,
+    })
 }
 
 /// Whole-file parse failed — re-parse the same in-memory bytes line by
@@ -708,5 +842,121 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("count: 7"));
+    }
+
+    /// #1856 / #1978: two top-level arrays of objects are two datasets.
+    /// The smaller array used to be serialized and cloned onto every row
+    /// of the larger one, and that JSON string then won `semantic_text`.
+    #[test]
+    fn two_top_level_arrays_stay_separate_datasets() {
+        let mut functions = Vec::new();
+        for i in 0..MULTI_ARRAY_SPLIT_MIN {
+            functions.push(format!(r#"{{"name":"f{i}","addr":{i}}}"#));
+        }
+        let text = format!(
+            r#"{{"generated":"2026-01-01","functions":[{}],"runs":[{{"label":"boot","start":1}},{{"label":"loop","start":9}}]}}"#,
+            functions.join(",")
+        );
+        let (stats, recs) = run(&text);
+        let primary: Vec<_> = recs.iter().filter(|r| r.group.is_none()).collect();
+        let runs: Vec<_> = recs
+            .iter()
+            .filter(|r| r.group.as_deref() == Some("runs"))
+            .collect();
+        assert_eq!(primary.len(), MULTI_ARRAY_SPLIT_MIN);
+        assert_eq!(primary[0].locator, "functions:e0");
+        assert!(
+            primary[0].fields.get("runs").is_none(),
+            "the sibling array must not be copied onto the primary row: {:?}",
+            primary[0].fields
+        );
+        assert_eq!(
+            primary[0].fields["generated"],
+            serde_json::json!("2026-01-01"),
+            "a small shared scalar is still merged"
+        );
+        assert_eq!(primary[0].fields["name"], serde_json::json!("f0"));
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].locator, "runs:e0");
+        assert_eq!(runs[0].fields["label"], serde_json::json!("boot"));
+        assert!(runs[0].fields.get("name").is_none());
+        assert_eq!(runs[0].fields["generated"], serde_json::json!("2026-01-01"));
+        assert!(stats
+            .populations
+            .contains(&(None, MULTI_ARRAY_SPLIT_MIN as u64)));
+        assert!(stats.populations.contains(&(Some("runs".into()), 2)));
+    }
+
+    /// Equal lengths must not depend on object-key order.
+    #[test]
+    fn equal_length_arrays_pick_the_lexicographically_smaller_key_as_primary() {
+        let row = r#"{"n":1},{"n":2},{"n":3},{"n":4},{"n":5},{"n":6},{"n":7},{"n":8},{"n":9},{"n":10},{"n":11},{"n":12},{"n":13},{"n":14},{"n":15},{"n":16},{"n":17},{"n":18},{"n":19},{"n":20},{"n":21},{"n":22},{"n":23},{"n":24},{"n":25},{"n":26},{"n":27},{"n":28},{"n":29},{"n":30},{"n":31},{"n":32},{"n":33}"#;
+        let text = format!(r#"{{"zeta":[{row}],"alpha":[{row}]}}"#);
+        let (_, recs) = run(&text);
+        let primary: Vec<_> = recs.iter().filter(|r| r.group.is_none()).collect();
+        assert_eq!(primary.len(), MULTI_ARRAY_SPLIT_MIN);
+        assert_eq!(primary[0].locator, "alpha:e0");
+        assert!(recs.iter().any(|r| r.group.as_deref() == Some("zeta")));
+        assert!(recs.iter().all(|r| r.group.as_deref() != Some("alpha")));
+    }
+
+    /// A wrapper value too big to clone is one sidecar record, not a field
+    /// on every row. A value under the cap stays shared, which is what the
+    /// single-element `errors` array in the largest-array test pins.
+    #[test]
+    fn an_oversized_shared_value_is_emitted_once() {
+        let blob = "x".repeat(SHARED_REPLICATE_MAX + 32);
+        let text = format!(r#"{{"blob":"{blob}","items":[{{"id":1}},{{"id":2}},{{"id":3}}]}}"#);
+        let (stats, recs) = run(&text);
+        let rows: Vec<_> = recs.iter().filter(|r| r.group.is_none()).collect();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().all(|r| r.fields.get("blob").is_none()),
+            "the blob must not be cloned onto every row"
+        );
+        let side: Vec<_> = recs.iter().filter(|r| r.group.is_some()).collect();
+        assert_eq!(side.len(), 1);
+        assert_eq!(side[0].group.as_deref(), Some("blob"));
+        assert_eq!(side[0].locator, "blob:shared");
+        assert!(side[0].fields["blob"].as_str().unwrap().len() > SHARED_REPLICATE_MAX);
+        assert_eq!(
+            stats
+                .populations
+                .iter()
+                .find(|(g, _)| g.is_none())
+                .map(|(_, n)| *n),
+            Some(3)
+        );
+        assert!(stats.populations.contains(&(Some("blob".into()), 1)));
+    }
+
+    /// The sink stopping one group (the phase-A sample) must not drop the
+    /// declared length or the next array.
+    #[test]
+    fn stopping_one_array_keeps_its_length_and_the_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        let mut functions = Vec::new();
+        for i in 0..MULTI_ARRAY_SPLIT_MIN {
+            functions.push(format!(r#"{{"name":"f{i}"}}"#));
+        }
+        let text = format!(
+            r#"{{"functions":[{}],"runs":[{{"label":"a"}},{{"label":"b"}},{{"label":"c"}}]}}"#,
+            functions.join(",")
+        );
+        std::fs::write(&path, text).unwrap();
+        let mut seen = std::collections::HashMap::<Option<String>, usize>::new();
+        let stats = extract(&path, false, &mut |r| {
+            let n = seen.entry(r.group.clone()).or_insert(0);
+            *n += 1;
+            *n < 2
+        })
+        .unwrap();
+        assert_eq!(seen.get(&None).copied(), Some(2));
+        assert_eq!(seen.get(&Some("runs".into())).copied(), Some(2));
+        assert!(stats
+            .populations
+            .contains(&(None, MULTI_ARRAY_SPLIT_MIN as u64)));
+        assert!(stats.populations.contains(&(Some("runs".into()), 3)));
     }
 }

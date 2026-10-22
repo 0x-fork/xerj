@@ -75,7 +75,7 @@ pub struct RawRecord {
     pub origin: FieldOrigin,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ExtractStats {
     pub records: u64,
     pub junk: u64,
@@ -83,6 +83,11 @@ pub struct ExtractStats {
     /// split before the whole body was emitted (#381). Carried out so the
     /// truncation is reported, never silent.
     pub truncated: bool,
+    /// Full length of each record array, keyed by the group the records were
+    /// emitted under. `None` is the ungrouped array. Recorded before the
+    /// sampler stops, so a 100_000-row array sampled at 500 still reports
+    /// 100_000. Empty for families that do not know a length.
+    pub populations: Vec<(Option<String>, u64)>,
 }
 
 /// Sink returns false to stop extraction early (sampling).

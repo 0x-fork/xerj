@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` no longer wedges or runs out of memory on a JSON object
+  made of several top-level arrays of records (#1856, #1978). When the
+  largest array is longer than a config document (32 records), each top-level
+  array of objects becomes its own dataset instead of being copied onto every
+  row of the largest one. A shared value over 4 KiB is stored once. A data
+  column that would be `semantic_text` falls back to plain text — still
+  searchable — when the real record count exceeds 100,000 or the elected text
+  exceeds 8 MiB, and the plan says so, including `--no-semantic`. The
+  pre-index budget counts records in `.json` files from 256 KiB up to 64 MiB
+  and can refuse on a structural memory ceiling. That ceiling is not a
+  measured store ratio, and no new disk ratio was invented for `.json`.
+
 - `POST /{index}/_refresh` and autoindex `finalize-refresh` no longer wait
   forever when a shard flush cannot get a finalize-gate or flush-semaphore
   permit. Admission gives up after `engine.flush_admit_timeout_secs`

@@ -3086,6 +3086,8 @@ struct GroupSketch {
     fields: HashMap<String, infer::FieldAcc>,
     key_fields: std::collections::HashSet<String>,
     records: u64,
+    /// Rows in this group. `records` stops at the sample; this does not.
+    population: u64,
 }
 
 fn take_pdf_spool_if_indexable<T>(
@@ -3338,8 +3340,10 @@ fn scan_file(
         extraction_elapsed = extraction_started.elapsed();
         parsed
     };
+    let mut populations: Vec<(Option<String>, u64)> = Vec::new();
     match extraction {
         Ok(stats) => {
+            populations = stats.populations;
             if groups.is_empty() {
                 out.junk = Some((
                     "junk".into(),
@@ -3374,11 +3378,20 @@ fn scan_file(
 
     out.sketches = groups
         .into_iter()
-        .map(|(group, (fields, records, key_fields))| GroupSketch {
-            group,
-            fields,
-            key_fields,
-            records,
+        .map(|(group, (fields, records, key_fields))| {
+            let declared = populations
+                .iter()
+                .filter(|(g, _)| g == &group)
+                .map(|(_, n)| *n)
+                .max()
+                .unwrap_or(records);
+            GroupSketch {
+                group,
+                fields,
+                key_fields,
+                records,
+                population: declared.max(records),
+            }
         })
         .collect();
     out.sketches.sort_by(|a, b| a.group.cmp(&b.group));
@@ -3457,6 +3470,7 @@ mod clustering_key_tests {
                 fields: s.sketches[0].fields.clone(),
                 key_fields: s.sketches[0].key_fields.clone(),
                 records: s.sketches[0].records,
+                population: s.sketches[0].population,
             })
             .collect();
         let scopes = vec![String::new(); rels.len()];
@@ -3479,6 +3493,56 @@ mod clustering_key_tests {
             .collect();
         names.sort();
         assert_eq!(names, ["email", "id"]);
+    }
+
+    /// #1856: phase A stops at the sample, but the sketch keeps the real
+    /// length of each array, and the sibling array is not a field of the
+    /// primary rows.
+    #[test]
+    fn a_multi_array_json_file_keeps_each_arrays_population() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut functions = Vec::new();
+        for i in 0..40 {
+            functions.push(format!(r#"{{"name":"f{i}","addr":{i}}}"#));
+        }
+        let body = format!(
+            r#"{{"functions":[{}],"runs":[{{"label":"boot","start":1}},{{"label":"loop","start":2}},{{"label":"done","start":3}}]}}"#,
+            functions.join(",")
+        );
+        let path = dir.path().join("subsystem_map.json");
+        std::fs::write(&path, body).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let budget = extract::pdf::ExtractionSpoolBudget::new(0, 0);
+        let progress = Progress::silent();
+        let meter = estimate::Meter::new();
+        let ctx = PhaseAContext {
+            state_dir: dir.path(),
+            budget: &budget,
+            capacity_warning: None,
+            progress: &progress,
+            meter: &meter,
+            tally: &ScanTally::default(),
+        };
+        let scanned = scan_file(&path, size, "d0", &ctx, 2, 2 << 30, false);
+        let primary = scanned
+            .sketches
+            .iter()
+            .find(|s| s.group.is_none())
+            .expect("primary array");
+        assert_eq!(primary.records, 2, "the sample stops at 2");
+        assert_eq!(primary.population, 40, "the array length is the population");
+        assert!(
+            !primary.fields.contains_key("runs"),
+            "sibling array leaked into the primary fields: {:?}",
+            primary.fields.keys().collect::<Vec<_>>()
+        );
+        let runs = scanned
+            .sketches
+            .iter()
+            .find(|s| s.group.as_deref() == Some("runs"))
+            .expect("runs group");
+        assert_eq!(runs.records, 2);
+        assert_eq!(runs.population, 3);
     }
 }
 
@@ -3565,6 +3629,116 @@ mod phase_a_grouping_tests {
             tally: &ScanTally::default(),
         };
         build_phase_a(root, &files, &keys, &digests, Vec::new(), &ctx, cfg).plan
+    }
+
+    /// #1978: the semantic cap sees the array's real length, not the 500-row
+    /// sample. 100_001 short prose rows elect `semantic_text` on the sample
+    /// and must fall back, with the warning on the field.
+    #[test]
+    fn a_long_prose_column_past_the_record_cap_falls_back_to_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = "The connection pool retries every failed handshake with backoff. \
+                    Each worker owns one socket and never shares it across threads.";
+        let n = infer::SEMANTIC_DATA_MAX_RECORDS + 1;
+        let mut body = String::with_capacity((n as usize) * (note.len() + 24));
+        body.push('[');
+        for i in 0..n {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(r#"{"id":"#);
+            body.push_str(&i.to_string());
+            body.push_str(r#","note":""#);
+            body.push_str(note);
+            body.push_str(r#""}"#);
+        }
+        body.push(']');
+        std::fs::write(dir.path().join("rows.json"), body).unwrap();
+
+        let plan = plan_for(dir.path());
+        let dataset = plan
+            .datasets
+            .iter()
+            .find(|d| d.specs.iter().any(|s| s.name == "note"))
+            .expect("rows dataset");
+        assert!(dataset.semantic_field.is_none(), "{dataset:#?}");
+        let spec = dataset.specs.iter().find(|s| s.name == "note").unwrap();
+        assert_eq!(spec.es_type, "text");
+        let notes = spec.notes.join(" ");
+        assert!(notes.contains("--no-semantic"), "{notes}");
+        assert!(notes.contains(&n.to_string()), "{notes}");
+    }
+
+    /// A prose column under both caps still elects semantic_text. The cap
+    /// must not turn every JSON text field into plain text.
+    #[test]
+    fn a_short_prose_column_stays_semantic_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = "The connection pool retries every failed handshake with backoff. \
+                    Each worker owns one socket and never shares it across threads.";
+        let mut body = String::from("[");
+        // More than a config document, so the file stays a data dataset.
+        for i in 0..40 {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(r#"{{"id":{i},"note":"{note}"}}"#));
+        }
+        body.push(']');
+        std::fs::write(dir.path().join("rows.json"), body).unwrap();
+        let plan = plan_for(dir.path());
+        let dataset = plan
+            .datasets
+            .iter()
+            .find(|d| d.specs.iter().any(|s| s.name == "note"))
+            .expect("rows dataset");
+        assert_eq!(
+            dataset.semantic_field.as_deref(),
+            Some("note"),
+            "{dataset:#?}"
+        );
+    }
+
+    /// #1856: a file shaped like `subsystem_map.json` (one long array of small
+    /// objects beside a second array) plans two data datasets. The sibling
+    /// array is not a field, and the short rows do not elect semantic_text.
+    #[test]
+    fn a_multi_array_json_file_plans_one_dataset_per_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut functions = Vec::new();
+        for i in 0..40 {
+            functions.push(format!(r#"{{"name":"fn{i}","addr":{i}}}"#));
+        }
+        let body = format!(
+            r#"{{"generated":"2026-01-01","functions":[{}],"runs":[{{"label":"boot","start":1}},{{"label":"loop","start":2}},{{"label":"done","start":3}}]}}"#,
+            functions.join(",")
+        );
+        std::fs::write(dir.path().join("subsystem_map.json"), body).unwrap();
+        let plan = plan_for(dir.path());
+        let data: Vec<_> = plan
+            .datasets
+            .iter()
+            .filter(|d| d.family != "docs")
+            .collect();
+        assert!(
+            data.iter().any(|d| d.group.is_none()),
+            "primary array: {:?}",
+            plan.datasets
+                .iter()
+                .map(|d| (&d.slug, &d.group, d.family.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            data.iter().any(|d| d.group.as_deref() == Some("runs")),
+            "runs array: {:?}",
+            plan.datasets
+                .iter()
+                .map(|d| (&d.slug, &d.group))
+                .collect::<Vec<_>>()
+        );
+        let primary = data.iter().find(|d| d.group.is_none()).unwrap();
+        assert!(primary.semantic_field.is_none(), "{primary:#?}");
+        assert!(primary.specs.iter().all(|s| s.name != "runs"));
     }
 
     /// #1198 end to end through the real planner: `--code-analyzer code` puts
@@ -4102,6 +4276,7 @@ fn build_phase_a(
                 fields: gs.fields,
                 key_fields: gs.key_fields,
                 records: gs.records,
+                population: gs.population,
             });
         }
     }
@@ -4136,6 +4311,7 @@ fn build_phase_a(
             sampled_total += sampled;
         }
         c.records += sampled_total;
+        c.population += sampled_total;
     }
 
     // per-file assignments
@@ -4167,6 +4343,17 @@ fn build_phase_a(
     for c in &clusters {
         let mut specs =
             infer::infer_fields_with_policy(&c.fields, c.records, cfg.no_semantic, c.is_docs);
+        // Data datasets only. A document dataset elects every body carrier;
+        // capping that would drop code and prose from the vector arm. The
+        // count is the real row count, not the sample: phase A stops at
+        // `cfg.sample` rows, and a 123_000-row array sampled at 500 looks
+        // cheap if the cap only sees 500 (#1978).
+        if !c.is_docs && !cfg.no_semantic {
+            let population = c.population.max(c.records);
+            if let Some(hit) = infer::cap_data_semantic(&mut specs, population) {
+                pr.note(&infer::semantic_fallback_warning(&c.slug, &hit));
+            }
+        }
         // Unity script-link enrichment fields are stamped by the phase-B
         // pipeline (not the extractor), so inference never sees them —
         // register them here or they would be dynamic-mapped coarsely.
@@ -7044,6 +7231,7 @@ fn run_index_report_inner(
             plan: cfg.budget_plan.as_deref(),
             approve: cfg.approve,
             duplicate_prefixes: &duplicate_prefixes,
+            memory_budget: xerj_common::resource::memory_safe_zone_bytes(),
         });
         for line in &assessment.lines {
             if assessment.needs_choice {

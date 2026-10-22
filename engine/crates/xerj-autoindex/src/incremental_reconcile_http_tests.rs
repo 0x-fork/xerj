@@ -6450,6 +6450,7 @@ mod delete_gate {
             plan: None,
             approve: None,
             duplicate_prefixes: &[],
+            memory_budget: None,
         });
         let plan_bytes = |name: &str| -> u64 {
             let plan = priced.body["plans"]

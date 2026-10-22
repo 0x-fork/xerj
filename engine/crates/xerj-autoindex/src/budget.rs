@@ -5,7 +5,13 @@
 //! with the room left under the node's flood-stage watermark, and — when the
 //! default plan does not fit — names a smaller plan and waits for an explicit
 //! yes. It never invents a ratio: a kind with no measured calibration is
-//! reported as unmeasured, and an unmeasured estimate does not refuse a run.
+//! reported as unmeasured, and an unmeasured disk estimate does not refuse a
+//! run.
+//!
+//! JSON record arrays are a separate check. A `.json` file between 256 KiB
+//! and 64 MiB is parsed for its record count, and that count is priced with
+//! a structural memory ceiling (vector width, not a measured RSS). The
+//! ceiling can refuse a run. It cannot make an unmeasured disk plan fit.
 //!
 //! Free space and the watermark come from [`crate::flood`], the one
 //! `GET /_cat/allocation?format=json` already made before the walk. A second
@@ -44,7 +50,27 @@ const CAP_1MB: u64 = 1 << 20;
 /// What the calibration measured, and where. An empty table is not a zero
 /// estimate. The numbers in [`MEASURED`] are dataset-index store sizes from
 /// one release binary on one host; they are not a promise about this machine.
-const CALIBRATION_NOTE: &str = "per-kind ratios are dataset-index store sizes measured 2026-10-21 with xerj v1.0.0-rc.97 on one 4-core Linux x86_64 host. Code and prose were measured on real repository sources and docs; data, pdf and unindexed kinds on synthetic files. Embeddings were the default lexical feature-hash (the neural embedder was not enabled). Catalog store size is not included. time_s is a rough projection from that host, not this machine. A kind with no row is unmeasured and does not refuse the run";
+const CALIBRATION_NOTE: &str = "per-kind ratios are dataset-index store sizes measured 2026-10-21 with xerj v1.0.0-rc.97 on one 4-core Linux x86_64 host. Code and prose were measured on real repository sources and docs; data, pdf and unindexed kinds on synthetic files. Embeddings were the default lexical feature-hash (the neural embedder was not enabled). Catalog store size is not included. time_s is a rough projection from that host, not this machine. A kind with no row is unmeasured and does not refuse the run. JSON record counts use a separate structural memory ceiling (memory_basis); that ceiling is not a measured store ratio";
+
+/// Bytes charged per counted JSON record when the plan embeds.
+///
+/// 384-d f32 is 1,536 bytes. 2,048 leaves about 512 bytes for the source
+/// document beside that one vector. Not a measured RSS. Not multiplied by
+/// chunk count: the semantic cap already refuses a data column whose text
+/// would chunk into tens of thousands of vectors.
+const SEMANTIC_RECORD_BYTES: u64 = 2048;
+
+/// Bytes charged per counted JSON record when the plan does not embed.
+const PLAIN_RECORD_BYTES: u64 = 512;
+
+/// `.json` files smaller than this are not parsed during the pre-flight.
+const JSON_PROBE_MIN: u64 = 256 << 10;
+
+/// `.json` files this size or larger are not parsed during the pre-flight.
+/// The same bound is the whole-file JSON read cap.
+const JSON_PROBE_MAX: u64 = 64 << 20;
+
+const MEMORY_BASIS: &str = "structural ceiling from the vector width, not a measured RSS and not a store-size ratio: 2048 bytes per counted JSON record when semantic vectors are on (one 384-d f32 vector plus about 512 bytes of source) or 512 bytes per record when they are off, plus the .json file size. Only .json files from 256 KiB up to 64 MiB are counted. A file that does not parse contributes nothing and does not refuse the run";
 
 /// One measured index of one kind.
 #[derive(Debug, Clone, Copy)]
@@ -327,6 +353,8 @@ struct Fact {
     kind: Kind,
     model: Model,
     vendored: bool,
+    /// Rows in a probed `.json` file. `None` when the file was not probed.
+    records: Option<u64>,
 }
 
 /// What the caller already decided, plus the walked files and the volume from
@@ -340,6 +368,10 @@ pub(crate) struct Request<'a> {
     pub plan: Option<&'a str>,
     pub approve: Option<Approval>,
     pub duplicate_prefixes: &'a [String],
+    /// Resident-memory ceiling for counted JSON records. `None` skips the
+    /// memory comparison. The live path passes
+    /// [`xerj_common::resource::memory_safe_zone_bytes`].
+    pub memory_budget: Option<u64>,
 }
 
 /// A line the operator typed at the budget prompt.
@@ -368,6 +400,9 @@ struct PlanEst {
     no_semantic: bool,
     keep: Option<Vec<String>>,
     fits: Option<bool>,
+    /// Structural memory ceiling for the JSON records this plan keeps.
+    /// `None` when the plan kept no probed `.json` file.
+    memory_bytes: Option<u64>,
 }
 
 pub struct Assessment {
@@ -481,7 +516,15 @@ pub(crate) fn assess(req: &Request<'_>) -> Assessment {
     let (budget_bytes, budget_basis, disk_json) = budget_view(req.volume, req.max_index_bytes);
     let plans = PLAN_NAMES
         .iter()
-        .filter_map(|name| estimate_plan(name, &facts, semantic_default, budget_bytes))
+        .filter_map(|name| {
+            estimate_plan(
+                name,
+                &facts,
+                semantic_default,
+                budget_bytes,
+                req.memory_budget,
+            )
+        })
         .collect::<Vec<_>>();
     let plan_names: Vec<String> = plans.iter().map(|p| p.name.to_string()).collect();
     let recommended = recommended_plan(&plans).map(|p| p.name);
@@ -561,6 +604,9 @@ pub(crate) fn assess(req: &Request<'_>) -> Assessment {
         "decision_required": needs_choice || matches!(preselect, Preselect::Refuse(_)),
         "plans": plans.iter().map(plan_json).collect::<Vec<_>>(),
         "recommended": recommended,
+        "json_records": json_record_total(&facts),
+        "memory_safe_zone_bytes": req.memory_budget,
+        "memory_basis": MEMORY_BASIS,
         "duplicate_prefixes": req.duplicate_prefixes,
         "accept": "re-run with --plan <name>, or --yes to take the recommended plan that fits. A named plan runs even when the estimate says it does not fit (the estimate errs high). --approve cancel indexes nothing",
         "calibration": CALIBRATION_NOTE,
@@ -879,6 +925,7 @@ pub fn assess_path(
         plan: None,
         approve: None,
         duplicate_prefixes: &duplicates,
+        memory_budget: xerj_common::resource::memory_safe_zone_bytes(),
     });
     Ok(assessment.body)
 }
@@ -989,6 +1036,7 @@ fn estimate_plan(
     facts: &[Fact],
     semantic_default: bool,
     budget_bytes: Option<u64>,
+    memory_budget: Option<u64>,
 ) -> Option<PlanEst> {
     let force_no_semantic = matches!(name, "no-vectors" | "code-and-docs-no-vectors");
     let no_semantic = force_no_semantic || !semantic_default;
@@ -1031,10 +1079,18 @@ fn estimate_plan(
         drops.push("vectors (semantic_text)".to_string());
     }
     let (index_bytes, time_s) = project_kept(&kept, !no_semantic);
-    let fits = match (index_bytes, budget_bytes) {
+    let memory_bytes = project_memory(&kept, !no_semantic);
+    let disk_fits = match (index_bytes, budget_bytes) {
         (Some(index), Some(budget)) => Some(index <= budget),
         _ => None,
     };
+    let memory_fits = match (memory_bytes, memory_budget) {
+        (Some(used), Some(budget)) => Some(used <= budget),
+        _ => None,
+    };
+    // Memory can refuse. It cannot turn an unmeasured disk plan into a fit:
+    // `disk == None && memory == Some(true)` stays `None`.
+    let fits = combine_fits(disk_fits, memory_fits);
     let source_bytes = kept.iter().map(|f| f.size).sum();
     let keep_rels = if kept.len() == facts.len() && !force_no_semantic {
         None
@@ -1055,7 +1111,40 @@ fn estimate_plan(
         no_semantic,
         keep: keep_rels,
         fits,
+        memory_bytes,
     })
+}
+
+fn combine_fits(disk: Option<bool>, memory: Option<bool>) -> Option<bool> {
+    if disk == Some(false) || memory == Some(false) {
+        Some(false)
+    } else if disk == Some(true) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Structural memory for probed JSON records this plan keeps.
+/// `None` when none of the kept files were probed, so a tree of source
+/// code is not given a made-up memory bill.
+fn project_memory(kept: &[&Fact], semantic: bool) -> Option<u64> {
+    let per = if semantic {
+        SEMANTIC_RECORD_BYTES
+    } else {
+        PLAIN_RECORD_BYTES
+    };
+    let mut any = false;
+    let mut bytes = 0u64;
+    let mut records = 0u64;
+    for fact in kept {
+        if let Some(n) = fact.records {
+            any = true;
+            records = records.saturating_add(n);
+            bytes = bytes.saturating_add(fact.size);
+        }
+    }
+    any.then(|| bytes.saturating_add(per.saturating_mul(records)))
 }
 
 fn keep(name: &str, fact: &Fact) -> bool {
@@ -1242,13 +1331,14 @@ fn plan_json(plan: &PlanEst) -> Value {
         "files": plan.files,
         "drops": plan.drops,
         "no_semantic": plan.no_semantic,
+        "memory_bytes": plan.memory_bytes,
         "time_s": plan.time_s,
         "time_basis": plan.time_s.map(|_| "rough projection from the calibration host, not this machine"),
     })
 }
 
 fn plan_size_phrase(plan: &PlanEst) -> String {
-    match plan.index_bytes {
+    let disk = match plan.index_bytes {
         Some(bytes) => format!(
             "estimated index {} for {} ({} source)",
             human_bytes(bytes),
@@ -1260,6 +1350,10 @@ fn plan_size_phrase(plan: &PlanEst) -> String {
             count_phrase(plan.files, "file", "files"),
             human_bytes(plan.source_bytes)
         ),
+    };
+    match plan.memory_bytes {
+        Some(bytes) => format!("{disk}; structural memory about {}", human_bytes(bytes)),
+        None => disk,
     }
 }
 
@@ -1305,6 +1399,12 @@ fn summary_lines(
         human_bytes(bytes),
         kind_phrase(facts)
     )];
+    if let Some(n) = json_record_total(facts) {
+        lines.push(format!(
+            "budget: {} in .json (structural memory ceiling, not a measured store ratio)",
+            count_phrase(n, "record", "records")
+        ));
+    }
     if let Some(default) = plans.iter().find(|p| p.name == "default") {
         let fit = match default.fits {
             Some(true) => "fits",
@@ -1391,7 +1491,63 @@ fn fact_of(file: &FileEntry) -> Fact {
         kind,
         model,
         vendored: order::vendored_reason(&file.rel).is_some(),
+        records: probe_json_records(file),
     }
+}
+
+/// Record count for one `.json` file, matching the extractor's split:
+/// a top-level array counts every element; an object sums every top-level
+/// array of objects of length ≥ 2; anything else is one record. Parse
+/// failure, gzip, and sizes outside [`JSON_PROBE_MIN`]..[`JSON_PROBE_MAX`]
+/// return `None` — the file is unmeasured and does not refuse the run.
+fn probe_json_records(file: &FileEntry) -> Option<u64> {
+    if extension(&file.rel) != "json" {
+        return None;
+    }
+    if file.size < JSON_PROBE_MIN || file.size >= JSON_PROBE_MAX {
+        return None;
+    }
+    let bytes = std::fs::read(&file.path).ok()?;
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    Some(json_value_records(&value))
+}
+
+fn json_value_records(value: &Value) -> u64 {
+    match value {
+        Value::Array(arr) => arr.len() as u64,
+        Value::Object(obj) => {
+            let mut sum = 0u64;
+            let mut any = false;
+            for child in obj.values() {
+                let Value::Array(arr) = child else {
+                    continue;
+                };
+                if arr.len() >= 2 && arr.iter().all(|el| el.is_object()) {
+                    sum = sum.saturating_add(arr.len() as u64);
+                    any = true;
+                }
+            }
+            if any {
+                sum
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    }
+}
+
+fn json_record_total(facts: &[Fact]) -> Option<u64> {
+    facts
+        .iter()
+        .fold(None, |acc, fact| match (acc, fact.records) {
+            (None, None) => None,
+            (Some(n), None) | (None, Some(n)) => Some(n),
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        })
 }
 
 /// Extension only. Sniff has not run; the census says so.
@@ -1628,6 +1784,7 @@ mod tests {
             plan: None,
             approve: None,
             duplicate_prefixes: &[],
+            memory_budget: None,
         });
         assert!(assessment.needs_choice, "{}", assessment.body);
         assert_eq!(
@@ -1655,6 +1812,7 @@ mod tests {
             plan: Some("default"),
             approve: None,
             duplicate_prefixes: &[],
+            memory_budget: None,
         });
         assert!(!assessment.needs_choice, "{}", assessment.body);
         match resolve(&assessment, Choice::Absent) {
@@ -1836,5 +1994,148 @@ mod tests {
         let body = removal_decision("code-and-docs", &[&prior, &prior], &discovered, &[])
             .expect("one file");
         assert_eq!(body["would_remove_total"], 1);
+    }
+
+    #[test]
+    fn json_record_count_sums_top_level_arrays_of_objects() {
+        let value = serde_json::json!({
+            "functions": [{"n": 1}, {"n": 2}, {"n": 3}],
+            "runs": [{"a": 1}, {"a": 2}],
+            "note": "x"
+        });
+        assert_eq!(json_value_records(&value), 5);
+        assert_eq!(json_value_records(&serde_json::json!([1, 2, 3, 4])), 4);
+        assert_eq!(json_value_records(&serde_json::json!({"a": 1})), 1);
+    }
+
+    /// #2102 priced disk only. A wide JSON array has no measured store ratio
+    /// (`.json` is `other`), so disk never refuses it. The record count does,
+    /// against the memory ceiling, and `no-vectors` is the cheaper plan.
+    /// A memory ceiling the file fits under must not flip an unmeasured disk
+    /// plan to `fits: true`.
+    #[test]
+    fn counted_json_records_can_refuse_on_memory_without_a_disk_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = 3_000u64;
+        let pad = "p".repeat(80);
+        let path = dir.path().join("rows.json");
+        let mut body = String::new();
+        body.push('[');
+        for i in 0..records {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(r#"{{"id":{i},"pad":"{pad}"}}"#));
+        }
+        body.push(']');
+        let size = body.len() as u64;
+        assert!(size >= JSON_PROBE_MIN, "{size}");
+        assert!(
+            size <= CAP_1MB,
+            "cap-1mb must still see this file, got {size}"
+        );
+        std::fs::write(&path, &body).unwrap();
+        let files = vec![FileEntry {
+            path,
+            rel: "rows.json".into(),
+            rel_id: "rows.json".into(),
+            is_symlink: false,
+            size,
+        }];
+        let plain = size + PLAIN_RECORD_BYTES * records;
+        let semantic = size + SEMANTIC_RECORD_BYTES * records;
+        assert!(plain < semantic);
+
+        // Disk budget is large enough that the measured `other` ratio fits.
+        // Memory is what separates default from no-vectors.
+        let request = |memory_budget, max_index_bytes| Request {
+            root: dir.path().to_str().unwrap(),
+            files: &files,
+            volume: None,
+            max_index_bytes,
+            no_semantic: false,
+            plan: None,
+            approve: None,
+            duplicate_prefixes: &[],
+            memory_budget,
+        };
+        let tight = assess(&request(Some(plain + 1), Some(u64::MAX)));
+        assert_eq!(tight.body["json_records"], serde_json::json!(records));
+        let plan = |body: &Value, name: &str| -> Value {
+            body["plans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let default = plan(&tight.body, "default");
+        assert_eq!(default["fits"], serde_json::json!(false), "{default}");
+        assert!(tight.needs_choice, "{}", tight.body);
+        let no_vectors = plan(&tight.body, "no-vectors");
+        assert_eq!(no_vectors["fits"], serde_json::json!(true), "{no_vectors}");
+        assert_eq!(tight.body["recommended"], serde_json::json!("no-vectors"));
+        assert!(
+            tight
+                .lines
+                .iter()
+                .any(|line| line.contains("3000") && line.contains("record")),
+            "{:?}",
+            tight.lines
+        );
+
+        let open = assess(&request(Some(u64::MAX), None));
+        let default = plan(&open.body, "default");
+        assert!(
+            default["fits"].is_null(),
+            "memory fitting must not accept an unmeasured disk plan: {default}"
+        );
+        assert!(default["memory_bytes"].as_u64().unwrap() >= semantic);
+        assert!(!open.needs_choice);
+
+        let missing = sample_files();
+        let untouched = assess(&Request {
+            root: "/data",
+            files: &missing,
+            volume: None,
+            max_index_bytes: None,
+            no_semantic: false,
+            plan: None,
+            approve: None,
+            duplicate_prefixes: &[],
+            memory_budget: Some(1),
+        });
+        assert!(untouched.body["json_records"].is_null());
+        assert!(untouched.body["plans"][0]["fits"].is_null());
+        assert!(!untouched.needs_choice);
+    }
+
+    #[test]
+    fn a_json_file_that_does_not_parse_does_not_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.json");
+        let body = "{".repeat(JSON_PROBE_MIN as usize + 8);
+        std::fs::write(&path, &body).unwrap();
+        let files = vec![FileEntry {
+            path,
+            rel: "broken.json".into(),
+            rel_id: "broken.json".into(),
+            is_symlink: false,
+            size: body.len() as u64,
+        }];
+        let assessment = assess(&Request {
+            root: dir.path().to_str().unwrap(),
+            files: &files,
+            volume: None,
+            max_index_bytes: None,
+            no_semantic: false,
+            plan: None,
+            approve: None,
+            duplicate_prefixes: &[],
+            memory_budget: Some(1),
+        });
+        assert!(assessment.body["json_records"].is_null());
+        assert!(!assessment.needs_choice, "{}", assessment.body);
     }
 }
