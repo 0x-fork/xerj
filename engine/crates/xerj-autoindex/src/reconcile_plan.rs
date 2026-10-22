@@ -811,6 +811,11 @@ fn ensure_compatible(
             if widenable_field_name(name) {
                 continue;
             }
+            // #1815: genesis already published this name as an unmapped
+            // overflow field of a dataset that hit the field cap.
+            if cap_overflow_fields(dataset).is_some_and(|overflow| overflow.contains(name)) {
+                continue;
+            }
             return Err(AssignFailure::File(format!(
                 "field {name} is absent from frozen dataset {} and cannot be added to its mapping",
                 dataset.slug
@@ -847,6 +852,20 @@ fn widenable_field_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The overflow field names genesis recorded when `infer` truncated the
+/// dataset at [`crate::infer::MAX_FIELDS_PER_DATASET`], or `None` when the
+/// dataset never hit the cap.
+fn cap_overflow_fields(dataset: &PlanDataset) -> Option<HashSet<&str>> {
+    dataset.specs.iter().find_map(|spec| {
+        spec.notes.iter().find_map(|note| {
+            note.strip_prefix(CAP_OVERFLOW_NOTE)
+                .map(|list| list.split(", ").filter(|name| !name.is_empty()).collect())
+        })
+    })
+}
+
+const CAP_OVERFLOW_NOTE: &str = "dataset field cap hit; unmapped overflow fields: ";
+
 fn widen_dataset(
     dataset: &PlanDataset,
     added: &mut Vec<FieldSpec>,
@@ -859,6 +878,11 @@ fn widen_dataset(
         .map(|spec| spec.name.as_str())
         .collect();
     known.extend(added.iter().map(|spec| spec.name.as_str()));
+    // #1815: a dataset that hit the field cap at genesis has an explicitly
+    // partial schema. Its overflow fields were published unmapped and pass
+    // through coercion (`coerce.rs`). A changed file that re-observes them, or
+    // grows another field, is the same shape genesis accepted, not drift.
+    let overflow = cap_overflow_fields(dataset);
     let mut pending: HashMap<String, FieldAcc> = HashMap::new();
     let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
     names.sort_unstable();
@@ -866,6 +890,13 @@ fn widen_dataset(
         let acc = &fields[name];
         if known.contains(name) || absent_field_is_tolerated(name, acc, dataset) || acc.n == 0 {
             continue;
+        }
+        if let Some(overflow) = &overflow {
+            if overflow.contains(name) || widenable_field_name(name) {
+                // Unmapped, exactly like the genesis overflow: the cap leaves
+                // no room to map it, and refusing it would drop the file.
+                continue;
+            }
         }
         if !widenable_field_name(name) {
             return Err(AssignFailure::File(format!(
@@ -1284,6 +1315,62 @@ mod tests {
             message.contains("Nothing was indexed for this file."),
             "{message}"
         );
+    }
+
+    /// #1815: a dataset genesis truncated at the field cap keeps its overflow
+    /// fields unmapped. A retained file that changes a value and grows a new
+    /// field must stay assigned, not be refused for "passing the field cap".
+    #[test]
+    fn capped_dataset_retains_a_changed_file_with_overflow_fields() {
+        let mut genesis: HashMap<String, FieldAcc> = (0..crate::infer::MAX_FIELDS_PER_DATASET + 3)
+            .map(|i| (format!("f_{i:04}"), acc(&[json!(i)])))
+            .collect();
+        genesis.insert("id".into(), acc(&[json!(1)]));
+        let specs = crate::infer::infer_fields(&genesis, 1, true);
+        assert_eq!(specs.len(), crate::infer::MAX_FIELDS_PER_DATASET);
+        let mut ds = dataset("wide", specs);
+        let overflow: Vec<String> = cap_overflow_fields(&ds)
+            .expect("genesis records the cap overflow")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(overflow.len(), 4);
+        ds.file_count = 1;
+        let mut previous = Plan {
+            datasets: vec![ds],
+            ..Plan::default()
+        };
+        previous
+            .files
+            .insert("old".into(), assignment("wide.json", "unix:77", "wide"));
+
+        let mut changed = genesis.clone();
+        changed.insert("id".into(), acc(&[json!(2)]));
+        changed.insert(
+            "paths_v1_new_route_get".into(),
+            acc(&[json!("get /v1/new")]),
+        );
+        let plan = reconcile_plan(
+            &inventory("wide.json", "unix:77", "new"),
+            &previous,
+            vec![scan(changed)],
+            50,
+            REBUILD,
+        )
+        .unwrap();
+        assert!(plan.junk_files.is_empty(), "{:?}", plan.junk_files);
+        assert_eq!(plan.files["new"].assignments, vec![(None, "wide".into())]);
+        assert!(
+            plan.incremental_fields
+                .get("wide")
+                .is_none_or(|added| added.is_empty()),
+            "a capped dataset cannot map more fields; overflow passes through"
+        );
+    }
+
+    #[test]
+    fn an_uncapped_dataset_has_no_overflow_fields() {
+        assert!(cap_overflow_fields(&dataset("rows", vec![spec("id", "long")])).is_none());
     }
 
     /// A NEW document file (empty `key_fields`, no group — the shape a fresh
