@@ -9301,7 +9301,15 @@ fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Hint for a query that names a field the index does not have.
+/// Hint for a query that names a field none of the matched indices map.
+///
+/// A prefix pattern (`proj-*`, the target `xerj search --prefix` and
+/// `xerj_search` both use) resolves to every dataset under it. Code datasets
+/// map `body` / `defs` / `code`; a JSON or CSV dataset often maps none of
+/// them. The field is unknown only when no resolved schema maps it (#2121) —
+/// the same rule as [`field_known_in_any`]. Reading the first index alone
+/// reported those code fields as missing whenever a data index was first in
+/// the resolved list, on a response that had already returned the code hits.
 ///
 /// Fires regardless of hit count: a bogus field inside a `multi_match` that
 /// also names a real one still returns results, so a zero-hit-only check would
@@ -9316,8 +9324,11 @@ fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
 fn unknown_field_hint(
     index: &str,
     body: &EsSearchBody,
-    schema: &xerj_common::types::Schema,
+    schemas: &[&xerj_common::types::Schema],
 ) -> Option<Value> {
+    if schemas.is_empty() {
+        return None;
+    }
     let query = body.query.as_ref()?;
     let mut referenced = Vec::new();
     referenced_query_fields(query, &mut referenced);
@@ -9325,19 +9336,9 @@ fn unknown_field_hint(
         return None;
     }
 
-    let known = |name: &str| -> bool {
-        // Accept the field itself, a subfield of a real field, and the ES
-        // metadata fields a query may legitimately target.
-        schema.field(name).is_some()
-            || name.starts_with('_')
-            || name
-                .split_once('.')
-                .is_some_and(|(parent, _)| schema.field(parent).is_some())
-    };
-
     let unknown: Vec<String> = referenced
         .iter()
-        .filter(|f| !known(f))
+        .filter(|f| !field_known_in_any(f, schemas))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -9347,8 +9348,9 @@ fn unknown_field_hint(
     }
 
     // Text-ish fields are what a full-text query actually wants; listing every
-    // keyword and numeric column would bury the answer.
-    let searchable = searchable_text_fields(schema);
+    // keyword and numeric column would bury the answer. Union across the
+    // pattern so the suggestion names a field some matched index actually maps.
+    let searchable = searchable_text_fields_across(schemas);
 
     let primary = searchable
         .iter()
@@ -9394,6 +9396,20 @@ fn searchable_text_fields(schema: &xerj_common::types::Schema) -> Vec<String> {
         })
         .map(|f| f.name.clone())
         .collect()
+}
+
+/// Searchable text fields across every matched index, first-seen order.
+/// A single schema keeps [`searchable_text_fields`]'s order.
+fn searchable_text_fields_across(schemas: &[&xerj_common::types::Schema]) -> Vec<String> {
+    let mut out = Vec::new();
+    for schema in schemas {
+        for name in searchable_text_fields(schema) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 /// The #1093 refusal reason for a search, or `None` when the query's lookup
@@ -11438,6 +11454,170 @@ mod unknown_field_refusal_tests {
         assert!(
             responses[1]["hits"]["total"]["value"].as_i64().unwrap_or(0) > 0,
             "the sibling item ran: {json}"
+        );
+    }
+
+    /// #2121: `xerj search` and MCP `xerj_search` send one plain-string
+    /// definition-first body at the prefix pattern (`proj-*`). That pattern
+    /// spans a code index and a JSON/CSV index that maps none of
+    /// `body`/`defs`/`code`/`name`. Those fields exist on the code index, so
+    /// the search must return that hit and must not attach an `unknown_field`
+    /// hint. The hint stays when no matched index maps the field.
+    ///
+    /// The comma target lists the CSV index first. Resolution preserves that
+    /// order, which is the case a first-schema check gets wrong. `proj-*` is
+    /// the pattern `xerj search --prefix proj` sends.
+    #[tokio::test]
+    async fn mixed_pattern_does_not_hint_a_field_some_index_maps() {
+        let state = test_state();
+        let strict_settings = json!({
+            "settings": {"index": {"query": {"strict_unknown_fields": true}}},
+        });
+        let mut code_create = strict_settings.clone();
+        code_create["mappings"] = json!({"properties": {
+            "name": {"type": "keyword"},
+            "code": {"type": "text"},
+            "body": {"type": "text"},
+            "defs": {"type": "text"},
+            "title": {"type": "text"},
+            "ax_path": {"type": "keyword"},
+            "line": {"type": "long"},
+        }});
+        let mut csv_create = strict_settings;
+        csv_create["mappings"] = json!({"properties": {
+            "sku": {"type": "keyword"},
+            "qty": {"type": "long"},
+            "note": {"type": "text"},
+        }});
+        for (index, body) in [("proj-code", code_create), ("proj-csv", csv_create)] {
+            let (status, resp) = request_json(&state, "PUT", &format!("/{index}"), body).await;
+            assert_eq!(status, StatusCode::OK, "{index}: {resp}");
+        }
+
+        let (status, resp) = request_json(
+            &state,
+            "PUT",
+            "/proj-code/_doc/sign",
+            json!({
+                "name": "SignWithSM2",
+                "code": "func SignWithSM2(digest []byte)",
+                "body": "func SignWithSM2(digest []byte) signature",
+                "defs": "func SignWithSM2",
+                "title": "sm2_dsa.go",
+                "ax_path": "sm2/sm2_dsa.go",
+                "line": 126,
+            }),
+        )
+        .await;
+        assert!(status.is_success(), "{resp}");
+        let (status, resp) = request_json(
+            &state,
+            "PUT",
+            "/proj-csv/_doc/row1",
+            json!({"sku": "A1", "qty": 3, "note": "crate of bolts"}),
+        )
+        .await;
+        assert!(status.is_success(), "{resp}");
+        for index in ["proj-code", "proj-csv"] {
+            state
+                .engine
+                .get_index(index)
+                .expect(index)
+                .refresh()
+                .await
+                .expect("refresh");
+        }
+
+        // The body both plain-string clients send. `mapped_property_names`
+        // is the union `xerj search` and `xerj_search` read from
+        // `GET /{pattern}/_mapping`; one code index is enough to keep
+        // `defs` / `name` even though the CSV index maps neither.
+        let mapping = json!({
+            "proj-csv": {"mappings": {"properties": {
+                "sku": {"type": "keyword"},
+                "qty": {"type": "long"},
+                "note": {"type": "text"},
+            }}},
+            "proj-code": {"mappings": {"properties": {
+                "name": {"type": "keyword"},
+                "code": {"type": "text"},
+                "body": {"type": "text"},
+                "defs": {"type": "text"},
+                "title": {"type": "text"},
+                "ax_path": {"type": "keyword"},
+                "line": {"type": "long"},
+            }}},
+        });
+        let mapped = xerj_common::code_query::mapped_property_names(&mapping)
+            .expect("heterogeneous mapping");
+        let numeric = xerj_common::code_query::numeric_property_names(&mapping);
+        let query = xerj_common::code_query::search_query_body_for_mapping(
+            "SignWithSM2",
+            10,
+            Some(&mapped),
+            Some(&numeric),
+        );
+        let rendered = query["query"].to_string();
+        assert!(
+            rendered.contains("\"defs\"") && rendered.contains("\"name\""),
+            "plain-string body must keep a field any matched index maps: {query}"
+        );
+        for path in ["/proj-csv,proj-code/_search", "/proj-*/_search"] {
+            let (status, json) = request_json(&state, "POST", path, query.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {json}");
+            let hits = json["hits"]["hits"].as_array().expect("hits");
+            assert!(
+                hits.iter().any(|h| {
+                    h["_index"] == "proj-code" && h["_source"]["ax_path"] == "sm2/sm2_dsa.go"
+                }),
+                "{path} must return the code hit: {json}"
+            );
+            let codes = json["_xerj"]["hints"]
+                .as_array()
+                .map(|h| {
+                    h.iter()
+                        .filter_map(|x| x["code"].as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert!(
+                !codes.contains(&"unknown_field"),
+                "{path} hinted a field another matched index maps: {codes:?} / {json}"
+            );
+        }
+
+        // No matched index maps `phantom`. Lenient mode still explains it;
+        // strict mode (already on these indices, the autoindex default)
+        // still refuses it.
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/proj-csv,proj-code/_search?strict_unknown_fields=false",
+            json!({"query": {"term": {"phantom": "x"}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let reason = json["_xerj"]["hints"]
+            .as_array()
+            .and_then(|h| h.iter().find(|x| x["code"] == "unknown_field"))
+            .and_then(|h| h["reason"].as_str())
+            .unwrap_or("");
+        assert!(
+            reason.contains("phantom"),
+            "a field on no matched index must still hint: {json}"
+        );
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/proj-*/_search",
+            json!({"query": {"term": {"phantom": "x"}}}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "strict still refuses a field no index maps: {json}"
         );
     }
 }
@@ -17517,14 +17697,32 @@ async fn search_impl(
     // shape of all — it returns plenty of results, silently searching fewer
     // fields than asked, so the caller has no signal at all.
     let mut all_hints: Vec<Value> = Vec::new();
+    // #2121: every matched index, not whichever name was resolved first.
+    // `xerj search` / `xerj_search` send one body at the whole prefix pattern;
+    // a field that any of those indices maps is a real target.
+    // A body with no query names no fields, so it skips the per-index reads.
+    let hint_schemas: Vec<xerj_common::types::Schema> = if body.query.is_none() {
+        Vec::new()
+    } else {
+        let mut out = Vec::with_capacity(index_names.len());
+        for name in &index_names {
+            if let Ok(idx) = state.engine.get_index(name) {
+                out.push(idx.schema().await);
+            }
+        }
+        out
+    };
+    if !hint_schemas.is_empty() {
+        let refs: Vec<&xerj_common::types::Schema> = hint_schemas.iter().collect();
+        if let Some(h) = unknown_field_hint(&index, &body, &refs) {
+            if let Some(Value::Array(items)) = h.get("hints") {
+                all_hints.extend(items.iter().cloned());
+            }
+        }
+    }
     if let Some(first) = index_names.first() {
         if let Ok(idx) = state.engine.get_index(first) {
             let schema = idx.schema().await;
-            if let Some(h) = unknown_field_hint(&index, &body, &schema) {
-                if let Some(Value::Array(items)) = h.get("hints") {
-                    all_hints.extend(items.iter().cloned());
-                }
-            }
             // A zero-hit exact filter on a real keyword field is nearly always
             // a wrong-value guess rather than a genuine absence, and the reply
             // gives no way to tell which. Sample a bounded slice of documents
