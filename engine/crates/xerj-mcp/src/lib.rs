@@ -9,10 +9,10 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as twenty
-//! tools: seventeen without a hub key, and three Corpus Hub tools
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as twenty-one
+//! tools: eighteen without a hub key, and three Corpus Hub tools
 //! (`xerj_hub_*`) that run the `xerj ask` flow itself. Thirteen of those
-//! seventeen construct exactly the request the running engine already accepts
+//! eighteen construct exactly the request the running engine already accepts
 //! and forward it to a configurable base URL. `xerj_index_budget` counts a
 //! folder and returns the budget plans; it does not index. `xerj_autoindex_remove`
 //! deletes one autoindexed folder after listing what that folder owns, and only
@@ -23,10 +23,11 @@
 //! when GitHub is unavailable. It sends by default; `confirm: false` previews,
 //! and `--disable-feedback` / `XERJ_DISABLE_FEEDBACK=true` turn sending off.
 //!
-//! ## The thirteen canonical agent operations
+//! ## Canonical agent operations
 //!
 //! | MCP tool               | XERJ endpoint                         | Real capability |
 //! |------------------------|---------------------------------------|-----------------|
+//! | `xerj_def` | `GET /{index}/_mapping` + `POST /{index}/_search` | local definition lookup with CLI ranking and deduplication |
 //! | `xerj_search`          | `POST /{index}/_search`               | ES query-DSL search (full-text / keyword / structured) |
 //! | `xerj_semantic_search` | `POST /{index}/_search` (`semantic`)  | server-side lexical embedding, no external key |
 //! | `xerj_vector_search`   | `POST /{index}/_search` (`knn`)       | kNN over a `dense_vector` field (HNSW-served unfiltered, exact filtered) |
@@ -64,8 +65,8 @@
 //!   understanding, no query language, no unbounded traversal. Every brain
 //!   tool description says both things, and engine refusals (e.g. the hops
 //!   cap) are passed back to the agent verbatim.
-//! * This proxy adds **no** capabilities of its own — whatever the engine
-//!   returns (including errors) is passed straight back to the agent.
+//! * `xerj_def` shares the CLI definition query and local result ranking;
+//!   engine errors are passed back unchanged.
 //!
 //! ## Configuration (environment)
 //!
@@ -93,12 +94,13 @@
 //!
 //! ## Token budgets (#1058)
 //!
-//! The five search tools accept `max_tokens` and are held to it: the response
+//! The six search tools accept `max_tokens` and are held to it: the response
 //! text NEVER exceeds the budget. Enforcement lives in [`token_budget`],
 //! counted with one named tokenizer (XERJ's `StandardTokenizer`, UAX #29
 //! words), with overlapping file:line passages deduped before budgeting and
 //! over-budget hits reduced to locators.
 
+mod def;
 mod hub;
 mod map;
 mod token_budget;
@@ -698,7 +700,7 @@ fn judge_arg_schema(query_required: bool) -> Value {
 }
 
 /// JSON-schema fragment for the optional `max_tokens` argument, shared by all
-/// five search tools (`xerj_search`, `xerj_hybrid_search`,
+/// six search tools (`xerj_def`, `xerj_search`, `xerj_hybrid_search`,
 /// `xerj_semantic_search`, `xerj_vector_search`, `xerj_code_search`) so the
 /// budget contract cannot drift between them.
 ///
@@ -747,6 +749,7 @@ pub fn tool_specs() -> Value {
 /// do not have to mutate `XERJ_HUB_PUBKEY`, which is process-global.
 pub fn tool_specs_with(include_hub: bool) -> Value {
     let mut specs = json!([
+        def::spec(),
         {
             "name": "xerj_search",
             "description":
@@ -1838,6 +1841,7 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
     // the response hits are penalized and trimmed back to `page`.
     let mut demote_page: Option<usize> = None;
     let result = match name {
+        "xerj_def" => return def::run(ctx, &args).await,
         "xerj_search" => {
             // Resolve before even the mapping GET: conflicting or malformed
             // scope arguments must never silently query a different corpus.
@@ -4036,9 +4040,10 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_five_search_tools_advertise_max_tokens() {
+    fn exactly_the_six_search_tools_advertise_max_tokens() {
         let specs = tool_specs();
         let search_tools = [
+            "xerj_def",
             "xerj_search",
             "xerj_hybrid_search",
             "xerj_semantic_search",
@@ -5057,7 +5062,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_all_eighteen() {
+    fn tools_list_has_all_tools() {
         let specs = tool_specs_with(true);
         let names: Vec<&str> = specs
             .as_array()
@@ -5065,8 +5070,9 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 21);
         for n in [
+            "xerj_def",
             "xerj_search",
             "xerj_semantic_search",
             "xerj_vector_search",
@@ -5165,23 +5171,23 @@ mod tests {
                 .collect()
         };
         let without = names(false);
-        assert_eq!(without.len(), 17, "{without:?}");
+        assert_eq!(without.len(), 18, "{without:?}");
         assert!(
             without.iter().all(|n| !n.starts_with("xerj_hub_")),
             "{without:?}"
         );
         let with = names(true);
-        assert_eq!(with.len(), 20, "{with:?}");
+        assert_eq!(with.len(), 21, "{with:?}");
         for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
             assert!(with.iter().any(|name| name == n), "missing {n}");
         }
 
         let help = tools_paragraph(false);
-        assert!(help.contains("proxies 17 tools"), "{help}");
+        assert!(help.contains("proxies 18 tools"), "{help}");
         assert!(!help.contains("xerj_hub_"), "{help}");
         assert!(help.contains("~/xerj-data"), "{help}");
         let help = tools_paragraph(true);
-        assert!(help.contains("proxies 20 tools"), "{help}");
+        assert!(help.contains("proxies 21 tools"), "{help}");
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }
