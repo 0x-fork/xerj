@@ -34,6 +34,10 @@ pub struct Es {
     /// Run-wide record of per-item back-pressure re-sends (#944), reported on
     /// `xerj-done`. Shared by every clone, like `admission`.
     throttle_ledger: Arc<ThrottleLedger>,
+    /// Set once a connect failure shows the node is not accepting connections
+    /// (#2177). Shared by every clone: one dead `_bulk` stops the rest of the
+    /// run from retrying into the same process.
+    node_down: Arc<NodeDownLatch>,
     /// Every delay this client has actually backed off for, in order.
     /// Test-only, and per-instance rather than global so a concurrent test
     /// cannot perturb it — `--test-threads=2` in CI is exactly the shape that
@@ -51,6 +55,183 @@ pub struct Es {
     /// this client, like `admission` — a clone is the same client.
     #[cfg(test)]
     backoff_delays: Arc<std::sync::Mutex<Vec<(Duration, Duration)>>>,
+    /// The reason text each retry notice rendered, in order. The print itself
+    /// goes to stderr; this is what a test asserts (#2177).
+    #[cfg(test)]
+    notices: Arc<Mutex<Vec<String>>>,
+}
+
+/// The message latched when the node stops accepting connections.
+struct NodeDownLatch {
+    message: Mutex<Option<String>>,
+}
+
+/// How long a non-connect retry notice may be, in characters.
+///
+/// Connect failures are not capped ([`notice_reason`]). This bound is only
+/// for the other transport and 5xx chains, and it keeps the tail — the
+/// cause — rather than a fixed prefix.
+const NOTICE_REASON_CHARS: usize = 240;
+
+/// `true` when `text` is the report [`node_down_message`] builds. The phase-B
+/// bail prints that report on its own, instead of wrapping it as a generic
+/// bulk failure.
+pub(crate) fn is_node_down_report(text: &str) -> bool {
+    text.contains("is down or unreachable")
+}
+
+/// One line of an anyhow chain (`{:#}` joins causes with `: `).
+fn one_line_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}").replace(['\n', '\r'], " ")
+}
+
+/// The text a retry notice shows for `error`.
+///
+/// A node that is not accepting connections is rendered in full. The chain
+/// reqwest and hyper-util produce for a refused `_bulk` is
+///
+/// ```text
+/// bulk send (request timeout 300s): error sending request for url (http://127.0.0.1:9200/_bulk): client error (Connect): tcp connect error: Connection refused (os error 111)
+/// ```
+///
+/// and character 120 of that string is the `t` of `tcp connect error`.
+/// Truncating there is what #2177 printed as `client error (Connect): t`.
+/// The address is the `for url (...)` segment; the OS cause is the last
+/// segment. Both have to survive.
+///
+/// This is the only place a transport-error chain is shortened. The other
+/// caps in this file (`SERVER_REASON_MAX`) bound the server's response body,
+/// and `generation_catalog` bounds a catalog field diff. Neither formats a
+/// connect error.
+fn notice_reason(error: &anyhow::Error) -> String {
+    let full = one_line_chain(error);
+    if is_node_unreachable(error) {
+        return full;
+    }
+    cap_keeping_tail(&full, NOTICE_REASON_CHARS)
+}
+
+/// Keep the end of `full` when it is longer than `max_chars`.
+///
+/// Causes are appended after `: `. If the cut would leave only a few
+/// characters of the next segment, start at the following boundary so a
+/// cause is never reduced to its first letter.
+fn cap_keeping_tail(full: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = full.chars().collect();
+    if chars.len() <= max_chars || max_chars == 0 {
+        return full.to_string();
+    }
+    let mut start = chars.len() - (max_chars - 1);
+    let preview: String = chars[start..].iter().collect();
+    if let Some(rel) = preview.find(": ") {
+        if rel > 0 && rel < 8 {
+            start = (start + rel + 2).min(chars.len());
+        }
+    }
+    let mut out = String::from("…");
+    out.extend(chars[start..].iter().copied());
+    out
+}
+
+/// `true` when `err` is "nothing accepted the connection", not a timeout, a
+/// TLS failure after connect, or an HTTP status.
+///
+/// `reqwest::Error::is_connect` is necessary but not sufficient: a connect
+/// timeout is also a connect error, and that one still belongs to the
+/// ordinary six-attempt budget. The OS refusal (`ConnectionRefused`, and the
+/// Windows wording "actively refused") is the dead-node signal.
+fn is_node_unreachable(err: &anyhow::Error) -> bool {
+    if chain_is_timeout(err) {
+        return false;
+    }
+    let mut connectish = false;
+    let mut refused = false;
+    for cause in err.chain() {
+        if let Some(req) = cause.downcast_ref::<reqwest::Error>() {
+            if req.is_connect() {
+                connectish = true;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable => return true,
+                _ => {}
+            }
+        }
+        let text = cause.to_string().to_ascii_lowercase();
+        if text.contains("client error (connect)") || text.contains("tcp connect error") {
+            connectish = true;
+        }
+        if text.contains("connection refused")
+            || text.contains("actively refused")
+            || text.contains("network is unreachable")
+            || text.contains("host is unreachable")
+            || text.contains("no route to host")
+        {
+            refused = true;
+        }
+    }
+    connectish && refused
+}
+
+fn chain_is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if let Some(req) = cause.downcast_ref::<reqwest::Error>() {
+            if req.is_timeout() {
+                return true;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::TimedOut {
+                return true;
+            }
+        }
+        cause.to_string().to_ascii_lowercase().contains("timed out")
+    })
+}
+
+fn node_down_message(url: &str, cause: &anyhow::Error) -> String {
+    let detail = one_line_chain(cause);
+    format!(
+        "the node at {url} is down or unreachable ({detail}). \
+         The run can be resumed: files already journaled stay indexed, and the \
+         file in flight was not marked complete. Re-run this command:\n  {}",
+        resume_command()
+    )
+}
+
+/// The process argv, quoted so a path with spaces pastes as one command.
+fn resume_command() -> String {
+    std::env::args()
+        .map(|arg| quote_resume_arg(&arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Quote one argv element. Unquoted when every character is safe to paste.
+/// Otherwise POSIX single quotes, or double quotes on Windows, where the
+/// report that found this (#2177) was pasted into cmd / PowerShell.
+fn quote_resume_arg(s: &str) -> String {
+    if s.is_empty() {
+        return if cfg!(windows) {
+            "\"\"".to_string()
+        } else {
+            "''".to_string()
+        };
+    }
+    let safe = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '\\'));
+    if safe {
+        s.to_string()
+    } else if cfg!(windows) {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// The server understood a create-index or put-mapping request and REFUSED it.
@@ -983,8 +1164,13 @@ impl Es {
             bulk_max_actions: BULK_MAX_ACTIONS,
             request_size: Arc::new(RequestSizeLedger::default()),
             throttle_ledger: Arc::new(ThrottleLedger::default()),
+            node_down: Arc::new(NodeDownLatch {
+                message: Mutex::new(None),
+            }),
             #[cfg(test)]
             backoff_delays: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            notices: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1047,6 +1233,12 @@ impl Es {
     /// How many distinct 429 congestion events this client answered.
     pub fn bulk_congestion_events(&self) -> u64 {
         self.admission.congestion_events()
+    }
+
+    /// `true` after a connect failure has shown the node is not accepting
+    /// connections. Phase B stops taking files when this flips (#2177).
+    pub fn node_is_down(&self) -> bool {
+        self.node_down.message.lock().unwrap().is_some()
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
@@ -1278,7 +1470,10 @@ impl Es {
     ///
     /// * `Failed` (5xx, transport): six attempts, five backoffs between them
     ///   and none after the last — a bounded budget, because nothing says a
-    ///   5xx will clear.
+    ///   5xx will clear. A connect failure (nothing is accepting connections)
+    ///   uses the same six, then latches: every later request on this client
+    ///   fails immediately. Repeating the six once per remaining file is the
+    ///   retry loop #2177 saw against a dead node.
     /// * `Throttled` (HTTP 429): the server asked for time, and how much time
     ///   is the server's call. A loading run (the admission gate is on) keeps
     ///   re-asking at the capped backoff for up to `throttle_patience`,
@@ -1293,6 +1488,9 @@ impl Es {
     ///   that does not parse).
     fn retry_loop<T>(&self, what: &str, mut attempt: impl FnMut() -> Attempt<T>) -> Result<T> {
         const MAX_ATTEMPTS: usize = 6;
+        if let Some(down) = self.latched_down() {
+            return Err(down);
+        }
         let mut delay = self.retry_initial_delay;
         let mut failures = 0usize;
         let started = Instant::now();
@@ -1327,7 +1525,11 @@ impl Es {
                 }
                 Attempt::Failed(e) => {
                     failures += 1;
+                    let unreachable = is_node_unreachable(&e);
                     if failures >= MAX_ATTEMPTS {
+                        if unreachable {
+                            return Err(self.latch_down(&e));
+                        }
                         return Err(e);
                     }
                     self.failure_notice(
@@ -1341,8 +1543,29 @@ impl Es {
                 }
             }
             self.backoff(delay);
+            // Another worker may have latched the node while this one slept.
+            if let Some(down) = self.latched_down() {
+                return Err(down);
+            }
             delay = (delay * 2).min(self.retry_max_delay);
         }
+    }
+
+    fn latched_down(&self) -> Option<anyhow::Error> {
+        self.node_down
+            .message
+            .lock()
+            .unwrap()
+            .clone()
+            .map(anyhow::Error::msg)
+    }
+
+    fn latch_down(&self, cause: &anyhow::Error) -> anyhow::Error {
+        let mut slot = self.node_down.message.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(node_down_message(&self.base, cause));
+        }
+        anyhow::Error::msg(slot.clone().expect("just inserted"))
     }
 
     /// Say on stderr that this run is waiting on the server, at most once per
@@ -1393,14 +1616,14 @@ impl Es {
         if !self.admission.announces() || matches!(last, Some(t) if t.elapsed() < NOTICE_EVERY) {
             return false;
         }
-        // One line, capped: transport error chains can run long and the point
-        // is the request and the bound, not the whole diagnostic.
-        let mut reason = format!("{error:#}").replace('\n', " ");
-        let cut = reason
-            .char_indices()
-            .nth(120)
-            .map_or(reason.len(), |(i, _)| i);
-        reason.truncate(cut);
+        // The reason is one line. A connect failure is printed in full: the
+        // old 120-character prefix cut the chain at the first letter of
+        // `tcp connect error`, which is the `client error (Connect): t`
+        // line in #2177. Other transport errors keep a bounded tail so the
+        // same cut cannot reduce their cause to one character either.
+        let reason = notice_reason(error);
+        #[cfg(test)]
+        self.notices.lock().unwrap().push(reason.clone());
         eprintln!(
             "autoindex: {what} failed: {reason}; retrying (attempt {attempt} of {max_attempts}, \
              {} s in this request so far)",
@@ -2743,6 +2966,136 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2, "one drop, one retry");
+    }
+
+    /// Unix says "Connection refused"; Windows says the target machine
+    /// "actively refused" it. Either is the OS cause #2177 cut off.
+    fn connect_refused(text: &str) -> bool {
+        let text = text.to_ascii_lowercase();
+        text.contains("connection refused") || text.contains("actively refused")
+    }
+
+    /// #2177: the 120-character prefix of a refused `_bulk` against the default
+    /// URL ends on the `t` of `tcp connect error`. The notice must keep the
+    /// address and the OS cause instead.
+    #[test]
+    fn the_connect_notice_keeps_the_cause_the_120_char_cut_reduced_to_t() {
+        let chain = "bulk send (request timeout 300s): error sending request for url (http://127.0.0.1:9200/_bulk): client error (Connect): tcp connect error: Connection refused (os error 111)";
+        let prefix: String = chain.chars().take(120).collect();
+        assert_eq!(
+            prefix,
+            "bulk send (request timeout 300s): error sending request for url (http://127.0.0.1:9200/_bulk): client error (Connect): t"
+        );
+        let err = anyhow::anyhow!("{chain}");
+        assert!(super::is_node_unreachable(&err), "{chain}");
+        assert_eq!(super::notice_reason(&err), chain);
+    }
+
+    /// A long non-connect failure shares [`super::notice_reason`]. The cap
+    /// keeps the cause at the end of the chain, not a one-character stub.
+    #[test]
+    fn a_long_transport_notice_keeps_the_tail_of_the_cause() {
+        let cause = "upstream closed the connection while flushing a segment";
+        let err = anyhow::anyhow!("{}: {cause}", "y".repeat(400));
+        let reason = super::notice_reason(&err);
+        assert!(reason.contains(cause), "{reason}");
+        assert!(reason.starts_with('…'), "{reason}");
+        assert!(
+            reason.chars().count() <= super::NOTICE_REASON_CHARS + 1,
+            "{}",
+            reason.chars().count()
+        );
+    }
+
+    /// The node accepts one `_bulk`, then closes the port. The next bulk must
+    /// name the address and the OS refusal, stop after the ordinary attempt
+    /// budget, and a bulk after that must not retry.
+    #[test]
+    fn bulk_against_a_node_that_closes_its_port_stops_and_names_the_connect_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            respond_json(&mut stream, br#"{"errors":false,"items":[]}"#);
+            drop(stream);
+            drop(listener);
+            closed_tx.send(()).unwrap();
+        });
+        // 300s is the production bulk timeout, so the rendered chain has the
+        // same prefix the field report cut. A refused connect returns at once;
+        // the timeout is only text.
+        let es = Es::with_bulk_policy(
+            &format!("http://{address}"),
+            None,
+            Duration::from_secs(300),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .unwrap()
+        .with_bulk_concurrency(1, true);
+        let body = b"{\"index\":{}}\n{}\n".to_vec();
+        let first = es.bulk(body.clone()).unwrap();
+        assert_eq!(first.item_errors, 0);
+        closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+
+        let before = es.backoff_delays.lock().unwrap().len();
+        let err = es.bulk(body.clone()).unwrap_err();
+        let backoffs = es.backoff_delays.lock().unwrap().len() - before;
+        assert_eq!(backoffs, 5, "six attempts, five sleeps, then stop");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!(
+                "the node at http://{address} is down or unreachable"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("tcp connect error"), "{message}");
+        assert!(connect_refused(&message), "{message}");
+        assert!(
+            message.contains(&format!("http://{address}/_bulk")),
+            "{message}"
+        );
+        assert!(message.contains("The run can be resumed"), "{message}");
+        let argv0 = std::env::args().next().expect("argv");
+        assert!(
+            message.contains(&argv0),
+            "the resume command must be this process's argv, missing {argv0} in {message}"
+        );
+        assert!(es.node_is_down());
+
+        let notices = es.notices.lock().unwrap().clone();
+        assert!(
+            !notices.is_empty(),
+            "the retries must say why they are retrying"
+        );
+        let reason = &notices[0];
+        assert!(reason.contains("tcp connect error"), "{reason}");
+        assert!(connect_refused(reason), "{reason}");
+        assert!(
+            reason.contains(&format!("http://{address}/_bulk")),
+            "{reason}"
+        );
+        let prefix: String = reason.chars().take(120).collect();
+        assert!(
+            !connect_refused(&prefix),
+            "the 120-character prefix is the #2177 cut and must not be what we print: {prefix}"
+        );
+        assert!(
+            reason.chars().count() > 120,
+            "the notice was cut to one character of the cause: {reason}"
+        );
+
+        let before = es.backoff_delays.lock().unwrap().len();
+        let again = es.bulk(body).unwrap_err();
+        let backoffs = es.backoff_delays.lock().unwrap().len() - before;
+        assert_eq!(
+            backoffs, 0,
+            "a later bulk retried a node already known to be down"
+        );
+        assert!(format!("{again:#}").contains("is down or unreachable"));
     }
 
     #[test]

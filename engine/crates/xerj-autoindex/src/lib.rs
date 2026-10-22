@@ -8805,6 +8805,15 @@ fn run_index_report_inner(
     // the current thread can run it too when no worker thread starts.
     let worker = || {
         loop {
+            // #2177: the node stopped accepting connections. Every later
+            // `_bulk` fails the same way, and `Es` has already latched, so
+            // stop this worker instead of walking the rest of the queue.
+            // `retire` still flushes a residual buffer; that flush hits the
+            // latch and returns immediately.
+            if es.node_is_down() {
+                pipe.retire();
+                break;
+            }
             let (i, pdf_spool) = match queue.lock().unwrap().pop() {
                 Some(job) => job,
                 None => {
@@ -9619,6 +9628,12 @@ fn run_index_report_inner(
 
     let bulk_errs = bulk_errors.into_inner().unwrap();
     if !bulk_errs.is_empty() {
+        // A dead node already names itself, the connect error, and the
+        // command that resumes (#2177). The generic bulk wrap would bury
+        // that under "fix the embedding configuration".
+        if let Some(down) = bulk_errs.iter().find(|e| esclient::is_node_down_report(e)) {
+            anyhow::bail!("{down}");
+        }
         // `bulk_errors` keeps only the first five distinct errors, so without
         // the counter the operator cannot tell one refused document from ten
         // thousand. That is the whole reason backend rejections are counted
