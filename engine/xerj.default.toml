@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 57 of XERJ's 135 user-facing settings to their
+# This file sets 59 of XERJ's 137 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -560,6 +560,27 @@ turbo_parallel = true
 # This increases ingest throughput at the cost of reduced search recall
 # (e.g. "running" will not match "run").
 turbo_fast_analyzer = false
+
+# ── Engine (6 settings; worker counts stay machine-derived) ──────────────────
+#
+# `ingest_shards`, `flush_workers`, `merge_workers` and `search_workers`
+# default from the host's core count (see EngineConfig). The two deadlines
+# below are absolute: they are what stops a wedged flush from parking
+# `_refresh` and `finalize-refresh` forever (#1635).
+# `XERJ_FLUSH_ADMIT_TIMEOUT_SECS` and `XERJ_FLUSH_TIMEOUT_SECS` override
+# them for one run.
+
+[engine]
+
+# How long a shard flush waits for a flush-admission permit before failing.
+# The wait is before the memtable is frozen, so a timeout loses no documents
+# and the flush can be retried.
+flush_admit_timeout_secs = 120
+
+# How long one index's flush may run before refresh reports that index as
+# failed and moves on. A publication already past the freeze is not cancelled.
+# Must be at least flush_admit_timeout_secs.
+flush_timeout_secs = 300
 
 # ── Cluster (5 settings, all commented out below) ─────────────────────────────
 #

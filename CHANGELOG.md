@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `POST /{index}/_refresh` and autoindex `finalize-refresh` no longer wait
+  forever when a shard flush cannot get a finalize-gate or flush-semaphore
+  permit. Admission gives up after `engine.flush_admit_timeout_secs`
+  (default 120 seconds, override `XERJ_FLUSH_ADMIT_TIMEOUT_SECS`) and does
+  not freeze the memtable. The caller gives up after
+  `engine.flush_timeout_secs` (default 300 seconds, override
+  `XERJ_FLUSH_TIMEOUT_SECS`) and leaves a publication that has already
+  frozen its memtable running. The refresh response names the stuck index
+  under `_shards.failures` and continues with the other indices. Autoindex
+  reports that failure instead of treating the refresh as success
+  ([#1635](https://github.com/xerj-org/xerj/issues/1635)).
+
 ## [1.0.0-rc.98] - 2026-10-21
 
 Window since v1.0.0-rc.97: a console-API security fix (CVE-2026-97406), a

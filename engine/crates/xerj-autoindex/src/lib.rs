@@ -9460,11 +9460,28 @@ fn run_index_report_inner(
     // phase — split into named sub-phases because the mix of one-shot refreshes
     // and per-dataset round trips has no single honest denominator.
     pr.phase("finalize-refresh", 1 + graph.is_some() as u64, 0);
-    es.refresh(&format!("{}-*", cfg.prefix)).ok();
+    // #1635: a refresh that never returns used to sit here at items=0 with
+    // no error (`rate=unknown`). The server now fails the stuck index by
+    // name. Swallowing that (`.ok()`) turned the failure back into a green
+    // run whose documents were not all refreshed.
+    let pattern = format!("{}-*", cfg.prefix);
+    es.refresh(&pattern).map_err(|error| {
+        anyhow::anyhow!(
+            "finalize-refresh of {pattern} failed: {error:#}. The server names the index that \
+             did not refresh; documents already written stay indexed and rerunning the same \
+             command resumes"
+        )
+    })?;
     pr.item_done(0);
     // The dot-prefixed edges index is outside the {prefix}-* pattern.
     if let Some(gr) = &graph {
-        es.refresh(&gr.edges_index).ok();
+        es.refresh(&gr.edges_index).map_err(|error| {
+            anyhow::anyhow!(
+                "finalize-refresh of {} failed: {error:#}. Documents already written stay \
+                 indexed and rerunning the same command resumes",
+                gr.edges_index
+            )
+        })?;
         pr.item_done(0);
     }
 

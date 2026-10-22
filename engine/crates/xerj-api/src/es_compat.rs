@@ -22563,6 +22563,10 @@ pub async fn refresh_index(
     let mut successful = 0u64;
     let mut failures = Vec::new();
     let mut response_status = StatusCode::OK;
+    // #1635: `Index::flush` bounds both flush admission and the caller-visible
+    // wait. One stuck index returns an error naming that index; this loop
+    // records it under `_shards.failures` and continues, so the refresh of
+    // the other indices in the pattern is not parked behind it.
     for (name, idx) in &handles {
         match idx.flush().await {
             Ok(()) => successful += 1,

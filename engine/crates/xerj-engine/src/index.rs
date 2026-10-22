@@ -2795,6 +2795,115 @@ mod flush_publication_recovery_tests {
             .expect("flush of an empty memtable must succeed");
     }
 
+    #[test]
+    fn flush_timeout_override_keeps_the_configured_value_when_the_env_is_junk() {
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, None), 120);
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, Some("30")), 30);
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, Some("  ")), 120);
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, Some("0")), 120);
+        assert_eq!(
+            super::resolve_flush_timeout_secs("X", 120, Some("lots")),
+            120
+        );
+        assert_eq!(
+            super::resolve_flush_timeout_secs("X", 120, Some("999999")),
+            120
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_that_never_finishes_fails_that_index_and_the_run_continues() {
+        // #1635 — `finalize-refresh` sat at items=0 with no error because
+        // `flush_finalize_gate().acquire()` (and the per-index flush
+        // semaphore) waited forever, and one stuck index blocked the refresh
+        // of every later index. Hold every finalize-gate permit — a flush
+        // that took one and never returned — and require the waiting index
+        // to fail by name without freezing its memtable, then the next index
+        // to flush normally.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("stuck-docs", Schema::empty()).unwrap();
+        engine
+            .create_index("healthy-docs", Schema::empty())
+            .unwrap();
+        let stuck = engine.get_index("stuck-docs").unwrap();
+        let healthy = engine.get_index("healthy-docs").unwrap();
+        stuck.abort_background_tasks();
+        healthy.abort_background_tasks();
+        stuck
+            .index_document(Some("s".into()), json!({"body": "wedged"}))
+            .await
+            .unwrap();
+        healthy
+            .index_document(Some("h".into()), json!({"body": "fine"}))
+            .await
+            .unwrap();
+        assert_eq!(stuck.memtable.doc_count(), 1);
+        assert_eq!(healthy.memtable.doc_count(), 1);
+
+        stuck.flush_admit_timeout_ms.store(100, Ordering::Relaxed);
+
+        let permits_n = crate::pools::sizing().flush_finalize as u32;
+        let held = crate::flush_finalize_gate()
+            .acquire_many(permits_n)
+            .await
+            .expect("the test must be able to hold the finalize gate");
+        assert_eq!(
+            crate::flush_finalize_gate().available_permits(),
+            0,
+            "the simulated flush must be holding every finalize permit"
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stuck.flush()).await;
+        let elapsed = started.elapsed();
+        let err = outcome
+            .expect("a flush waiting on a permit that never returns must not hang (#1635)")
+            .expect_err("a wedged finalize gate must fail the flush");
+        drop(held);
+
+        let message = err.to_string();
+        assert!(
+            message.contains("stuck-docs"),
+            "the failure must name the stuck index, got: {message}"
+        );
+        assert!(
+            message.contains("finalize gate"),
+            "the failure must name the wait that expired, got: {message}"
+        );
+        assert!(
+            message.contains("not frozen"),
+            "the timeout must be before the memtable freeze, got: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "admission timeout is 100ms; flush took {elapsed:?}"
+        );
+        assert_eq!(
+            stuck.memtable.doc_count(),
+            1,
+            "a timed-out admission must leave the memtable intact"
+        );
+
+        healthy
+            .flush()
+            .await
+            .expect("the next index must still flush after the stuck one failed");
+        assert_eq!(healthy.memtable.doc_count(), 0);
+
+        stuck
+            .flush_admit_timeout_ms
+            .store(30_000, Ordering::Relaxed);
+        stuck.flush_timeout_ms.store(30_000, Ordering::Relaxed);
+        stuck
+            .flush()
+            .await
+            .expect("retry after the wedge clears must succeed; the timeout did not freeze");
+        assert_eq!(stuck.memtable.doc_count(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn schemaless_cidr_term_matches_the_subnet_after_flush() {
         // #786: a CIDR `term` on an undeclared (dynamically mapped) ip-shaped
@@ -9032,6 +9141,16 @@ pub struct Index {
     /// just the handful rayon uses inside a single flush.
     flush_sema: Arc<tokio::sync::Semaphore>,
 
+    /// Milliseconds a shard flush may wait for `flush_sema` or the
+    /// process-global finalize gate before failing. The wait is before the
+    /// memtable freeze (#1635). Production sets this once from
+    /// `engine.flush_admit_timeout_secs`; tests shrink it.
+    flush_admit_timeout_ms: AtomicU64,
+    /// Milliseconds `flush` / `refresh` waits for one index before returning
+    /// an error that names the index. The publish coordinator is detached,
+    /// not aborted (#1015, #1635).
+    flush_timeout_ms: AtomicU64,
+
     /// Set to `true` while a segment merge is in progress.  Prevents the
     /// background merge thread from queueing overlapping merges.
     merge_in_progress: Arc<std::sync::atomic::AtomicBool>,
@@ -9636,6 +9755,7 @@ impl Index {
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
         let segment_hydration_budget = index_segment_hydration_budget(config);
+        let (flush_admit_ms, flush_budget_ms) = configured_flush_timeouts_ms(config);
         let passage_chunk_fields_init = passage_chunk_fields_from_schema(&managed.schema);
         let date_field_scales_snapshot = date_field_scales(&managed.schema);
         // #392: kept back from the struct literal so the SQ8 handle setup at
@@ -9754,6 +9874,8 @@ impl Index {
             flush_sema: Arc::new(tokio::sync::Semaphore::new(
                 config.engine.ingest_shards.max(4),
             )),
+            flush_admit_timeout_ms: AtomicU64::new(flush_admit_ms),
+            flush_timeout_ms: AtomicU64::new(flush_budget_ms),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
             compression_config: config.compression.clone(),
@@ -10092,6 +10214,7 @@ impl Index {
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
         let segment_hydration_budget = index_segment_hydration_budget(config);
+        let (flush_admit_ms, flush_budget_ms) = configured_flush_timeouts_ms(config);
         let date_field_scales_snapshot = date_field_scales(&schema.schema);
         let index = Arc::new(Self {
             name,
@@ -10201,6 +10324,8 @@ impl Index {
             flush_sema: Arc::new(tokio::sync::Semaphore::new(
                 config.engine.ingest_shards.max(4),
             )),
+            flush_admit_timeout_ms: AtomicU64::new(flush_admit_ms),
+            flush_timeout_ms: AtomicU64::new(flush_budget_ms),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
             compression_config: config.compression.clone(),
@@ -11817,6 +11942,9 @@ impl Index {
         let permit_cell = Arc::new(permit_cell);
         let permit_cell_cb = Arc::clone(&permit_cell);
         let flush_signal_cb = Arc::clone(&self.flush_signal);
+        let index_name = self.name.as_str().to_string();
+        let admit_timeout =
+            std::time::Duration::from_millis(self.flush_admit_timeout_ms.load(Ordering::Relaxed));
         rt.spawn(async move {
             let on_drained = move || {
                 if let Ok(mut guard) = permit_cell_cb.lock() {
@@ -11837,6 +11965,8 @@ impl Index {
                 dv_skip,
                 on_drained,
                 warm_caches,
+                index_name,
+                admit_timeout,
                 #[cfg(test)]
                 None,
             )
@@ -12103,8 +12233,22 @@ impl Index {
         };
         // Explicit refresh: wait behind any in-flight concurrent flushes
         // (semaphore has 4 permits) so the user-visible flush sees a
-        // fully-drained memtable once the await returns.
-        let _permit = self.flush_sema.acquire().await.ok();
+        // fully-drained memtable once the await returns. The wait is
+        // bounded (#1635); a permit that never arrives fails this index
+        // instead of parking the caller.
+        let index_name = self.name.as_str().to_string();
+        let admit_timeout =
+            std::time::Duration::from_millis(self.flush_admit_timeout_ms.load(Ordering::Relaxed));
+        let flush_timeout =
+            std::time::Duration::from_millis(self.flush_timeout_ms.load(Ordering::Relaxed));
+        let deadline = std::time::Instant::now() + flush_timeout;
+        let _permit = wait_for_flush_permit(
+            &index_name,
+            "the flush semaphore",
+            admit_timeout.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            self.flush_sema.acquire(),
+        )
+        .await?;
         // M5.2 — explicit refresh drains EVERY non-empty shard in
         // sequence (one shard per `do_flush_shard` call) so the
         // user-visible `refresh()` returns with zero unflushed
@@ -12122,7 +12266,14 @@ impl Index {
             if self.memtable.shard_load(shard_idx).0 == 0 {
                 continue;
             }
-            do_flush_shard(
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(flush_budget_timeout_error(&index_name, flush_timeout));
+            }
+            // Spawn so a timeout detaches the shard task instead of
+            // cancelling a publication that has already frozen the
+            // memtable (#1015). The success path still waits for it.
+            let task = tokio::spawn(do_flush_shard(
                 shard_idx,
                 Arc::clone(&self.store),
                 Arc::clone(&self.memtable),
@@ -12134,10 +12285,12 @@ impl Index {
                 dv_skip.clone(),
                 || {}, // serial refresh path — no permit to drop early
                 self.publish_warm_caches(),
+                index_name.clone(),
+                admit_timeout,
                 #[cfg(test)]
                 None,
-            )
-            .await?;
+            ));
+            await_flush_task(&index_name, left, task).await?;
         }
 
         // Update the doc counter so maybe_auto_flush uses a fresh baseline.
@@ -12249,6 +12402,10 @@ impl Index {
 
             let flush_signal_cb = Arc::clone(&self.flush_signal);
             let collection_publication = Arc::clone(&self.collection_publication);
+            let index_name = self.name.as_str().to_string();
+            let admit_timeout = std::time::Duration::from_millis(
+                self.flush_admit_timeout_ms.load(Ordering::Relaxed),
+            );
             tokio::spawn(async move {
                 // Release permit after drain (Phase 1), not after Phase 2
                 // I/O — lets new flushes dispatch while segment writes
@@ -12274,6 +12431,8 @@ impl Index {
                     dv_skip,
                     on_drained,
                     warm_caches,
+                    index_name,
+                    admit_timeout,
                     #[cfg(test)]
                     None,
                 )
@@ -25507,9 +25666,17 @@ impl Index {
         let data_dir = self.data_dir.clone();
         let warm_caches = self.publish_warm_caches();
         let index = Arc::clone(self);
+        let index_name = self.name.as_str().to_string();
+        let admit_timeout =
+            std::time::Duration::from_millis(self.flush_admit_timeout_ms.load(Ordering::Relaxed));
+        let flush_timeout =
+            std::time::Duration::from_millis(self.flush_timeout_ms.load(Ordering::Relaxed));
+        let coordinator_name = index_name.clone();
         // This coordinator is the cancellation boundary for the whole flush.
         // If the request future is dropped, its JoinHandle detaches and the
         // coordinator continues owning every shard publication transaction.
+        // The await below uses the same detach on timeout (#1635): the
+        // coordinator is not aborted (#1015).
         let coordinator = tokio::spawn(async move {
             let mut shard_futures = Vec::with_capacity(n_shards);
             for shard_idx in 0..n_shards {
@@ -25542,10 +25709,21 @@ impl Index {
                 let excluded_fts_fields = excluded_fts_fields.clone();
                 let dv_skip = dv_skip.clone();
                 let warm_caches = warm_caches.clone();
+                let shard_index_name = coordinator_name.clone();
                 #[cfg(test)]
                 let test_hook = flush_test_hook.clone();
                 shard_futures.push(tokio::spawn(async move {
-                    let permit = sema.acquire_owned().await.ok();
+                    let permit = match wait_for_flush_permit(
+                        &shard_index_name,
+                        "the flush semaphore",
+                        admit_timeout,
+                        sema.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(error) => return Err(error),
+                    };
                     let permit_cell = Arc::new(std::sync::Mutex::new(permit));
                     let permit_cell_cb = Arc::clone(&permit_cell);
                     let on_drained = move || {
@@ -25565,6 +25743,8 @@ impl Index {
                         dv_skip,
                         on_drained,
                         warm_caches,
+                        shard_index_name,
+                        admit_timeout,
                         #[cfg(test)]
                         test_hook,
                     )
@@ -25608,13 +25788,7 @@ impl Index {
             index.query_cache.clear();
             result
         });
-        let result = match coordinator.await {
-            Ok(result) => result,
-            Err(error) => Err(EngineError::Common(xerj_common::XerjError::internal(
-                format!("flush coordinator failed: {error}"),
-            ))),
-        };
-        result
+        await_flush_task(&index_name, flush_timeout, coordinator).await
     }
 
     /// Check if the memtable exceeds the configured thresholds.
@@ -33321,6 +33495,119 @@ mod captured_entry_verdict_table {
     }
 }
 
+/// Resolve the two flush deadlines for one index.
+///
+/// Environment overrides win over the config file, matching `XERJ_FIN_CONC`.
+/// A value that is not a whole number of seconds in `1..=86_400` is ignored
+/// and reported; an override that would make the caller give up before
+/// admission can finish is raised to the admission bound.
+fn configured_flush_timeouts_ms(config: &Config) -> (u64, u64) {
+    let admit = resolve_flush_timeout_secs(
+        "XERJ_FLUSH_ADMIT_TIMEOUT_SECS",
+        config.engine.flush_admit_timeout_secs,
+        std::env::var("XERJ_FLUSH_ADMIT_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    );
+    let mut overall = resolve_flush_timeout_secs(
+        "XERJ_FLUSH_TIMEOUT_SECS",
+        config.engine.flush_timeout_secs,
+        std::env::var("XERJ_FLUSH_TIMEOUT_SECS").ok().as_deref(),
+    );
+    if overall < admit {
+        warn!(
+            admit_secs = admit,
+            flush_secs = overall,
+            "flush timeout is shorter than the admission timeout; raising it so a flush \
+             can finish waiting for a permit"
+        );
+        overall = admit;
+    }
+    (admit.saturating_mul(1000), overall.saturating_mul(1000))
+}
+
+/// `configured` is the validated config value. `env_value` is the raw
+/// override, already read by the caller so tests can pass it without
+/// touching the process environment.
+fn resolve_flush_timeout_secs(name: &str, configured: u64, env_value: Option<&str>) -> u64 {
+    let Some(raw) = env_value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return configured;
+    };
+    let max = xerj_common::config::EngineConfig::MAX_FLUSH_TIMEOUT_SECS;
+    match raw.parse::<u64>() {
+        Ok(secs) if (1..=max).contains(&secs) => secs,
+        _ => {
+            warn!(
+                "{name}={raw} is not a whole number of seconds from 1 to {max}; using {configured}s"
+            );
+            configured
+        }
+    }
+}
+
+fn flush_admit_timeout_error(index: &str, what: &str, budget: std::time::Duration) -> EngineError {
+    warn!(
+        index,
+        wait = what,
+        budget_ms = budget.as_millis() as u64,
+        "flush timed out waiting for admission; the memtable was not frozen"
+    );
+    EngineError::Common(xerj_common::XerjError::internal(format!(
+        "index [{index}] flush timed out after {budget:?} waiting for {what}; \
+         the memtable was not frozen, so this flush can be retried"
+    )))
+}
+
+fn flush_budget_timeout_error(index: &str, budget: std::time::Duration) -> EngineError {
+    warn!(
+        index,
+        budget_ms = budget.as_millis() as u64,
+        "flush timed out; the publish coordinator was left running"
+    );
+    EngineError::Common(xerj_common::XerjError::internal(format!(
+        "index [{index}] flush timed out after {budget:?}; the publish coordinator was left \
+         running so a publication already past the freeze can finish, and this refresh can be \
+         retried"
+    )))
+}
+
+/// Wait for a flush-admission permit.
+///
+/// A closed semaphore still yields `Ok(None)`, which is what the old
+/// `.ok()` did. A timeout is an error and does not hold a permit: the
+/// acquire future is dropped, so the wait is cancelled before the freeze.
+async fn wait_for_flush_permit<T>(
+    index: &str,
+    what: &str,
+    budget: std::time::Duration,
+    acquire: impl std::future::Future<Output = std::result::Result<T, tokio::sync::AcquireError>>,
+) -> Result<Option<T>> {
+    match tokio::time::timeout(budget, acquire).await {
+        Ok(Ok(permit)) => Ok(Some(permit)),
+        Ok(Err(_)) => Ok(None),
+        Err(_) => Err(flush_admit_timeout_error(index, what, budget)),
+    }
+}
+
+/// Bound one spawned flush task.
+///
+/// Dropping the [`JoinHandle`] on timeout detaches the task. It does not
+/// abort it, so a publication that has already frozen the memtable keeps
+/// its non-cancellable worker (#1015).
+async fn await_flush_task(
+    index: &str,
+    budget: std::time::Duration,
+    task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(EngineError::Common(xerj_common::XerjError::internal(
+            format!("index [{index}] flush task failed: {error}"),
+        ))),
+        Err(_) => Err(flush_budget_timeout_error(index, budget)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_flush_shard(
     shard_idx: usize,
@@ -33340,6 +33627,8 @@ async fn do_flush_shard(
     // read-path caches, threaded through because this is a free fn without
     // access to `Index`.
     warm_caches: PublishWarmCaches,
+    index_name: String,
+    admit_timeout: std::time::Duration,
     #[cfg(test)] test_hook: Option<FlushPublisherTestHook>,
 ) -> Result<()> {
     // #1226 — re-check emptiness BEFORE the process-global finalize gate.
@@ -33365,7 +33654,24 @@ async fn do_flush_shard(
     let fin_permit = if bypass_finalize_gate {
         None
     } else {
-        crate::flush_finalize_gate().acquire().await.ok()
+        // #1635 — this acquire used to wait forever. A finalize that holds
+        // the process-global permit and never returns parked every later
+        // `_refresh` with no error. Timing out here is before the freeze,
+        // so the memtable is unchanged and the caller can retry.
+        match wait_for_flush_permit(
+            &index_name,
+            "the finalize gate",
+            admit_timeout,
+            crate::flush_finalize_gate().acquire(),
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                on_drained();
+                return Err(error);
+            }
+        }
     };
     // #1015 — NO collection-publication guard here.  The drain below is a
     // FREEZE, not a removal: the claimed docs stay reader-visible in the
@@ -59141,6 +59447,8 @@ mod flush_memory_integration_tests {
             dv_skip,
             || {},
             warm_caches,
+            idx.name.as_str().to_string(),
+            std::time::Duration::from_secs(30),
             Some(hook),
         )
         .await;
@@ -60950,6 +61258,8 @@ mod exact_scan_hydration_tests {
                 std::collections::HashSet::new(),
                 move || drained_flag.store(true, std::sync::atomic::Ordering::SeqCst),
                 idx.publish_warm_caches(),
+                idx.name.as_str().to_string(),
+                std::time::Duration::from_secs(30),
                 None,
             ),
         )

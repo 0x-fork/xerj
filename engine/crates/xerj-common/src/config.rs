@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **135 settings** versus
+//! Configuration is intentionally minimal: **137 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -79,7 +79,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// High-throughput turbo indexing — 3 settings.
     pub indexing: IndexingConfig,
-    /// Engine parallelism — 4 settings.
+    /// Engine parallelism and flush deadlines — 6 settings.
     pub engine: EngineConfig,
     /// Cluster / Raft settings — 5 settings.
     pub cluster: ClusterConfig,
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 135 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 137 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -563,7 +563,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (135 user-facing settings total; counted by
+// Sub-configs  (137 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1957,13 +1957,15 @@ impl IndexingConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Engine parallelism settings for vertical scaling.
+/// Engine parallelism and flush-deadline settings.
 ///
 /// Controls how many independent ingest/flush/search pipelines run in
-/// parallel.  The default is tuned for the host's core count.  Increase
-/// `ingest_shards` on high-core-count machines for linear throughput scaling.
+/// parallel, and how long a flush may wait before it fails instead of
+/// parking a refresh forever.  The worker defaults are tuned for the host's
+/// core count.  Increase `ingest_shards` on high-core-count machines for
+/// linear throughput scaling.
 ///
-/// **4 settings.**
+/// **6 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
@@ -1988,6 +1990,25 @@ pub struct EngineConfig {
     /// (default: every core).  Search is the path a user waits on, so it gets
     /// the whole machine unless you deliberately hold cores back.
     pub search_workers: usize,
+    /// How long a shard flush waits for a flush-admission permit — the
+    /// per-index `flush_sema` or the process-global finalize gate — before
+    /// failing (default: [`Self::DEFAULT_FLUSH_ADMIT_TIMEOUT_SECS`]).
+    ///
+    /// The wait is before the memtable freeze, so a timeout drops no
+    /// documents and the flush can be retried. A healthy finalize is well
+    /// under a second; this bound exists so a permit held by a wedged
+    /// finalize cannot park every later flush (#1635).
+    /// `XERJ_FLUSH_ADMIT_TIMEOUT_SECS` overrides it for one run.
+    pub flush_admit_timeout_secs: u64,
+    /// How long `flush` / `refresh` waits for one index's flush before
+    /// returning an error that names the index (default:
+    /// [`Self::DEFAULT_FLUSH_TIMEOUT_SECS`]).
+    ///
+    /// Must be at least [`Self::flush_admit_timeout_secs`]. A publication
+    /// that has already frozen the memtable is not cancelled; the caller
+    /// stops waiting and can retry. `XERJ_FLUSH_TIMEOUT_SECS` overrides it
+    /// for one run.
+    pub flush_timeout_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -1999,11 +2020,23 @@ impl Default for EngineConfig {
             flush_workers: threads_for(Workload::Maintenance),
             merge_workers: threads_for(Workload::Maintenance),
             search_workers: threads_for(Workload::Latency),
+            flush_admit_timeout_secs: Self::DEFAULT_FLUSH_ADMIT_TIMEOUT_SECS,
+            flush_timeout_secs: Self::DEFAULT_FLUSH_TIMEOUT_SECS,
         }
     }
 }
 
 impl EngineConfig {
+    /// How long a flush may wait for admission before failing, in seconds.
+    /// See [`Self::flush_admit_timeout_secs`].
+    pub const DEFAULT_FLUSH_ADMIT_TIMEOUT_SECS: u64 = 120;
+    /// How long a caller waits for one index's flush, in seconds.
+    /// See [`Self::flush_timeout_secs`].
+    pub const DEFAULT_FLUSH_TIMEOUT_SECS: u64 = 300;
+    /// Upper bound on either flush deadline. Past a day the value is a typo,
+    /// and an unbounded wait is the hang #1635 exists to end.
+    pub const MAX_FLUSH_TIMEOUT_SECS: u64 = 86_400;
+
     /// Upper bound on any of the worker knobs. Threads are not free: past this
     /// the request is far more likely to be a typo than an intention, and a
     /// silently clamped typo is the bug class in #204.
@@ -2036,6 +2069,30 @@ impl EngineConfig {
                     Self::MAX_WORKERS
                 )));
             }
+        }
+        // A zero deadline would fail every flush; a missing deadline is the
+        // #1635 hang. Refuse both rather than clamping.
+        if !(1..=Self::MAX_FLUSH_TIMEOUT_SECS).contains(&self.flush_admit_timeout_secs) {
+            return Err(crate::XerjError::config(format!(
+                "engine.flush_admit_timeout_secs must be from 1 to {} seconds, got {}",
+                Self::MAX_FLUSH_TIMEOUT_SECS,
+                self.flush_admit_timeout_secs
+            )));
+        }
+        if !(1..=Self::MAX_FLUSH_TIMEOUT_SECS).contains(&self.flush_timeout_secs) {
+            return Err(crate::XerjError::config(format!(
+                "engine.flush_timeout_secs must be from 1 to {} seconds, got {}",
+                Self::MAX_FLUSH_TIMEOUT_SECS,
+                self.flush_timeout_secs
+            )));
+        }
+        if self.flush_timeout_secs < self.flush_admit_timeout_secs {
+            return Err(crate::XerjError::config(format!(
+                "engine.flush_timeout_secs ({}) must be at least \
+                 engine.flush_admit_timeout_secs ({}) so a flush can finish \
+                 waiting for admission",
+                self.flush_timeout_secs, self.flush_admit_timeout_secs
+            )));
         }
         Ok(())
     }
@@ -2971,6 +3028,30 @@ mod tests {
     }
 
     #[test]
+    fn flush_deadlines_must_be_positive_and_ordered() {
+        let zero = Config::from_toml_str("[engine]\nflush_admit_timeout_secs = 0\n");
+        let err = zero.expect_err("a zero flush admission timeout must be refused");
+        assert!(
+            err.to_string().contains("flush_admit_timeout_secs"),
+            "the error must name the setting, got: {err}"
+        );
+        let inverted = Config::from_toml_str(
+            "[engine]\nflush_admit_timeout_secs = 90\nflush_timeout_secs = 30\n",
+        );
+        let err = inverted.expect_err("the flush timeout must cover admission");
+        assert!(
+            err.to_string().contains("flush_timeout_secs"),
+            "the error must name the setting, got: {err}"
+        );
+        let cfg = Config::from_toml_str(
+            "[engine]\nflush_admit_timeout_secs = 30\nflush_timeout_secs = 90\n",
+        )
+        .expect("a shorter admission bound inside the flush bound is valid");
+        assert_eq!(cfg.engine.flush_admit_timeout_secs, 30);
+        assert_eq!(cfg.engine.flush_timeout_secs, 90);
+    }
+
+    #[test]
     fn max_result_window_must_be_a_positive_es_int() {
         assert!(Config::from_toml_str("[limits]\nmax_result_window = 0\n").is_err());
         assert!(Config::from_toml_str("[limits]\nmax_result_window = 2147483648\n").is_err());
@@ -3725,7 +3806,7 @@ mod tests {
         ("embedding", 20),
         ("limits", 15),
         ("indexing", 3),
-        ("engine", 4),
+        ("engine", 6),
         ("cluster", 5),
         ("pit", 3),
         ("search_context", 7),
@@ -3778,7 +3859,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 135,
+            total, 137,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
