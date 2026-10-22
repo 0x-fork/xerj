@@ -197,8 +197,11 @@ irm https://xerj.org/get.ps1 | iex
 ```
 
 One static binary, no JVM, no dependencies. Prebuilt for Linux, macOS and Windows on x86-64
-and arm64. You can also [build from source](#build-from-source). It speaks the Elasticsearch
-API, so existing clients, dashboards and tooling work against it unchanged.
+and arm64. The x86-64 builds need a CPU with AVX2, BMI2 and FMA (x86-64-v3: Intel Haswell
+2013 and later, AMD Excavator/Zen and later); on an older CPU they stop at launch with an
+illegal-instruction error, so the installer checks before downloading and tells you to
+[build from source](#build-from-source) instead. It speaks the Elasticsearch API, so existing
+clients, dashboards and tooling work against it unchanged.
 
 First commands after install (the installer prints where `xerj` landed; add it to your PATH
 if needed): `xerj --insecure --data-dir ~/xerj-data &`, wait until `http://localhost:9200`
@@ -575,6 +578,15 @@ git clone https://github.com/xerj-org/xerj
 cd xerj/engine
 cargo build --release -p xerj-server
 ./target/release/xerj --insecure --data-dir ~/xerj-data
+```
+
+The x86-64 release builds target `x86-64-v3` (AVX2, BMI2, FMA; set per target in
+`engine/.cargo/config.toml`), which is why the prebuilt binaries crash at launch on CPUs older
+than Intel Haswell (2013) or AMD Excavator/Zen. `RUSTFLAGS` overrides that file, so on such a
+CPU build with a lower baseline instead of installing the prebuilt binary:
+
+```sh
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release -p xerj-server
 ```
 
 To run the conformance suite against a running server:

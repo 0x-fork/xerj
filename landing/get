@@ -15,6 +15,10 @@
 #                           install without verifying SHA-256. Only useful on a
 #                           box with no hashing tool at all; you are choosing to
 #                           run an unverified binary.
+#   XERJ_SKIP_CPU_CHECK=1   install an x86_64 build even when this CPU does
+#                           not advertise AVX2/BMI2/FMA (see "CPU feature
+#                           floor" below). The binary will crash at launch if
+#                           the hardware really lacks them.
 # =============================================================================
 set -eu
 
@@ -74,6 +78,55 @@ case "$arch" in
   aarch64|arm64)       cpu="aarch64" ;;
   *) die "unsupported CPU: $arch (xerj ships x86_64/amd64 and aarch64/arm64 builds for Linux, macOS and Windows)" ;;
 esac
+# An x86_64 shell on Apple Silicon is Rosetta 2 (`arch -x86_64`, an Intel
+# terminal app, …): uname lies about the hardware. Install the native arm64
+# build instead of an x86_64 one that would run translated (and, before
+# macOS 15, without AVX2 at all). rustup-init makes the same correction.
+if [ "$os" = "Darwin" ] && [ "$cpu" = "x86_64" ] \
+  && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+  say "${YEL}note:${RST} this shell runs under Rosetta 2 on Apple Silicon — installing the native arm64 build"
+  cpu="aarch64"
+fi
+
+# --- CPU feature floor (x86_64 only) -----------------------------------------
+# Every x86_64 release binary is built with `-C target-cpu=x86-64-v3`
+# (engine/.cargo/config.toml), so it executes AVX2/BMI2/FMA instructions
+# unconditionally. On a CPU without them — Intel before Haswell (2013), AMD
+# before Excavator/Zen, some Atom/Celeron/Pentium parts, VMs that hide the
+# flags — the process dies at launch with "Illegal instruction" and prints
+# nothing (#2161, field report #2158). Refuse here, before the download, and
+# say why. The arm64 builds have no such floor (ARMv8-A baseline).
+#
+# Only positive evidence fails the check: a readable feature list that lacks
+# a feature. When the list cannot be read at all (no /proc/cpuinfo, no
+# sysctl) the check is skipped, not failed. XERJ_SKIP_CPU_CHECK=1 bypasses it.
+if [ "$cpu" = "x86_64" ] && [ "${XERJ_SKIP_CPU_CHECK:-}" != "1" ]; then
+  missing=''
+  if [ "$os" = "Darwin" ]; then
+    # hw.optional.* answers 1/0 per feature, nothing when the key is unknown.
+    for f in avx1_0 avx2_0 bmi1 bmi2 f16c fma; do
+      [ "$(sysctl -n "hw.optional.$f" 2>/dev/null)" = "0" ] && missing="$missing $f"
+    done
+  elif [ -r /proc/cpuinfo ]; then
+    # Linux, and the /proc emulation of Git Bash / MSYS / Cygwin on Windows.
+    # The flag names are the kernel's: LZCNT is advertised as `abm`.
+    flags=$(sed -n 's/^flags[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo | head -n1)
+    if [ -n "$flags" ]; then
+      for f in avx avx2 bmi1 bmi2 f16c fma abm movbe xsave; do
+        case " $flags " in *" $f "*) ;; *) missing="$missing $f" ;; esac
+      done
+    fi
+  fi
+  if [ -n "$missing" ]; then
+    die "this CPU lacks${missing} — the x86_64 release binaries are built for x86-64-v3
+       (AVX2/BMI2/FMA: Intel Haswell 2013+, AMD Excavator/Zen+) and crash at launch with
+       'Illegal instruction' without them (https://github.com/${REPO}/issues/2161).
+       Build for this CPU instead: RUSTFLAGS='-C target-cpu=x86-64-v2' cargo build --release -p xerj-server
+         (https://github.com/${REPO}#build-from-source)
+       To install the prebuilt binary anyway (e.g. a sandbox hides flags the hardware has):
+         XERJ_SKIP_CPU_CHECK=1"
+  fi
+fi
 if [ "$os" = "Linux" ]; then
   case "${XERJ_LIBC:-musl}" in
     musl) ;;                              # the default set above

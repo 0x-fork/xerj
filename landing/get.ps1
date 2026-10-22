@@ -11,6 +11,9 @@
 #   XERJ_INSTALL_DIR=path   install location (default: %LOCALAPPDATA%\Programs\xerj)
 #   XERJ_REPO=owner/name    source repo (default: xerj-org/xerj)
 #   XERJ_NO_PATH=1          do not add the install dir to the user PATH
+#   XERJ_SKIP_CPU_CHECK=1   install the x64 build even when this CPU does not
+#                           advertise AVX2 (see "CPU feature floor" below). It
+#                           will crash at launch if the hardware really lacks it.
 #
 # Works on Windows PowerShell 5.1 and PowerShell 7+.
 #
@@ -52,6 +55,54 @@
     default { Fail "unsupported CPU '$rawArch' - xerj ships Windows builds for x64 (AMD64) and ARM64" }
   }
   $target = "$cpu-pc-windows-msvc"
+
+  # --- CPU feature floor (x64 only) -------------------------------------------
+  # Every x64 release binary is built with `-C target-cpu=x86-64-v3`
+  # (engine/.cargo/config.toml), so it executes AVX2/BMI2/FMA instructions
+  # unconditionally. On a CPU without them - Intel before Haswell (2013), AMD
+  # before Excavator/Zen, some Atom/Celeron/Pentium parts, VMs that hide the
+  # flags - xerj.exe dies at launch with STATUS_ILLEGAL_INSTRUCTION
+  # (0xc000001d) and prints nothing (#2161, field report #2158). Refuse here,
+  # before the download, and say why. The ARM64 build has no such floor.
+  #
+  # Only positive evidence fails the check; when the features cannot be read
+  # it is skipped, not failed. $env:XERJ_SKIP_CPU_CHECK=1 bypasses it.
+  if ($cpu -eq 'x86_64' -and $env:XERJ_SKIP_CPU_CHECK -ne '1') {
+    $missing = @()
+    try {
+      if ($PSVersionTable.PSVersion.Major -ge 7) {
+        # PowerShell 7+ (.NET Core 3.0+): CPUID-backed, independent of the OS build.
+        foreach ($f in 'Avx', 'Avx2', 'Bmi1', 'Bmi2', 'Fma', 'Lzcnt') {
+          $t = "System.Runtime.Intrinsics.X86.$f" -as [type]
+          if ($t -and -not $t::IsSupported) { $missing += $f.ToLower() }
+        }
+      } else {
+        # Windows PowerShell 5.1 (.NET Framework has no intrinsics API):
+        # kernel32!IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE = 40).
+        # That constant exists since Windows 10 version 2004 (build 19041);
+        # older builds answer 0 whatever the hardware, so skip them.
+        $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+        if ($build -ge 19041) {
+          if (-not ('XerjInstaller.Cpu' -as [type])) {
+            Add-Type -Namespace 'XerjInstaller' -Name 'Cpu' -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(int feature);
+'@
+          }
+          if (-not [XerjInstaller.Cpu]::IsProcessorFeaturePresent(40)) { $missing += 'avx2' }
+        }
+      }
+    } catch {
+      $missing = @()   # could not read the features: do not guess
+    }
+    if ($missing.Count -gt 0) {
+      Fail ("this CPU lacks $($missing -join ', ') - the x64 release binaries are built for x86-64-v3 " +
+            "(AVX2/BMI2/FMA: Intel Haswell 2013+, AMD Excavator/Zen+) and crash at launch with " +
+            "STATUS_ILLEGAL_INSTRUCTION without them (https://github.com/$Repo/issues/2161). " +
+            "Build for this CPU instead: `$env:RUSTFLAGS='-C target-cpu=x86-64-v2'; cargo build --release -p xerj-server " +
+            "(https://github.com/$Repo#build-from-source). To install the prebuilt binary anyway " +
+            "(e.g. a sandbox hides a feature the hardware has): `$env:XERJ_SKIP_CPU_CHECK='1'")
+    }
+  }
 
   # --- resolve version -------------------------------------------------------
   if ($env:XERJ_VERSION) {

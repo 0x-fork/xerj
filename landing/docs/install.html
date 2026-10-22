@@ -241,7 +241,7 @@
     <li><strong>OS:</strong> Linux (any distro — the Linux build is fully static musl, Alpine included), macOS (Apple Silicon arm64 / Intel x86_64), or Windows 10+ (x64 / ARM64).</li>
     <li><strong>RAM:</strong> 400 MB idle. 2 GB working set per active index. Scales linearly with segment resident set.</li>
     <li><strong>Disk:</strong> Any fs that supports <code class="inline">fsync</code> and mmap. Prefer SSD.</li>
-    <li><strong>CPU:</strong> x86_64 with AVX2 or arm64 with NEON. The release build uses SIMD for hot paths.</li>
+    <li><strong>CPU:</strong> x86_64 with AVX2, BMI2 and FMA (x86-64-v3: Intel Haswell 2013 and later, AMD Excavator/Zen and later), or arm64 with NEON. The x86_64 release builds are compiled for that baseline and stop at launch with an illegal-instruction error on older CPUs; both installers check the CPU before downloading and refuse with the reason. On such a CPU, <a href="https://github.com/xerj-org/xerj#build-from-source">build from source</a> with <code class="inline">RUSTFLAGS="-C target-cpu=x86-64-v2"</code>.</li>
     <li><strong>Open files:</strong> 65536 ulimit is sufficient for most deployments.</li>
   </ul>
 
@@ -254,7 +254,7 @@
   <p>Both installers verify <strong>fail-closed</strong>: each computes the archive's own SHA-256 and compares it against the published digest, and if the checksum cannot be downloaded, or no SHA-256 tool (<code class="inline">sha256sum</code>, <code class="inline">shasum</code>, <code class="inline">openssl</code>, <code class="inline">busybox</code>…) can be found, the installer stops rather than installing an unverified binary.</p>
   <p>On Linux the one-liner installs the <strong>static musl</strong> build by default — it runs on any distro including Alpine and has no glibc-version floor. Ask for the glibc build explicitly if you need it:</p>
 <pre class="code">$ curl -fsSL https://xerj.org/get | XERJ_LIBC=gnu sh</pre>
-  <p>Other environment overrides: <code class="inline">XERJ_VERSION</code> (install a specific tag), <code class="inline">XERJ_INSTALL_DIR</code> (default <code class="inline">~/.local/bin</code> on Linux and macOS, <code class="inline">%LOCALAPPDATA%\Programs\xerj</code> on Windows), <code class="inline">XERJ_REPO</code>.</p>
+  <p>Other environment overrides: <code class="inline">XERJ_VERSION</code> (install a specific tag), <code class="inline">XERJ_INSTALL_DIR</code> (default <code class="inline">~/.local/bin</code> on Linux and macOS, <code class="inline">%LOCALAPPDATA%\Programs\xerj</code> on Windows), <code class="inline">XERJ_REPO</code>, <code class="inline">XERJ_SKIP_CPU_CHECK=1</code> (install an x86_64 build even when the CPU does not advertise AVX2; it will crash at launch if the hardware really lacks it).</p>
 
   <h2>Manual download</h2>
   <p>Every release publishes eight targets, each with a <code class="inline">.sha256</code> alongside: <code class="inline">x86_64</code>/<code class="inline">aarch64</code> × <code class="inline">unknown-linux-musl</code> (static, any distro), <code class="inline">unknown-linux-gnu</code>, <code class="inline">apple-darwin</code>, and <code class="inline">pc-windows-msvc</code> (.zip).</p>
