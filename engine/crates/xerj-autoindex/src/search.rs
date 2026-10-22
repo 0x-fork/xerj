@@ -324,6 +324,34 @@ pub(crate) fn prefer_citable_line_on_the_same_path(hits: &mut [Value]) {
     }
 }
 
+/// How many hits to fetch before the local test/example penalty trims to `k`.
+///
+/// The extra window is the one `xerj def` uses, so an implementation just
+/// outside the engine's top `k` can outrank a higher-BM25 test file. The
+/// query stays a plain bool: a `function_score` wildcard on `ax_path` is the
+/// path `xerj def` already measured at 422ms against 6ms.
+pub fn search_fetch_size(k: usize) -> usize {
+    crate::def::def_collect_size(k)
+}
+
+/// Order a plain-word search page.
+///
+/// On a code corpus, [`crate::def::penalize_demoted_paths`] halves the score
+/// of test/example/fuzz/bench paths and the page is trimmed back to `page`
+/// after the existing same-path and catalog passes. A prose corpus skips
+/// the penalty and the trim — the node was asked for `page` hits already.
+pub(crate) fn rank_plain_search_hits(hits: &mut Vec<Value>, code_corpus: bool, page: usize) {
+    if code_corpus {
+        crate::def::penalize_demoted_paths(hits);
+    }
+    prefer_citable_line_on_the_same_path(hits);
+    let mut ordered = demote_catalog_noise(std::mem::take(hits));
+    if code_corpus {
+        ordered.truncate(page);
+    }
+    *hits = ordered;
+}
+
 /// What the node held when a search or def returned no hits.
 ///
 /// `None` means that read failed. An empty `Some` is a real answer.
@@ -670,7 +698,14 @@ pub fn run_search_cli() -> i32 {
     let numeric = mapped
         .as_ref()
         .and(raw_mapping.as_ref().map(numeric_property_names));
-    let body = search_query_body_for_mapping(&query, k, mapped.as_ref(), numeric.as_ref());
+    // A readable mapping with none of `name` / `code` / `defs` is prose.
+    // An unreadable mapping keeps the code-shaped query, and the same
+    // test/example penalty (#2122).
+    let code_corpus = !xerj_common::code_query::code_symbol_fields_absent(mapped.as_ref());
+    let mut body = search_query_body_for_mapping(&query, k, mapped.as_ref(), numeric.as_ref());
+    if code_corpus && k > 0 {
+        body["size"] = json!(search_fetch_size(k));
+    }
     let mut resp = match es.search(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
@@ -678,18 +713,11 @@ pub fn run_search_cli() -> i32 {
             return 1;
         }
     };
+    // Test/example penalty, then the same-path line preference and the
+    // catalog partition (#1504). `--json` sees the same order as the printer.
+    // The penalty trims the wider fetch back to `-k`.
     if let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) {
-        prefer_citable_line_on_the_same_path(hits);
-    }
-
-    // Stubs and catalogs repeat the words of a question and outrank the
-    // implementation. Same partition `xerj code` applies (#1504, candle
-    // `.pyi` report). `--json` sees the same order as the text printer.
-    if let Some(arr) = resp.pointer("/hits/hits").and_then(Value::as_array) {
-        let ordered = demote_catalog_noise(arr.clone());
-        if let Some(slot) = resp.pointer_mut("/hits/hits") {
-            *slot = Value::Array(ordered);
-        }
+        rank_plain_search_hits(hits, code_corpus, k);
     }
     if as_json {
         println!(
@@ -1685,5 +1713,114 @@ mod tests {
         let none =
             search_query_body_for_mapping("timeout", 5, Some(&prose_names), Some(&prose_numeric));
         assert!(none["query"].get("match_none").is_some(), "{none}");
+    }
+
+    fn hit(path_key: &str, path: &str, score: f64) -> Value {
+        json!({
+            "_score": score,
+            "_source": { path_key: path }
+        })
+    }
+
+    /// #2122: a test/example path that only barely leads is ranked behind the
+    /// implementation, and it is still in the page. A test that scores more
+    /// than twice as high stays ahead of the implementation. A `*.test.ts`
+    /// file is not a demoted path — the predicate is `path_is_demoted`, not
+    /// a second rule list.
+    #[test]
+    fn code_search_penalizes_test_paths_and_keeps_them() {
+        let mut hits = vec![
+            hit("ax_path", "src/tests/render.test.tsx", 12.0),
+            hit("ax_path", "examples/App.tsx", 11.0),
+            hit("ax_path", "src/render.tsx", 9.0),
+            hit("path", "tests/render_contract.rs", 30.0),
+            hit("ax_path", "src/Foo.test.tsx", 14.0),
+            hit("ax_path", "src/fixtures/transcript.json", 8.0),
+        ];
+        rank_plain_search_hits(&mut hits, true, 5);
+        let paths: Vec<&str> = hits
+            .iter()
+            .map(|h| {
+                h["_source"]
+                    .get("ax_path")
+                    .or_else(|| h["_source"].get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap()
+            })
+            .collect();
+        // 30→15 and 14 stay ahead of the implementation at 9. 12→6 drops behind
+        // it but stays on the page. 11→5.5 falls off the page of 5; it is
+        // not deleted when the page has room (asserted below).
+        assert_eq!(
+            paths,
+            vec![
+                "tests/render_contract.rs",
+                "src/Foo.test.tsx",
+                "src/render.tsx",
+                "src/fixtures/transcript.json",
+                "src/tests/render.test.tsx",
+            ],
+            "{paths:?}"
+        );
+        let mut wide = vec![
+            hit("ax_path", "examples/App.tsx", 11.0),
+            hit("ax_path", "src/render.tsx", 9.0),
+        ];
+        rank_plain_search_hits(&mut wide, true, 5);
+        assert_eq!(wide.len(), 2, "a demoted hit stays when it still fits");
+        assert_eq!(wide[0]["_source"]["ax_path"], "src/render.tsx");
+        assert_eq!(wide[1]["_source"]["ax_path"], "examples/App.tsx");
+        assert_eq!(wide[1]["_score"], json!(5.5));
+        assert_eq!(wide[0]["_score"], json!(9.0));
+
+        let mut only_tests = vec![
+            hit("ax_path", "tests/a.rs", 10.0),
+            hit("ax_path", "fuzz/targets/b.rs", 8.0),
+        ];
+        rank_plain_search_hits(&mut only_tests, true, 5);
+        assert_eq!(only_tests[0]["_source"]["ax_path"], "tests/a.rs");
+        assert_eq!(only_tests[1]["_source"]["ax_path"], "fuzz/targets/b.rs");
+        assert_eq!(only_tests[0]["_score"], json!(5.0));
+
+        let mut prose = vec![
+            hit("ax_path", "tests/a.rs", 12.0),
+            hit("ax_path", "src/render.tsx", 9.0),
+        ];
+        rank_plain_search_hits(&mut prose, false, 1);
+        assert_eq!(prose.len(), 2, "a prose page is not trimmed");
+        assert_eq!(prose[0]["_source"]["ax_path"], "tests/a.rs");
+        assert_eq!(prose[0]["_score"], json!(12.0));
+    }
+
+    /// The fetch is wider than `-k` on purpose, and the query body does not
+    /// grow a `function_score` / `ax_path` wildcard to do the demotion.
+    #[test]
+    fn code_search_window_is_local_and_wider_than_the_page() {
+        assert_eq!(search_fetch_size(5), 45);
+        assert!(search_fetch_size(5) > 5);
+        let body = search_query_body("render the transcript", 5);
+        let rendered = body["query"].to_string();
+        assert!(!rendered.contains("function_score"), "{rendered}");
+        assert!(!rendered.contains("ax_path"), "{rendered}");
+        assert_eq!(body["size"], 5, "the builder stays at k; the CLI widens");
+    }
+
+    /// Catalog stubs still sink, on a code page and a prose page.
+    #[test]
+    fn path_penalty_does_not_undo_catalog_demotion() {
+        let mut hits = vec![
+            json!({"_score": 30.0, "_source": {"ax_path": "src/model.pyi"}}),
+            hit("ax_path", "tests/test_model.py", 12.0),
+            hit("ax_path", "src/model.py", 9.0),
+        ];
+        rank_plain_search_hits(&mut hits, true, 5);
+        let paths: Vec<&str> = hits
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["src/model.py", "tests/test_model.py", "src/model.pyi"]
+        );
     }
 }

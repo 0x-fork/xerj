@@ -305,8 +305,78 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     rec(pattern.as_bytes(), text.as_bytes())
 }
 
-fn path_is_demoted(path: &str) -> bool {
+/// True when `path` is a test, example, fuzz target, or bench
+/// (`tests/…`, `examples/…`, `fuzz/…`, `benches/…`, at any directory depth).
+///
+/// `xerj def` withholds the preferred-kind bonus on these paths.
+/// Plain-word `xerj search` and the plain-string `xerj_search` tool apply
+/// [`penalize_demoted_paths`] with the same predicate (#2122) — one set of
+/// path rules, not a second copy. `*` matches across `/`.
+pub fn path_is_demoted(path: &str) -> bool {
     DEMOTED_PATH_GLOBS.iter().any(|glob| glob_match(glob, path))
+}
+
+/// Share of its BM25 `_score` a demoted path keeps.
+///
+/// Halving puts a test file that only barely outscored the implementation
+/// behind it, and leaves a test file that scored more than twice as high —
+/// the query is about that test — in front. The hit is never removed.
+pub const DEMOTED_PATH_SCORE_FACTOR: f64 = 0.5;
+
+fn source_path_for_demotion(src: &Value) -> &str {
+    src.get("ax_path")
+        .or_else(|| src.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Ranking penalty for plain-word search over a code index (#2122).
+///
+/// Demoted paths keep [`DEMOTED_PATH_SCORE_FACTOR`] of their `_score`, then
+/// the slice is stable-sorted by that score. This is not a filter: a page
+/// that is only tests is unchanged in order, and a test that still leads
+/// after the penalty stays first. Paths the predicate does not match,
+/// including `*.test.ts` and `fixtures/`, are left alone. Hits with no
+/// numeric `_score` are not given one.
+pub fn penalize_demoted_paths(hits: &mut [Value]) {
+    let mut adjusted: Vec<(f64, Option<f64>)> = Vec::with_capacity(hits.len());
+    let mut any = false;
+    for hit in hits.iter() {
+        let src = hit.get("_source").unwrap_or(&Value::Null);
+        let demoted = path_is_demoted(source_path_for_demotion(src));
+        let base = hit.get("_score").and_then(Value::as_f64);
+        let (sort_score, rewrite) = match base {
+            Some(base) if demoted => {
+                let penalized = base * DEMOTED_PATH_SCORE_FACTOR;
+                (penalized, Some(penalized))
+            }
+            Some(base) => (base, None),
+            None => (0.0, None),
+        };
+        any |= demoted;
+        adjusted.push((sort_score, rewrite));
+    }
+    if !any {
+        return;
+    }
+    let mut order: Vec<usize> = (0..hits.len()).collect();
+    order.sort_by(|&a, &b| {
+        adjusted[b]
+            .0
+            .partial_cmp(&adjusted[a].0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let original = hits.to_vec();
+    for (place, old) in order.into_iter().enumerate() {
+        let mut hit = original[old].clone();
+        if let Some(score) = adjusted[old].1 {
+            if let Some(obj) = hit.as_object_mut() {
+                obj.insert("_score".into(), json!(score));
+            }
+        }
+        hits[place] = hit;
+    }
 }
 
 /// The old `function_score` filter matched the tokens `pub`, `public`, and
@@ -331,15 +401,8 @@ pub(crate) fn rerank_def_hits(hits: &mut [Value]) {
             let src = hit.get("_source").unwrap_or(&Value::Null);
             let mut bonus = 0.0;
             let kind = src.get("kind").and_then(Value::as_str).unwrap_or("");
-            if PREFERRED_KINDS.contains(&kind) {
-                let path = src
-                    .get("ax_path")
-                    .or_else(|| src.get("path"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !path_is_demoted(path) {
-                    bonus += KIND_WEIGHT;
-                }
+            if PREFERRED_KINDS.contains(&kind) && !path_is_demoted(source_path_for_demotion(src)) {
+                bonus += KIND_WEIGHT;
             }
             if src
                 .get("code")
@@ -779,6 +842,11 @@ mod tests {
         assert!(path_is_demoted("examples/dump.rs"));
         assert!(path_is_demoted("fuzz/fuzz_targets/x.rs") || path_is_demoted("tokio/fuzz/a.rs"));
         assert!(!path_is_demoted("tokio/src/runtime/runtime.rs"));
+        assert!(
+            !path_is_demoted("src/Foo.test.tsx"),
+            "a test suffix is not one of the path rules"
+        );
+        assert!(!path_is_demoted("src/fixtures/transcript.json"));
         assert!(!declaration_is_public("struct Runtime"));
         assert!(declaration_is_public("pub(crate) struct Runtime"));
         assert!(!declaration_is_public("publication"));

@@ -106,11 +106,14 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use xerj_common::code_query::{
-    mapped_property_names, numeric_property_names, search_query_body_for_mapping,
+    code_symbol_fields_absent, mapped_property_names, numeric_property_names,
+    search_query_body_for_mapping,
 };
 
 /// MCP protocol revision we default to when the client does not request one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+/// `POST /_search` page size when the caller omits `size` (`EsSearchBody`).
+const DEFAULT_SEARCH_SIZE: usize = 10;
 /// Default XERJ ES-compatible endpoint.
 const DEFAULT_XERJ_URL: &str = "http://localhost:9200";
 
@@ -1773,6 +1776,9 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         None
     };
 
+    // Set only for a plain-string code search (#2122). `Some(page)` means
+    // the response hits are penalized and trimmed back to `page`.
+    let mut demote_page: Option<usize> = None;
     let result = match name {
         "xerj_search" => {
             // #1961: a plain-string query is shaped from the target's mapping,
@@ -1780,16 +1786,40 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
             // answers HTTP 400 `strict_unknown_fields` because the body names
             // `defs` and `name`, which it does not map. A DSL object is
             // forwarded untouched (no mapping read, no rewriting).
-            let mapping = match args.get("query") {
-                Some(Value::String(q)) if !q.trim().is_empty() => {
-                    fetch_mapping(ctx, search_index(&args)).await
-                }
-                _ => None,
+            let plain = matches!(
+                args.get("query"),
+                Some(Value::String(q)) if !q.trim().is_empty()
+            );
+            let mapping = if plain {
+                fetch_mapping(ctx, search_index(&args)).await
+            } else {
+                None
             };
-            match mapping {
-                Some(mapping) => build_search_with_mapping(&args, Some(&mapping)),
+            let mut built = match mapping.as_ref() {
+                Some(mapping) => build_search_with_mapping(&args, Some(mapping)),
                 None => build_search(&args),
+            };
+            if plain_search_demotes_test_paths(&args, mapping.as_ref()) {
+                let page = match opt_u64(&args, "size") {
+                    Ok(Some(n)) => n as usize,
+                    Ok(None) => DEFAULT_SEARCH_SIZE,
+                    Err(msg) => return tool_text(msg, true),
+                };
+                let from = match opt_u64(&args, "from") {
+                    Ok(Some(n)) => n,
+                    Ok(None) => 0,
+                    Err(msg) => return tool_text(msg, true),
+                };
+                demote_page = Some(page);
+                // First page only: a wider fetch, then trim back to `page`
+                // after the penalty. `from` > 0 keeps the caller's window.
+                if from == 0 && page > 0 {
+                    if let Ok((_, _, Some(body))) = built.as_mut() {
+                        body["size"] = json!(xerj_autoindex::search::search_fetch_size(page));
+                    }
+                }
             }
+            built
         }
         "xerj_semantic_search" => build_semantic(&args),
         "xerj_vector_search" => build_vector(&args),
@@ -1830,9 +1860,53 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
     };
 
     match result {
-        Ok((method, path, body)) => engine_request(ctx, method, &path, body, budget).await,
+        Ok((method, path, body)) => {
+            engine_request(ctx, method, &path, body, budget, demote_page).await
+        }
         Err(msg) => tool_text(msg, true),
     }
+}
+
+/// Plain-word `xerj_search` on a code corpus (#2122).
+///
+/// Same gate as `xerj search`: a readable mapping with none of `name` /
+/// `code` / `defs` is prose and is left on the engine's order. An unreadable
+/// mapping keeps the code-shaped query, so the demotion applies there too.
+/// An explicit `sort`, `rerank`, or `judge` owns the order.
+fn plain_search_demotes_test_paths(args: &Value, mapping: Option<&Value>) -> bool {
+    let Some(Value::String(q)) = args.get("query") else {
+        return false;
+    };
+    if q.trim().is_empty() {
+        return false;
+    }
+    if ["sort", "rerank", "judge"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|v| !v.is_null()))
+    {
+        return false;
+    }
+    let mapped = mapping.and_then(mapped_property_names);
+    !code_symbol_fields_absent(mapped.as_ref())
+}
+
+/// Halve test/example/fuzz/bench scores and trim to the caller's page.
+///
+/// The penalty is [`xerj_autoindex::def::penalize_demoted_paths`] — the same
+/// `path_is_demoted` rules `xerj def` uses. A response that is not a search
+/// hit list is returned unchanged.
+fn apply_search_path_demotion(text: &str, page: usize) -> String {
+    let Ok(mut resp) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    {
+        let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) else {
+            return text.to_string();
+        };
+        xerj_autoindex::def::penalize_demoted_paths(hits);
+        hits.truncate(page);
+    }
+    serde_json::to_string(&resp).unwrap_or_else(|_| text.to_string())
 }
 
 /// HTTP method of a proxied engine request. The engine's graph surface is not
@@ -2831,6 +2905,7 @@ async fn engine_request(
     path: &str,
     body: Option<Value>,
     budget: Option<usize>,
+    demote_page: Option<usize>,
 ) -> Value {
     let url = format!("{}{}", ctx.base_url, path);
     let mut req = match method {
@@ -2850,6 +2925,10 @@ async fn engine_request(
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
+                let text = match demote_page {
+                    Some(page) => apply_search_path_demotion(&text, page),
+                    None => text,
+                };
                 match budget {
                     Some(max_tokens) => {
                         tool_text(token_budget::budget_json_response(&text, max_tokens), false)
@@ -3199,6 +3278,82 @@ mod tests {
             with["query"], without["query"],
             "a code corpus must keep the #916 query"
         );
+    }
+
+    /// #2122: the demotion is plain-word search on a code corpus. A prose
+    /// mapping, a DSL object, and an explicit sort/rerank/judge do not take it.
+    #[test]
+    fn plain_search_demotion_follows_the_code_corpus_gate() {
+        let code = json!({
+            "ax-rust": { "mappings": { "properties": {
+                "name": {"type": "keyword"}, "code": {"type": "text"}, "defs": {"type": "text"}
+            }}}
+        });
+        let prose = json!({
+            "ax-docs": { "mappings": { "properties": {
+                "body": {"type": "text"}, "title": {"type": "text"}
+            }}}
+        });
+        assert!(plain_search_demotes_test_paths(
+            &json!({"query": "render the transcript"}),
+            Some(&code)
+        ));
+        assert!(plain_search_demotes_test_paths(
+            &json!({"query": "render the transcript"}),
+            None
+        ));
+        assert!(!plain_search_demotes_test_paths(
+            &json!({"query": "render the transcript"}),
+            Some(&prose)
+        ));
+        assert!(!plain_search_demotes_test_paths(
+            &json!({"query": {"match": {"body": "render"}}}),
+            Some(&code)
+        ));
+        assert!(!plain_search_demotes_test_paths(
+            &json!({"query": "render", "sort": ["_score"]}),
+            Some(&code)
+        ));
+        assert!(!plain_search_demotes_test_paths(
+            &json!({"query": "render", "rerank": {"query": "render"}}),
+            Some(&code)
+        ));
+        assert!(!plain_search_demotes_test_paths(
+            &json!({"query": "  "}),
+            Some(&code)
+        ));
+    }
+
+    /// The same penalty the CLI applies: a barely-leading test drops behind
+    /// the implementation and stays on the page; the wider fetch is trimmed
+    /// back to the caller's size.
+    #[test]
+    fn plain_string_response_penalizes_test_paths_and_trims_the_window() {
+        let raw = r#"{"hits":{"hits":[
+            {"_id":"t","_score":12.0,"_source":{"ax_path":"src/tests/render.test.tsx"}},
+            {"_id":"i","_score":9.0,"_source":{"ax_path":"src/render.tsx"}},
+            {"_id":"s","_score":30.0,"_source":{"ax_path":"tests/contract.rs"}},
+            {"_id":"x","_score":1.0,"_source":{"ax_path":"src/extra.rs"}}
+        ]}}"#;
+        let text = apply_search_path_demotion(raw, 3);
+        let resp: Value = serde_json::from_str(&text).unwrap();
+        let paths: Vec<&str> = resp["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "tests/contract.rs",
+                "src/render.tsx",
+                "src/tests/render.test.tsx"
+            ]
+        );
+        assert_eq!(resp["hits"]["hits"][2]["_score"], json!(6.0));
+        assert_eq!(resp["hits"]["hits"][1]["_score"], json!(9.0));
+        assert_eq!(apply_search_path_demotion("not json", 3), "not json");
     }
 
     /// A numeric mapping of a code field drops that leg (#1284 via #1601):
@@ -4077,6 +4232,10 @@ mod tests {
     /// One HTTP/1.1 request, then a tiny JSON 200. Reads Content-Length so the
     /// client is not left waiting on a half-consumed body.
     fn read_one_http(listener: std::net::TcpListener) -> String {
+        read_one_http_reply(listener, r#"{"ok":true,"stored":true}"#.to_string())
+    }
+
+    fn read_one_http_reply(listener: std::net::TcpListener, response_body: String) -> String {
         use std::io::{Read, Write};
         let (mut sock, _) = listener.accept().expect("accept");
         sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -4112,7 +4271,6 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let response_body = r#"{"ok":true,"stored":true}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
             response_body.len()
@@ -4218,6 +4376,161 @@ mod tests {
             request.contains("\"text\""),
             "the mapped prose field was not searched: {request}"
         );
+        assert!(
+            !request.contains("\"size\""),
+            "a prose corpus must not widen the fetch for the code-path penalty: {request}"
+        );
+    }
+
+    /// #2122: plain-word search on a code index asks for the rerank window and
+    /// returns the implementation ahead of a test file that only barely led.
+    /// The test file is still in the page.
+    #[test]
+    fn search_tool_demotes_test_paths_on_a_code_index() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mapping = r#"{"ax-code":{"mappings":{"properties":{"name":{"type":"keyword"},"code":{"type":"text"},"defs":{"type":"text"},"body":{"type":"text"}}}}}"#;
+        let hits = r#"{"took":1,"hits":{"total":{"value":3,"relation":"eq"},"hits":[{"_id":"t","_score":12.0,"_source":{"ax_path":"src/tests/render.test.tsx"}},{"_id":"i","_score":9.0,"_source":{"ax_path":"src/render.tsx"}},{"_id":"s","_score":30.0,"_source":{"ax_path":"tests/contract.rs"}}]}}"#;
+        let server = std::thread::spawn(move || serve_mapping_then_search(listener, mapping, hits));
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": { "name": "xerj_search", "arguments": {
+                "query": "render the transcript",
+                "size": 3
+            } }
+        });
+        let res = block_on(call_tool(&ctx, &msg));
+        let request = server.join().expect("fake node thread");
+        assert_eq!(res["isError"], false, "{res}");
+        let window = xerj_autoindex::search::search_fetch_size(3);
+        assert!(
+            request.contains(&format!("\"size\":{window}")),
+            "the first page must fetch the rerank window {window}: {request}"
+        );
+        let body: Value = serde_json::from_str(&tool_body(&res)).unwrap();
+        let paths: Vec<&str> = body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "tests/contract.rs",
+                "src/render.tsx",
+                "src/tests/render.test.tsx"
+            ]
+        );
+    }
+
+    /// A prose corpus keeps the engine order, including a `tests/` path.
+    #[test]
+    fn search_tool_does_not_demote_paths_on_a_prose_index() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mapping = r#"{"ax-docs":{"mappings":{"properties":{"body":{"type":"text"},"title":{"type":"text"},"text":{"type":"text"}}}}}"#;
+        let hits = r#"{"took":1,"hits":{"hits":[{"_id":"t","_score":12.0,"_source":{"ax_path":"tests/guide.md"}},{"_id":"i","_score":9.0,"_source":{"ax_path":"guide.md"}}]}}"#;
+        let server = std::thread::spawn(move || serve_mapping_then_search(listener, mapping, hits));
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": { "name": "xerj_search", "arguments": {
+                "query": "how does the retry policy work"
+            } }
+        });
+        let res = block_on(call_tool(&ctx, &msg));
+        let request = server.join().expect("fake node thread");
+        assert_eq!(res["isError"], false, "{res}");
+        assert!(!request.contains("\"size\""), "{request}");
+        let body: Value = serde_json::from_str(&tool_body(&res)).unwrap();
+        assert_eq!(
+            body["hits"]["hits"][0]["_source"]["ax_path"],
+            "tests/guide.md"
+        );
+        assert_eq!(body["hits"]["hits"][0]["_score"], json!(12.0));
+    }
+
+    /// A DSL object is forwarded and returned in the engine's order. `from`
+    /// keeps the caller's page size instead of the rerank window.
+    #[test]
+    fn search_tool_leaves_a_dsl_query_and_a_later_page_unwidened() {
+        let hits = r#"{"hits":{"hits":[{"_id":"t","_score":12.0,"_source":{"ax_path":"tests/a.rs"}},{"_id":"i","_score":9.0,"_source":{"ax_path":"src/a.rs"}}]}}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = hits.to_string();
+        let server = std::thread::spawn(move || read_one_http_reply(listener, body));
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: None,
+        };
+        let res = block_on(call_tool(
+            &ctx,
+            &json!({
+                "params": { "name": "xerj_search", "arguments": {
+                    "query": { "match": { "body": "render the transcript" } }
+                } }
+            }),
+        ));
+        let request = server.join().expect("fake node thread");
+        assert_eq!(res["isError"], false, "{res}");
+        assert!(
+            request.contains("\"match\""),
+            "a DSL query is forwarded: {request}"
+        );
+        let parsed: Value = serde_json::from_str(&tool_body(&res)).unwrap();
+        assert_eq!(
+            parsed["hits"]["hits"][0]["_source"]["ax_path"],
+            "tests/a.rs"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mapping = r#"{"ax-code":{"mappings":{"properties":{"name":{"type":"keyword"},"code":{"type":"text"},"defs":{"type":"text"}}}}}"#;
+        let page_hits = hits.to_string();
+        let server =
+            std::thread::spawn(move || serve_mapping_then_search(listener, mapping, &page_hits));
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: None,
+        };
+        let res = block_on(call_tool(
+            &ctx,
+            &json!({
+                "params": { "name": "xerj_search", "arguments": {
+                    "query": "render the transcript",
+                    "size": 3,
+                    "from": 3
+                } }
+            }),
+        ));
+        let request = server.join().expect("fake node thread");
+        assert_eq!(res["isError"], false, "{res}");
+        assert!(
+            request.contains("\"from\":3"),
+            "the caller's offset is forwarded: {request}"
+        );
+        assert!(
+            request.contains("\"size\":3") && !request.contains("\"size\":43"),
+            "a later page keeps the caller's size: {request}"
+        );
+        let parsed: Value = serde_json::from_str(&tool_body(&res)).unwrap();
+        let paths: Vec<&str> = parsed["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/a.rs", "tests/a.rs"]);
     }
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
