@@ -939,21 +939,29 @@ async fn cat_indices_inner(
 
     let mut rows = Vec::new();
     for info in &selected {
+        let idx = state.engine.get_index(&info.name).ok();
         // Real on-disk size: recursive byte sum of the index's data_dir.
         // Single-shard (pri=1, rep=0), so store.size == pri.store.size, and
         // dataset.size (the 8.13 column) equals store.size for a fully-mounted
         // (non-partial, non-searchable-snapshot) shard.
-        let size = state
-            .engine
-            .get_index(&info.name)
+        let size = idx
+            .as_ref()
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
+        // #2140: `docs.count` is a BARE count, so it must omit the autoindex
+        // file-card anchors the same way `_count` (#1624) and `autoindex map`
+        // do. Reading the raw stats count here made an operator see one phantom
+        // document per indexed file and distrust both numbers.
+        let doc_count = match idx.as_ref() {
+            Some(idx) => content_doc_count(idx).await,
+            None => info.doc_count,
+        };
         // Emit the stable REAL settings uuid (the same value
         // GET /{index}/_settings returns), not a fresh random one per call.
         rows.push((
             info.name.clone(),
             stable_index_uuid(&info.name),
-            info.doc_count,
+            doc_count,
             size,
             human_bytes(size),
         ));
@@ -1226,6 +1234,91 @@ mod cat_format_json_tests {
         let mut starred = index_names(&body);
         starred.sort();
         assert_eq!(starred, vec![".xerj-memory-x", "logs"]);
+    }
+
+    async fn put_doc(app: &axum::Router, index: &str, id: &str, body: Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/{index}/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "index {index}/{id}: {}",
+            response.status()
+        );
+    }
+
+    async fn refresh(app: &axum::Router, index: &str) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/{index}/_refresh"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "refresh {index}");
+    }
+
+    /// #2140: `docs.count` in `_cat/indices` is a BARE count, so it has to omit
+    /// the autoindex file-card anchors exactly as `_count` (#1624) and
+    /// `autoindex map` do. Reading the raw stats count made every indexed file
+    /// add one phantom document to the cat column while `_count` omitted it, and
+    /// an operator comparing the two could not tell which number was real.
+    #[tokio::test]
+    async fn cat_indices_docs_count_omits_file_card_anchors_like_bare_count() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        put_index(&app, "cards").await;
+        put_doc(&app, "cards", "rec", json!({"body": "a real record"})).await;
+        put_doc(
+            &app,
+            "cards",
+            "card",
+            json!({"ax_locator": "file", "title": "a.rs", "ax_path": "a.rs"}),
+        )
+        .await;
+        refresh(&app, "cards").await;
+
+        let (status, count) = get(&app, "/cards/_count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count["count"], 1, "bare _count omits the file card (#1624)");
+
+        let (status, body) = get(&app, "/_cat/indices?format=json&h=index,docs.count").await;
+        assert_eq!(status, StatusCode::OK);
+        let row = body
+            .as_array()
+            .expect("json array")
+            .iter()
+            .find(|row| row["index"] == "cards")
+            .expect("cards row");
+        assert_eq!(
+            row["docs.count"], "1",
+            "docs.count must match the bare _count, not the physical doc total"
+        );
+
+        let (status, shards) = get(&app, "/_cat/shards?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let shard = shards
+            .as_array()
+            .expect("json array")
+            .iter()
+            .find(|row| row["index"] == "cards")
+            .expect("cards shard row");
+        assert_eq!(shard["docs"], "1", "the shard column adds up to docs.count");
+
+        // The card stays searchable: #1624 only changed the bare count, and a
+        // graph anchor must not become an invisible document.
+        let (status, body) = get(&app, "/cards/_search?q=ax_locator:file").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hits"]["total"]["value"], 1);
     }
 }
 
@@ -31689,13 +31782,20 @@ pub async fn cat_shards(
     let indices = state.engine.list_indices().await;
     let mut rows: Vec<(String, u64, u64)> = Vec::new();
     for info in &indices {
+        let idx = state.engine.get_index(&info.name).ok();
         // Real on-disk size: recursive byte sum of the index's data_dir.
-        let store_bytes = state
-            .engine
-            .get_index(&info.name)
+        let store_bytes = idx
+            .as_ref()
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        rows.push((info.name.clone(), info.doc_count, store_bytes));
+        // #2140: the shard docs column has to add up to `_cat/indices`
+        // docs.count, which is a bare count (#1624), so omit file-card anchors
+        // here too rather than making the two cat endpoints disagree.
+        let docs = match idx.as_ref() {
+            Some(idx) => content_doc_count(idx).await,
+            None => info.doc_count,
+        };
+        rows.push((info.name.clone(), docs, store_bytes));
     }
     // `_cat/shards` is the call an operator makes straight after seeing a red
     // cluster, so an index whose primary could not be opened has to be in it.
