@@ -144,6 +144,11 @@ hidden-name rule, same `.gitignore`/`.xerjignore` stack. Two consequences:
 
 * An ignored directory costs no watch and produces no events. A `cargo build`
   writing into an ignored `target/` cannot wake the watcher at all.
+* An ignored **file** inside a watched directory (`app.log` under a `*.log`
+  rule, a lockfile, an artefact written next to the sources) does produce
+  events, on its parent's watch. They are dropped before a pass starts, by
+  the same ignore stack the walk uses, so a tool that keeps rewriting such a
+  file does not cycle the watcher through passes that hash nothing (#2180).
 * A watched run and a plain re-run agree on what is indexed, because they apply
   the same rules from the same code — not from a second implementation.
 
