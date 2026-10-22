@@ -8,7 +8,11 @@
         "properties": {
           "index": {
             "type": "string",
-            "description": "Index name or pattern to search. Defaults to `ax-*` — the prefix `xerj autoindex` writes — so the common case needs no argument. Pass an explicit name to search anything else. Never DELETE an index you did not create in this session. A shared default prefix is not a reason to delete one: use `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` is the same operation). It lists the indices, catalog rows, doc counts and sizes, deletes nothing without confirmation, and never removes another folder under that prefix."
+            "description": "Index name or pattern to search. Defaults to `ax-*` — the prefix `xerj autoindex` writes — so the common case needs no argument. Pass an explicit name to search anything else. Cannot be combined with `prefix`. Never DELETE an index you did not create in this session. A shared default prefix is not a reason to delete one: use `xerj autoindex remove --prefix <name>` (MCP tool `xerj_autoindex_remove` is the same operation). It lists the indices, catalog rows, doc counts and sizes, deletes nothing without confirmation, and never removes another folder under that prefix."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Autoindex prefix, like `xerj search --prefix`: `project` searches `project-*`. Pass the prefix without the `-*` suffix. Leading/trailing whitespace is trimmed; an empty prefix is an error. Cannot be combined with a non-empty `index`. With neither argument, searches `ax-*`."
           },
           "query": {
             "type": [

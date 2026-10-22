@@ -773,8 +773,17 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                         "description": format!(
                             "Index name or pattern to search. Defaults to `ax-*` — \
                              the prefix `xerj autoindex` writes — so the common case needs \
-                             no argument. Pass an explicit name to search anything else.{NEVER_DELETE_INDEX}"
+                             no argument. Pass an explicit name to search anything else. \
+                             Cannot be combined with `prefix`.{NEVER_DELETE_INDEX}"
                         )
+                    },
+                    "prefix": {
+                        "type": "string",
+                        "description": "Autoindex prefix, like `xerj search --prefix`: \
+                         `project` searches `project-*`. Pass the prefix without the \
+                         `-*` suffix. Leading/trailing whitespace is trimmed; an empty \
+                         prefix is an error. Cannot be combined with a non-empty `index`. \
+                         With neither argument, searches `ax-*`."
                     },
                     "query": {
                         "type": ["object", "string"],
@@ -1830,6 +1839,12 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
     let mut demote_page: Option<usize> = None;
     let result = match name {
         "xerj_search" => {
+            // Resolve before even the mapping GET: conflicting or malformed
+            // scope arguments must never silently query a different corpus.
+            let index = match search_index(&args) {
+                Ok(index) => index,
+                Err(msg) => return tool_text(msg, true),
+            };
             // #1961: a plain-string query is shaped from the target's mapping,
             // exactly like `xerj search` (#1602). Without this, a prose corpus
             // answers HTTP 400 `strict_unknown_fields` because the body names
@@ -1840,7 +1855,7 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
                 Some(Value::String(q)) if !q.trim().is_empty()
             );
             let mapping = if plain {
-                fetch_mapping(ctx, search_index(&args)).await
+                fetch_mapping(ctx, &index).await
             } else {
                 None
             };
@@ -2247,14 +2262,29 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
     build_search_with_mapping(args, None)
 }
 
-/// The index pattern a tool call targets: the CLI's `ax-*` default (#962); an
-/// explicit argument wins.
-fn search_index(args: &Value) -> &str {
-    args.get("index")
+/// One scope for both mapping discovery and search. `prefix` follows the
+/// CLI's `{prefix}-*` expansion (`xerj-autoindex/src/search.rs`); `index`
+/// retains its existing blank-as-absent behavior (#962).
+fn search_index(args: &Value) -> Result<String, String> {
+    let index = args
+        .get("index")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("ax-*")
+        .filter(|s| !s.is_empty());
+    let prefix = match args.get("prefix") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim()),
+        Some(_) => return Err("`prefix` must be a non-empty string, for example {\"prefix\": \"project\"} searches project-*".into()),
+    };
+    match (index, prefix) {
+        (Some(_), Some(_)) => Err(
+            "pass either `index` or `prefix`, not both; `prefix`: \"project\" searches project-*"
+                .into(),
+        ),
+        (Some(index), None) => Ok(index.to_owned()),
+        (None, Some(prefix)) => Ok(format!("{prefix}-*")),
+        (None, None) => Ok("ax-*".into()),
+    }
 }
 
 /// [`build_search`] with the target's `GET /{index}/_mapping` body (#1961).
@@ -2268,7 +2298,7 @@ fn build_search_with_mapping(
     args: &Value,
     mapping: Option<&Value>,
 ) -> Result<BuiltRequest, String> {
-    let index = search_index(args);
+    let index = search_index(args)?;
     let mut body = serde_json::Map::new();
     let mut plain_string = false;
     match args.get("query") {
@@ -3321,6 +3351,43 @@ mod tests {
         assert_eq!(path, "/ax-*/_search");
         let (_, path, _) = built(build_search(&json!({ "index": "docs" })));
         assert_eq!(path, "/docs/_search");
+    }
+
+    #[test]
+    fn search_prefix_selects_only_the_requested_corpus() {
+        for query in [json!("retry policy"), json!({"match_all": {}}), Value::Null] {
+            let (_, path, body) = built(build_search(&json!({
+                "prefix": "  project  ", "query": query
+            })));
+            assert_eq!(path, "/project-*/_search");
+            assert!(body.get("prefix").is_none());
+        }
+        let (_, path, _) = built(build_search(&json!({
+            "index": "  ", "prefix": "project"
+        })));
+        assert_eq!(path, "/project-*/_search");
+    }
+
+    #[test]
+    fn search_prefix_rejects_conflicting_or_invalid_arguments() {
+        let error = build_search(&json!({"index": "docs", "prefix": "project"})).unwrap_err();
+        assert!(
+            error.contains("`index`") && error.contains("`prefix`"),
+            "{error}"
+        );
+        for prefix in [
+            json!(""),
+            json!("  "),
+            json!(42),
+            json!(false),
+            json!([]),
+            json!({}),
+        ] {
+            let error = build_search(&json!({"prefix": prefix})).unwrap_err();
+            assert!(error.contains("`prefix`"), "{error}");
+        }
+        let (_, path, _) = built(build_search(&json!({"prefix": null})));
+        assert_eq!(path, "/ax-*/_search");
     }
 
     /// #1961: a plain-string query on a prose corpus must not name the code
@@ -4414,8 +4481,18 @@ mod tests {
         mapping_body: &str,
         search_body: &str,
     ) -> String {
+        serve_mapping_then_search_requests(listener, mapping_body, search_body)
+            .pop()
+            .unwrap()
+    }
+
+    fn serve_mapping_then_search_requests(
+        listener: std::net::TcpListener,
+        mapping_body: &str,
+        search_body: &str,
+    ) -> Vec<String> {
         use std::io::{Read, Write};
-        let mut last = String::new();
+        let mut requests = Vec::new();
         for body in [mapping_body, search_body] {
             let (mut sock, _) = listener.accept().expect("accept");
             sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -4453,14 +4530,130 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            last = String::from_utf8_lossy(&buf).into_owned();
+            requests.push(String::from_utf8_lossy(&buf).into_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = sock.write_all(response.as_bytes());
         }
-        last
+        requests
+    }
+
+    #[test]
+    fn search_prefix_scopes_both_mapping_and_search_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            serve_mapping_then_search_requests(
+                listener,
+                r#"{"project-docs":{"mappings":{"properties":{"text":{"type":"text"}}}}}"#,
+                r#"{"hits":{"total":{"value":1},"hits":[{"_index":"project-docs","_id":"1"}]}}"#,
+            )
+        });
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            auth: None,
+        };
+        let result = block_on(call_tool(
+            &ctx,
+            &json!({"params": {
+                "name": "xerj_search",
+                "arguments": {"prefix": "project", "query": "retry policy"}
+            }}),
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(
+            requests[0].starts_with("GET /project-*/_mapping HTTP/1.1"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("POST /project-*/_search HTTP/1.1"),
+            "{}",
+            requests[1]
+        );
+        assert!(!requests[1].contains("\"defs\""), "{}", requests[1]);
+        assert!(requests[1].contains("\"text\""), "{}", requests[1]);
+        assert!(!requests[1].contains("\"prefix\""), "{}", requests[1]);
+        let body: Value = serde_json::from_str(&tool_body(&result)).unwrap();
+        assert_eq!(body["hits"]["hits"][0]["_index"], "project-docs");
+    }
+
+    #[test]
+    fn search_prefix_preserves_code_path_demotion() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            serve_mapping_then_search_requests(
+                listener,
+                r#"{"project-code":{"mappings":{"properties":{"name":{"type":"keyword"},"defs":{"type":"text"},"body":{"type":"text"}}}}}"#,
+                r#"{"hits":{"hits":[{"_id":"t","_score":12.0,"_source":{"ax_path":"tests/retry.rs"}},{"_id":"i","_score":9.0,"_source":{"ax_path":"src/retry.rs"}}]}}"#,
+            )
+        });
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            auth: None,
+        };
+        let result = block_on(call_tool(
+            &ctx,
+            &json!({"params": {
+                "name": "xerj_search", "arguments": {"prefix": "project", "query": "retry policy"}
+            }}),
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(
+            requests[0].starts_with("GET /project-*/_mapping HTTP/1.1"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("POST /project-*/_search HTTP/1.1"),
+            "{}",
+            requests[1]
+        );
+        let body: Value = serde_json::from_str(&tool_body(&result)).unwrap();
+        assert_eq!(
+            body["hits"]["hits"][0]["_source"]["ax_path"],
+            "src/retry.rs"
+        );
+        assert_eq!(body["hits"]["hits"][1]["_score"], 6.0);
+    }
+
+    #[test]
+    fn search_prefix_errors_send_no_mapping_or_search_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let ctx = Ctx {
+            // A hang guard if a regression attempts HTTP before validation.
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            auth: None,
+        };
+        for arguments in [
+            json!({"index": "docs", "prefix": "project", "query": "retry"}),
+            json!({"prefix": false, "query": "retry"}),
+            json!({"prefix": "  ", "query": {"match_all": {}}}),
+        ] {
+            let result = block_on(call_tool(
+                &ctx,
+                &json!({"params": {
+                    "name": "xerj_search", "arguments": arguments
+                }}),
+            ));
+            assert_eq!(result["isError"], true, "{result}");
+            assert!(tool_body(&result).contains("`prefix`"), "{result}");
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
     }
 
     /// #1961 end to end: the tool reads `GET /{index}/_mapping` first, so the
