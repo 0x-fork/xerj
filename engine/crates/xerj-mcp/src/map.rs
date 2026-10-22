@@ -500,10 +500,188 @@ fn summary_entry(entry: &Value) -> Value {
     })
 }
 
-/// `xerj_map` dispatch: read the catalog, render the map. A missing catalog
-/// (the node never ran autoindex) is an error with the fix named — the
-/// response an agent can act on — while an empty-but-present catalog is a
-/// normal empty result, not an error.
+/// Locator fields autoindex stamps on every record and maps as keyword
+/// (`xerj_autoindex::PROVENANCE_FIELDS`). Copied here so this proxy does not
+/// depend on that crate. The profiler never sees them, so a catalog written
+/// before #2120 omits them from `fields_json` even though they are queryable.
+const PROVENANCE_FIELDS: &[&str] = &[
+    "ax_path",
+    "ax_paths",
+    "ax_file",
+    "ax_locator",
+    "ax_dataset",
+    "ax_run",
+    "ax_format",
+];
+
+fn provenance_field(name: &str) -> Value {
+    json!({
+        "name": name,
+        "es_type": "keyword",
+        "coverage": 1.0,
+        "cardinality_est": 0,
+        "notes": [
+            "autoindex provenance locator, mapped keyword and stamped on every record; \
+             not sampled, so cardinality_est 0 means unmeasured"
+        ],
+    })
+}
+
+fn mapped_only_field(name: &str, spec: &Value) -> Value {
+    let es_type = spec.get("type").and_then(Value::as_str).unwrap_or("object");
+    if PROVENANCE_FIELDS.contains(&name) {
+        let mut field = provenance_field(name);
+        if let Some(obj) = field.as_object_mut() {
+            obj.insert("es_type".into(), json!(es_type));
+        }
+        field
+    } else {
+        json!({
+            "name": name,
+            "es_type": es_type,
+            "notes": ["mapped on the index but absent from the profiled catalog"],
+        })
+    }
+}
+
+/// Union each dataset's `fields_json` with the index mapping's top-level
+/// properties (or, when `mapping` is `None` because the mapping read failed,
+/// with [`PROVENANCE_FIELDS`]).
+///
+/// A corrupt `fields_json` is left alone: the renderer already turns that
+/// into an empty field list rather than an error, and inventing locators on
+/// top of a parse failure would hide the corruption.
+///
+/// Names are appended in sorted order. `render_response` re-sorts by
+/// coverage, so this order only matters for the bytes stored back into the
+/// hit, which nothing else reads.
+pub(crate) fn merge_mapped_fields(resp: &mut Value, mapping: Option<&Value>) {
+    let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for hit in hits.iter_mut() {
+        let Some(src) = hit.get_mut("_source").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let index = src
+            .get("index_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let raw = src
+            .get("fields_json")
+            .and_then(Value::as_str)
+            .unwrap_or("[]");
+        let Ok(mut fields) = serde_json::from_str::<Vec<Value>>(raw) else {
+            continue;
+        };
+        if fields.iter().any(|f| !f.is_object()) {
+            continue;
+        }
+        let present: std::collections::HashSet<String> = fields
+            .iter()
+            .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let properties = mapping.and_then(|m| {
+            m.get(&index)
+                .and_then(|v| v.pointer("/mappings/properties"))
+                .and_then(Value::as_object)
+        });
+        if let Some(props) = properties {
+            let mut names: Vec<&String> = props.keys().collect();
+            names.sort();
+            for name in names {
+                if name.starts_with('_') || present.contains(name.as_str()) {
+                    continue;
+                }
+                fields.push(mapped_only_field(name, &props[name]));
+            }
+        } else if mapping.is_none() {
+            for name in PROVENANCE_FIELDS {
+                if present.contains(*name) {
+                    continue;
+                }
+                fields.push(provenance_field(name));
+            }
+        }
+        if let Ok(encoded) = serde_json::to_string(&fields) {
+            src.insert("fields_json".into(), Value::String(encoded));
+        }
+    }
+}
+
+fn field_count_means(mapping_read: bool) -> &'static str {
+    if mapping_read {
+        "each indexes[].field_count is the catalog's profiled fields union that index's \
+         top-level mapping fields, the same set xerj_plan counts as top-level mapping fields. \
+         ax_* locators the profiler did not sample are included"
+    } else {
+        "each indexes[].field_count is the catalog's profiled fields plus the ax_* provenance \
+         locators autoindex maps as keyword. The live mapping could not be read, so other \
+         mapped-but-unprofiled fields are not listed. xerj_plan's field count is top-level \
+         mapping fields"
+    }
+}
+
+fn annotate_field_count(rendered: &str, mapping_read: bool) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(rendered) else {
+        return rendered.to_string();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "field_count_means".into(),
+            json!(field_count_means(mapping_read)),
+        );
+    }
+    value.to_string()
+}
+
+async fn fetch_mappings(ctx: &Ctx, indexes: &[String]) -> Option<Value> {
+    if indexes.is_empty() {
+        return Some(json!({}));
+    }
+    let path = indexes
+        .iter()
+        .map(|name| super::enc(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let url = format!("{}/{path}/_mapping", ctx.base_url);
+    let mut req = ctx.client.get(&url);
+    if let Some(auth) = &ctx.auth {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn index_names(resp: &Value) -> Vec<String> {
+    resp.pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .map(|hits| {
+            let mut names: Vec<String> = hits
+                .iter()
+                .filter_map(|h| {
+                    h.pointer("/_source/index_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        })
+        .unwrap_or_default()
+}
+
+/// `xerj_map` dispatch: read the catalog, union each index's live mapping so
+/// `ax_*` locators and any other mapped-but-unprofiled field are listed, then
+/// render. A missing catalog (the node never ran autoindex) is an error with
+/// the fix named — the response an agent can act on — while an empty-but-present
+/// catalog is a normal empty result, not an error.
 pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
     let parsed = match parse_args(args) {
         Ok(a) => a,
@@ -521,7 +699,15 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
                 match serde_json::from_str::<Value>(&text) {
-                    Ok(v) => tool_text(render_response(&v, &parsed), false),
+                    Ok(mut v) => {
+                        let mapping = fetch_mappings(ctx, &index_names(&v)).await;
+                        let mapping_read = mapping.is_some();
+                        merge_mapped_fields(&mut v, mapping.as_ref());
+                        tool_text(
+                            annotate_field_count(&render_response(&v, &parsed), mapping_read),
+                            false,
+                        )
+                    }
                     Err(e) => tool_text(
                         format!("xerj_map: catalog reply was not JSON ({e}): {text}"),
                         true,
@@ -915,6 +1101,101 @@ mod tests {
         let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
         assert_eq!(out["matched"], 1);
         assert_eq!(out["indexes_omitted"], 250 - 1);
+    }
+
+    #[test]
+    fn mapped_fields_the_catalog_omitted_are_unioned_in() {
+        let fields =
+            r#"[{"name":"language","es_type":"keyword","cardinality_est":2,"coverage":1.0}]"#;
+        let mut resp = catalog_response(vec![dataset_doc("ax-code", 28, fields)]);
+        let mapping = json!({
+            "ax-code": { "mappings": { "properties": {
+                "language": {"type": "keyword"},
+                "ax_path": {"type": "keyword"},
+                "ax_file": {"type": "keyword"},
+                "symbols": {"type": "object"},
+                "_internal": {"type": "keyword"}
+            }}}
+        });
+        merge_mapped_fields(&mut resp, Some(&mapping));
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        let idx = &out["indexes"][0];
+        // language (catalog) + ax_path + ax_file + symbols. `_internal` is not
+        // a user field, matching the planner's skip of `_`-prefixed names.
+        assert_eq!(idx["field_count"], 4, "{idx}");
+        let names: Vec<&str> = idx["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        assert!(names.contains(&"ax_path"), "{names:?}");
+        assert!(names.contains(&"ax_file"), "{names:?}");
+        assert!(names.contains(&"symbols"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with('_')), "{names:?}");
+        let ax = idx["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "ax_path")
+            .unwrap();
+        assert_eq!(ax["es_type"], "keyword");
+        assert_eq!(ax["coverage"], 1.0);
+        let language = idx["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "language")
+            .unwrap();
+        assert_eq!(
+            language["cardinality_est"], 2,
+            "a profiled field keeps its catalog stats"
+        );
+    }
+
+    #[test]
+    fn a_failed_mapping_read_still_lists_the_provenance_locators() {
+        let fields =
+            r#"[{"name":"language","es_type":"keyword","cardinality_est":1,"coverage":1.0}]"#;
+        let mut resp = catalog_response(vec![dataset_doc("ax-code", 1, fields)]);
+        merge_mapped_fields(&mut resp, None);
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        assert_eq!(
+            out["indexes"][0]["field_count"],
+            1 + PROVENANCE_FIELDS.len()
+        );
+        let names: Vec<&str> = out["indexes"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        for loc in PROVENANCE_FIELDS {
+            assert!(names.contains(loc), "missing {loc} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_mapping_that_omits_an_index_does_not_invent_locators() {
+        let fields =
+            r#"[{"name":"language","es_type":"keyword","cardinality_est":1,"coverage":1.0}]"#;
+        let mut resp = catalog_response(vec![dataset_doc("ax-code", 1, fields)]);
+        merge_mapped_fields(
+            &mut resp,
+            Some(&json!({"other": {"mappings": {"properties": {}}}})),
+        );
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        assert_eq!(out["indexes"][0]["field_count"], 1, "{out}");
+    }
+
+    #[test]
+    fn corrupt_fields_json_is_not_rewritten_by_the_mapping_merge() {
+        let mut resp = catalog_response(vec![dataset_doc("ax-bad", 5, "not json")]);
+        merge_mapped_fields(&mut resp, None);
+        assert_eq!(
+            resp["hits"]["hits"][0]["_source"]["fields_json"],
+            "not json"
+        );
     }
 
     #[test]

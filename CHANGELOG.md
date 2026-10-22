@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--plan` and `--yes` choose what to index; they do not agree to the
   deletion.
 
+- `POST /_ask` (`xerj_plan`) grounds a slash-bearing path in the prompt as a
+  keyword `prefix` on `ax_path` (then `path`, `filepath`, `file`, `ax_file`).
+  A directory gets a trailing slash so `crates/app/src/` does not match
+  `crates/app/src2/`. An index with none of those keyword fields is a 422
+  that names the path, instead of dropping it as an ignored lowercase
+  modifier. `xerj_map` lists the `ax_*` locators stamped on every record,
+  and when the live mapping can be read its `field_count` is the catalog
+  fields union the top-level mapping fields — the same set the plan counts,
+  labeled on both sides. Cardinality of a locator the profiler never sampled
+  stays unmeasured
+  ([#2120](https://github.com/xerj-org/xerj/issues/2120)).
+
 - A bare hub question that names a language or a technology
   (`xerj "how do I use async let in Swift"`, `xerj "Swift Result type map"`)
   routes from the catalogue entry — slug, topics, a language word in the

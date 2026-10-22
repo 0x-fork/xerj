@@ -198,9 +198,60 @@ pub struct DatasetDocInput<'a> {
     pub run_id: &'a str,
 }
 
+/// Field list stored on a dataset doc.
+///
+/// The profiler never observes the `ax_*` provenance locators — they are
+/// stamped after sampling — but the mapping builder maps every
+/// `PROVENANCE_FIELDS` entry as `keyword` and every record carries them.
+/// Leaving them out of
+/// `fields_json` is what made `xerj_map` omit `ax_path` while `xerj_plan`
+/// counted it (#2120). Appending here does not touch `pd.specs`: that vec
+/// is hashed into `schema_identity`, and a new spec there would abort every
+/// existing state dir.
+pub fn catalog_field_specs(specs: &[crate::infer::FieldSpec]) -> Vec<crate::infer::FieldSpec> {
+    let mut out = specs.to_vec();
+    for name in crate::PROVENANCE_FIELDS {
+        if out.iter().any(|s| s.name == *name) {
+            continue;
+        }
+        out.push(provenance_catalog_spec(name));
+    }
+    out
+}
+
+/// A locator the pipeline stamps on every record. Coverage is 1 because the
+/// stamp is unconditional. Cardinality is unmeasured (`0` plus the note) —
+/// `ax_path` is high and `ax_dataset` is not, and inventing either number
+/// would be a false claim.
+fn provenance_catalog_spec(name: &str) -> crate::infer::FieldSpec {
+    crate::infer::FieldSpec {
+        name: name.to_string(),
+        es_type: "keyword".into(),
+        date_enc: None,
+        semantic: None,
+        cardinality_est: 0,
+        cardinality_overflow: false,
+        null_ratio: 0.0,
+        avg_len: 0.0,
+        coverage: 1.0,
+        examples: Vec::new(),
+        notes: vec![
+            "autoindex provenance locator, mapped keyword and stamped on every record; \
+             not sampled, so cardinality_est 0 means unmeasured"
+                .into(),
+        ],
+        date_min: None,
+        date_max: None,
+        date_evidence: Vec::new(),
+        num_min: None,
+        num_max: None,
+    }
+}
+
 pub fn dataset_doc(inp: &DatasetDocInput) -> (String, Value) {
     let id = format!("ds:{}:{}", inp.prefix, inp.pd.slug);
-    let fields_json = serde_json::to_string(&inp.pd.specs).unwrap_or_else(|_| "[]".into());
+    let fields_json =
+        serde_json::to_string(&catalog_field_specs(&inp.pd.specs)).unwrap_or_else(|_| "[]".into());
     let doc = json!({
         "doc_kind": "dataset",
         "slug": inp.pd.slug,
@@ -861,7 +912,11 @@ pub fn render_map_page(
         }
         // fields table
         if let Some(fj) = d.get("fields_json").and_then(|v| v.as_str()) {
-            if let Ok(specs) = serde_json::from_str::<Vec<crate::infer::FieldSpec>>(fj) {
+            if let Ok(parsed) = serde_json::from_str::<Vec<crate::infer::FieldSpec>>(fj) {
+                // Old catalogs were written before locators were appended.
+                // Rendering them here is what an already-indexed corpus's
+                // `xerj autoindex map` shows, without a reindex (#2120).
+                let specs = catalog_field_specs(&parsed);
                 s.push_str("| field | type | semantic | cardinality | null% | examples |\n");
                 s.push_str("|---|---|---|---|---|---|\n");
                 let mut sorted: Vec<&crate::infer::FieldSpec> = specs.iter().collect();
@@ -872,7 +927,9 @@ pub fn render_map_page(
                         .then(a.name.cmp(&b.name))
                 });
                 for f in sorted.iter().take(40) {
-                    let card = if f.cardinality_overflow {
+                    let card = if f.notes.iter().any(|n| n.contains("not sampled")) {
+                        "—".to_string()
+                    } else if f.cardinality_overflow {
                         format!("{}+", crate::infer::DISTINCT_CAP)
                     } else {
                         f.cardinality_est.to_string()
@@ -1168,6 +1225,48 @@ mod duplicate_tests {
 
     /// A newline in an example used to end the markdown row. The next line
     /// (`## Branded types…`) was then a heading in the middle of the table.
+    #[test]
+    fn catalog_fields_include_provenance_locators_the_profiler_never_saw() {
+        let specs = catalog_field_specs(&[one_field("language", "rust")]);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        for loc in crate::PROVENANCE_FIELDS {
+            assert!(names.contains(loc), "missing {loc}: {names:?}");
+        }
+        let again = catalog_field_specs(&specs);
+        assert_eq!(
+            again.len(),
+            specs.len(),
+            "a locator already stored is not duplicated"
+        );
+        let ax_path = specs.iter().find(|s| s.name == "ax_path").unwrap();
+        assert_eq!(ax_path.es_type, "keyword");
+        assert_eq!(ax_path.coverage, 1.0);
+        assert!(ax_path.notes.iter().any(|n| n.contains("not sampled")));
+    }
+
+    #[test]
+    fn an_old_catalog_map_still_lists_ax_path() {
+        let dataset = json!({
+            "index_name": "ax-code",
+            "slug": "code",
+            "record_count": 10,
+            "file_count": 1,
+            "formats": "rs",
+            "fields_json": serde_json::to_string(&vec![one_field("language", "rust")]).unwrap()
+        });
+        let rendered = render_map(None, &[dataset], &[], &[], &[], 0);
+        assert!(rendered.contains("`ax_path`"), "{rendered}");
+        assert!(rendered.contains("`ax_locator`"), "{rendered}");
+        let row = rendered
+            .lines()
+            .find(|l| l.contains("`ax_path`"))
+            .expect("ax_path row");
+        assert!(
+            row.contains("| — | 0%"),
+            "unmeasured cardinality is not a fake 0: {row}"
+        );
+    }
+
     #[test]
     fn an_example_newline_stays_inside_its_table_row() {
         let dataset = json!({
