@@ -14,6 +14,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="/theme.js"></script>
 <title>XERJ.ai — Brand concept book</title>
 <meta name="description" content="XERJ.ai brand concept book. Voice, logo, colors, typography, grid rules, and the principles that make type the UI.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -557,20 +558,6 @@
   <span><a href="./">HOME</a> · <a href="product">PRODUCT</a> · <a href="/docs/">DOCS</a> · <a href="playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>
 
-<script>
-  (function () {
-  const root = document.documentElement;
-  for (const btn of document.querySelectorAll('[data-theme]')) {
-    btn.addEventListener('click', () => {
-      const t = btn.getAttribute('data-theme');
-      root.setAttribute('data-theme', t);
-      for (const b of document.querySelectorAll('[data-theme]')) {
-        b.classList.toggle('active', b.getAttribute('data-theme') === t);
-      }
-    });
-  }
-  })();
-</script>
 
 </body>
 </html>

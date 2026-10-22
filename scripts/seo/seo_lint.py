@@ -619,6 +619,17 @@ class Lint:
             if not page.viewport:
                 self.gate("viewport.missing", rel, "no viewport meta (rule 34)")
 
+            # -- Day/Night toggle (#1973): one shared script remembers the choice.
+            if 'class="theme"' in src:
+                if '<script src="/theme.js"></script>' not in head:
+                    self.gate("theme.script_missing", rel,
+                              "page has the DAY/NIGHT toggle but <head> does not load "
+                              "/theme.js, so the choice is lost on the next page (#1973)")
+                if "root.setAttribute('data-theme'" in src:
+                    self.gate("theme.inline_toggle", rel,
+                              "inline DAY/NIGHT handler duplicates /theme.js and never "
+                              "saves the choice; remove it (#1973)")
+
             # -- Open Graph + Twitter (30, 31, 32)
             for k in ("og:title", "og:type", "og:url", "og:image", "og:description"):
                 if not self._meta(page, k):

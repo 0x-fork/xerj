@@ -14,6 +14,7 @@
 <!-- ga4:end -->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="/theme.js"></script>
 <title>XERJ.ai — Playground</title>
 <meta name="description" content="Live XERJ dashboards running on seeded data — click filters, drill down, read real queries. Leave a work email to unlock the interactive playground.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -265,18 +266,6 @@
   // prior pages are still in the current lexical scope. Wrapping
   // the whole inline block keeps them isolated.
   (function () {
-  // Theme toggle (shared).
-  const root = document.documentElement;
-  for (const btn of document.querySelectorAll('[data-theme]')) {
-    btn.addEventListener('click', () => {
-      const t = btn.getAttribute('data-theme');
-      root.setAttribute('data-theme', t);
-      for (const b of document.querySelectorAll('[data-theme]')) {
-        b.classList.toggle('active', b.getAttribute('data-theme') === t);
-      }
-    });
-  }
-
   // ---------- playground gate ----------
   // Persist in localStorage so returning visitors skip the form.
   // In production this also POSTs to /api/leads (CF Pages Function)
