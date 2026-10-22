@@ -129,8 +129,12 @@ pub fn detect_licence(repo_dir: &std::path::Path) -> String {
         .flatten()
         .filter(|e| e.path().is_file())
         .map(|e| e.file_name().to_string_lossy().to_string())
+        // Case-insensitive: plenty of projects ship `license.txt`,
+        // `License.md` or `copying` (jfreechart, ta4j; issue #2201), and a
+        // missed file records NONE-FOUND, which is treated as restricted.
         .filter(|n| {
-            n.starts_with("LICENSE") || n.starts_with("LICENCE") || n.starts_with("COPYING")
+            let u = n.to_uppercase();
+            u.starts_with("LICENSE") || u.starts_with("LICENCE") || u.starts_with("COPYING")
         })
         .collect();
     names.sort();
@@ -490,6 +494,30 @@ mod tests {
         let empty = holder.path().join("nolicense");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(detect_licence(&empty), "NONE-FOUND");
+    }
+
+    #[test]
+    fn detect_licence_file_name_is_case_insensitive() {
+        // Issue #2201: jfreechart ships `license.txt` (LGPL-2.1) and was
+        // recorded NONE-FOUND.
+        let holder = tempfile::tempdir().unwrap();
+        let repo = holder.path().join("jfreechart");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("license.txt"),
+            "GNU LESSER GENERAL PUBLIC LICENSE\nVersion 2.1, February 1999",
+        )
+        .unwrap();
+        assert_eq!(detect_licence(&repo), "LGPL");
+
+        let mixed = holder.path().join("mixed");
+        std::fs::create_dir_all(&mixed).unwrap();
+        std::fs::write(
+            mixed.join("License.md"),
+            "MIT License\n\nPermission is hereby granted, free of charge",
+        )
+        .unwrap();
+        assert_eq!(detect_licence(&mixed), "MIT");
     }
 
     #[test]
