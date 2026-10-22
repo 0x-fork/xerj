@@ -2865,6 +2865,125 @@ mod flush_publication_recovery_tests {
         );
     }
 
+    /// The #1635 admission deadline is wall-clock time. After #2129, a
+    /// paused-clock runtime waiting for a permit held elsewhere auto-advanced
+    /// straight to the 120 s deadline and failed at once. That is how every
+    /// `start_paused` flush test failed at default parallelism whenever
+    /// another test held the process-global finalize gate.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_does_not_expire_a_flush_admission_wait() {
+        let sema = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let releaser = std::sync::Arc::clone(&sema);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            releaser.add_permits(1);
+        });
+        let started = std::time::Instant::now();
+        let permit = super::wait_for_flush_permit(
+            "paused-admit",
+            "the finalize gate",
+            std::time::Duration::from_secs(120),
+            sema.acquire(),
+        )
+        .await
+        .expect("a permit released after 200ms of real time is inside a 120s budget");
+        assert!(permit.is_some());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "the wait must have lasted until the permit was really released"
+        );
+        holder.join().unwrap();
+    }
+
+    /// The other half: under a paused clock the deadlines still fire, on the
+    /// wall clock, for both the admission wait and a spawned flush task.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_still_enforces_the_wall_clock_flush_deadlines() {
+        let sema = tokio::sync::Semaphore::new(0);
+        let started = std::time::Instant::now();
+        let err = super::wait_for_flush_permit(
+            "paused-admit",
+            "the finalize gate",
+            std::time::Duration::from_millis(100),
+            sema.acquire(),
+        )
+        .await
+        .expect_err("a permit that never comes must still time out");
+        assert!(err.to_string().contains("paused-admit"));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+
+        // A flush task that never finishes. It is pending on the runtime, not
+        // parked on the blocking pool: tokio does not auto-advance a paused
+        // clock while blocking work is in flight, so no timer of any kind
+        // fires then (see `within_wall_clock`).
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+        let started = std::time::Instant::now();
+        let err =
+            super::await_flush_task("paused-flush", std::time::Duration::from_millis(100), task)
+                .await
+                .expect_err("a flush task that never finishes must time out");
+        assert!(err.to_string().contains("paused-flush"));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        drop(tx);
+
+        let task = tokio::spawn(async move {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150))
+            })
+            .await
+            .unwrap();
+            Ok(())
+        });
+        super::await_flush_task("paused-flush", std::time::Duration::from_secs(300), task)
+            .await
+            .expect("a flush task that really finishes in 150ms is inside a 300s budget");
+    }
+
+    /// End to end, as CI hit it: a paused-clock index flushes while another
+    /// runtime holds every finalize-gate permit for a moment of real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_flush_waits_for_a_finalize_gate_held_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("paused-gate", Schema::empty()).unwrap();
+        let index = engine.get_index("paused-gate").unwrap();
+        index.abort_background_tasks();
+        index
+            .index_document(Some("p".into()), json!({"body": "paused"}))
+            .await
+            .unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let permits = crate::pools::sizing().flush_finalize as u32;
+                let _held = crate::flush_finalize_gate()
+                    .acquire_many(permits)
+                    .await
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            });
+        });
+        held_rx.recv().unwrap();
+        index
+            .flush()
+            .await
+            .expect("a healthy flush must wait for a gate held for 200ms, not time out");
+        assert_eq!(index.memtable.doc_count(), 0);
+        holder.join().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_flush_that_never_finishes_fails_that_index_and_the_run_continues() {
         // #1635 — `finalize-refresh` sat at items=0 with no error because
@@ -33710,10 +33829,50 @@ async fn wait_for_flush_permit<T>(
     budget: std::time::Duration,
     acquire: impl std::future::Future<Output = std::result::Result<T, tokio::sync::AcquireError>>,
 ) -> Result<Option<T>> {
-    match tokio::time::timeout(budget, acquire).await {
-        Ok(Ok(permit)) => Ok(Some(permit)),
-        Ok(Err(_)) => Ok(None),
-        Err(_) => Err(flush_admit_timeout_error(index, what, budget)),
+    match within_wall_clock(budget, acquire).await {
+        Some(Ok(permit)) => Ok(Some(permit)),
+        Some(Err(_)) => Ok(None),
+        None => Err(flush_admit_timeout_error(index, what, budget)),
+    }
+}
+
+/// Await `fut` for at most `budget` of wall-clock time.
+///
+/// The flush deadlines (#1635) are operator budgets in real seconds, so they
+/// are measured with [`std::time::Instant`], not tokio's clock. The two differ
+/// when the clock is paused (`#[tokio::test(start_paused = true)]`): a paused
+/// runtime that goes idle auto-advances to its next timer. A flush waiting on
+/// the process-global finalize gate, whose permit another runtime holds, is
+/// idle on its own runtime, so a plain `tokio::time::timeout(120s)` fired at
+/// once and failed a healthy flush with "timed out after 120s". A tokio timer
+/// never fires before the wall-clock deadline on a running clock, so the
+/// early-fire branch below is only taken when the clock is paused. It waits a
+/// real slice on the blocking pool (no timer, so no auto-advance) and tries
+/// again. `None` means the wall-clock budget ran out; the future is dropped.
+/// While blocking-pool work is in flight a paused clock does not advance at
+/// all, so the deadline is only checked once that work (or the future)
+/// makes progress; a running clock has no such gap.
+async fn within_wall_clock<F: std::future::Future>(
+    budget: std::time::Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let deadline = std::time::Instant::now() + budget;
+    tokio::pin!(fut);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Ok(output) = tokio::time::timeout(left, &mut fut).await {
+            return Some(output);
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let nap = left.min(std::time::Duration::from_millis(5));
+        tokio::select! {
+            biased;
+            output = &mut fut => return Some(output),
+            _ = tokio::task::spawn_blocking(move || std::thread::sleep(nap)) => {}
+        }
     }
 }
 
@@ -33727,12 +33886,12 @@ async fn await_flush_task(
     budget: std::time::Duration,
     task: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
-    match tokio::time::timeout(budget, task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(EngineError::Common(xerj_common::XerjError::internal(
+    match within_wall_clock(budget, task).await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(EngineError::Common(xerj_common::XerjError::internal(
             format!("index [{index}] flush task failed: {error}"),
         ))),
-        Err(_) => Err(flush_budget_timeout_error(index, budget)),
+        None => Err(flush_budget_timeout_error(index, budget)),
     }
 }
 
