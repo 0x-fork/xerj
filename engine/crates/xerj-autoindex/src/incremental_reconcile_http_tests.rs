@@ -70,6 +70,14 @@ struct HttpState {
     unavailable_dataset_mappings: Vec<String>,
     /// Every dataset index a `_mapping` PUT was attempted for, in order.
     dataset_mapping_puts: Vec<String>,
+    /// Properties installed for a dataset index: the create body the first
+    /// time the index is seen, then additive `_mapping` merges. A later
+    /// `_mapping` whose `type` disagrees with what is already stored is the
+    /// engine's type-change refusal (`field [X] already exists as [old],
+    /// cannot add [new]`). A create of an index that already exists is
+    /// ignored, the way `Es::ensure_index` swallows "exists" without
+    /// re-sending the body.
+    installed_dataset_properties: HashMap<String, serde_json::Map<String, Value>>,
     /// Opt-in (#931): fail the Nth data bulk (1-based) the way
     /// `fail_next_data_bulk` fails the next one. Lets a replay be interrupted
     /// AFTER some operations committed, which is the only state in which
@@ -186,6 +194,16 @@ impl HttpEndpoint {
 
     fn data_bulk_requests(&self) -> usize {
         self.state.lock().unwrap().data_bulk_requests
+    }
+
+    /// Properties the fake has installed for one dataset index (#2176).
+    fn dataset_properties(&self, index: &str) -> Option<Value> {
+        self.state
+            .lock()
+            .unwrap()
+            .installed_dataset_properties
+            .get(index)
+            .map(|properties| Value::Object(properties.clone()))
     }
 
     /// #755: the catalog mapping the endpoint finally acknowledged.
@@ -308,6 +326,7 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<HttpState>>) {
         let mut conflict: Option<String> = None;
         let mut unavailable = false;
         let mut refused_dataset: Option<String> = None;
+        let mut type_conflict: Option<String> = None;
         if path.ends_with("/_mapping") {
             assert!(value.get("properties").is_some());
             assert!(value.get("mappings").is_none());
@@ -337,11 +356,19 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<HttpState>>) {
                 if selected(&locked.refused_dataset_mappings) {
                     refused_dataset = Some(index.clone());
                 }
+                if refused_dataset.is_none() && !unavailable {
+                    let incoming = value["properties"].as_object().cloned().unwrap_or_default();
+                    type_conflict = apply_dataset_mapping(&mut locked, &index, &incoming);
+                }
                 locked.dataset_mapping_puts.push(index);
             }
         } else {
             assert!(value.pointer("/mappings/properties").is_some());
             assert!(value.get("properties").is_none());
+            let index = path.trim_start_matches('/');
+            if !index.is_empty() && index != catalog::CATALOG_INDEX {
+                remember_dataset_create(&mut locked, index, &value);
+            }
         }
         if let Some(index) = refused_dataset {
             // Byte for byte the shape of the refusal in #929.
@@ -378,6 +405,23 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<HttpState>>) {
                     "status": 400
                 }),
             )
+        } else if let Some(reason) = type_conflict {
+            // Same shape as the catalog conflict above, and the same words
+            // `xerj-api` uses when `PUT /_mapping` changes a field's type
+            // (`es_compat.rs`). `update_mapping` does not swallow a body that
+            // contains "exists"; `ensure_index` does, which is why a create
+            // of an existing index never reaches this branch.
+            (
+                400,
+                json!({
+                    "error": {
+                        "root_cause": [{"type": "mapper_parsing_exception", "reason": reason}],
+                        "type": "mapper_parsing_exception",
+                        "reason": reason
+                    },
+                    "status": 400
+                }),
+            )
         } else {
             (200, json!({"acknowledged": true}))
         }
@@ -400,6 +444,60 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<HttpState>>) {
         bytes
     )
     .unwrap();
+}
+
+/// Store the create-body properties the first time an index is seen.
+/// A later create is the "index exists" case: the body is not applied.
+fn remember_dataset_create(state: &mut HttpState, index: &str, body: &Value) {
+    if state.installed_dataset_properties.contains_key(index) {
+        return;
+    }
+    let Some(properties) = body
+        .pointer("/mappings/properties")
+        .and_then(Value::as_object)
+        .cloned()
+    else {
+        return;
+    };
+    state
+        .installed_dataset_properties
+        .insert(index.to_owned(), properties);
+}
+
+/// Merge a dataset `_mapping` into the stored properties, or refuse a type
+/// change. Returns the engine's reason when a stored field's `type` would
+/// change; the stored map is left untouched in that case.
+fn apply_dataset_mapping(
+    state: &mut HttpState,
+    index: &str,
+    incoming: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    if let Some(existing) = state.installed_dataset_properties.get(index) {
+        for (name, spec) in incoming {
+            let (Some(old), Some(new)) = (
+                existing
+                    .get(name)
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str),
+                spec.get("type").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if old != new {
+                return Some(format!(
+                    "field [{name}] already exists as [{old}], cannot add [{new}]"
+                ));
+            }
+        }
+    }
+    let slot = state
+        .installed_dataset_properties
+        .entry(index.to_owned())
+        .or_default();
+    for (name, spec) in incoming {
+        slot.entry(name.clone()).or_insert_with(|| spec.clone());
+    }
+    None
 }
 
 fn bulk_http(body: &[u8], state: &Arc<Mutex<HttpState>>) -> (u16, Value) {
@@ -5652,6 +5750,189 @@ fn a_watch_pass_rehashes_only_what_changed_and_publishes_it() {
         published(&endpoint),
         published(&reference),
         "a watched index must equal a fresh full index"
+    );
+}
+
+fn joined_docs(endpoint: &HttpEndpoint) -> String {
+    endpoint
+        .data_docs()
+        .iter()
+        .map(|doc| doc.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// #2176: a Python file indexed as a comment and an import freezes `docs`
+/// without a `code` field. Adding a function while `--watch` is running must
+/// publish the new source, install `code` on the dataset, and still index a
+/// sibling file that changed in the same pass. On the failing build this
+/// pass returns the frozen-schema error and neither edit lands.
+#[test]
+fn adding_a_python_function_under_watch_indexes_the_new_field_and_sibling_edits() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let root = corpus.path().canonicalize().unwrap();
+    fs::write(
+        root.join("module.py"),
+        "# The birchbefore marker identifies the cancellation module.\nimport math\n",
+    )
+    .unwrap();
+    fs::write(root.join("notes.md"), "birchdoc-before\n").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(&root, state_dir.path(), &endpoint.url, false);
+    let mut carry = crate::watch::Carry::default();
+    let (outcome, _) =
+        crate::watch::one_pass(&config, &root, &mut carry, &crate::watch::ChangeSet::full());
+    assert_eq!(outcome.unwrap().0, 0, "the symbol-less file must index");
+    let first = joined_docs(&endpoint);
+    assert!(
+        first.contains("birchbefore"),
+        "the first pass must publish the original source: {first}"
+    );
+    assert!(first.contains("birchdoc-before"), "{first}");
+
+    fs::write(
+        root.join("module.py"),
+        "# The birchafter marker identifies the cancellation module.\n\
+         import math\n\
+         \n\
+         def cancel_request():\n\
+             return \"birchfunction\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("notes.md"), "birchdoc-after\n").unwrap();
+    let burst =
+        crate::watch::ChangeSet::from_paths(&[root.join("module.py"), root.join("notes.md")]);
+    let (outcome, _) = crate::watch::one_pass(&config, &root, &mut carry, &burst);
+    let (code, _) = outcome
+        .expect("adding `code` to a frozen docs dataset must not fail the watch pass (#2176)");
+    assert_eq!(code, 0, "both files are compatible once the mapping grows");
+    let indexed = joined_docs(&endpoint);
+    assert!(
+        indexed.contains("birchafter"),
+        "the rewritten file must be live: {indexed}"
+    );
+    assert!(
+        indexed.contains("birchfunction"),
+        "the function body must be searchable: {indexed}"
+    );
+    assert!(
+        indexed.contains("birchdoc-after"),
+        "a sibling edit in the same pass must still be indexed: {indexed}"
+    );
+    assert!(
+        !indexed.contains("birchbefore"),
+        "the old source must not stay searchable: {indexed}"
+    );
+    assert!(
+        !indexed.contains("birchdoc-before"),
+        "the old note must not stay searchable: {indexed}"
+    );
+    assert!(
+        endpoint.data_docs().iter().any(|doc| {
+            doc.get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code.contains("cancel_request"))
+        }),
+        "a symbol document must carry the new `code` field: {indexed}"
+    );
+    let properties = endpoint
+        .dataset_properties("incremental-http-docs")
+        .expect("the docs index mapping must have been installed");
+    let code_type = properties["code"]["type"]
+        .as_str()
+        .expect("code must be a mapped field");
+    assert!(
+        code_type == "text" || code_type == "keyword",
+        "code must be a searchable scalar, got {code_type}"
+    );
+    a_rerun_changes_nothing(&config, &endpoint, "function added under watch");
+}
+
+/// A type change cannot be applied to a frozen field. Only that file is
+/// skipped; the other file in the pass is published, and the printed rebuild
+/// command is a real `autoindex` of a new state dir and prefix.
+#[test]
+fn a_type_change_skips_one_file_and_the_printed_rebuild_indexes_it() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let root = corpus.path().canonicalize().unwrap();
+    fs::write(root.join("good.csv"), "id,value\n2,beta\n").unwrap();
+    fs::write(root.join("bad.csv"), "id,value\n1,alpha\n").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(&root, state_dir.path(), &endpoint.url, false);
+    let mut carry = crate::watch::Carry::default();
+    assert_eq!(
+        crate::watch::one_pass(&config, &root, &mut carry, &crate::watch::ChangeSet::full())
+            .0
+            .unwrap()
+            .0,
+        0
+    );
+
+    // The data row keeps a number so the sniffer still treats the first line
+    // as a header. `id` stays the frozen `long` field and the string is a
+    // type conflict, not a new `col_1` schema.
+    fs::write(root.join("good.csv"), "id,value\n2,good-new\n").unwrap();
+    fs::write(root.join("bad.csv"), "id,value\nnot-a-number,2\n").unwrap();
+    let burst = crate::watch::ChangeSet::from_paths(&[root.join("good.csv"), root.join("bad.csv")]);
+    let (outcome, _) = crate::watch::one_pass(&config, &root, &mut carry, &burst);
+    let (code, summary) = outcome.expect("a type change must not fail the rest of the pass");
+    assert_eq!(code, 3, "the unmappable file is junk, and junk exits 3");
+    let skipped = summary.expect("the pass must report the skipped file")["skipped"].clone();
+    let rendered = skipped.to_string();
+    let command = incremental_schema_rebuild_command(&config, state_dir.path());
+    assert!(
+        rendered.contains("incompatible"),
+        "the reason must name the type conflict: {rendered}"
+    );
+    assert!(
+        rendered.contains("bad.csv"),
+        "the reason must name the file: {rendered}"
+    );
+    assert!(
+        rendered.contains(&command),
+        "the reason must print the rebuild command\nreason: {rendered}\ncommand: {command}"
+    );
+    assert!(
+        rendered.contains("Documents already indexed for this file are dropped"),
+        "{rendered}"
+    );
+    let indexed = joined_docs(&endpoint);
+    assert!(
+        indexed.contains("good-new"),
+        "the sibling file must be published: {indexed}"
+    );
+    assert!(
+        !indexed.contains("not-a-number"),
+        "the type-changed file must not be published: {indexed}"
+    );
+    assert!(
+        !indexed.contains("alpha"),
+        "documents already indexed for the skipped file are dropped: {indexed}"
+    );
+
+    let journal_before = fs::read(state_dir.path().join("journal.ndjson")).unwrap();
+    let rebuild_state = PathBuf::from(format!("{}-reindex", state_dir.path().display()));
+    fs::create_dir_all(&rebuild_state).unwrap();
+    let mut rebuild = config.clone();
+    rebuild.prefix = format!("{}-reindex", config.prefix);
+    rebuild.state_dir = Some(rebuild_state);
+    assert!(
+        matches!(run_index(rebuild).unwrap(), 0 | 3),
+        "the printed destination must accept a fresh index of the same folder"
+    );
+    let rebuilt = joined_docs(&endpoint);
+    assert!(
+        rebuilt.contains("not-a-number"),
+        "the rebuild must index the file the watcher skipped: {rebuilt}"
+    );
+    assert_eq!(
+        fs::read(state_dir.path().join("journal.ndjson")).unwrap(),
+        journal_before,
+        "the rebuild uses its own state dir and must not rewrite the watcher journal"
     );
 }
 

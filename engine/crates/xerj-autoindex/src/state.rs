@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -566,6 +566,18 @@ pub struct Plan {
     /// a spurious "plan changed" generation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused_datasets: Vec<RefusedDataset>,
+    /// Scalar fields installed on a frozen dataset after the first pass (#2176).
+    ///
+    /// Keyed by dataset slug. Empty — and omitted from the serialized plan —
+    /// until a watched file grows a field the frozen `specs` do not name.
+    /// Those specs stay frozen: `schema_identity`, `index_identity`, and the
+    /// generation-to-generation dataset equality check all read them, and
+    /// changing them aborts the next generation. The mapping update sends
+    /// this list on top of the frozen specs. The server accepts the additive
+    /// `PUT /_mapping`. A no-op re-run copies the list forward, so the plan
+    /// compares equal and commits nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub incremental_fields: BTreeMap<String, Vec<crate::infer::FieldSpec>>,
 }
 
 /// A dataset the plan inferred and the server refused to map (#929).

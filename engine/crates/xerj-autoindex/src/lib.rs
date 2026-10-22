@@ -422,7 +422,7 @@ fn install_dataset_mappings(
 ) -> Result<Vec<MappingRefusal>> {
     let mut refused = Vec::new();
     for dataset in &plan.datasets {
-        let create_body = dataset_create_body(dataset);
+        let create_body = dataset_mapping_body(dataset, extra_fields(plan, &dataset.slug));
         let update_body = json!({
             "properties": create_body["mappings"]["properties"].clone()
         });
@@ -475,7 +475,39 @@ fn install_dataset_mappings(
 ///   marker therefore rides the plan frozen in the journal: a pending
 ///   generation replayed after a restart still declares the analyzer.
 fn dataset_create_body(dataset: &PlanDataset) -> Value {
+    dataset_mapping_body(dataset, &[])
+}
+
+fn extra_fields<'a>(plan: &'a Plan, slug: &str) -> &'a [infer::FieldSpec] {
+    plan.incremental_fields
+        .get(slug)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// The index-create body, plus fields an incremental run added after the
+/// schema was frozen (#2176). An extra name that the frozen mapping already
+/// declares is left alone, so this cannot change `impl` from `text` to a
+/// re-inferred `keyword`.
+fn dataset_mapping_body(dataset: &PlanDataset, extra: &[infer::FieldSpec]) -> Value {
     let mut create_body = build_mapping(&dataset.specs);
+    if let Some(props) = create_body
+        .pointer_mut("/mappings/properties")
+        .and_then(Value::as_object_mut)
+    {
+        for spec in extra {
+            if props.contains_key(&spec.name) {
+                continue;
+            }
+            let property = match spec.es_type.as_str() {
+                "date" => {
+                    json!({"type": "date", "format": "strict_date_optional_time||epoch_millis"})
+                }
+                es_type => json!({"type": es_type}),
+            };
+            props.insert(spec.name.clone(), property);
+        }
+    }
     create_body["mappings"]["properties"]["ax_paths"] = json!({"type": "keyword"});
     if dataset.family == "docs" || dataset.family == "code" {
         if let Some(props) = create_body
@@ -1032,7 +1064,41 @@ fn project_reconcile_plan(
             })
             .collect()
     });
-    reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample)
+    let rebuild = incremental_schema_rebuild_command(cfg, state_dir);
+    reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample, &rebuild)
+}
+
+/// The command a per-file schema refusal tells the operator to run.
+///
+/// A new `--state-dir` and a new `--prefix` are both required: the watcher's
+/// journal owns the current pair, and `preflight` refuses a different prefix
+/// in that directory. The destination sits beside the live state dir so the
+/// watcher can keep running until the operator stops it. Every flag that
+/// changes what gets indexed is carried by [`legacy_rebuild_argv`].
+fn incremental_schema_rebuild_command(cfg: &IndexCfg, state_dir: &Path) -> String {
+    let rebuild_dir = format!("{}-reindex", state_dir.display());
+    let rebuild_prefix = format!("{}-reindex", cfg.prefix);
+    legacy_rebuild_argv(cfg, Path::new(&rebuild_dir), &rebuild_prefix)
+        .iter()
+        .map(|arg| quote_shell(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Shell-quote one argv element. Safe characters are the same set
+/// `catalog::shell_quote` uses; that helper is private to its module.
+fn quote_shell(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let safe = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '\\'));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// Code/AST coverage for one corpus: how much of what a person would call
@@ -4435,6 +4501,7 @@ fn build_phase_a(
         duplicate_files,
         alias_paths_indexed: true,
         refused_datasets: Vec::new(),
+        incremental_fields: Default::default(),
     };
     PhaseA {
         plan,
