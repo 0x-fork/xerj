@@ -81,15 +81,17 @@ fn corrupt(msg: &str) -> XerjError {
 
 /// Dot product with eight independent accumulators.
 ///
-/// A single-accumulator `for` loop is a strict serial FP dependency chain
-/// that rustc must NOT auto-vectorize (float addition is not associative),
-/// so the beam search was spending ~5 ns/dim in scalar fmadds. Eight
-/// independent chains let LLVM keep multiple SIMD lanes busy; the exact
-/// f32 sum differs from the serial order only in rounding, which is fine
-/// here — graph distances only decide beam ORDER and callers rescore
-/// exact similarities downstream.
-#[inline]
-fn dot_unrolled(a: &[f32], b: &[f32]) -> f32 {
+/// A single-accumulator `for` loop is a strict serial f32 dependency chain.
+/// LLVM will not reassociate it, so it stays scalar even at `x86-64-v3`.
+/// Eight independent chains are what the beam-search inner loop actually
+/// vectorizes. The release baseline is `x86-64-v2` (no AVX2; #2161), and
+/// the same source is compiled again in [`dot_avx2`] with AVX2 and FMA
+/// enabled. Rust does not contract `acc += x * y` into an FMA, so the two
+/// compilations are bit-identical; only the instruction width changes.
+/// Callers rescore exact similarities downstream — this value only orders
+/// the beam.
+#[inline(always)]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     // `as_chunks::<8>()` yields the same 8-wide windows + remainder as
     // `chunks_exact(8)` (the `x`/`y` are now `&[f32; 8]`, so the fixed
@@ -112,6 +114,36 @@ fn dot_unrolled(a: &[f32], b: &[f32]) -> f32 {
         s += x * y;
     }
     s
+}
+
+/// [`dot_scalar`] compiled with AVX2 and FMA available to LLVM.
+///
+/// # Safety
+///
+/// The current CPU must support both AVX2 and FMA. The `*_avx2` entry
+/// points check `is_x86_feature_detected` before calling in.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    dot_scalar(a, b)
+}
+
+/// `AVX2 == true` selects [`dot_avx2`]. That monomorphization is only
+/// reached from a `#[target_feature(enable = "avx2,fma")]` wrapper.
+#[inline(always)]
+fn dot<const AVX2: bool>(a: &[f32], b: &[f32]) -> f32 {
+    // `AVX2` is read on every architecture so the const parameter is used
+    // when the x86 block below is compiled out.
+    if AVX2 && cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            // SAFETY: the corresponding `*_avx2` wrapper checked both features
+            // and carries `target_feature(enable = "avx2,fma")`.
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    dot_scalar(a, b)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -379,7 +411,7 @@ fn query_inverse(graph: &impl GraphStorageRead, query: &[f32]) -> f32 {
 }
 
 #[inline(always)]
-fn slot_distance(
+fn slot_distance<const AVX2: bool>(
     graph: &impl GraphStorageRead,
     query: &[f32],
     query_inverse_norm: f32,
@@ -388,7 +420,7 @@ fn slot_distance(
     let vector = graph.vector(slot);
     match graph.metric() {
         DistanceMetric::Cosine => {
-            1.0 - dot_unrolled(query, vector) * query_inverse_norm * graph.inverse_norm(slot)
+            1.0 - dot::<AVX2>(query, vector) * query_inverse_norm * graph.inverse_norm(slot)
         }
         metric => compute_distance(metric, query, vector),
     }
@@ -401,15 +433,45 @@ fn greedy_layer(
     start: u32,
     layer: usize,
 ) -> (u32, f32) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: both features are present; `greedy_layer_avx2` enables them.
+            return unsafe { greedy_layer_avx2(graph, query, query_inverse_norm, start, layer) };
+        }
+    }
+    greedy_layer_impl::<false>(graph, query, query_inverse_norm, start, layer)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn greedy_layer_avx2(
+    graph: &impl GraphStorageRead,
+    query: &[f32],
+    query_inverse_norm: f32,
+    start: u32,
+    layer: usize,
+) -> (u32, f32) {
+    greedy_layer_impl::<true>(graph, query, query_inverse_norm, start, layer)
+}
+
+#[inline(always)]
+fn greedy_layer_impl<const AVX2: bool>(
+    graph: &impl GraphStorageRead,
+    query: &[f32],
+    query_inverse_norm: f32,
+    start: u32,
+    layer: usize,
+) -> (u32, f32) {
     let mut best = start;
-    let mut best_distance = slot_distance(graph, query, query_inverse_norm, start);
+    let mut best_distance = slot_distance::<AVX2>(graph, query, query_inverse_norm, start);
     loop {
         let mut improved = false;
         if layer >= graph.layer_count(best) {
             break;
         }
         for &neighbor in graph.neighbors(best, layer) {
-            let distance = slot_distance(graph, query, query_inverse_norm, neighbor);
+            let distance = slot_distance::<AVX2>(graph, query, query_inverse_norm, neighbor);
             if distance < best_distance {
                 best_distance = distance;
                 best = neighbor;
@@ -436,6 +498,48 @@ where
     G: GraphStorageRead,
     A: Fn(u32) -> bool + ?Sized,
 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: both features are present; `beam_avx2` enables them.
+            return unsafe { beam_avx2(graph, query, query_inverse_norm, entry, ef, layer, admit) };
+        }
+    }
+    beam_impl::<G, A, false>(graph, query, query_inverse_norm, entry, ef, layer, admit)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn beam_avx2<G, A>(
+    graph: &G,
+    query: &[f32],
+    query_inverse_norm: f32,
+    entry: u32,
+    ef: usize,
+    layer: usize,
+    admit: &A,
+) -> Vec<(f32, u32)>
+where
+    G: GraphStorageRead,
+    A: Fn(u32) -> bool + ?Sized,
+{
+    beam_impl::<G, A, true>(graph, query, query_inverse_norm, entry, ef, layer, admit)
+}
+
+#[inline(always)]
+fn beam_impl<G, A, const AVX2: bool>(
+    graph: &G,
+    query: &[f32],
+    query_inverse_norm: f32,
+    entry: u32,
+    ef: usize,
+    layer: usize,
+    admit: &A,
+) -> Vec<(f32, u32)>
+where
+    G: GraphStorageRead,
+    A: Fn(u32) -> bool + ?Sized,
+{
     let node_count = graph.node_count();
     if entry as usize >= node_count {
         return vec![];
@@ -449,7 +553,7 @@ where
         seen
     }
 
-    let entry_distance = slot_distance(graph, query, query_inverse_norm, entry);
+    let entry_distance = slot_distance::<AVX2>(graph, query, query_inverse_norm, entry);
     let mut candidates: BinaryHeap<Reverse<(ordered_float::OrderedFloat, u32)>> =
         BinaryHeap::with_capacity(ef * 4);
     let mut results: BinaryHeap<(ordered_float::OrderedFloat, u32)> =
@@ -484,7 +588,7 @@ where
             if test_and_set(&mut visited, neighbor) {
                 continue;
             }
-            let distance = slot_distance(graph, query, query_inverse_norm, neighbor);
+            let distance = slot_distance::<AVX2>(graph, query, query_inverse_norm, neighbor);
             let farthest = results
                 .peek()
                 .map(|&(distance, _)| distance.0)
@@ -514,6 +618,32 @@ fn select_diverse(
     candidates: &[(f32, u32)],
     max_neighbors: usize,
 ) -> Vec<(f32, u32)> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: both features are present; `select_diverse_avx2` enables them.
+            return unsafe { select_diverse_avx2(graph, candidates, max_neighbors) };
+        }
+    }
+    select_diverse_impl::<false>(graph, candidates, max_neighbors)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn select_diverse_avx2(
+    graph: &impl GraphStorageRead,
+    candidates: &[(f32, u32)],
+    max_neighbors: usize,
+) -> Vec<(f32, u32)> {
+    select_diverse_impl::<true>(graph, candidates, max_neighbors)
+}
+
+#[inline(always)]
+fn select_diverse_impl<const AVX2: bool>(
+    graph: &impl GraphStorageRead,
+    candidates: &[(f32, u32)],
+    max_neighbors: usize,
+) -> Vec<(f32, u32)> {
     let mut sorted = candidates.to_vec();
     sorted.sort_unstable_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
     let mut kept = Vec::with_capacity(max_neighbors);
@@ -524,7 +654,7 @@ fn select_diverse(
         let vector = graph.vector(candidate);
         let inverse_norm = graph.inverse_norm(candidate);
         let diverse = kept.iter().all(|&(_, retained)| {
-            slot_distance(graph, vector, inverse_norm, retained) >= candidate_distance
+            slot_distance::<AVX2>(graph, vector, inverse_norm, retained) >= candidate_distance
         });
         if diverse {
             kept.push((candidate_distance, candidate));
@@ -534,6 +664,32 @@ fn select_diverse(
 }
 
 fn backlink_distances(graph: &impl GraphStorageRead, base: u32, layer: usize) -> Vec<(f32, u32)> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: both features are present; `backlink_distances_avx2` enables them.
+            return unsafe { backlink_distances_avx2(graph, base, layer) };
+        }
+    }
+    backlink_distances_impl::<false>(graph, base, layer)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn backlink_distances_avx2(
+    graph: &impl GraphStorageRead,
+    base: u32,
+    layer: usize,
+) -> Vec<(f32, u32)> {
+    backlink_distances_impl::<true>(graph, base, layer)
+}
+
+#[inline(always)]
+fn backlink_distances_impl<const AVX2: bool>(
+    graph: &impl GraphStorageRead,
+    base: u32,
+    layer: usize,
+) -> Vec<(f32, u32)> {
     let vector = graph.vector(base);
     let inverse_norm = graph.inverse_norm(base);
     graph
@@ -541,7 +697,7 @@ fn backlink_distances(graph: &impl GraphStorageRead, base: u32, layer: usize) ->
         .iter()
         .map(|&neighbor| {
             (
-                slot_distance(graph, vector, inverse_norm, neighbor),
+                slot_distance::<AVX2>(graph, vector, inverse_norm, neighbor),
                 neighbor,
             )
         })
@@ -1151,7 +1307,7 @@ impl HnswIndex {
         let ep = graph.entry_slot()?;
         let q_inv = query_inverse(&graph, query);
         let mut curr = ep;
-        let mut curr_dist = slot_distance(&graph, query, q_inv, curr);
+        let mut curr_dist = slot_distance::<false>(&graph, query, q_inv, curr);
         for layer in (1..=graph.entry_layer()).rev() {
             let (s, d) = greedy_layer(&graph, query, q_inv, curr, layer);
             curr = s;
@@ -1434,7 +1590,7 @@ mod tests {
             let vector = &graph.vectors[start..start + graph.dim];
             match graph.metric {
                 DistanceMetric::Cosine => {
-                    1.0 - dot_unrolled(query, vector)
+                    1.0 - dot_scalar(query, vector)
                         * query_inverse_norm
                         * graph.inv_norms[slot as usize]
                 }
@@ -1990,5 +2146,84 @@ mod tests {
             recall >= 0.9,
             "recall@10 regression: got {recall:.3}, expected >= 0.9"
         );
+    }
+
+    /// The AVX2 compilation of the beam-search dot product must return the
+    /// same bits as the scalar compilation. Lengths cover the 8-wide chunk,
+    /// the remainder, and an unaligned window.
+    #[test]
+    fn avx2_dot_matches_scalar_bits() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+                return;
+            }
+            let mut state = 0xC0FFEE_u64;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let unit = ((state >> 33) as u32 as f32) / 2147483648.0;
+                unit * 4.0 - 2.0
+            };
+            let mut data = Vec::with_capacity(2048);
+            for _ in 0..2048 {
+                data.push(next());
+            }
+            data[3] = 0.0;
+            data[4] = -0.0;
+            data[10] = 1.0e20;
+            data[11] = -1.0e-20;
+            for &len in &[0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 768] {
+                for &off in &[0usize, 1] {
+                    if off + len * 2 > data.len() {
+                        continue;
+                    }
+                    let a = &data[off..off + len];
+                    let b = &data[off + len..off + len * 2];
+                    let scalar = dot_scalar(a, b);
+                    // SAFETY: the feature check above succeeded.
+                    let avx = unsafe { dot_avx2(a, b) };
+                    assert_eq!(
+                        scalar.to_bits(),
+                        avx.to_bits(),
+                        "len {len} off {off}: scalar {scalar} avx2 {avx}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Production search (AVX2 kernel on this host, scalar otherwise) must
+    /// agree bit-for-bit with the scalar eight-accumulator formula.
+    #[test]
+    fn search_cosine_distance_matches_scalar_dot() {
+        let dim = 32usize;
+        let idx = make_index(dim);
+        let mut state = 0xA11CE_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (((state >> 33) as u32) as f32) / 2147483648.0 * 2.0 - 1.0
+        };
+        let mut vecs = Vec::new();
+        for i in 0..40u64 {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            idx.insert(i, v.clone()).unwrap();
+            vecs.push(v);
+        }
+        let q = vecs[0].clone();
+        let q_norm = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let q_inv = if q_norm > 0.0 { 1.0 / q_norm } else { 0.0 };
+        let hits = idx.search(&q, 8, 64).unwrap();
+        assert!(!hits.is_empty());
+        for (id, dist) in hits {
+            let v = &vecs[id as usize];
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let inv = if n > 0.0 { 1.0 / n } else { 0.0 };
+            let expect = 1.0 - dot_scalar(&q, v) * q_inv * inv;
+            assert_eq!(
+                dist.to_bits(),
+                expect.to_bits(),
+                "id {id}: search {dist} scalar {expect}"
+            );
+        }
     }
 }

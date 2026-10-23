@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- x86_64 release binaries no longer require AVX2. The build baseline is
+  `x86-64-v2` (SSE4.2). The HNSW eight-accumulator dot product — the kernel
+  `x86-64-v3` was actually vectorizing — compiles an AVX2+FMA variant and
+  selects it at runtime when the CPU has both features; the scalar
+  compilation is bit-identical. Installers install on CPUs without AVX2
+  instead of refusing. `XERJ_SKIP_CPU_CHECK` is gone
+  ([#2161](https://github.com/xerj-org/xerj/issues/2161)).
+
 - `xerj corpus index` killed mid-index resumes that build's journal instead of
   starting a legacy index under a new prefix. When the journal still has a
   generation in progress, indexing continues at the uncommitted operations and
