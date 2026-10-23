@@ -67,6 +67,8 @@ pub struct ResourceGovernor {
     /// AUTO-tier *capped* value (e.g. 16 GiB on a 119 GiB box): a live override
     /// exists precisely to climb past that conservative cap, so it must be able
     /// to reach up to real machine memory, never just a fraction of the cap.
+    /// On a commit-bound Windows box this stops at the post-reserve commit
+    /// ceiling instead: a raise cannot grant commit the system will not give.
     machine_memory_bytes: u64,
     /// Boot-derived RSS admission threshold = `memory_limit_bytes * pct/100`.
     /// `0` = the watermark was disabled at startup and stays disabled; a runtime
@@ -136,6 +138,24 @@ pub struct ResourceGovernor {
     disk_blocked: AtomicBool,
     /// Last sampled used-percentage of the data-dir filesystem.
     disk_used_pct: AtomicU64,
+
+    // ── Windows commit ceiling (#1122) ──────────────────────────────────
+    // Physical RAM is the AUTO tier's input on every platform. On Windows the
+    // allocator aborts when commit charge hits the commit limit, which with
+    // no pagefile is about RAM and is already partly spent by other processes.
+    // These fields are zero off Windows (and when the probe fails), and the
+    // admission path below then behaves exactly as it did before.
+    /// `MEMORYSTATUSEX::ullTotalPageFile`. `0` = no commit probe.
+    commit_limit_bytes: u64,
+    /// Available commit below this engages the breaker even when RSS is under
+    /// the watermark. `0` disables the check.
+    commit_reserve_bytes: u64,
+    /// Last sampled `ullAvailPageFile`.
+    available_commit_bytes: AtomicU64,
+    /// Latched: available commit is under [`Self::commit_reserve_bytes`].
+    commit_starved: AtomicBool,
+    /// The process cap was lowered to the commit ceiling at startup.
+    commit_capped: bool,
 }
 
 impl ResourceGovernor {
@@ -159,24 +179,30 @@ impl ResourceGovernor {
         if self.memory_tripped.load(Ordering::Relaxed) {
             let rss = self.rss_bytes.load(Ordering::Relaxed);
             let watermark = self.memory_watermark_bytes.load(Ordering::Relaxed);
+            let starved = self.commit_starved.load(Ordering::Relaxed);
             // Inside the release band (#1250) RSS is already under the
             // watermark while the drain finishes; say so rather than print a
-            // false `>=`.
-            let relation = if rss >= watermark {
+            // false `>=`. A commit-starvation trip with RSS still under the
+            // watermark is neither of those: the process has not crossed the
+            // RSS line, Windows has run out of commit.
+            let relation = if starved && rss < watermark {
+                "under"
+            } else if rss >= watermark {
                 ">="
             } else {
                 "draining below"
             };
-            return Err(XerjError::circuit_breaking(format!(
-                "[parent] real memory circuit breaker tripped: rss={}MB {relation} watermark={}MB \
-                 ({}% of limit={}MB); writes rejected to prevent an out-of-memory kill \
-                 (raise limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB, or live \
-                 with PUT _cluster/settings {{\"persistent\":\
-                 {{\"indices.breaker.total.limit\":\"<N>gb\"}}}})",
-                rss / (1024 * 1024),
-                watermark / (1024 * 1024),
-                pct_of(watermark, self.memory_limit_bytes),
-                self.memory_limit_bytes / (1024 * 1024),
+            let commit = (self.commit_capped || starved).then(|| CommitBreakerDetail {
+                limit: self.commit_limit_bytes,
+                available: self.available_commit_bytes.load(Ordering::Relaxed),
+                reserve: self.commit_reserve_bytes,
+            });
+            return Err(XerjError::circuit_breaking(memory_breaker_reason(
+                rss,
+                relation,
+                watermark,
+                self.memory_limit_bytes,
+                commit,
             )));
         }
         Ok(())
@@ -429,6 +455,20 @@ impl ResourceGovernor {
     /// `0` when it isn't available (e.g. from the [`Self::refresh`] test
     /// wrapper); it only affects that one log line, never admission.
     pub fn refresh_memory_disk(&self, rss: u64, disk_used_pct: u64, disk_avail_bytes: u64) {
+        self.refresh_memory_observing(rss, disk_used_pct, disk_avail_bytes, None);
+    }
+
+    /// [`Self::refresh_memory_disk`] plus an optional Windows available-commit
+    /// sample. `None` leaves the commit latch as it was (Linux, and tests
+    /// that only move RSS). A `Some` below the commit reserve engages the
+    /// breaker even when `rss` is under the watermark.
+    pub fn refresh_memory_observing(
+        &self,
+        rss: u64,
+        disk_used_pct: u64,
+        disk_avail_bytes: u64,
+        available_commit: Option<u64>,
+    ) {
         // ── RSS watermark, with a bounded release hysteresis (#1250) ──
         //
         // Engage at `rss >= watermark`. Once engaged, hold the latch while RSS
@@ -447,20 +487,43 @@ impl ResourceGovernor {
         let cur_mem = self.memory_tripped.load(Ordering::Relaxed);
         let retuned = self.memory_trip_watermark.load(Ordering::Relaxed) != watermark;
         let release_bytes = watermark - (watermark / 20);
-        let mem_next = watermark != 0
-            && if rss >= watermark {
-                true
-            } else if cur_mem && !retuned {
-                rss >= release_bytes && rss < prev_rss
-            } else {
-                false
-            };
+        // `None` keeps the previous latch so an RSS-only refresh (Linux, and
+        // the test helper) does not clear a commit trip it did not sample.
+        // Reserve 0 means this platform has no commit probe: starved stays
+        // false and the formula below is the pre-#1122 RSS check.
+        let starved = if self.commit_reserve_bytes == 0 {
+            false
+        } else if let Some(available) = available_commit {
+            self.available_commit_bytes
+                .store(available, Ordering::Relaxed);
+            available < self.commit_reserve_bytes
+        } else {
+            self.commit_starved.load(Ordering::Relaxed)
+        };
+        self.commit_starved.store(starved, Ordering::Relaxed);
+        let mem_next = if watermark == 0 {
+            starved
+        } else if rss >= watermark || starved {
+            true
+        } else if cur_mem && !retuned {
+            rss >= release_bytes && rss < prev_rss
+        } else {
+            false
+        };
         if mem_next {
             self.memory_trip_watermark
                 .store(watermark, Ordering::Relaxed);
         }
         if mem_next != self.memory_tripped.swap(mem_next, Ordering::Relaxed) {
-            if mem_next {
+            if mem_next && starved {
+                tracing::warn!(
+                    available_commit_mb = self.available_commit_bytes.load(Ordering::Relaxed)
+                        / (1024 * 1024),
+                    commit_limit_mb = self.commit_limit_bytes / (1024 * 1024),
+                    reserve_mb = self.commit_reserve_bytes / (1024 * 1024),
+                    "available Windows commit is under the reserve — engaging the parent memory circuit breaker (writes → 429)"
+                );
+            } else if mem_next {
                 tracing::warn!(
                     rss_mb = rss / (1024 * 1024),
                     watermark_mb = watermark / (1024 * 1024),
@@ -628,6 +691,34 @@ fn cap_memory_limit(machine_limit: u64, cap_mb: u64) -> u64 {
         return machine_limit;
     }
     machine_limit.min(cap_mb.saturating_mul(1024 * 1024))
+}
+
+/// Lower a tiered cap to the Windows commit ceiling. `None` (Linux, macOS, a
+/// failed probe) returns `tiered_limit` unchanged.
+fn apply_windows_commit_ceiling(
+    tiered_limit: u64,
+    budget: Option<&xerj_common::resource::WindowsCommitBudget>,
+) -> u64 {
+    match budget {
+        Some(budget) if budget.commit_bound && budget.effective_bytes < tiered_limit => {
+            budget.effective_bytes.max(1)
+        }
+        _ => tiered_limit,
+    }
+}
+
+/// Hard clamp for a live `indices.breaker.total.limit` override. Off Windows
+/// this is physical/cgroup memory. On a commit-bound Windows box it stops at
+/// the post-reserve ceiling, so raising the breaker cannot grant commit
+/// Windows will not give the process.
+fn windows_override_ceiling(
+    physical: u64,
+    budget: Option<&xerj_common::resource::WindowsCommitBudget>,
+) -> u64 {
+    match budget {
+        Some(budget) if budget.commit_bound => budget.effective_bytes.min(physical).max(1),
+        _ => physical,
+    }
 }
 
 /// The AUTO process-memory cap, in MiB, chosen from the effective memory the
@@ -914,7 +1005,22 @@ fn build(config: &Config) -> ResourceGovernor {
     if let Some(warning) = &resolved_process_cap.warning {
         tracing::warn!("{warning}");
     }
-    let memory_limit_bytes = cap_memory_limit(effective_memory_bytes, resolved_process_cap.cap_mb);
+    let tiered_memory_limit = cap_memory_limit(effective_memory_bytes, resolved_process_cap.cap_mb);
+    // Windows only: the tier above is still physical RAM / cgroup. A no-pagefile
+    // box's commit limit is about that RAM, and other processes have already
+    // charged most of it. Lower the cap to what this process can still commit,
+    // minus a reserve, so the watermark trips before the allocator aborts.
+    // Linux and macOS pass `None` and keep `tiered_memory_limit` byte for byte.
+    let commit_budget = xerj_common::resource::windows_commit_sample()
+        .map(xerj_common::resource::windows_commit_budget);
+    let memory_limit_bytes =
+        apply_windows_commit_ceiling(tiered_memory_limit, commit_budget.as_ref());
+    let commit_capped = memory_limit_bytes < tiered_memory_limit;
+    let machine_memory_bytes =
+        windows_override_ceiling(effective_memory_bytes, commit_budget.as_ref());
+    let startup_starved = commit_budget.as_ref().is_some_and(|budget| {
+        budget.reserve_bytes > 0 && budget.available_commit < budget.reserve_bytes
+    });
 
     // ── memtable budget: 0 = auto-derive from the effective (cgroup-aware)
     // memory limit — see `auto_memtable_budget`. Must be derived from the
@@ -987,7 +1093,12 @@ fn build(config: &Config) -> ResourceGovernor {
         (ProcessMemoryCapSource::Env, _, 0) => "uncapped via XERJ_MAX_PROCESS_MEMORY_MB",
         (ProcessMemoryCapSource::Env, _, _) => "explicit XERJ_MAX_PROCESS_MEMORY_MB",
     };
-    if resolved_process_cap.cap_mb == 0 {
+    if let Some(budget) = commit_budget.as_ref().filter(|_| commit_capped) {
+        tracing::info!(
+            "{}",
+            commit_ceiling_startup_line(effective_memory_bytes, memory_limit_bytes, budget)
+        );
+    } else if resolved_process_cap.cap_mb == 0 {
         tracing::info!(
             "memory: detected {} usable, using the whole machine (no process cap — {}); \
              set limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB to add one",
@@ -1001,6 +1112,12 @@ fn build(config: &Config) -> ResourceGovernor {
             format_gib(effective_memory_bytes),
             format_gib(memory_limit_bytes),
             cap_reason,
+        );
+    }
+    if startup_starved {
+        tracing::warn!(
+            "Windows has no commit left under the reserve — writes will be rejected until \
+             commit is free. Enlarge the pagefile or close other programs"
         );
     }
 
@@ -1026,12 +1143,20 @@ fn build(config: &Config) -> ResourceGovernor {
         memtable_used_bytes: AtomicU64::new(0),
         memtable_tripped: AtomicBool::new(false),
         memory_limit_bytes,
-        machine_memory_bytes: effective_memory_bytes,
+        machine_memory_bytes,
         memory_watermark_bytes_default: memory_watermark_bytes,
         memory_watermark_bytes: AtomicU64::new(memory_watermark_bytes),
-        rss_bytes: AtomicU64::new(0),
-        memory_tripped: AtomicBool::new(false),
-        memory_trip_watermark: AtomicU64::new(0),
+        rss_bytes: AtomicU64::new(if startup_starved {
+            current_process_memory_bytes()
+        } else {
+            0
+        }),
+        memory_tripped: AtomicBool::new(startup_starved),
+        memory_trip_watermark: AtomicU64::new(if startup_starved {
+            memory_watermark_bytes
+        } else {
+            0
+        }),
         max_query_memory_bytes,
         search_pool: Arc::new(Semaphore::new(max_concurrent_searches)),
         max_concurrent_searches,
@@ -1044,6 +1169,16 @@ fn build(config: &Config) -> ResourceGovernor {
         disk_threshold_enabled: AtomicBool::new(true),
         disk_blocked: AtomicBool::new(false),
         disk_used_pct: AtomicU64::new(0),
+        commit_limit_bytes: commit_budget.as_ref().map(|b| b.commit_limit).unwrap_or(0),
+        commit_reserve_bytes: commit_budget.as_ref().map(|b| b.reserve_bytes).unwrap_or(0),
+        available_commit_bytes: AtomicU64::new(
+            commit_budget
+                .as_ref()
+                .map(|b| b.available_commit)
+                .unwrap_or(0),
+        ),
+        commit_starved: AtomicBool::new(startup_starved),
+        commit_capped,
     }
 }
 
@@ -1061,6 +1196,20 @@ fn build(config: &Config) -> ResourceGovernor {
 /// the watermark was dead on macOS however much memory the process took.
 pub fn current_rss_bytes() -> u64 {
     xerj_common::resource::current_rss_bytes().unwrap_or(0)
+}
+
+/// Bytes the memory breaker compares to the watermark.
+///
+/// Off Windows this is [`current_rss_bytes`]. On Windows it is the max of the
+/// working set and the process commit charge: a trimmed working set can sit
+/// under the watermark while commit charge is what the next allocation fails
+/// on (#1122).
+pub fn current_process_memory_bytes() -> u64 {
+    let rss = current_rss_bytes();
+    match xerj_common::resource::process_commit_charge_bytes() {
+        Some(commit) => rss.max(commit),
+        None => rss,
+    }
 }
 
 /// Total system RAM in bytes. Falls back to [`ASSUMED_TOTAL_BYTES`] on a
@@ -1432,6 +1581,76 @@ fn pct_of(part: u64, whole: u64) -> u64 {
     }
 }
 
+struct CommitBreakerDetail {
+    limit: u64,
+    available: u64,
+    reserve: u64,
+}
+
+/// Admission text for the parent memory breaker.
+///
+/// `commit == None` is the ordinary RSS sentence: it names
+/// `limits.max_process_memory_mb` / `XERJ_MAX_PROCESS_MEMORY_MB` and the live
+/// `indices.breaker.total.limit` hint (#2238). A Windows commit ceiling
+/// replaces that hint: raising `indices.breaker.total.limit` cannot create
+/// commit, and the sentence names the limit and the pagefile instead.
+fn memory_breaker_reason(
+    rss: u64,
+    relation: &str,
+    watermark: u64,
+    limit: u64,
+    commit: Option<CommitBreakerDetail>,
+) -> String {
+    const MIB: u64 = 1024 * 1024;
+    let base = format!(
+        "[parent] real memory circuit breaker tripped: rss={}MB {relation} watermark={}MB \
+         ({}% of limit={}MB); writes rejected to prevent an out-of-memory kill",
+        rss / MIB,
+        watermark / MIB,
+        pct_of(watermark, limit),
+        limit / MIB,
+    );
+    match commit {
+        Some(detail) => format!(
+            "{base}. Windows commit limit is {}MB with {}MB still committable \
+             (reserve {}MB). Enlarge the pagefile (System Properties → Advanced → \
+             Performance → Settings → Advanced → Virtual memory) or close other programs. \
+             XERJ_MAX_PROCESS_MEMORY_MB cannot exceed that commit limit",
+            detail.limit / MIB,
+            detail.available / MIB,
+            detail.reserve / MIB,
+        ),
+        None => format!(
+            "{base} (raise limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB, or live \
+             with PUT _cluster/settings {{\"persistent\":\
+             {{\"indices.breaker.total.limit\":\"<N>gb\"}}}})"
+        ),
+    }
+}
+
+fn commit_ceiling_startup_line(
+    physical: u64,
+    limit: u64,
+    budget: &xerj_common::resource::WindowsCommitBudget,
+) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!(
+        "memory: detected {} usable, using a {} cap (auto tier lowered to the Windows commit \
+         ceiling); physical RAM is {}, Windows commit limit is {}MB, {}MB still committable \
+         (this process holds {}MB, reserve {}MB). Enlarge the pagefile (System Properties → \
+         Advanced → Performance → Settings → Advanced → Virtual memory) or close other \
+         programs. limits.max_process_memory_mb and XERJ_MAX_PROCESS_MEMORY_MB cannot exceed \
+         that commit limit",
+        format_gib(limit),
+        format_gib(limit),
+        format_gib(physical),
+        budget.commit_limit / MIB,
+        budget.committable / MIB,
+        budget.process_commit / MIB,
+        budget.reserve_bytes / MIB,
+    )
+}
+
 fn human_bytes(b: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -1651,6 +1870,69 @@ mod tests {
         assert_eq!(cap_memory_limit(2 * GIB, 8192), 2 * GIB);
         // A cgroup smaller than the cap still wins.
         assert_eq!(cap_memory_limit(512 * 1024 * 1024, 8192), 512 * 1024 * 1024);
+    }
+
+    /// #1122, field report #2174. Injected commit numbers, not a live Windows
+    /// box: 16 GiB physical, no pagefile, ~4 GiB still committable. The AUTO
+    /// tier stays the 8 GiB step (physical RAM is unchanged). The cap the
+    /// governor actually uses is the commit ceiling, and a 95% watermark
+    /// leaves room for the 100 MiB flush that aborted that run.
+    #[test]
+    fn windows_commit_lowers_the_cap_without_moving_the_auto_tier() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        const AUTO: u64 = xerj_common::config::AUTO_PROCESS_MEMORY_MB;
+        let physical = 16 * GIB;
+        let resolved = resolve_process_memory_cap(physical, AUTO, None);
+        assert_eq!(
+            resolved.cap_mb,
+            8 * 1024,
+            "tier input is still physical RAM"
+        );
+        let tiered = cap_memory_limit(physical, resolved.cap_mb);
+        assert_eq!(tiered, 8 * GIB);
+
+        let budget = xerj_common::resource::windows_commit_budget(
+            xerj_common::resource::WindowsCommitSample {
+                total_phys: physical,
+                commit_limit: physical,
+                available_commit: 4 * GIB,
+                process_commit: 200 * MIB,
+            },
+        );
+        let limited = apply_windows_commit_ceiling(tiered, Some(&budget));
+        assert!(limited < tiered);
+        assert_eq!(limited, budget.effective_bytes);
+        let watermark = limited * 95 / 100;
+        assert!(budget.committable - watermark >= 100 * MIB);
+        assert_eq!(
+            windows_override_ceiling(physical, Some(&budget)),
+            budget.effective_bytes,
+            "a live breaker raise stops at the commit ceiling"
+        );
+
+        // No budget (Linux, macOS, failed probe): the tiered cap is returned.
+        assert_eq!(apply_windows_commit_ceiling(tiered, None), tiered);
+        assert_eq!(windows_override_ceiling(physical, None), physical);
+
+        // 64 GiB with commit covering RAM: tier stays 16 GiB, ceiling does not bind.
+        let big = 64 * GIB;
+        let big_tier = cap_memory_limit(big, resolve_process_memory_cap(big, AUTO, None).cap_mb);
+        assert_eq!(big_tier, 16 * GIB);
+        let covered = xerj_common::resource::windows_commit_budget(
+            xerj_common::resource::WindowsCommitSample {
+                total_phys: big,
+                commit_limit: 96 * GIB,
+                available_commit: 80 * GIB,
+                process_commit: 512 * MIB,
+            },
+        );
+        assert!(!covered.commit_bound);
+        assert_eq!(
+            apply_windows_commit_ceiling(big_tier, Some(&covered)),
+            big_tier
+        );
+        assert_eq!(windows_override_ceiling(big, Some(&covered)), big);
     }
 
     /// The 2 GiB memtable floor must not punch through a smaller ceiling —
@@ -2043,6 +2325,141 @@ mod tests {
         );
     }
 
+    /// The sentence autoindex matches on (`real memory circuit breaker tripped`
+    /// … `writes rejected to prevent an out-of-memory kill`) stays when commit
+    /// is not the ceiling. That sentence names the process-memory cap and the
+    /// live cluster-settings hint (#2238). Numbers are the historical 16 GiB
+    /// fixture, and it does not mention the pagefile.
+    #[test]
+    fn the_rss_breaker_message_is_unchanged_without_a_commit_ceiling() {
+        const MIB: u64 = 1024 * 1024;
+        let msg = memory_breaker_reason(15_679 * MIB, ">=", 15_564 * MIB, 16_384 * MIB, None);
+        assert_eq!(
+            msg,
+            "[parent] real memory circuit breaker tripped: rss=15679MB >= watermark=15564MB \
+             (94% of limit=16384MB); writes rejected to prevent an out-of-memory kill \
+             (raise limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB, or live \
+             with PUT _cluster/settings {\"persistent\":{\"indices.breaker.total.limit\":\"<N>gb\"}})"
+        );
+        assert!(!msg.contains("pagefile"));
+    }
+
+    #[test]
+    fn a_commit_ceiling_names_the_limit_and_how_to_raise_it() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let msg = memory_breaker_reason(
+            3_200 * MIB,
+            "under",
+            3_061 * MIB,
+            3_222 * MIB,
+            Some(CommitBreakerDetail {
+                limit: 16 * GIB,
+                available: 900 * MIB,
+                reserve: 1_074 * MIB,
+            }),
+        );
+        assert!(msg.contains("[parent] real memory circuit breaker tripped"));
+        assert!(msg.contains("writes rejected to prevent an out-of-memory kill"));
+        assert!(msg.contains("Windows commit limit is 16384MB"));
+        assert!(msg.contains("900MB still committable"));
+        assert!(msg.contains("reserve 1074MB"));
+        assert!(msg.contains("pagefile"));
+        assert!(msg.contains("Virtual memory"));
+        assert!(msg.contains("XERJ_MAX_PROCESS_MEMORY_MB cannot exceed that commit limit"));
+        assert!(
+            !msg.contains("indices.breaker.total.limit"),
+            "raising the breaker cannot create commit Windows will not give: {msg}"
+        );
+
+        let line = commit_ceiling_startup_line(
+            16 * GIB,
+            3_378_511_872,
+            &xerj_common::resource::windows_commit_budget(
+                xerj_common::resource::WindowsCommitSample {
+                    total_phys: 16 * GIB,
+                    commit_limit: 16 * GIB,
+                    available_commit: 4 * GIB,
+                    process_commit: 200 * MIB,
+                },
+            ),
+        );
+        assert!(line.contains("memory: detected "));
+        assert!(line.contains(" usable, using a "));
+        assert!(line.contains(" cap "));
+        assert!(line.contains("physical RAM is 16 GiB"));
+        assert!(line.contains("Windows commit limit is 16384MB"));
+        assert!(line.contains("pagefile"));
+        assert!(line.contains("XERJ_MAX_PROCESS_MEMORY_MB"));
+    }
+
+    /// RSS is under the watermark. Available commit is under the reserve.
+    /// That is the pagefileless shape: the process has not "used its cap",
+    /// the machine has run out of commit, and the next allocation would abort.
+    #[test]
+    fn commit_starvation_rejects_writes_and_releases_when_commit_returns() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let mut g = build(&cfg);
+        // Overwrite whatever this host probed. The test injects the shortage.
+        g.commit_limit_bytes = 16 * GIB;
+        g.commit_reserve_bytes = 512 * MIB;
+        g.commit_capped = true;
+        g.available_commit_bytes.store(4 * GIB, Ordering::Relaxed);
+        g.commit_starved.store(false, Ordering::Relaxed);
+        g.memory_tripped.store(false, Ordering::Relaxed);
+
+        let watermark = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        assert!(
+            watermark > 10 * MIB,
+            "rss sample must sit under the watermark"
+        );
+        g.refresh_memory_observing(10 * MIB, 0, 0, Some(128 * MIB));
+        assert!(g.memory_breaker_engaged());
+        assert!(!g.thread_spawn_safe());
+        let msg = format!("{}", g.check_ingest_admission().unwrap_err());
+        assert_eq!(g.check_ingest_admission().unwrap_err().http_status(), 429);
+        assert!(msg.contains("rss=10MB under watermark="), "{msg}");
+        assert!(msg.contains("Windows commit limit is 16384MB"), "{msg}");
+        assert!(msg.contains("128MB still committable"), "{msg}");
+        assert!(msg.contains("pagefile"), "{msg}");
+
+        g.refresh_memory_observing(10 * MIB, 0, 0, Some(2 * GIB));
+        assert!(
+            g.check_ingest_admission().is_ok(),
+            "commit back above the reserve releases the breaker"
+        );
+        assert!(g.thread_spawn_safe());
+    }
+
+    /// Off Windows there is no commit charge, so the breaker probe is the RSS
+    /// sample it just took. Both probes read the kernel counter, and that
+    /// read allocates, as do other tests in this process, so one pair can
+    /// differ by pages. A quiet pair is the contract.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn process_memory_matches_rss_off_windows() {
+        assert!(xerj_common::resource::process_commit_charge_bytes().is_none());
+        assert!(xerj_common::resource::available_commit_bytes().is_none());
+        assert!(xerj_common::resource::windows_commit_sample().is_none());
+        let mut last_process = 0u64;
+        let mut last_rss = 0u64;
+        for _ in 0..128 {
+            last_process = current_process_memory_bytes();
+            last_rss = current_rss_bytes();
+            if last_process > 0 && last_process == last_rss {
+                return;
+            }
+        }
+        panic!(
+            "off Windows the breaker probe is RSS; no quiet pair in 128 tries \
+             (last process={last_process} rss={last_rss})"
+        );
+    }
+
     #[test]
     fn disk_flood_blocks_with_hysteresis() {
         let mut cfg = Config::default();
@@ -2324,10 +2741,17 @@ mod tests {
             err.contains("draining below watermark"),
             "an in-band rejection must not claim rss >= watermark: {err}"
         );
-        assert!(
-            err.contains("limits.max_process_memory_mb"),
-            "an RSS rejection must name the process-memory cap: {err}"
-        );
+        if g.commit_capped {
+            assert!(
+                err.contains("Windows commit limit"),
+                "a commit-capped rejection names the limit instead of the process cap: {err}"
+            );
+        } else {
+            assert!(
+                err.contains("limits.max_process_memory_mb"),
+                "an RSS rejection must name the process-memory cap: {err}"
+            );
+        }
         g.refresh(0, wm * 97 / 100, 0);
         assert!(
             g.check_ingest_admission().is_err(),

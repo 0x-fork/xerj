@@ -60,6 +60,12 @@ async fn allocation_json_reports_the_flood_stage_gate_and_text_does_not() {
         .parse()
         .expect("integer percent");
     assert!(percent <= 100, "{percent}");
+    let data_dir = _dir.path().to_string_lossy().into_owned();
+    assert_eq!(
+        row["path.data"].as_str(),
+        Some(data_dir.as_str()),
+        "memory writes name this directory when the flood-stage block fires: {row}"
+    );
 
     let response = app
         .oneshot(

@@ -17,7 +17,7 @@ pub mod esclient;
 pub mod estimate;
 pub mod extract;
 pub mod feedback;
-mod flood;
+pub mod flood;
 pub mod gain;
 pub mod gate;
 mod generation_catalog;
@@ -32,6 +32,7 @@ pub mod infer;
 pub mod init;
 /// `--label`: ingest-time labelling through the node's `/_decide` (#1062).
 pub mod label;
+pub mod memory_cli;
 pub mod objsource;
 #[cfg(test)]
 mod objsource_minio_tests;

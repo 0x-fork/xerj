@@ -13,6 +13,13 @@
 //! or the HTTP doubles in this crate's tests) is not guessed at. Those runs
 //! behave as they did before: the write itself still reports the block if one
 //! engages later.
+//!
+//! Memory writes (#2284) hit the same watermark later, as a nested
+//! `cluster_block_exception`, because `/_memory` stringifies the document
+//! error. [`explain_memory_flood`] turns that body into the same kind of
+//! sentence this module already prints for autoindex: free space, the
+//! threshold, and the config override — plus the data-dir path and the
+//! `--data-dir` move, which is the recovery the memory field report needed.
 
 use serde_json::Value;
 
@@ -178,6 +185,173 @@ fn parse_bool(value: &Value) -> Option<bool> {
     }
 }
 
+/// How a memory-write error body relates to the flood-stage block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryFloodClass {
+    /// Some other failure. The caller keeps its existing error text.
+    Other,
+    /// The node already replaced the nested exception with the plain sentence.
+    Plain(String),
+    /// Raw `cluster_block_exception` for the flood-stage block. Percents are
+    /// taken from the reason when it names them (`disk usage 96% exceeded
+    /// flood-stage watermark [95%]`).
+    Raw {
+        used_pct: Option<u64>,
+        flood_pct: Option<u8>,
+    },
+}
+
+/// Disk facts a memory-write client can attach to the plain sentence.
+///
+/// The server fills these from `statvfs` on its data dir. A client that only
+/// has `GET /_cat/allocation?format=json` fills them with
+/// [`disk_facts_from_allocation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskFacts {
+    pub data_dir: String,
+    pub free_bytes: Option<u64>,
+    pub used_pct: Option<u64>,
+    pub flood_pct: Option<u8>,
+}
+
+/// `Some` when `body` is a flood-stage write refusal.
+///
+/// `Plain` is returned unchanged (the server already explained it). A raw
+/// nested `cluster_block_exception` is rewritten with `facts`: error-text
+/// percents win over `facts`, because those are the numbers the block used.
+/// `None` means this is not that block — an explicit `index.blocks.write`,
+/// a mapping error, a validation 400 — and the caller must not claim the
+/// disk is full.
+pub fn explain_memory_flood(body: &Value, facts: Option<&DiskFacts>) -> Option<String> {
+    match classify_memory_flood(body) {
+        MemoryFloodClass::Other => None,
+        MemoryFloodClass::Plain(text) => Some(text),
+        MemoryFloodClass::Raw {
+            used_pct,
+            flood_pct,
+        } => {
+            let facts = facts.cloned().unwrap_or(DiskFacts {
+                data_dir: String::new(),
+                free_bytes: None,
+                used_pct: None,
+                flood_pct: None,
+            });
+            Some(memory_flood_stage_message(
+                &facts.data_dir,
+                facts.free_bytes,
+                used_pct.or(facts.used_pct),
+                flood_pct.or(facts.flood_pct),
+            ))
+        }
+    }
+}
+
+/// The sentence memory writes show instead of a nested `cluster_block_exception`.
+///
+/// Same free-space scale and the same `limits.disk_flood_stage_percent` /
+/// `PUT /_cluster/settings` recovery as the autoindex refusal (#2077, #823).
+/// `data_dir` empty is printed as unknown rather than omitted: the field
+/// report's fix was moving that directory to another drive.
+pub fn memory_flood_stage_message(
+    data_dir: &str,
+    free_bytes: Option<u64>,
+    used_pct: Option<u64>,
+    flood_pct: Option<u8>,
+) -> String {
+    let free = match free_bytes {
+        Some(bytes) => format_bytes(bytes),
+        None => "unknown".to_string(),
+    };
+    let used = match used_pct {
+        Some(pct) => format!("{pct}% used"),
+        None => "used percent unknown".to_string(),
+    };
+    let flood = match flood_pct {
+        Some(pct) => format!("threshold {pct}%"),
+        None => "threshold unknown".to_string(),
+    };
+    let dir = if data_dir.is_empty() {
+        "unknown"
+    } else {
+        data_dir
+    };
+    // Hysteresis (#823): the block stays latched for 1% under the threshold.
+    // The disk is still the reason; say the block has not released yet.
+    let held = match (used_pct, flood_pct) {
+        (Some(used), Some(flood)) if used < u64::from(flood) => {
+            " The disk flood-stage write block is still engaged."
+        }
+        _ => "",
+    };
+    format!(
+        "the disk holding the data dir is nearly full, so this memory write was refused \
+         (free {free}, {used}, {flood}, data dir {dir}).{held} \
+         Free space on that drive, or restart the node with --data-dir on another drive. \
+         Set limits.disk_flood_stage_percent above the used percent in the node config and \
+         restart (0 disables the watermark), or raise it live with \
+         PUT /_cluster/settings {{\"persistent\":{{\"cluster.routing.allocation.disk.watermark.flood_stage\":\"<percent>\"}}}}."
+    )
+}
+
+/// `path.data`, `disk.avail`, `disk.percent`, and `disk.flood_stage` from one
+/// allocation body. Missing columns stay empty; this does not invent a
+/// threshold the node left out.
+pub fn disk_facts_from_allocation(body: &Value) -> DiskFacts {
+    let row = body.as_array().and_then(|rows| rows.first());
+    let data_dir = row
+        .and_then(|row| row.get("path.data"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let volume = volume_from_allocation(body);
+    DiskFacts {
+        data_dir,
+        free_bytes: volume.and_then(|v| v.avail),
+        used_pct: volume.and_then(|v| v.used_percent),
+        flood_pct: volume.and_then(|v| v.flood_stage),
+    }
+}
+
+fn classify_memory_flood(body: &Value) -> MemoryFloodClass {
+    if let Some(reason) = body.pointer("/error/reason").and_then(Value::as_str) {
+        if reason.contains("the disk holding the data dir is nearly full") {
+            return MemoryFloodClass::Plain(reason.to_string());
+        }
+    }
+    // `Value`'s JSON keeps the words even when `/_memory` has stringified the
+    // inner `cluster_block_exception` into `error.reason`.
+    let flat = body.to_string();
+    if flat.contains("cluster_block_exception")
+        && flat.contains("read_only_allow_delete")
+        && (flat.contains("flood-stage") || flat.contains("flood_stage"))
+    {
+        let (used_pct, flood_pct) = percents_from_flood_text(&flat);
+        return MemoryFloodClass::Raw {
+            used_pct,
+            flood_pct,
+        };
+    }
+    MemoryFloodClass::Other
+}
+
+/// `disk usage 96% exceeded flood-stage watermark [95%]` — the governor's
+/// block reason. Absent on a block that only names `read_only_allow_delete`.
+fn percents_from_flood_text(text: &str) -> (Option<u64>, Option<u8>) {
+    let used = text.split("disk usage ").nth(1).and_then(|rest| {
+        let num = rest.split('%').next()?.trim();
+        num.parse().ok()
+    });
+    let flood = text
+        .split("flood-stage watermark [")
+        .nth(1)
+        .and_then(|rest| {
+            let num = rest.split(['%', ']']).next()?.trim();
+            let n: u64 = num.parse().ok()?;
+            u8::try_from(n.min(100)).ok()
+        });
+    (used, flood)
+}
+
 /// `/_cat/allocation` emits free space as a raw byte count with a `b` suffix
 /// (`"2147483648b"`). Anything else is left unknown rather than guessed.
 fn parse_bytes(value: &Value) -> Option<u64> {
@@ -288,6 +462,148 @@ mod tests {
         assert_eq!(volume.used_percent, Some(40));
         assert_eq!(volume.flood_stage, Some(95));
         assert!(volume_from_allocation(&json!({"acknowledged": true})).is_none());
+    }
+
+    fn nested_flood_body() -> Value {
+        // The shape `/_memory` used to return: the document error JSON
+        // stringified into `error.reason`, so the agent saw only
+        // `cluster_block_exception`.
+        let inner = json!({
+            "error": {
+                "root_cause": [{
+                    "type": "cluster_block_exception",
+                    "reason": "index [.xerj-memory-notes] is blocked for read_only_allow_delete (disk usage 96% exceeded flood-stage watermark [95%]) operations"
+                }],
+                "type": "cluster_block_exception",
+                "reason": "index [.xerj-memory-notes] is blocked for read_only_allow_delete (disk usage 96% exceeded flood-stage watermark [95%]) operations"
+            },
+            "status": 429
+        });
+        json!({
+            "error": {
+                "type": "memory_error",
+                "reason": format!("failed to store memory: {inner}")
+            },
+            "status": 429
+        })
+    }
+
+    #[test]
+    fn a_nested_flood_stage_block_becomes_the_plain_disk_sentence() {
+        let facts = DiskFacts {
+            data_dir: "D:\\xerj-data".to_string(),
+            free_bytes: Some(2 * 1024 * 1024 * 1024),
+            used_pct: None,
+            flood_pct: None,
+        };
+        let message = explain_memory_flood(&nested_flood_body(), Some(&facts))
+            .expect("the nested cluster_block_exception is the flood-stage block");
+        assert!(
+            message.contains("the disk holding the data dir is nearly full"),
+            "{message}"
+        );
+        assert!(message.contains("free 2.0gb"), "{message}");
+        assert!(message.contains("96% used"), "{message}");
+        assert!(message.contains("threshold 95%"), "{message}");
+        assert!(message.contains("data dir D:\\xerj-data"), "{message}");
+        assert!(
+            message.contains("restart the node with --data-dir on another drive"),
+            "{message}"
+        );
+        assert!(
+            message.contains("limits.disk_flood_stage_percent"),
+            "{message}"
+        );
+        assert!(
+            message.contains("cluster.routing.allocation.disk.watermark.flood_stage"),
+            "{message}"
+        );
+        assert!(!message.contains("cluster_block_exception"), "{message}");
+
+        // The sentence, once written, is not composed again.
+        let already = json!({
+            "error": { "type": "memory_error", "reason": message }
+        });
+        assert_eq!(
+            explain_memory_flood(&already, None).as_deref(),
+            Some(already["error"]["reason"].as_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_explicit_write_block_is_not_called_a_full_disk() {
+        let write = json!({
+            "error": {
+                "type": "cluster_block_exception",
+                "reason": "index [notes] is blocked for write operations"
+            },
+            "status": 403
+        });
+        assert!(explain_memory_flood(&write, None).is_none());
+
+        // `read_only_allow_delete` set by the block API, with no flood-stage
+        // wording, is that block — not a guess that the disk is full.
+        let manual = json!({
+            "error": {
+                "type": "cluster_block_exception",
+                "reason": "index [notes] is blocked for read_only_allow_delete operations"
+            },
+            "status": 429
+        });
+        assert!(explain_memory_flood(&manual, None).is_none());
+    }
+
+    #[test]
+    fn allocation_supplies_the_path_and_free_space_the_error_omits() {
+        let body = json!({
+            "error": {
+                "type": "cluster_block_exception",
+                "reason": "index [n] is blocked for read_only_allow_delete (disk usage 96% exceeded flood-stage watermark [95%]) operations"
+            }
+        });
+        let facts = disk_facts_from_allocation(&json!([{
+            "disk.percent": "96",
+            "disk.avail": "2147483648b",
+            "disk.flood_stage": "95",
+            "path.data": "/var/lib/xerj"
+        }]));
+        assert_eq!(facts.data_dir, "/var/lib/xerj");
+        assert_eq!(facts.free_bytes, Some(2 * 1024 * 1024 * 1024));
+        let message = explain_memory_flood(&body, Some(&facts)).unwrap();
+        assert!(message.contains("data dir /var/lib/xerj"), "{message}");
+        assert!(message.contains("free 2.0gb"), "{message}");
+
+        // No allocation and no percents in a flood reason still explains,
+        // with the unknowns named rather than invented.
+        let bare = json!({
+            "error": {
+                "type": "cluster_block_exception",
+                "reason": "read_only_allow_delete flood-stage"
+            }
+        });
+        let message = explain_memory_flood(&bare, None).unwrap();
+        assert!(message.contains("free unknown"), "{message}");
+        assert!(message.contains("data dir unknown"), "{message}");
+        assert!(message.contains("--data-dir"), "{message}");
+    }
+
+    #[test]
+    fn a_block_still_engaged_under_the_threshold_says_so() {
+        let body = json!({
+            "error": {
+                "type": "cluster_block_exception",
+                "reason": "index [n] is blocked for read_only_allow_delete (disk usage 94% exceeded flood-stage watermark [95%]) operations"
+            }
+        });
+        let message = explain_memory_flood(&body, None).unwrap();
+        assert!(
+            message.contains("The disk flood-stage write block is still engaged."),
+            "{message}"
+        );
+        assert!(
+            message.contains("the disk holding the data dir is nearly full"),
+            "{message}"
+        );
     }
 
     /// The probe runs before the walk: a flooded node refuses with the

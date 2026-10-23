@@ -3102,6 +3102,52 @@ fn error_detail(err: &reqwest::Error) -> String {
     out
 }
 
+/// `POST /_memory/{namespace}` — not recall, not the bare list.
+fn is_memory_store_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/_memory/") else {
+        return false;
+    };
+    !rest.is_empty() && !rest.contains('/')
+}
+
+/// #2284: a flood-stage block on `xerj_memory_store` is a nested
+/// `cluster_block_exception`. Replace that blob with the plain disk sentence.
+/// `None` keeps the HTTP wrapper — this was not the flood-stage block.
+async fn memory_flood_tool_text(ctx: &Ctx, body_text: &str) -> Option<String> {
+    let body = serde_json::from_str::<Value>(body_text).ok()?;
+    // `None` facts: a plain server sentence comes back unchanged, and a raw
+    // block becomes the sentence with unknown free space. The raw case is
+    // filled in from `/_cat/allocation` below — the same probe autoindex uses.
+    let without = xerj_autoindex::flood::explain_memory_flood(&body, None)?;
+    if body
+        .pointer("/error/reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason == without)
+    {
+        return Some(without);
+    }
+    let facts = fetch_allocation(ctx)
+        .await
+        .map(|alloc| xerj_autoindex::flood::disk_facts_from_allocation(&alloc));
+    Some(xerj_autoindex::flood::explain_memory_flood(&body, facts.as_ref()).unwrap_or(without))
+}
+
+async fn fetch_allocation(ctx: &Ctx) -> Option<Value> {
+    let url = format!(
+        "{}/_cat/allocation?format=json",
+        ctx.base_url.trim_end_matches('/')
+    );
+    let mut req = ctx.client.get(&url);
+    if let Some(auth) = &ctx.auth {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
 /// The query `xerj_search` should locate inside each passage (#2266).
 /// Other tools do not get the annotation: a semantic/vector ordinal is a
 /// chunk index, and `xerj_def` already returns the declaration's `line`.
@@ -3158,6 +3204,12 @@ async fn engine_request(
                         tool_text(token_budget::budget_json_response(&text, max_tokens), false)
                     }
                     None => tool_text(text, false),
+                }
+            } else if is_memory_store_path(path) {
+                if let Some(explained) = memory_flood_tool_text(ctx, &text).await {
+                    tool_text(explained, true)
+                } else {
+                    tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
                 }
             } else {
                 tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
@@ -3286,6 +3338,162 @@ mod tests {
         assert!(text.contains("unauthorized"), "{text}");
         assert!(!text.contains("no XERJ node is listening"), "{text}");
         assert!(!text.contains("xerj --insecure"), "{text}");
+    }
+
+    /// One HTTP/1.1 response, then close. Enough for the memory-store tests,
+    /// which may open a second connection for `/_cat/allocation`.
+    async fn answer_once(listener: tokio::net::TcpListener, status: &str, body: &str) {
+        let body = body.to_string();
+        let status = status.to_string();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
+                body.len()
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes()).await;
+        });
+    }
+
+    /// #2284: the server already explained the flood-stage block. The tool
+    /// text is that sentence, not `XERJ returned HTTP` plus the JSON.
+    #[tokio::test]
+    async fn memory_store_prints_a_plain_flood_reason_verbatim() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reason = "the disk holding the data dir is nearly full, so this memory write was refused (free 2.0gb, 96% used, threshold 95%, data dir D:\\xerj-data). Free space on that drive, or restart the node with --data-dir on another drive.";
+        let body = format!(
+            r#"{{"error":{{"type":"memory_error","reason":{}}},"status":429}}"#,
+            serde_json::to_string(reason).unwrap()
+        );
+        answer_once(listener, "429 Too Many Requests", &body).await;
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": {
+                "name": "xerj_memory_store",
+                "arguments": { "namespace": "notes", "text": "remember this" }
+            }
+        });
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, reason);
+        assert!(!text.contains("cluster_block_exception"), "{text}");
+        assert!(!text.contains("XERJ returned HTTP"), "{text}");
+    }
+
+    /// The raw nested exception: the tool probes allocation (the #2077 read)
+    /// and says the disk is nearly full, with free space and the data dir.
+    #[tokio::test]
+    async fn memory_store_rewrites_a_nested_cluster_block_using_allocation() {
+        let store = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = store.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Two requests, either order, possibly one connection each.
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = store.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("GET /_cat/allocation") {
+                    r#"[{"disk.percent":"96","disk.avail":"2147483648b","disk.flood_stage":"95","disk.threshold_enabled":"true","disk.flood_blocked":"true","path.data":"D:\\xerj-data"}]"#.to_string()
+                } else {
+                    let inner = r#"{"error":{"type":"cluster_block_exception","reason":"index [.xerj-memory-notes] is blocked for read_only_allow_delete (disk usage 96% exceeded flood-stage watermark [95%]) operations"},"status":429}"#;
+                    format!(
+                        r#"{{"error":{{"type":"memory_error","reason":{}}},"status":429}}"#,
+                        serde_json::to_string(&format!("failed to store memory: {inner}")).unwrap()
+                    )
+                };
+                let header = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
+                    body.len()
+                );
+                // Allocation is 200. A 429 on the probe would be ignored and
+                // the sentence would say free space is unknown.
+                let header = if req.contains("GET /_cat/allocation") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    header
+                };
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes()).await;
+            }
+        });
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": {
+                "name": "xerj_memory_store",
+                "arguments": { "namespace": "notes", "text": "remember this" }
+            }
+        });
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("the disk holding the data dir is nearly full"),
+            "{text}"
+        );
+        assert!(text.contains("free 2.0gb"), "{text}");
+        assert!(text.contains("96% used"), "{text}");
+        assert!(text.contains("threshold 95%"), "{text}");
+        assert!(text.contains("data dir D:\\xerj-data"), "{text}");
+        assert!(
+            text.contains("restart the node with --data-dir on another drive"),
+            "{text}"
+        );
+        assert!(!text.contains("cluster_block_exception"), "{text}");
+        assert!(!text.contains("XERJ returned HTTP"), "{text}");
+    }
+
+    /// A memory-store 400 is not a full disk. The HTTP wrapper stays.
+    #[tokio::test]
+    async fn memory_store_validation_error_is_not_a_flood_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        answer_once(
+            listener,
+            "400 Bad Request",
+            r#"{"error":{"type":"memory_error","reason":"a memory must have non-empty `text` or a `vector`"},"status":400}"#,
+        )
+        .await;
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: None,
+        };
+        let msg = json!({
+            "params": {
+                "name": "xerj_memory_store",
+                "arguments": { "namespace": "notes", "text": "remember this" }
+            }
+        });
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("XERJ returned HTTP 400"), "{text}");
+        assert!(text.contains("non-empty"), "{text}");
+        assert!(!text.contains("nearly full"), "{text}");
+        assert!(!text.contains("--data-dir"), "{text}");
     }
 
     #[test]
