@@ -21,6 +21,10 @@
     <lastmod>2026-10-19</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/answer-questions-about-a-docs-folder-with-citations</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/ask-questions-about-a-github-repo-without-cloning</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
@@ -49,6 +53,10 @@
     <lastmod>2026-10-20</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/batch-lookup-ids-from-csv-against-local-index</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/catalog-files-with-autoindex-map</loc>
     <lastmod>2026-10-19</lastmod>
   </url>
@@ -73,6 +81,10 @@
     <lastmod>2026-10-19</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/count-keyword-mentions-over-time-jsonl</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/do-search-embeddings-help</loc>
     <lastmod>2026-10-19</lastmod>
   </url>
@@ -91,6 +103,10 @@
   <url>
     <loc>https://xerj.org/answers/filter-knn-exact-scan-caveat</loc>
     <lastmod>2026-10-19</lastmod>
+  </url>
+  <url>
+    <loc>https://xerj.org/answers/find-duplicate-github-issues-before-filing</loc>
+    <lastmod>2026-10-20</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/full-text-search-browser-history</loc>
@@ -169,6 +185,10 @@
     <lastmod>2026-10-19</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/local-search-mcp-for-codex-and-cursor</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/mcp-api-search-or-vector-search</loc>
     <lastmod>2026-10-20</lastmod>
   </url>
@@ -229,6 +249,10 @@
     <lastmod>2026-10-19</lastmod>
   </url>
   <url>
+    <loc>https://xerj.org/answers/search-claude-code-past-sessions</loc>
+    <lastmod>2026-10-20</lastmod>
+  </url>
+  <url>
     <loc>https://xerj.org/answers/search-confluence-html-export</loc>
     <lastmod>2026-10-19</lastmod>
   </url>
@@ -243,6 +267,10 @@
   <url>
     <loc>https://xerj.org/answers/search-files-in-an-s3-bucket</loc>
     <lastmod>2026-10-19</lastmod>
+  </url>
+  <url>
+    <loc>https://xerj.org/answers/search-github-issues-and-prs-locally</loc>
+    <lastmod>2026-10-20</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/search-gmail-takeout-mbox-locally</loc>
@@ -327,6 +355,10 @@
   <url>
     <loc>https://xerj.org/answers/vector-database-vs-full-text-search</loc>
     <lastmod>2026-10-19</lastmod>
+  </url>
+  <url>
+    <loc>https://xerj.org/answers/verify-ai-report-claims-against-sources</loc>
+    <lastmod>2026-10-20</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/what-a-share-link-guest-can-reach</loc>

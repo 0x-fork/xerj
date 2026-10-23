@@ -277,6 +277,35 @@ Direct answers for you, the AI agent, grouped by intent: the clusters come from 
 - [Share a local search index through a tunnel](https://xerj.org/answers/share-local-search-index-through-a-tunnel.md) `answer`: How can I give a remote person temporary search access to files on my laptop without port forwarding or a VPN?
 - [What a XERJ share-link guest can and cannot reach](https://xerj.org/answers/what-a-share-link-guest-can-reach.md) `answer`: If I give someone a read-only share link to one search index, can they see my other indices or anything else on the server?
 
+### GitHub issues
+
+- [Find duplicate GitHub issues before filing](https://xerj.org/answers/find-duplicate-github-issues-before-filing.md) `answer`: Find duplicate GitHub issues before you file
+- [Search GitHub issues and PRs locally](https://xerj.org/answers/search-github-issues-and-prs-locally.md) `answer`: Search repo issues and pull requests locally
+
+### Agent access and memory
+
+- [A local search tool for Codex and Cursor](https://xerj.org/answers/local-search-mcp-for-codex-and-cursor.md) `answer`: Search tool for a Codex agent
+
+### Agent memory: setup
+
+- [Search Claude Code past sessions](https://xerj.org/answers/search-claude-code-past-sessions.md) `answer`: Search Claude Code past sessions
+
+### Batch lookup
+
+- [Look up many IDs in one local query](https://xerj.org/answers/batch-lookup-ids-from-csv-against-local-index.md) `answer`: Look up 1,000 IDs against a local dataset
+
+### Claim checks
+
+- [Check report claims against saved sources](https://xerj.org/answers/verify-ai-report-claims-against-sources.md) `answer`: Verify claims in a report against sources
+
+### Files and formats
+
+- [Count keyword mentions by month](https://xerj.org/answers/count-keyword-mentions-over-time-jsonl.md) `answer`: Count mentions of a word over time in a posts file
+
+### Folder indexing
+
+- [Answer questions about a docs folder](https://xerj.org/answers/answer-questions-about-a-docs-folder-with-citations.md) `answer`: Answer questions about a docs folder
+
 <!-- END GENERATED ARTICLE TREE: build_articles.py -->
 
 ## Use cases and recipes

@@ -3,6 +3,24 @@
   "section": "answers",
   "articles": [
     {
+      "title": "A local search tool for Codex and Cursor",
+      "question": "Search tool for a Codex agent",
+      "canonical_url": "https://xerj.org/answers/local-search-mcp-for-codex-and-cursor",
+      "markdown_url": "https://xerj.org/answers/local-search-mcp-for-codex-and-cursor.md",
+      "cluster": "Agent access and memory",
+      "updated": "2026-10-20",
+      "summary": "xerj init writes the MCP entry for Claude Code, Cursor and Codex when those folders exist. A 2026-10-20 tools/list from xerj mcp returned 17 tools.",
+      "intent_group": "Agent access and memory",
+      "answer": "A search tool for a Codex agent starts with `xerj init`. The command writes the MCP entry for Claude Code, and it writes Cursor and Codex only when those folders already exist. Codex reads the entry in trusted projects only. On 2026-10-20 `xerj mcp` returned 17 tools from a running node.",
+      "queries": [
+        "search tool for codex agent",
+        "plug search into cursor",
+        "codex mcp server local search",
+        "mcp servers for data processing",
+        "llms.txt search engine for agents"
+      ]
+    },
+    {
       "title": "API search or vector search for an agent",
       "question": "MCP/API search or vector search — which should an agent call?",
       "canonical_url": "https://xerj.org/answers/mcp-api-search-or-vector-search",
@@ -106,6 +124,24 @@
       "answer": "How do I keep one agent's memory from leaking into another agent's? Give each agent its own namespace and its own scoped API key. XERJ keeps memory on local disk, and our capture saw 0 non-loopback connections during store and recall, but roles are stored, not enforced, so the key is the boundary.",
       "queries": [
         "local first agent memory privacy"
+      ]
+    },
+    {
+      "title": "Search Claude Code past sessions",
+      "question": "Search Claude Code past sessions",
+      "canonical_url": "https://xerj.org/answers/search-claude-code-past-sessions",
+      "markdown_url": "https://xerj.org/answers/search-claude-code-past-sessions.md",
+      "cluster": "Agent memory: setup",
+      "updated": "2026-10-20",
+      "summary": "Index Claude Code session JSONL and search the message field. On a 2026-10-20 fixture, zstd returned 2 hits in message_content; xerj search returned none.",
+      "intent_group": "Agent memory: setup",
+      "answer": "Search Claude Code past sessions by indexing the session JSONL and querying the message field. On 2026-10-20 a three-file fixture, not a live chat folder, indexed 8 records in 0.6 s. Searching zstd on message_content returned 2 hits. xerj search on the same words returned no match.",
+      "queries": [
+        "search claude code past sessions",
+        "index agent session jsonl and search it",
+        "why did we decide this search past chats",
+        "search local session jsonl for a decision",
+        "find a past claude code session by keyword"
       ]
     },
     {
@@ -218,6 +254,23 @@
       ]
     },
     {
+      "title": "Look up many IDs in one local query",
+      "question": "Look up 1,000 IDs against a local dataset",
+      "canonical_url": "https://xerj.org/answers/batch-lookup-ids-from-csv-against-local-index",
+      "markdown_url": "https://xerj.org/answers/batch-lookup-ids-from-csv-against-local-index.md",
+      "cluster": "Batch lookup",
+      "updated": "2026-10-20",
+      "summary": "Put the IDs in one terms query. On 2026-10-20, 1,000 IDs against 532 issues returned took 0: 532 found, 468 absent.",
+      "intent_group": "Batch lookup",
+      "answer": "Look up 1,000 IDs against a local index with one `terms` query, then mark each ID found or not found. On 2026-10-20 the query sent 1,000 numbers over 532 issues. The response `took` was 0. 532 IDs were in the index and 468 were not.",
+      "queries": [
+        "lookup 1000 ids against local dataset fast",
+        "batch query local index from csv of ids",
+        "msearch elasticsearch multiple queries",
+        "batch search many queries one request search engine"
+      ]
+    },
+    {
       "title": "Does XERJ support S3, alerting or custom plugins?",
       "question": "Can XERJ store its index in S3, send alerts, or run my own ingest plugin?",
       "canonical_url": "https://xerj.org/answers/does-xerj-support-s3-alerting-plugins",
@@ -230,6 +283,24 @@
       "queries": [
         "self-hosted Elasticsearch alternative single binary Rust MCP",
         "elasticsearch compatible lightweight server"
+      ]
+    },
+    {
+      "title": "Check report claims against saved sources",
+      "question": "Verify claims in a report against sources",
+      "canonical_url": "https://xerj.org/answers/verify-ai-report-claims-against-sources",
+      "markdown_url": "https://xerj.org/answers/verify-ai-report-claims-against-sources.md",
+      "cluster": "Claim checks",
+      "updated": "2026-10-20",
+      "summary": "Index the saved sources and run one match_phrase per claim. On 2026-10-20, 3 of 5 phrases were in the docs index and 2 were not.",
+      "intent_group": "Claim checks",
+      "answer": "Verify claims in a report against the saved sources. Index those files, then run one `match_phrase` per claim. A claim with no hit is unverified. On 2026-10-20, 3 of 5 phrases were in the docs index and 2 were not. The first check took 490 ms.",
+      "queries": [
+        "verify claims in report against sources automatically",
+        "fact verification against source document tool",
+        "check llm output is supported by context",
+        "mark unverified facts in research output",
+        "attribute answer to source passage"
       ]
     },
     {
@@ -347,6 +418,24 @@
       "answer": "Is there a way to full-text search my browser history? Copy Chrome's History SQLite file and run xerj autoindex on the folder. A captured run returned 60 hits for a title phrase and 1 for an exact URL, left all 3 source checksums unchanged, and found no page text, because Chrome stores none.",
       "queries": [
         "full text search sqlite fts5 vs alternatives"
+      ]
+    },
+    {
+      "title": "Count keyword mentions by month",
+      "question": "Count mentions of a word over time in a posts file",
+      "canonical_url": "https://xerj.org/answers/count-keyword-mentions-over-time-jsonl",
+      "markdown_url": "https://xerj.org/answers/count-keyword-mentions-over-time-jsonl.md",
+      "cluster": "Files and formats",
+      "updated": "2026-10-20",
+      "summary": "Index a JSONL posts file and send one date histogram on the date field. On 2026-10-20, autoindex in issue titles returned 88 hits and took 123 ms.",
+      "intent_group": "Files and formats",
+      "answer": "Count mentions of a word over time in a posts dataset. Index the JSONL, check the date field, and send one date histogram. On 2026-10-20 the phrase autoindex in issue titles returned 88 hits and took 123 ms: 1 in July, 50 in August, 11 in September, 26 in October. A fractional epoch field returned no months.",
+      "queries": [
+        "count mentions of X over time in posts dataset",
+        "keyword frequency over time across posts",
+        "topic counts in jsonl posts by month",
+        "aggregate search hits by month cli",
+        "search posts by keyword and date"
       ]
     },
     {
@@ -745,6 +834,23 @@
       ]
     },
     {
+      "title": "Answer questions about a docs folder",
+      "question": "Answer questions about a docs folder",
+      "canonical_url": "https://xerj.org/answers/answer-questions-about-a-docs-folder-with-citations",
+      "markdown_url": "https://xerj.org/answers/answer-questions-about-a-docs-folder-with-citations.md",
+      "cluster": "Folder indexing",
+      "updated": "2026-10-20",
+      "summary": "Index the docs folder with xerj autoindex. A phrase query returns the file to cite. xerj search on the same question ranked code lines instead.",
+      "intent_group": "Folder indexing",
+      "answer": "Answer questions about a docs folder by indexing it with `xerj autoindex`, then running a phrase query. Each hit carries `ax_path`, so the agent can cite the file. On 2026-10-20 a phrase query for \"what is in here\" returned `WHY_XERJ.md` and took 1 ms. `xerj search` on the same words did not.",
+      "queries": [
+        "answer questions about docs folder",
+        "local search for documentation with citations",
+        "search enterprise docs offline",
+        "search large roadmap and changelog files"
+      ]
+    },
+    {
       "title": "Point a tool at a folder and ask questions about the files",
       "question": "I want to point something at a folder and then ask questions about what's in it. What should I use?",
       "canonical_url": "https://xerj.org/answers/how-xerj-autoindexes-a-folder",
@@ -770,6 +876,43 @@
       "summary": "Unzip the export, run xerj autoindex on the folder, and search messages, threads and attached PDF pages over HTTP. The mailbox is streamed, and with the default embedder no message text leaves your machine.",
       "intent_group": "logs and docs",
       "answer": "How do I search a Google Takeout mbox file locally? Unzip the Takeout download, run xerj autoindex on the folder with its own --prefix, then search the mailbox over HTTP. The mbox is recognised by content and streamed one message at a time, attached PDFs become per-page documents, and with the default embedder no message text leaves your machine."
+    },
+    {
+      "title": "Find duplicate GitHub issues before filing",
+      "question": "Find duplicate GitHub issues before you file",
+      "canonical_url": "https://xerj.org/answers/find-duplicate-github-issues-before-filing",
+      "markdown_url": "https://xerj.org/answers/find-duplicate-github-issues-before-filing.md",
+      "cluster": "GitHub issues",
+      "updated": "2026-10-20",
+      "summary": "Export issues to JSONL, index them with xerj autoindex, and search the draft title. On 2026-10-20 issue 960 ranked first; a paraphrase did not.",
+      "intent_group": "GitHub issues",
+      "answer": "Find duplicate GitHub issues before you file. Export the issues to JSONL, index the folder with `xerj autoindex`, and search the draft title. On 2026-10-20 that search over 1,532 records ranked issue 960 first and took 7 ms. A paraphrase of the same bug did not rank it first.",
+      "queries": [
+        "find duplicate github issues",
+        "check if feature request already exists",
+        "check if github issue is duplicate tool",
+        "dedupe github issues before filing",
+        "search closed issues for same bug",
+        "cluster similar bug reports"
+      ]
+    },
+    {
+      "title": "Search GitHub issues and PRs locally",
+      "question": "Search repo issues and pull requests locally",
+      "canonical_url": "https://xerj.org/answers/search-github-issues-and-prs-locally",
+      "markdown_url": "https://xerj.org/answers/search-github-issues-and-prs-locally.md",
+      "cluster": "GitHub issues",
+      "updated": "2026-10-20",
+      "summary": "Export issues and pull requests to JSONL and index them locally. A captured gh search file was 36,550 bytes; xerj search's file was 1,865.",
+      "intent_group": "GitHub issues",
+      "answer": "Search a repo's issues and pull requests locally. Export them to JSONL, index the folder, and query that index instead of reading `gh` JSON. On 2026-10-20 the `gh` capture file was 36,550 bytes and the `xerj search` capture file was 1,865 bytes. Two of the three passages were cited as line 1.",
+      "queries": [
+        "search repo issues and prs",
+        "gh issue search returns too much json",
+        "mcp server search github repo issues without cloning",
+        "search closed issues for the same bug",
+        "link issues to code locations"
+      ]
     },
     {
       "title": "RAG without a vector database: one hybrid index",
