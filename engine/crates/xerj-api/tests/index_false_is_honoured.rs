@@ -681,10 +681,9 @@ async fn documented_gaps_are_still_open_and_still_documented() {
          fallback: {body}"
     );
 
-    // GAP 5 — `_validate/query` never opens the index, so it answers on the
-    // parse alone and says a query `_search` refuses is valid. Pre-existing
-    // and identical on `main`, but it now disagrees with `_search` on the same
-    // body, so it is stated rather than left for a user to trip over.
+    // GAP 5 CLOSED — `_validate/query` now asks every resolved index the same
+    // buildability question `_search` asks, so it no longer says a query
+    // `_search` refuses is valid.
     let (status, body) = json_req(
         &app,
         "POST",
@@ -692,12 +691,40 @@ async fn documented_gaps_are_still_open_and_still_documented() {
         json!({ "query": { "match": { "note": "pelicans" } } }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "GAP 5 changed: {body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body.get("valid").and_then(Value::as_bool),
-        Some(true),
-        "GAP 5 changed — `_validate/query` now consults the mapping, \
-         update the CHANGELOG: {body}"
+        Some(false),
+        "GAP 5 closed: {body}"
+    );
+    let reason = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("Cannot search on field [note]"),
+        "got {reason:?}: {body}"
+    );
+
+    // `explain=true` reports the refusal per index instead of one top-level
+    // sentence.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/t/_validate/query?explain=true",
+        json!({ "query": { "match": { "note": "pelicans" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["valid"], false, "{body}");
+    assert_eq!(body["explanations"][0]["index"], "t");
+    assert_eq!(body["explanations"][0]["valid"], false);
+    assert!(
+        body["explanations"][0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Cannot search on field [note]"),
+        "{body}"
     );
 }
 

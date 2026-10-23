@@ -20929,6 +20929,19 @@ impl Index {
         }
     }
 
+    /// Validate a query exactly as [`Index::search`] will build it, without
+    /// executing it. One definition of "buildable": the alias and
+    /// keyword-full-text rewrites, then the unsearchable-field (#204) and
+    /// non-numeric-value (#1284) checks. `_validate/query` uses this so its
+    /// `valid` flag cannot disagree with `_search` on the same body.
+    pub async fn validate_query(
+        &self,
+        query: &QueryNode,
+    ) -> std::result::Result<(), xerj_common::XerjError> {
+        let schema = self.schema.read().await;
+        check_buildable_query(query, &schema.schema).map(|_| ())
+    }
+
     /// Inner search implementation (without timeout wrapper).
     async fn search_inner(
         &self,
@@ -21053,26 +21066,11 @@ impl Index {
         // from `_source` (#204 — accepted means honoured).
         let resolved_query = {
             let schema = self.schema.read().await;
-            let resolved = rewrite_keyword_full_text_to_term(
-                &rewrite_query_aliases(&request.query, &schema.schema),
-                &schema.schema,
-            );
-            if let Some(field) = unsearchable_query_field(&resolved, &schema.schema) {
-                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
-                    format!(
-                        "failed to create query: Cannot search on field [{field}] \
-                         since it is not indexed nor has doc values."
-                    ),
-                )));
-            }
-            // #1284: a non-numeric value against a numeric field is a query
-            // that cannot be built, and ES fails it (`query_shard_exception` /
-            // `number_format_exception`) rather than answering a 0-hit.
-            if let Some(value) = non_numeric_term_value(&resolved, &schema.schema) {
-                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
-                    format!("failed to create query: For input string: \"{value}\""),
-                )));
-            }
+            // One definition of "buildable" (alias/keyword rewrites + the
+            // unsearchable-field and #1284 numeric checks), shared with
+            // `_validate/query`; see `check_buildable_query`.
+            let resolved = check_buildable_query(&request.query, &schema.schema)
+                .map_err(EngineError::Common)?;
             // #437: a sort field this engine cannot resolve (any of 11 ES
             // meta-field names besides the ones handled below, or an
             // unmapped/misspelled field) fell through to `_source` lookup
@@ -43235,6 +43233,37 @@ fn has_analyzed_text_term_leaf(q: &QueryNode, schema: &Schema) -> bool {
 
 /// The first field in `q` that the mapping has made completely unsearchable.
 ///
+/// The schema checks that make a query unbuildable, shared by `search` and
+/// `_validate/query`. Applies the same two rewrites execution does (field
+/// aliases, then keyword full-text → term) before checking:
+///
+/// - a field declared `"index": false` with no doc values has neither postings
+///   nor a column to scan, so ES rejects the query (#204);
+/// - a non-numeric value against a numeric field cannot be built (#1284).
+///
+/// Returns the rewritten tree `search` should execute, or the same error
+/// `_search` would return. `_validate/query` calls this through
+/// [`Index::validate_query`]; before that it answered from the parse alone and
+/// reported `valid: true` for a body `_search` refused.
+fn check_buildable_query(
+    query: &QueryNode,
+    schema: &Schema,
+) -> std::result::Result<QueryNode, xerj_common::XerjError> {
+    let resolved = rewrite_keyword_full_text_to_term(&rewrite_query_aliases(query, schema), schema);
+    if let Some(field) = unsearchable_query_field(&resolved, schema) {
+        return Err(xerj_common::XerjError::invalid_query(format!(
+            "failed to create query: Cannot search on field [{field}] \
+             since it is not indexed nor has doc values."
+        )));
+    }
+    if let Some(value) = non_numeric_term_value(&resolved, schema) {
+        return Err(xerj_common::XerjError::invalid_query(format!(
+            "failed to create query: For input string: \"{value}\""
+        )));
+    }
+    Ok(resolved)
+}
+
 /// A field is unsearchable when its mapping declares BOTH `"index": false`
 /// (no postings) and no doc values (nothing to scan instead) — for example
 /// `{"type": "text", "index": false}`, since `text` has no doc values by
@@ -43310,12 +43339,9 @@ fn has_analyzed_text_term_leaf(q: &QueryNode, schema: &Schema) -> bool {
 /// which it raises whether or not `index: false` was declared — a wider
 /// divergence than this change, and one this error message would misreport.
 ///
-/// And one surface never reaches this function at all: `_validate/query`
-/// (`xerj-api/src/es_compat.rs::validate_query`) answers from the parse alone
-/// and never opens the index, so it still reports `{"valid": true}` for a body
-/// `_search` refuses. That is its behaviour on `main` too — this change did
-/// not alter it — but it now disagrees with `_search`, so it is written down
-/// here and in the CHANGELOG instead of being left to surprise someone.
+/// `_validate/query` reaches this check through [`check_buildable_query`]
+/// (via `Index::validate_query`), so its `valid` flag is the same answer
+/// `_search` gives for the same body.
 fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
     let check = |field: &str| -> Option<String> {
         let fc = declared_field(schema, field)?;

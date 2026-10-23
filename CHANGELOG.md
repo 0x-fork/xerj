@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrecorded with the journal kept, instead of a ledger that names no build
   ([#2239](https://github.com/xerj-org/xerj/issues/2239)).
 
+- `_validate/query` now asks every resolved index the same buildability
+  question `_search` does: a query naming a field that is neither indexed nor
+  has doc values, or a non-numeric value against a numeric field, reports
+  `valid: false` (with `error`/`explanations`) instead of claiming a body
+  `_search` rejects is valid. The parse-only answer is kept for a selector
+  that resolves to no index.
+
 - A `semantic` query on a `semantic_text` field returns `highlight` fragments
   when the request asks for them (#1947). The fragments are the field's
   best-scoring chunks for the query embedding, in score order, limited by

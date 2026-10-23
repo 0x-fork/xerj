@@ -19498,7 +19498,7 @@ pub struct ValidateQueryParams {
 }
 
 pub async fn validate_query(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<ValidateQueryParams>,
     body: OptionalJson<Value>,
@@ -19520,17 +19520,63 @@ pub async fn validate_query(
 
     match xerj_query::parse_request(&query_doc) {
         Ok(req) => {
+            // Parsing is only half the answer: `_search` also rewrites aliases,
+            // lowers keyword full-text to term, and rejects unsearchable fields
+            // and non-numeric values against numeric fields while it builds the
+            // query. Ask every resolved index the same question so this
+            // endpoint cannot report `valid: true` for a body `_search` refuses
+            // (the "GAP 5" this endpoint used to carry).
+            let targets = resolve_index_selector(&state, &index).await;
+            let mut successful = 0u64;
+            let mut first_error: Option<String> = None;
+            let mut explanations = Vec::new();
+            for name in &targets {
+                let outcome = match state.engine.get_index(name) {
+                    // A target the selector named but the engine does not hold
+                    // stays on the parse-only answer, as before.
+                    Ok(idx) => idx
+                        .validate_query(&req.query)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(_) => Ok(()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        successful += 1;
+                        if explain {
+                            explanations.push(json!({
+                                "index": name,
+                                "valid": true,
+                                "explanation": format!("{:?}", req.query),
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.clone());
+                        }
+                        if explain {
+                            explanations.push(json!({
+                                "index": name,
+                                "valid": false,
+                                "error": error,
+                            }));
+                        }
+                    }
+                }
+            }
+            let total = targets.len() as u64;
+            let failed = total.saturating_sub(successful);
             let mut resp = json!({
-                "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                "valid": true,
+                "_shards": { "total": total, "successful": successful, "failed": failed },
+                "valid": failed == 0,
                 "_index": index,
             });
+            if let Some(error) = first_error {
+                resp["error"] = json!(error);
+            }
             if explain {
-                resp["explanations"] = json!([{
-                    "index": index,
-                    "valid": true,
-                    "explanation": format!("{:?}", req.query),
-                }]);
+                resp["explanations"] = json!(explanations);
             }
             Json(resp).into_response()
         }
