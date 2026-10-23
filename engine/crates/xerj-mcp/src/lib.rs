@@ -1239,6 +1239,7 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                 "warnings — AGPL/SSPL/Elastic/BUSL/GPL/LGPL/MPL sources are approach-only. ",
                 "Refuses indices older than 30 days (override with stale_ok). ",
                 "A no-match is NOT an error: it says the corpus is wrong for the task. ",
+                "A line `weak match: the corpus may not cover this` means the passages are nearest neighbours, not coverage — fall back to grep or another corpus. ",
                 "Pass `max_tokens` to cap the response at a token budget (never exceeded; ",
                 "see that argument for the tokenizer and the locator-only rule). ",
                 "Corpora: `xerj corpus list`."),

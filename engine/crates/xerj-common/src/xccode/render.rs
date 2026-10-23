@@ -1,13 +1,49 @@
 //! The ONE output renderer. `xerj code` prints its `text`; the
 //! `xerj_code_search` MCP tool returns the same bytes as its payload — parity
 //! pinned by test, because two renderers always drift.
+//!
+//! A weak page is labelled [`WEAK_PAGE_PROSE`] and each passage is marked
+//! `weak`. A page that clears the checks in [`page_is_weak_match`] is
+//! byte-identical to the unlabelled rendering, including every strong passage
+//! on a page whose tail alone is weak.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
 use super::licence;
-use super::passage::{best_window, commaus, locator_repo, py_len, symbol_passage, take_chars};
+use super::passage::{
+    best_window, commaus, locator_repo, py_len, query_terms, symbol_passage, take_chars,
+};
+
+/// Printed once, above the hits, when [`page_is_weak_match`] is true.
+/// Agents key off this exact line.
+pub const WEAK_PAGE_PROSE: &str = "weak match: the corpus may not cover this";
+
+/// MEATL form of [`WEAK_PAGE_PROSE`].
+const WEAK_PAGE_MEATL: &str = "@weak why=corpus-may-not-cover";
+
+/// A passage whose `_score` is strictly below this fraction of the page's
+/// top score is marked `weak` on its own header. Half the best hit is "well
+/// below": an exact tie with half, and every nearer score, stays unmarked.
+const WEAK_SCORE_RATIO: f64 = 0.5;
+
+/// Coverage is only a page-level signal once the query has this many content
+/// terms. Two terms (`start node`) would flag a hit that shares one of them.
+const MIN_TERMS_FOR_COVERAGE: usize = 3;
+
+/// English function words of length >= 3. They are not coverage: a nearest
+/// neighbour is still English, so `the` / `with` / `into` would otherwise
+/// count as the query being present. Technical words (`list`, `type`,
+/// `index`, `set`) stay content.
+const STOPWORDS: &[&str] = &[
+    "about", "across", "after", "all", "also", "and", "any", "are", "been", "before", "being",
+    "both", "but", "can", "could", "did", "does", "doing", "each", "for", "from", "had", "has",
+    "have", "how", "into", "its", "just", "more", "most", "not", "one", "only", "other", "our",
+    "out", "per", "should", "some", "such", "than", "that", "the", "them", "then", "they", "this",
+    "under", "use", "used", "using", "via", "was", "were", "what", "when", "where", "which", "who",
+    "whose", "why", "will", "with", "within", "without", "would", "you", "your",
+];
 
 /// How to render the hit list.
 pub struct RenderOpts<'a> {
@@ -74,8 +110,9 @@ fn is_symbol_record(src: &Value) -> bool {
         && src.get("code").is_some_and(Value::is_string)
 }
 
-/// Render the full result block: the optional arms-ran note line, one block
-/// per hit, the footer. `note` is printed EVERY time it exists — a silently
+/// Render the full result block: the optional arms-ran note line, the
+/// weak-page line when [`page_is_weak_match`] says so, one block per hit,
+/// the footer. `note` is printed EVERY time it exists — a silently
 /// BM25-only "hybrid" result must never read as hybrid.
 pub fn render(
     hits: &[Value],
@@ -83,13 +120,25 @@ pub fn render(
     opts: &RenderOpts,
     note: Option<&str>,
 ) -> String {
+    let top = top_score(hits);
+    let page_weak = page_is_weak_match(hits, opts, top);
     let mut out = String::new();
     if let Some(n) = note {
         out.push_str(&note_line(n, opts.meatl));
         out.push('\n');
     }
+    if page_weak {
+        out.push_str(if opts.meatl {
+            WEAK_PAGE_MEATL
+        } else {
+            WEAK_PAGE_PROSE
+        });
+        out.push('\n');
+    }
     for h in hits {
-        out.push_str(&render_hit(h, licences, opts));
+        let score = hit_score(h);
+        let weak = page_weak || passage_is_score_weak(score, top);
+        out.push_str(&render_hit(h, licences, opts, weak));
     }
     if !opts.meatl {
         out.push('\n');
@@ -122,6 +171,116 @@ fn note_line(note: &str, meatl: bool) -> String {
     } else {
         format!("[{note}]")
     }
+}
+
+fn hit_score(hit: &Value) -> f64 {
+    hit.get("_score").and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn top_score(hits: &[Value]) -> f64 {
+    hits.iter().map(hit_score).fold(0.0, f64::max)
+}
+
+/// True when `score` sits strictly below [`WEAK_SCORE_RATIO`] of `top`.
+fn passage_is_score_weak(score: f64, top: f64) -> bool {
+    top > 0.0 && score < top * WEAK_SCORE_RATIO
+}
+
+/// Query content terms: [`query_terms`], stopwords removed, order kept,
+/// duplicates dropped. Matching is a lowercase substring of the hit text,
+/// the same comparison passage selection uses — literal, so a stem the
+/// engine would equate (`channels` / `channel`) counts only when the
+/// surface form occurs.
+fn content_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for term in query_terms(query) {
+        if STOPWORDS.contains(&term.as_str()) || out.iter().any(|seen| seen == &term) {
+            continue;
+        }
+        out.push(term);
+    }
+    out
+}
+
+/// Every non-`ax_*` string on the hit, plus highlight passages. Coverage
+/// reads the record, so a term outside the rendered window still counts.
+fn hit_haystack(hit: &Value) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(src) = hit.get("_source").and_then(Value::as_object) {
+        for (key, value) in src {
+            if !key.starts_with("ax_") {
+                collect_strings(value, &mut parts);
+            }
+        }
+    }
+    if let Some(passages) = hit.pointer("/fields/_passage").and_then(Value::as_array) {
+        for passage in passages {
+            if let Some(text) = passage.get("text").and_then(Value::as_str) {
+                parts.push(text);
+            }
+        }
+    }
+    parts.join("\n").to_lowercase()
+}
+
+fn collect_strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => out.push(text),
+        Value::Array(items) => {
+            for item in items {
+                collect_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn terms_covered(haystack: &str, terms: &[String]) -> usize {
+    terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count()
+}
+
+/// One RRF leg at rank 1: `1/(k+1)`. Two legs at rank 1 — a typical strong
+/// hybrid hit — score twice that. k is [`super::RRF_K`] (60), the value the
+/// request sends.
+fn rrf_one_leg_rank1() -> f64 {
+    1.0 / (super::RRF_K as f64 + 1.0)
+}
+
+/// The page is a weak match when the best passage does not cover the query,
+/// or when a hybrid/RRF top score is below one leg at rank 1.
+///
+/// Coverage: the query has at least [`MIN_TERMS_FOR_COVERAGE`] content terms
+/// and the best hit's text contains strictly fewer than half of them
+/// (`matched * 2 < terms`). That is the nearest-neighbour page, whose RRF
+/// scores sit next to a real hit's (rank 1 on both legs is `2/(k+1)` either
+/// way), and the one-term collision (`recall` inside `recall@k`).
+///
+/// Score: with `rrf_scores`, a top score strictly below [`rrf_one_leg_rank1`]
+/// is under half of the two-leg rank-1 score. BM25 has no such bar — its
+/// magnitude is the corpus's IDF — so a BM25 page is weak only on coverage,
+/// and a passage is marked on its own only by [`passage_is_score_weak`].
+fn page_is_weak_match(hits: &[Value], opts: &RenderOpts, top: f64) -> bool {
+    if opts.rrf_scores && top > 0.0 && top < rrf_one_leg_rank1() {
+        return true;
+    }
+    let terms = content_terms(opts.query);
+    if terms.len() < MIN_TERMS_FOR_COVERAGE {
+        return false;
+    }
+    let best = hits
+        .iter()
+        .map(|hit| terms_covered(&hit_haystack(hit), &terms))
+        .max()
+        .unwrap_or(0);
+    best * 2 < terms.len()
 }
 
 /// `file:line` when the record or a lexical `_passage` carries one.
@@ -383,10 +542,15 @@ fn lexical_passage_line(hit: &Value, lexical_lines: bool) -> Option<u64> {
     first.get("ordinal").and_then(Value::as_u64).map(|o| o + 1)
 }
 
-fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) -> String {
+fn render_hit(
+    h: &Value,
+    licences: &HashMap<String, String>,
+    opts: &RenderOpts,
+    weak: bool,
+) -> String {
     let src = h.get("_source").cloned().unwrap_or(Value::Null);
     let loc = citation_in(h, opts.lexical_lines, opts.checkout, opts.query);
-    let score = h.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
+    let score = hit_score(h);
     let lic = licences
         .get(locator_repo(&loc))
         .cloned()
@@ -404,7 +568,8 @@ fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) 
         } else {
             format!(" why={lic}")
         };
-        return format!("@ok f={loc} {shown}{why}\n");
+        let weak_tok = if weak { " weak" } else { "" };
+        return format!("@ok f={loc} {shown}{why}{weak_tok}\n");
     }
 
     let shown = if opts.rrf_scores {
@@ -417,7 +582,8 @@ fn render_hit(h: &Value, licences: &HashMap<String, String>, opts: &RenderOpts) 
     } else {
         format!(", {lic}")
     };
-    let mut out = format!("\n─── {loc}  ({shown}{lic_part})\n");
+    let weak_part = if weak { ", weak" } else { "" };
+    let mut out = format!("\n─── {loc}  ({shown}{lic_part}{weak_part})\n");
 
     // `body` is the content field of every family EXCEPT plain text (`.txt`
     // mirrors put their passage in `text`, #1139) and `*-symbols` records
@@ -1203,5 +1369,226 @@ mod tests {
             "{msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn prose_opts<'a>(query: &'a str, rrf: bool) -> RenderOpts<'a> {
+        RenderOpts {
+            corpus: "recommenders",
+            query,
+            full: 800,
+            no_symbol: true,
+            meatl: false,
+            rrf_scores: rrf,
+            age_days: None,
+            strict_licence: false,
+            lexical_lines: false,
+            checkout: None,
+        }
+    }
+
+    fn doc(path: &str, score: f64, body: &str) -> Value {
+        json!({
+            "_score": score,
+            "_source": { "ax_path": path, "line": 10, "body": body }
+        })
+    }
+
+    /// Issue #1986: a hybrid page of nearest neighbours carries the same RRF
+    /// magnitude as a real hit (rank 1 on both legs is `2/(k+1)` either way)
+    /// and used to render as five confident passages.
+    #[test]
+    fn nearest_neighbour_page_is_labelled_weak_and_a_covering_page_is_not() {
+        let query = "combine multiple recall channel results into one final ranked list";
+        let misses = vec![
+            doc(
+                "scann/tune.md",
+                2.0 / 61.0,
+                "ScaNN recall@k improves when the number of leaves is about 200.",
+            ),
+            doc(
+                "scann/other.md",
+                2.0 / 65.0,
+                "More notes on ANN leaf size and how recall moves with it.",
+            ),
+        ];
+        let opts = prose_opts(query, true);
+        let top = top_score(&misses);
+        assert!(
+            page_is_weak_match(&misses, &opts, top),
+            "one shared stem (recall) is under half the content terms"
+        );
+        let text = render(
+            &misses,
+            &HashMap::new(),
+            &opts,
+            Some("hybrid RRF(k=60) — BM25 over 1 index(es), vector over 1 of 1"),
+        );
+        assert!(
+            text.starts_with(
+                "[hybrid RRF(k=60) — BM25 over 1 index(es), vector over 1 of 1]\n\
+                 weak match: the corpus may not cover this\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("─── scann/tune.md:10  (rrf 0.0328, weak)\n"),
+            "{text}"
+        );
+        assert!(text.contains(", weak)"), "{text}");
+        assert!(text.contains("2 passages from 'recommenders'\n"), "{text}");
+
+        // The same scores, with the passage actually covering the need, stay
+        // a strong page: no banner, no per-hit marker.
+        let covered = vec![doc(
+            "docs/ranking.md",
+            2.0 / 61.0,
+            "Combine multiple recall channel results into one final ranked list \
+             by a second-stage scorer.",
+        )];
+        let covered_opts = prose_opts(query, true);
+        assert!(
+            !page_is_weak_match(&covered, &covered_opts, top_score(&covered)),
+            "a passage that contains the query terms is coverage"
+        );
+        let strong = render(&covered, &HashMap::new(), &covered_opts, None);
+        assert!(!strong.contains("weak"), "{strong}");
+        assert!(strong.contains("(rrf 0.0328)\n"), "{strong}");
+    }
+
+    #[test]
+    fn coverage_uses_the_best_hit_and_half_the_terms_is_enough() {
+        // 4 content terms. 2/4 is half (`matched * 2 < 4` is false). The
+        // first hit covers one term; the second covers two. The page follows
+        // the best hit.
+        let query = "lazy dfa cache eviction";
+        let hits = vec![
+            doc("a.rs", 10.0, "unrelated buffer pooling notes"),
+            doc("b.rs", 9.0, "the cache eviction policy lives here"),
+        ];
+        let opts = prose_opts(query, false);
+        assert_eq!(content_terms(query), ["lazy", "dfa", "cache", "eviction"]);
+        assert!(
+            !page_is_weak_match(&hits, &opts, top_score(&hits)),
+            "two of four terms on the best hit is half, which still stands"
+        );
+        let only_one = vec![doc("a.rs", 10.0, "a cache of buffers")];
+        assert!(
+            page_is_weak_match(&only_one, &opts, 10.0),
+            "one of four terms is under half"
+        );
+        // A two-term query never takes the coverage path.
+        let short = prose_opts("start node", false);
+        let miss = vec![doc("a.rs", 9.0, "nothing relevant here at all")];
+        assert!(!page_is_weak_match(&miss, &short, 9.0));
+    }
+
+    #[test]
+    fn stopwords_do_not_count_as_coverage() {
+        let query = "the and for with cold start users";
+        assert_eq!(content_terms(query), ["cold", "start", "users"]);
+        let prose = vec![doc("a.md", 5.0, "the and for with something else")];
+        let opts = prose_opts(query, false);
+        assert!(page_is_weak_match(&prose, &opts, 5.0));
+        let hit = vec![doc("a.md", 5.0, "Cold-start users receive a prior.")];
+        assert!(!page_is_weak_match(&hit, &opts, 5.0));
+    }
+
+    #[test]
+    fn a_passage_below_half_the_top_score_is_marked_and_the_top_is_not() {
+        assert!(
+            !passage_is_score_weak(6.0, 12.0),
+            "exactly half stays a hit"
+        );
+        assert!(passage_is_score_weak(5.99, 12.0));
+        assert!(!passage_is_score_weak(0.0, 0.0));
+
+        let mut tail = apache_hit();
+        tail["_score"] = json!(4.0);
+        tail["_source"]["ax_path"] = json!("tantivy/src/other.rs");
+        tail["_source"]["line"] = json!(3);
+        let hits = vec![apache_hit(), tail];
+        let text = render(
+            &hits,
+            &licences(),
+            &RenderOpts {
+                corpus: "xerj-search",
+                query: "rebuild segment reader",
+                full: 800,
+                no_symbol: false,
+                meatl: false,
+                rrf_scores: false,
+                age_days: None,
+                strict_licence: false,
+                lexical_lines: false,
+                checkout: None,
+            },
+            None,
+        );
+        assert!(
+            text.contains("─── tantivy/src/reader.rs:30  (score 12.35, Apache-2.0/MIT)\n"),
+            "the strong hit is unchanged: {text}"
+        );
+        assert!(
+            text.contains("─── tantivy/src/other.rs:3  (score 4.00, Apache-2.0/MIT, weak)\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("weak match"),
+            "a covered top hit means the corpus has the need: {text}"
+        );
+    }
+
+    #[test]
+    fn rrf_below_one_leg_at_rank_one_is_weak_even_when_the_terms_match() {
+        // k = 60. Rank 1 on one leg is 1/61. Rank 2 on one leg is 1/62,
+        // which is under half of the two-leg rank-1 score 2/61.
+        let rank1 = 1.0 / 61.0;
+        let rank2 = 1.0 / 62.0;
+        let body = "pub fn rebuild_segment_reader() {}";
+        let strong = vec![doc("a.rs", rank1, body)];
+        let weak = vec![doc("a.rs", rank2, body)];
+        let opts = prose_opts("rebuild segment reader", true);
+        assert!(!page_is_weak_match(&strong, &opts, rank1));
+        assert!(page_is_weak_match(&weak, &opts, rank2));
+        let text = render(&weak, &HashMap::new(), &opts, None);
+        assert!(
+            text.contains("weak match: the corpus may not cover this\n"),
+            "{text}"
+        );
+        assert!(text.contains(", weak)\n"), "{text}");
+        let ok = render(&strong, &HashMap::new(), &opts, None);
+        assert!(!ok.contains("weak"), "{ok}");
+    }
+
+    #[test]
+    fn meatl_marks_a_weak_page_on_its_own_record() {
+        let hits = vec![doc(
+            "scann/tune.md",
+            2.0 / 61.0,
+            "ScaNN recall@k improves when leaves grow.",
+        )];
+        let text = render(
+            &hits,
+            &HashMap::new(),
+            &RenderOpts {
+                corpus: "tfrs",
+                query: "combine multiple recall channel results into one final ranked list",
+                full: 800,
+                no_symbol: true,
+                meatl: true,
+                rrf_scores: true,
+                age_days: None,
+                strict_licence: false,
+                lexical_lines: false,
+                checkout: None,
+            },
+            Some("hybrid RRF(k=60)"),
+        );
+        assert_eq!(
+            text,
+            "@mode hybrid RRF(k=60)\n\
+             @weak why=corpus-may-not-cover\n\
+             @ok f=scann/tune.md:10 rrf=0.0328 weak\n"
+        );
     }
 }
