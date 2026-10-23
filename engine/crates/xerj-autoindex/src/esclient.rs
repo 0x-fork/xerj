@@ -25,6 +25,9 @@ pub struct Es {
     /// How long one `bulk` call keeps re-offering records the server
     /// rejected with a per-item 429 (see [`THROTTLE_PATIENCE`]).
     throttle_patience: Duration,
+    /// How long a bulk that has not had a single item accepted keeps
+    /// re-asking a parent memory breaker (see [`ZERO_PROGRESS_PATIENCE`]).
+    zero_progress_patience: Duration,
     /// Most actions this client puts in one `_bulk` request before the server
     /// has said anything about it. See [`BULK_MAX_ACTIONS`]; tests shrink it.
     bulk_max_actions: usize,
@@ -624,6 +627,53 @@ impl BulkAdmission {
 /// 5xx and write blocks are NOT waited on — they are not congestion.
 pub const THROTTLE_PATIENCE: Duration = Duration::from_secs(600);
 
+/// How long a bulk that has accepted nothing will keep re-asking the parent
+/// memory breaker before the run stops and names the cap (#2238).
+///
+/// [`THROTTLE_PATIENCE`] stays the budget once any item in the bulk has been
+/// accepted: a drain that is freeing memory (the #944 mailbox held the
+/// breaker for 57 s before drains existed; releases after #948 are seconds)
+/// must be allowed to finish. A bulk the server has not taken a single item
+/// from is the other shape — the 8 GiB auto tier's breaker loop, indexed
+/// count stuck at 0 for several minutes with no statement of what to change.
+/// Ninety seconds is past that 57 s hold and past one drain of the auto
+/// tier's 2 GiB memtable budget, and short of a multi-minute spin.
+pub const ZERO_PROGRESS_PATIENCE: Duration = Duration::from_secs(90);
+
+/// The parent memory breaker, as opposed to a disk flood-stage 429 or a
+/// thread-pool rejection. Both of its reasons carry one of these phrases.
+pub(crate) fn is_parent_memory_breaker(reason: &str) -> bool {
+    reason.contains("circuit breaker") || reason.contains("memtable byte budget")
+}
+
+/// Name `limits.max_process_memory_mb` on a parent-breaker 429 that does not
+/// already name it (#2238). Other failures are returned unchanged, and a
+/// reason that already carries the knob is not annotated twice.
+pub(crate) fn memory_cap_hint(reason: &str) -> String {
+    const MARKER: &str = "limits.max_process_memory_mb";
+    if reason.contains(MARKER) || !is_parent_memory_breaker(reason) {
+        return reason.to_owned();
+    }
+    format!(
+        "{reason} — raise {MARKER} or XERJ_MAX_PROCESS_MEMORY_MB \
+         (the auto memory tier derives this breaker's limit from that cap; 0 = whole machine)"
+    )
+}
+
+/// The back-pressure stop, with the process-memory cap named when the
+/// rejection is the parent breaker.
+pub(crate) fn backpressure_exhausted(
+    items: u64,
+    patience: Duration,
+    reason: &str,
+) -> BackpressureExhausted {
+    BackpressureExhausted {
+        items,
+        patience,
+        reason: memory_cap_hint(reason),
+    }
+}
+
 /// How often the wait is announced on stderr, so a run that is waiting on
 /// the server does not look like a hang.
 const NOTICE_EVERY: Duration = Duration::from_secs(30);
@@ -948,7 +998,7 @@ fn parse_round(v: &Value) -> Round {
                     op["error"]
                         .get("reason")
                         .and_then(Value::as_str)
-                        .map(|r| r.chars().take(300).collect())
+                        .map(|r| r.chars().take(SERVER_REASON_MAX).collect())
                         .unwrap_or_else(error_text),
                 );
             }
@@ -987,6 +1037,10 @@ pub struct BulkOutcome {
     /// failure that says "come back later" rather than "something is broken".
     /// Callers use it to name the stop as back-pressure, not as an abort.
     pub throttled_out: u64,
+    /// The patience budget that elapsed when `throttled_out` was set.
+    /// `None` until a bulk gives up. The full [`THROTTLE_PATIENCE`] once any
+    /// item was accepted; [`ZERO_PROGRESS_PATIENCE`] when none was (#2238).
+    pub exhausted_after: Option<Duration>,
 }
 
 impl BulkOutcome {
@@ -1000,6 +1054,9 @@ impl BulkOutcome {
         }
         if self.first_server_error.is_none() {
             self.first_server_error = other.first_server_error;
+        }
+        if self.exhausted_after.is_none() {
+            self.exhausted_after = other.exhausted_after;
         }
     }
 }
@@ -1161,6 +1218,7 @@ impl Es {
             retry_max_delay,
             admission: Arc::new(BulkAdmission::off()),
             throttle_patience: THROTTLE_PATIENCE,
+            zero_progress_patience: ZERO_PROGRESS_PATIENCE,
             bulk_max_actions: BULK_MAX_ACTIONS,
             request_size: Arc::new(RequestSizeLedger::default()),
             throttle_ledger: Arc::new(ThrottleLedger::default()),
@@ -1184,6 +1242,14 @@ impl Es {
     #[cfg(test)]
     fn with_throttle_patience(mut self, patience: Duration) -> Self {
         self.throttle_patience = patience;
+        self
+    }
+
+    /// How long a bulk the server has not accepted a single item from keeps
+    /// re-asking a parent memory breaker (tests shrink it).
+    #[cfg(test)]
+    fn with_zero_progress_patience(mut self, patience: Duration) -> Self {
+        self.zero_progress_patience = patience;
         self
     }
 
@@ -1479,7 +1545,11 @@ impl Es {
     ///   re-asking at the capped backoff for up to `throttle_patience`,
     ///   announcing the wait every [`NOTICE_EVERY`]; a one-shot client (gate
     ///   off — a probe, a status read) treats a 429 like a 5xx and gives up
-    ///   after six, because a 10-minute wait is wrong for a question.
+    ///   after six, because a 10-minute wait is wrong for a question. A
+    ///   parent memory breaker that has accepted nothing is the exception
+    ///   inside that budget: it stops at [`ZERO_PROGRESS_PATIENCE`] and names
+    ///   `limits.max_process_memory_mb` (#2238), because waiting out ten
+    ///   minutes cannot shrink a budget the drain is not being asked to free.
     ///   Measured reason for the patience: the parent memory circuit breaker
     ///   answered a bulk with HTTP 429 and held the server above the
     ///   watermark for 57 s on the 1 GB mailbox run — the six attempts
@@ -1501,20 +1571,33 @@ impl Es {
                 Attempt::Abort(e) => return Err(e),
                 Attempt::Throttled(reason) => {
                     self.admission.on_congestion();
+                    let raw = reason.as_deref().unwrap_or("HTTP 429");
                     let err = match &reason {
-                        Some(r) => anyhow!("{what}: HTTP 429 Too Many Requests: {r}"),
+                        Some(r) => {
+                            anyhow!("{what}: HTTP 429 Too Many Requests: {}", memory_cap_hint(r))
+                        }
                         None => anyhow!("{what}: HTTP 429 Too Many Requests"),
                     };
                     if self.admission.enabled() {
                         let waited = started.elapsed();
-                        if waited >= self.throttle_patience {
+                        // A whole-request 429 accepted nothing. The parent
+                        // memory breaker stops at the short budget; every
+                        // other 429 (disk flood, thread-pool rejection) keeps
+                        // the full patience, because that condition can clear.
+                        let limit = if is_parent_memory_breaker(raw) {
+                            self.throttle_patience.min(self.zero_progress_patience)
+                        } else {
+                            self.throttle_patience
+                        };
+                        if waited >= limit {
                             return Err(err);
                         }
                         self.throttle_notice(
                             &mut last_notice,
-                            reason.as_deref().unwrap_or("HTTP 429"),
+                            raw,
                             &format!("retrying {what}"),
                             waited,
+                            limit,
                         );
                     } else {
                         failures += 1;
@@ -1577,14 +1660,16 @@ impl Es {
         reason: &str,
         doing: &str,
         waited: Duration,
+        giving_up_after: Duration,
     ) {
         if !self.admission.announces() || matches!(last, Some(t) if t.elapsed() < NOTICE_EVERY) {
             return;
         }
+        let reason = memory_cap_hint(reason);
         eprintln!(
             "autoindex: server is shedding load — {reason}; {doing} (waited {}s, giving up after {}s)",
             waited.as_secs(),
-            self.throttle_patience.as_secs()
+            giving_up_after.as_secs()
         );
         *last = Some(Instant::now());
     }
@@ -1794,15 +1879,21 @@ impl Es {
     /// 429/5xx retries the WHOLE request (`retry_loop`). A 200 whose items
     /// carry `status: 429` re-offers ONLY those items, after a backoff, for up
     /// to `throttle_patience` — the memory breaker's shape, see
-    /// [`THROTTLE_PATIENCE`]. Records the server took are never sent twice,
-    /// and a record it refused for a reason waiting cannot fix (a per-item
-    /// 400, 5xx, or a write block) is not re-offered.
+    /// [`THROTTLE_PATIENCE`]. A parent memory breaker that has not accepted a
+    /// single item of this bulk stops at [`ZERO_PROGRESS_PATIENCE`] instead
+    /// (#2238). Records the server took are never sent twice, and a record it
+    /// refused for a reason waiting cannot fix (a per-item 400, 5xx, or a
+    /// write block) is not re-offered.
     fn bulk_window(&self, body: Vec<u8>) -> Result<SentWindow> {
         let mut body = body;
         // Item errors settled by earlier rounds of this call (a bad record's
         // 400): the record is not re-offered, its error is still reported.
         let mut settled_item_errors = 0u64;
         let mut settled_first_error: Option<String> = None;
+        // Set once any round took an item. From then on the full patience
+        // applies, even if later rounds are all 429: a drain in progress
+        // (#944 held 57 s) must be allowed to finish.
+        let mut accepted_any = false;
         let episode = Instant::now();
         let mut delay = self.retry_initial_delay;
         let mut last_notice: Option<Instant> = None;
@@ -1819,14 +1910,30 @@ impl Es {
             if round.throttled.is_empty() || round.other_server_errors > 0 {
                 return Ok(SentWindow::Done(outcome));
             }
+            if round.items > round.throttled.len() {
+                accepted_any = true;
+            }
             // Only per-item 429s stand between this bulk and a clean
             // outcome. Wait while patience lasts; after that the caller gets
             // the server's own reason, exactly as before — but named as
             // back-pressure (#944), so the run's terminal line can say
             // `reason=server-backpressure` rather than `reason=aborted`.
+            // Zero accepts against the parent memory breaker use the short
+            // budget (#2238). Any other 429, and any bulk that has landed an
+            // item, keeps the full patience.
+            let parent = round
+                .throttle_reason
+                .as_deref()
+                .is_some_and(is_parent_memory_breaker);
+            let limit = if accepted_any || !parent {
+                self.throttle_patience
+            } else {
+                self.throttle_patience.min(self.zero_progress_patience)
+            };
             let waited = episode.elapsed();
-            if waited >= self.throttle_patience {
+            if waited >= limit {
                 outcome.throttled_out = round.throttled.len() as u64;
+                outcome.exhausted_after = Some(limit);
                 return Ok(SentWindow::Done(outcome));
             }
             // A response whose item count does not match the body cannot be
@@ -1848,6 +1955,7 @@ impl Es {
                     .unwrap_or("per-item HTTP 429"),
                 &format!("re-offering {} rejected record(s)", round.throttled.len()),
                 waited,
+                limit,
             );
             self.throttle_ledger
                 .reissues
@@ -2523,6 +2631,7 @@ mod tests {
     use std::io::Read;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -4017,6 +4126,160 @@ mod tests {
         assert_eq!(outcome.server_errors, 2);
     }
 
+    /// Answer every connection with `body` until `stop` is set. The
+    /// zero-progress tests need a server that outlasts the short budget.
+    fn serve_until(
+        listener: TcpListener,
+        body: Vec<u8>,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = read_request(&mut stream);
+                    respond_json(&mut stream, &body);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        })
+    }
+
+    /// #2238: every item 429 from the parent breaker, forever. The run must
+    /// stop at the zero-progress budget and name `limits.max_process_memory_mb`,
+    /// not sit out the full ten-minute patience with the indexed count at 0.
+    #[test]
+    fn a_parent_breaker_that_accepts_nothing_stops_at_zero_progress_patience() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = serve_until(
+            listener,
+            items_response(
+                &[item("a", 429, Some(BREAKER)), item("b", 429, Some(BREAKER))],
+                true,
+            ),
+            Arc::clone(&stop),
+        );
+        let es = client(address, 4)
+            .with_throttle_patience(Duration::from_secs(2))
+            .with_zero_progress_patience(Duration::from_millis(50));
+        let started = Instant::now();
+        let outcome = es.bulk([pair("a"), pair("b")].concat()).unwrap();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "zero accepts must not wait the 2s patience, took {elapsed:?}"
+        );
+        assert_eq!(
+            outcome.exhausted_after,
+            Some(Duration::from_millis(50)),
+            "{outcome:?}"
+        );
+        assert!(outcome.throttled_out >= 1, "{outcome:?}");
+        let backoffs = es.backoff_delays.lock().unwrap().len();
+        assert!(
+            (1..=10).contains(&backoffs),
+            "retried inside the short budget, did not spin: {backoffs} backoffs"
+        );
+        let hinted = super::memory_cap_hint(outcome.first_server_error.as_deref().unwrap());
+        assert!(hinted.contains("limits.max_process_memory_mb"), "{hinted}");
+    }
+
+    /// #944/#1250: once any item of the bulk has been accepted, a later run of
+    /// all-429 answers keeps the full patience. Fail-fast applies only to a
+    /// bulk the server has not taken a single item from.
+    #[test]
+    fn a_bulk_that_landed_an_item_keeps_the_full_patience() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut first = true;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let _ = read_request(&mut stream);
+                        if first {
+                            first = false;
+                            respond_json(
+                                &mut stream,
+                                &items_response(
+                                    &[item("a", 201, None), item("b", 429, Some(BREAKER))],
+                                    true,
+                                ),
+                            );
+                        } else {
+                            items_answered(&mut stream, &[429]);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        });
+        let es = client(address, 4)
+            .with_throttle_patience(Duration::from_millis(300))
+            .with_zero_progress_patience(Duration::from_millis(20));
+        let started = Instant::now();
+        let outcome = es.bulk([pair("a"), pair("b")].concat()).unwrap();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "an accepted item must keep the 300ms patience, stopped after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the full patience is 300ms, took {elapsed:?}"
+        );
+        assert_eq!(
+            outcome.exhausted_after,
+            Some(Duration::from_millis(300)),
+            "{outcome:?}"
+        );
+        assert!(outcome.throttled_out >= 1, "{outcome:?}");
+    }
+
+    #[test]
+    fn backpressure_exhausted_names_the_process_memory_cap_once() {
+        let error = super::backpressure_exhausted(4, Duration::from_secs(90), BREAKER);
+        let rendered = error.to_string();
+        assert!(rendered.contains("after 90s"), "{rendered}");
+        assert!(rendered.contains("circuit breaker"), "{rendered}");
+        assert!(
+            rendered.contains("limits.max_process_memory_mb"),
+            "{rendered}"
+        );
+        assert_eq!(
+            super::memory_cap_hint(&error.reason),
+            error.reason,
+            "a reason that already names the cap is not annotated twice"
+        );
+        assert_eq!(
+            super::memory_cap_hint("mapper_parsing_exception"),
+            "mapper_parsing_exception"
+        );
+    }
+
     #[test]
     fn bulk_item_selection_keeps_lines_byte_identical_and_knows_delete_has_no_source() {
         let del = b"{\"delete\":{\"_index\":\"i\",\"_id\":\"x\"}}\n".to_vec();
@@ -4142,6 +4405,57 @@ mod tests {
             "six attempts, five backoffs — a probe does not wait ten minutes"
         );
         server.join().unwrap();
+    }
+
+    /// A plain HTTP 429 (no bulk `items`) from the parent breaker is the same
+    /// zero-progress loop: stop at the short budget and name the cap. A probe
+    /// (admission off) still stops after six attempts — covered above.
+    #[test]
+    fn a_plain_parent_breaker_429_names_the_cap_and_stops_short() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = read_request(&mut stream);
+                    let body = br#"{"error":{"type":"circuit_breaking_exception","reason":"[parent] real memory circuit breaker tripped: rss=9MB >= watermark=8MB"},"status":429}"#;
+                    respond_status(&mut stream, "429 Too Many Requests", body);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        });
+        let es = client(address, 4)
+            .with_throttle_patience(Duration::from_secs(2))
+            .with_zero_progress_patience(Duration::from_millis(40));
+        let started = Instant::now();
+        let error = es.bulk(BULK.to_vec()).unwrap_err();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("limits.max_process_memory_mb"),
+            "{rendered}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a parent breaker that accepts nothing must not wait 2s, took {elapsed:?}"
+        );
+        let backoffs = es.backoff_delays.lock().unwrap().len();
+        assert!(
+            (1..=8).contains(&backoffs),
+            "retried inside the short budget: {backoffs} backoffs"
+        );
     }
 
     // ── #955: a request is bounded in actions and bytes, and a request the

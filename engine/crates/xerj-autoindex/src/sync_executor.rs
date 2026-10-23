@@ -2679,28 +2679,35 @@ fn check_bulk_outcome(
     outcome: crate::esclient::BulkOutcome,
 ) -> Result<()> {
     // `Es::bulk` has already re-sent per-item 429s, and only those, for the
-    // whole of its patience (`THROTTLE_PATIENCE`, #944/#949).
-    // What is left is either a server condition that did not clear — fatal,
-    // and resumable, because a sealed operation is journaled applied only
-    // after this returns — or a record the server refused outright.
+    // whole of its patience (`THROTTLE_PATIENCE`, #944/#949, shortened to
+    // `ZERO_PROGRESS_PATIENCE` when a parent memory breaker accepts nothing,
+    // #2238). What is left is either a server condition that did not clear —
+    // fatal, and resumable, because a sealed operation is journaled applied
+    // only after this returns — or a record the server refused outright.
     if outcome.throttled_out > 0 {
-        return Err(anyhow::Error::new(crate::esclient::BackpressureExhausted {
-            items: outcome.server_errors,
-            patience: es.throttle_patience(),
-            reason: outcome
-                .first_server_error
-                .unwrap_or_else(|| "unknown server error".into()),
-        }));
+        let patience = outcome
+            .exhausted_after
+            .unwrap_or_else(|| es.throttle_patience());
+        let reason = outcome
+            .first_server_error
+            .unwrap_or_else(|| "unknown server error".into());
+        return Err(anyhow::Error::new(crate::esclient::backpressure_exhausted(
+            outcome.server_errors,
+            patience,
+            &reason,
+        )));
     }
     if outcome.server_errors > 0 {
+        let reason = outcome
+            .first_server_error
+            .as_deref()
+            .map(crate::esclient::memory_cap_hint)
+            .unwrap_or_else(|| "unknown server error".into());
         anyhow::bail!(
-            "the server failed {} of a prepared bulk's items: {}. Nothing from this bulk was \
+            "the server failed {} of a prepared bulk's items: {reason}. Nothing from this bulk was \
              journaled applied; fix the reported server condition and rerun the same command — \
              the run resumes from its last committed operation",
             outcome.server_errors,
-            outcome
-                .first_server_error
-                .unwrap_or_else(|| "unknown server error".into())
         );
     }
     anyhow::ensure!(

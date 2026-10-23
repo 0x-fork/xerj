@@ -2539,6 +2539,16 @@ fn replacement_failpoint(_boundary: u8, _state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The first server error, with `limits.max_process_memory_mb` named when
+/// the rejection is the parent memory breaker (#2238).
+fn server_error_text(outcome: &crate::esclient::BulkOutcome) -> String {
+    outcome
+        .first_server_error
+        .as_deref()
+        .map(crate::esclient::memory_cap_hint)
+        .unwrap_or_else(|| "unknown server error".into())
+}
+
 /// Send one bulk body and fold its per-item rejections into
 /// `rejected_records`.
 ///
@@ -2570,10 +2580,7 @@ fn record_bulk_outcome(
                      complete; fix the server condition (or wait for it to clear) and rerun \
                      autoindex — the run resumes from the journal",
                     outcome.server_errors,
-                    outcome
-                        .first_server_error
-                        .as_deref()
-                        .unwrap_or("unknown server error")
+                    server_error_text(&outcome)
                 ));
                 return true;
             }
@@ -2883,10 +2890,7 @@ where
                          complete; fix the server condition (or wait for it to clear) and rerun \
                          autoindex — the run resumes from the journal",
                         outcome.server_errors,
-                        outcome
-                            .first_server_error
-                            .as_deref()
-                            .unwrap_or("unknown server error")
+                        server_error_text(&outcome)
                     );
                     for t in &tokens {
                         st.failed.insert(*t);
@@ -14041,6 +14045,7 @@ mod bulk_pipe_tests {
             first_error: None,
             first_server_error: None,
             throttled_out: 0,
+            exhausted_after: None,
         }
     }
 
