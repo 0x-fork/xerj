@@ -953,7 +953,8 @@ impl<'a> EsSyncBackend<'a> {
     /// `credit` ticks the current phase once per window after that window's
     /// answer is in. The capability probe passes `false`: it is one sample,
     /// not one of the phase's windows, and a tick there would walk the bar
-    /// past its denominator.
+    /// past its denominator. A `timed_out` page bails before the tick, so a
+    /// partial window is not counted as zero and is not credited (#1761).
     fn windowed_value_counts(
         &self,
         index: &str,
@@ -982,6 +983,18 @@ impl<'a> EsSyncBackend<'a> {
                     "aggs": {"values": {"terms": {"field": field, "size": window.len()}}}
                 }),
             )?;
+            // A deadline page is HTTP 200 with `timed_out` and an empty
+            // aggregation. Counting it as "every digest is absent" aborts a
+            // generation whose rows are on the node (#1761's concurrent
+            // catalog writer hits this deadline). Say so; rerunning resumes.
+            if response.get("timed_out") == Some(&Value::Bool(true)) {
+                anyhow::bail!(
+                    "finalize-verify search on {index} returned timed_out: the page is partial \
+                     and is not a live count (a concurrent writer on this index can hold \
+                     publication across the deadline). Nothing from this window was counted — \
+                     rerun the same command, which resumes"
+                );
+            }
             for bucket in response
                 .pointer("/aggregations/values/buckets")
                 .and_then(Value::as_array)
@@ -1052,6 +1065,16 @@ impl<'a> EsSyncBackend<'a> {
                         ]}}
                     }),
                 )?;
+                if response.get("timed_out") == Some(&Value::Bool(true)) {
+                    anyhow::bail!(
+                        "finalize-verify search on {} returned timed_out: the page is partial \
+                         and is not a live catalog count (a concurrent corpus build publishing \
+                         to this shared index can hold the publication bracket across the \
+                         deadline). Nothing from this window was counted — rerun the same \
+                         command, which resumes",
+                        crate::catalog::CATALOG_INDEX
+                    );
+                }
                 let page_total = response
                     .pointer("/hits/total/value")
                     .and_then(Value::as_u64)
@@ -1090,6 +1113,9 @@ impl<'a> EsSyncBackend<'a> {
             );
             // One tick per window, after the window's pages have all come
             // back. The phase denominator is windows, not pages (#1267).
+            // A `timed_out` page bails above, so a partial catalog window is
+            // not counted as zero and the phase does not sit at 0/N while
+            // another corpus publishes to this shared index (#1761).
             credit_verify_items(self.pr, 1);
         }
         Ok(counts)

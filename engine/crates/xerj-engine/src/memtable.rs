@@ -2997,6 +2997,14 @@ pub enum MemBoolPred {
         field: String,
         value: String,
     },
+    /// Disjunction of exact values on one field. The catalog finalize-verify
+    /// query is `bool.filter [terms file_key, term run_id]`; without this arm
+    /// that bool fell through to `DocsForScan` and cloned every buffered
+    /// catalog row, including the other run's (#1761).
+    Terms {
+        field: String,
+        values: Vec<String>,
+    },
     Range {
         field: String,
         gte: Option<f64>,
@@ -4096,7 +4104,9 @@ impl FtsMemtable {
     ) -> Option<(Vec<(String, usize)>, u64)> {
         enum Col<'a> {
             Kw(&'a Vec<Option<String>>, &'a str),
+            KwAny(&'a Vec<Option<String>>, FxHashSet<String>),
             NumEq(&'a Vec<Option<f64>>, f64),
+            NumAny(&'a Vec<Option<f64>>, FxHashSet<u64>),
             Num(
                 &'a Vec<Option<f64>>,
                 Option<f64>,
@@ -4143,6 +4153,40 @@ impl FtsMemtable {
                         cols.push(Col::NumEq(col, needle));
                     }
                 }
+                MemBoolPred::Terms { field, values } => {
+                    if self.doc_values.array_fields.contains(field.as_str()) {
+                        return None;
+                    }
+                    // #677: dotted path → source scan (see the Term arm).
+                    if field.contains('.') {
+                        return None;
+                    }
+                    // CIDR is not a literal in the column; the source scan
+                    // expands it. An empty value list matches nothing and
+                    // stays on this path — `None` would clone the memtable.
+                    if values.iter().any(|v| v.contains('/')) {
+                        return None;
+                    }
+                    if let Some(col) = self.doc_values.keyword.get(field.as_str()) {
+                        if self
+                            .doc_values
+                            .keyword_has_whitespace
+                            .contains(field.as_str())
+                        {
+                            return None;
+                        }
+                        let set: FxHashSet<String> = values.iter().cloned().collect();
+                        cols.push(Col::KwAny(col, set));
+                    } else {
+                        let col = self.doc_values.numeric.get(field.as_str())?;
+                        let mut set: FxHashSet<u64> = FxHashSet::default();
+                        for v in values {
+                            let needle = v.parse::<f64>().ok()?;
+                            set.insert(needle.to_bits());
+                        }
+                        cols.push(Col::NumAny(col, set));
+                    }
+                }
                 MemBoolPred::Range {
                     field,
                     gte,
@@ -4169,7 +4213,16 @@ impl FtsMemtable {
             for c in &cols {
                 let ok = match c {
                     Col::Kw(col, want) => col.get(idx).and_then(|o| o.as_deref()) == Some(*want),
+                    Col::KwAny(col, set) => col
+                        .get(idx)
+                        .and_then(|o| o.as_deref())
+                        .is_some_and(|v| set.contains(v)),
                     Col::NumEq(col, want) => col.get(idx).copied().flatten() == Some(*want),
+                    Col::NumAny(col, set) => col
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|v| set.contains(&v.to_bits())),
                     Col::Num(col, gte, gt, lte, lt) => match col.get(idx).copied().flatten() {
                         None => false,
                         Some(v) => {
@@ -4229,7 +4282,9 @@ impl FtsMemtable {
     ) -> Option<()> {
         enum Col<'a> {
             Kw(&'a Vec<Option<String>>, &'a str),
+            KwAny(&'a Vec<Option<String>>, FxHashSet<String>),
             NumEq(&'a Vec<Option<f64>>, f64),
+            NumAny(&'a Vec<Option<f64>>, FxHashSet<u64>),
             Num(
                 &'a Vec<Option<f64>>,
                 Option<f64>,
@@ -4268,6 +4323,37 @@ impl FtsMemtable {
                         cols.push(Col::NumEq(col, needle));
                     }
                 }
+                MemBoolPred::Terms { field, values } => {
+                    if self.doc_values.array_fields.contains(field.as_str()) {
+                        return None;
+                    }
+                    // #677: dotted path → source scan (see the Term arm).
+                    if field.contains('.') {
+                        return None;
+                    }
+                    if values.iter().any(|v| v.contains('/')) {
+                        return None;
+                    }
+                    if let Some(col) = self.doc_values.keyword.get(field.as_str()) {
+                        if self
+                            .doc_values
+                            .keyword_has_whitespace
+                            .contains(field.as_str())
+                        {
+                            return None;
+                        }
+                        let set: FxHashSet<String> = values.iter().cloned().collect();
+                        cols.push(Col::KwAny(col, set));
+                    } else {
+                        let col = self.doc_values.numeric.get(field.as_str())?;
+                        let mut set: FxHashSet<u64> = FxHashSet::default();
+                        for v in values {
+                            let needle = v.parse::<f64>().ok()?;
+                            set.insert(needle.to_bits());
+                        }
+                        cols.push(Col::NumAny(col, set));
+                    }
+                }
                 MemBoolPred::Range {
                     field,
                     gte,
@@ -4292,7 +4378,16 @@ impl FtsMemtable {
             for c in &cols {
                 let ok = match c {
                     Col::Kw(col, want) => col.get(idx).and_then(|o| o.as_deref()) == Some(*want),
+                    Col::KwAny(col, set) => col
+                        .get(idx)
+                        .and_then(|o| o.as_deref())
+                        .is_some_and(|v| set.contains(v)),
                     Col::NumEq(col, want) => col.get(idx).copied().flatten() == Some(*want),
+                    Col::NumAny(col, set) => col
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|v| set.contains(&v.to_bits())),
                     Col::Num(col, gte, gt, lte, lt) => match col.get(idx).copied().flatten() {
                         None => false,
                         Some(v) => {
@@ -6262,6 +6357,43 @@ mod filtered_docs_arc_tests {
         let brute = brute_ids(&mem, &filter);
         assert_eq!(brute.len(), 400);
         assert_eq!(columnar_ids(&mem, &preds), brute);
+    }
+
+    /// `terms` disjunction, alone and conjoined with a `term` — the catalog
+    /// finalize-verify shape (`terms file_key` AND `term run_id`). Must equal
+    /// the JSON matcher and must not bail to the full-source walk.
+    #[test]
+    fn columnar_terms_conjunction_matches_brute() {
+        let mem = build_mem(4000);
+        let terms = vec![MemBoolPred::Terms {
+            field: "status".to_string(),
+            values: vec!["s1".to_string(), "s2".to_string()],
+        }];
+        let terms_filter = json!({ "terms": { "status": ["s1", "s2"] } });
+        let terms_brute = brute_ids(&mem, &terms_filter);
+        assert_eq!(terms_brute.len(), 1600);
+        assert_eq!(columnar_ids(&mem, &terms), terms_brute);
+
+        // status ∈ {s1, s2} AND status = s1 → the 800 s1 docs.
+        let conj = vec![
+            MemBoolPred::Terms {
+                field: "status".to_string(),
+                values: vec!["s1".to_string(), "s2".to_string()],
+            },
+            MemBoolPred::Term {
+                field: "status".to_string(),
+                value: "s1".to_string(),
+            },
+        ];
+        let conj_filter = json!({
+            "bool": { "filter": [
+                { "terms": { "status": ["s1", "s2"] } },
+                { "term": { "status": "s1" } },
+            ]}
+        });
+        let conj_brute = brute_ids(&mem, &conj_filter);
+        assert_eq!(conj_brute.len(), 800);
+        assert_eq!(columnar_ids(&mem, &conj), conj_brute);
     }
 
     /// A predicate field that ever carried an ARRAY value makes the column

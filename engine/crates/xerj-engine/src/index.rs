@@ -912,6 +912,142 @@ mod collection_publication_fail_closed_tests {
         assert_eq!(result.total.value, 5_050, "exact under churn");
     }
 
+    /// #1761 — finalize-verify's catalog query shares `autoindex-catalog` with
+    /// every other corpus build. Explicit-id catalog bulks publish one
+    /// document at a time, each bracket covering WAL + memtable insert, and
+    /// the next bracket opens immediately. A capture that clones the other
+    /// run's buffered rows never fits in that gap, so the verify search waits
+    /// out its deadline (`timed_out`, empty hits) and the phase sits at 0/N.
+    ///
+    /// This holds a tight `index_document` loop of another run's rows across
+    /// the exact verify filter (`terms file_key` AND `term run_id`) and
+    /// requires the search to return this run's count inside a short timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn catalog_verify_search_completes_while_another_run_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("file_key", FieldType::Keyword))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("run_id", FieldType::Keyword))
+            .unwrap();
+        engine.create_index("autoindex-catalog", schema).unwrap();
+        let idx = engine.get_index("autoindex-catalog").unwrap();
+
+        const THIS_RUN: usize = 24;
+        const OTHER_RUN: usize = 2_000;
+        let this_docs: Vec<(Option<String>, Value)> = (0..THIS_RUN)
+            .map(|i| {
+                (
+                    Some(format!("this-{i}")),
+                    json!({"file_key": format!("k{i}"), "run_id": "this-run"}),
+                )
+            })
+            .collect();
+        for r in idx.index_documents_batched(this_docs).await {
+            r.unwrap();
+        }
+        idx.flush().await.unwrap();
+        let other_docs: Vec<(Option<String>, Value)> = (0..OTHER_RUN)
+            .map(|i| {
+                (
+                    Some(format!("other-{i}")),
+                    json!({"file_key": format!("o{i}"), "run_id": "other-run"}),
+                )
+            })
+            .collect();
+        for r in idx.index_documents_batched(other_docs).await {
+            r.unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicU64::new(0));
+        let writer_idx = Arc::clone(&idx);
+        let writer_stop = Arc::clone(&stop);
+        let writer_wrote = Arc::clone(&wrote);
+        let writer = tokio::spawn(async move {
+            let mut n: u64 = 0;
+            while !writer_stop.load(Ordering::Relaxed) {
+                writer_idx
+                    .index_document(
+                        Some(format!("other-{}", n % OTHER_RUN as u64)),
+                        json!({
+                            "file_key": format!("o{}", n % OTHER_RUN as u64),
+                            "run_id": "other-run"
+                        }),
+                    )
+                    .await
+                    .expect("concurrent catalog write");
+                writer_wrote.fetch_add(1, Ordering::Relaxed);
+                n += 1;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while wrote.load(Ordering::Relaxed) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the other run never published a document");
+
+        let keys: Vec<String> = (0..THIS_RUN).map(|i| format!("k{i}")).collect();
+        let request = xerj_query::parse_request(&json!({
+            "query": {"bool": {"filter": [
+                {"terms": {"file_key": keys}},
+                {"term": {"run_id": "this-run"}}
+            ]}},
+            "size": THIS_RUN,
+            "track_total_hits": true,
+            "_source": ["file_key"],
+            "timeout": "2s"
+        }))
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = idx.search(&request).await.expect("verify search");
+        let elapsed = started.elapsed();
+        let buffered = idx.memtable.doc_count();
+        stop.store(true, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(30), writer)
+            .await
+            .expect("writer did not stop")
+            .unwrap();
+
+        assert!(
+            !result.timed_out,
+            "finalize-verify catalog search timed out under a concurrent writer \
+             in {elapsed:?}: total={} hits={}",
+            result.total.value,
+            result.hits.len()
+        );
+        assert_eq!(
+            result.total.value, THIS_RUN as u64,
+            "the run_id filter must not count the other run's rows"
+        );
+        assert_eq!(
+            result.hits.len(),
+            THIS_RUN,
+            "the page must carry every match"
+        );
+        assert!(
+            buffered > THIS_RUN,
+            "the other run's rows must still be memtable-resident (buffered {buffered}); \
+             a flush would hide the publication stall this test exists for"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the search must finish inside its timeout, took {elapsed:?}"
+        );
+        assert!(
+            result.hits.iter().all(|hit| hit.id.starts_with("this-")),
+            "a hit from the other run leaked into the page: {:?}",
+            result.hits.iter().map(|hit| &hit.id).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn cache_and_singleflight_namespace_include_publication_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -10868,12 +11004,16 @@ impl Index {
         #[cfg(test)]
         if let Err(e) = self.wal_admission_test_fault(&doc_id) {
             collection_publication.cancel();
+            drop(collection_publication);
+            self.collection_publication.handoff_to_readers().await;
             return Err(e.into());
         }
         let seq_no = match self.store.index(&doc_id, source.clone()) {
             Ok(seq_no) => seq_no,
             Err(e) => {
                 collection_publication.cancel();
+                drop(collection_publication);
+                self.collection_publication.handoff_to_readers().await;
                 return Err(e.into());
             }
         };
@@ -10916,6 +11056,9 @@ impl Index {
             .unwrap_or(1);
         collection_publication.commit();
         drop(collection_publication);
+        // The next document's bracket must not open until a search parked on
+        // this one has validated its capture (#1761). No shard lock is held.
+        self.collection_publication.handoff_to_readers().await;
         // Auto-evolve schema for new fields.
         // Fast path: skip the schema read lock every doc when schema is stable.
         // We cache a hash of the document field keys and only re-check schema
@@ -11273,6 +11416,7 @@ impl Index {
         drop(copy_schema);
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         let t4_dur = t4.elapsed();
 
         if batch_len >= 1000 {
@@ -11712,6 +11856,7 @@ impl Index {
             .collect();
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         // The raw path already parsed every source for schema evolution and
         // FTS analysis. Publish those same authoritative values to HNSW before
         // the batch becomes observable to its caller.
@@ -12039,6 +12184,7 @@ impl Index {
             .fetch_add(batch_len as u64, Ordering::Relaxed);
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers_blocking();
 
         if !vector_sources.is_empty() {
             // This API runs on the CLI's Rayon workers. Cross into the cached
@@ -12290,6 +12436,7 @@ impl Index {
         }
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         // Step 5: schema evolution + vector indexing (post-lock).
         for ingest in &processed {
             self.evolve_schema_from_doc(&ingest.source).await;
@@ -14018,6 +14165,7 @@ impl Index {
                         }
                     }
                     drop(collection_publication);
+                    self.collection_publication.handoff_to_readers().await;
                     if let Err(e) = apply_result {
                         tracing::warn!("merge: apply_merge failed: {e:?}");
                         failed_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16475,6 +16623,7 @@ impl Index {
             if generation != capture_generation || in_flight != 0 {
                 return Err(collection_capture_crossed());
             }
+            self.collection_publication.note_capture_validated();
         }
         // #1220 regression hook: park the scan the instant its capture
         // validates, so a test can publish a write, merge or flush into the
@@ -18409,6 +18558,7 @@ impl Index {
             if generation != capture_generation || in_flight != 0 {
                 return Err(collection_capture_crossed());
             }
+            self.collection_publication.note_capture_validated();
         }
         let captured_segment_ids: std::collections::HashSet<&str> =
             snap.segments.iter().map(|meta| meta.id.as_str()).collect();
@@ -19424,6 +19574,8 @@ impl Index {
             Ok(deleted_seq) => deleted_seq,
             Err(e) => {
                 collection_publication.cancel();
+                drop(collection_publication);
+                self.collection_publication.handoff_to_readers().await;
                 return Err(e.into());
             }
         };
@@ -19454,6 +19606,7 @@ impl Index {
             let seq_no = self.store.current_seq_no().saturating_sub(1);
             collection_publication.commit();
             drop(collection_publication);
+            self.collection_publication.handoff_to_readers().await;
             #[cfg(test)]
             self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
             return Ok(DeleteDocOutcome {
@@ -19471,6 +19624,7 @@ impl Index {
         let seq_no = deleted_seq.unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1));
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         // v0.6.2 — propagate the delete into the HNSW graph. Pre-fix
         // a deleted doc was unfindable via _get / _search but the
         // vector still showed up in kNN results forever (the node
@@ -20263,6 +20417,12 @@ impl Index {
                     // admission never captured a view — `total.relation`
                     // is `gte`, so the page is a bound, not an empty corpus.
                     ReadAdmission::WriterActive => {
+                        // Park visibly so the writer, after it drops this
+                        // bracket, can keep the next one closed until we
+                        // capture (#1761). The guard disarms on timeout and
+                        // on the wake.
+                        self.collection_publication.arm_reader();
+                        let _waiting = ReaderWaitGuard(&self.collection_publication);
                         if tokio::time::timeout_at(
                             tokio::time::Instant::from_std(deadline),
                             notified,
@@ -20275,6 +20435,12 @@ impl Index {
                     }
                 }
             };
+            // Hold a capture reservation until this attempt returns. The
+            // snapshot check inside `search_inner` publishes
+            // `note_capture_validated` as soon as the pair is stable, which
+            // is what lets the writer open its next bracket while the scan
+            // of that snapshot is still running.
+            let _capture = ReaderCapture::begin(&self.collection_publication);
             let result = self
                 .search_at_generation(request, token.generation(), deadline)
                 .await;
@@ -22425,6 +22591,7 @@ impl Index {
             if generation != capture_generation || in_flight != 0 {
                 return Err(collection_capture_crossed());
             }
+            self.collection_publication.note_capture_validated();
         }
         // #1212 — the captured world's segment ids, scoping every LIVE
         // version-map read the walk performs below. The scan's segments are
@@ -31563,7 +31730,13 @@ impl Index {
                 Some(Arc::new(PrefilterSet::from_set(set)))
             }
             Column::Keyword(k) => {
-                let mut set: HashSet<u32> = HashSet::new();
+                // One pass over `ords` for every value in the window. The
+                // previous loop scanned the whole ordinal column once per
+                // terms value, so a 1,024-value finalize-verify window walked
+                // a large shared catalog 1,024 times (the seg-loop in #1761).
+                // Duplicate values share an ordinal and are counted once.
+                let mut wanted: HashSet<u32> = HashSet::new();
+                let mut card: usize = 0;
                 for v in values {
                     let term = match v {
                         Value::String(s) => {
@@ -31584,12 +31757,19 @@ impl Index {
                     let Some(ord) = k.ord_for_term(&term) else {
                         continue; // term absent in this segment → contributes 0
                     };
-                    let card = k.per_ord_count.get(ord as usize).copied().unwrap_or(0) as usize;
-                    if set.len() + card > TERM_PREFILTER_CAP {
+                    if !wanted.insert(ord) {
+                        continue;
+                    }
+                    let n = k.per_ord_count.get(ord as usize).copied().unwrap_or(0) as usize;
+                    if card + n > TERM_PREFILTER_CAP {
                         return None;
                     }
+                    card += n;
+                }
+                let mut set: HashSet<u32> = HashSet::with_capacity(card);
+                if !wanted.is_empty() {
                     for (pos, &o) in k.ords.iter().enumerate() {
-                        if o == ord && !k.null_bitmap.contains(pos as u32) {
+                        if wanted.contains(&o) && !k.null_bitmap.contains(pos as u32) {
                             set.insert(pos as u32);
                         }
                     }
@@ -33604,6 +33784,37 @@ tokio::task_local! {
 // This deliberately remains a free function so background tasks can own every
 // flush dependency without retaining `Index`; grouping the values would only
 // hide the same pipeline dependency set behind an uninformative bag of fields.
+/// Disarms a reader wait on drop, including the deadline-timeout return.
+struct ReaderWaitGuard<'a>(&'a crate::collection_publication::CollectionPublication);
+
+impl Drop for ReaderWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.disarm_reader();
+    }
+}
+
+/// Reserves a capture slot for one `search()` attempt. Dropped when that
+/// attempt returns. `note_capture_validated` is what releases a waiting
+/// writer, and it fires at the capture check, not here.
+struct ReaderCapture {
+    publication: Arc<crate::collection_publication::CollectionPublication>,
+}
+
+impl ReaderCapture {
+    fn begin(publication: &Arc<crate::collection_publication::CollectionPublication>) -> Self {
+        publication.begin_capture();
+        Self {
+            publication: Arc::clone(publication),
+        }
+    }
+}
+
+impl Drop for ReaderCapture {
+    fn drop(&mut self) {
+        self.publication.end_capture();
+    }
+}
+
 fn collection_publication_interrupted() -> EngineError {
     EngineError::Fts(anyhow::anyhow!(
         "collection publication was interrupted; reopen the index so WAL recovery can rebuild a consistent searchable state"
@@ -46181,7 +46392,7 @@ fn mem_bool_preds(q: &QueryNode) -> Option<Vec<crate::memtable::MemBoolPred>> {
     // `doc_values_range_query` paths would pay (~all-matching doc_id
     // String clones per query at a 200 k-doc memtable).
     let children: Vec<&QueryNode> = match q {
-        QueryNode::Term { .. } | QueryNode::Range { .. } => vec![q],
+        QueryNode::Term { .. } | QueryNode::Range { .. } | QueryNode::Terms { .. } => vec![q],
         QueryNode::Bool {
             must,
             should,
@@ -46223,6 +46434,31 @@ fn mem_bool_preds(q: &QueryNode) -> Option<Vec<crate::memtable::MemBoolPred>> {
                 preds.push(MemBoolPred::Term {
                     field: field.clone(),
                     value: val_str,
+                });
+            }
+            QueryNode::Terms { field, values, .. } => {
+                // Same lowering (and CIDR bailout) as the Term arm. An empty
+                // list is a real predicate that matches nothing; returning
+                // None would send the caller through `DocsForScan` and clone
+                // every buffered document (#1761).
+                let mut lowered: Vec<String> = Vec::with_capacity(values.len());
+                for value in values {
+                    let val_str = match value {
+                        Value::String(s) => {
+                            if s.contains('/') {
+                                return None;
+                            }
+                            s.clone()
+                        }
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => return None,
+                    };
+                    lowered.push(val_str);
+                }
+                preds.push(MemBoolPred::Terms {
+                    field: field.clone(),
+                    values: lowered,
                 });
             }
             QueryNode::Range {
