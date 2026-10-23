@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of refusing. `XERJ_SKIP_CPU_CHECK` is gone
   ([#2161](https://github.com/xerj-org/xerj/issues/2161)).
 
+- MCP JSON search responses with `max_tokens` no longer deduplicate rows
+  with distinct `ax_locator` values or hits from different indices merely
+  because their relative paths and passage line numbers match. Deduplication
+  includes the available source index, file identity and record locator;
+  overlapping file and code-symbol passages in the same source still
+  deduplicate. Plain-string `xerj_search` requests the
+  provenance fields needed for this distinction by default.
+
 - `xerj corpus index` killed mid-index resumes that build's journal instead of
   starting a legacy index under a new prefix. When the journal still has a
   generation in progress, indexing continues at the uncommitted operations and

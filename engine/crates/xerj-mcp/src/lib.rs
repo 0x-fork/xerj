@@ -2389,6 +2389,8 @@ fn build_search_with_mapping(
         body.entry("_source".to_string()).or_insert_with(|| {
             json!([
                 "ax_path",
+                "ax_file",
+                "ax_locator",
                 "path",
                 "line",
                 "start_line",

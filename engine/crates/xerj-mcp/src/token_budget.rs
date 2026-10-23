@@ -136,19 +136,48 @@ pub fn truncate_to_budget(text: &str, max_tokens: usize) -> String {
 
 // ───────────────────── JSON surface (the four `_search` tools) ─────────────
 
-/// A hit's `file:line` span, when the hit carries one: `(file, start, end)`
-/// inclusive. Mirrors `xccode::passage::provenance`'s field order (`ax_path`,
-/// `ax_file`, `path`, `file`; `start_line`/`line`), then falls back to the
-/// engine's `_passage` block, whose `ordinal` is the zero-based start line of
-/// the winning passage. `end` is `end_line` when present, else the start plus
+/// A relative path is meaningful only within its source index. Content IDs
+/// distinguish versions at the same path; record locators distinguish rows
+/// whose passage ordinals are local to each record, not the containing file.
+#[derive(PartialEq)]
+struct HitSource {
+    index: Option<String>,
+    file: String,
+    content_id: Option<String>,
+    record: Option<String>,
+}
+
+type HitSpan = (HitSource, u64, u64);
+
+/// A hit's inclusive line span within one source. Mirrors the provenance
+/// path order (`ax_path`, `ax_file`, `path`, `file`; `start_line`/`line`), then
+/// falls back to the engine's `_passage` block. Its `ordinal` is relative to
+/// the record, so those spans are compared only within the same locator.
+/// `end` is `end_line` when present, else the start plus
 /// the shown passage's own line count — an estimate, and labelled as one
 /// wherever it is described: it exists to catch *overlap*, not to cite.
-fn hit_span(hit: &Value) -> Option<(String, u64, u64)> {
+fn hit_span(hit: &Value) -> Option<HitSpan> {
     let src = hit.get("_source")?;
     let file = ["ax_path", "ax_file", "path", "file"]
         .iter()
         .find_map(|k| src.get(*k).and_then(Value::as_str))?
         .to_string();
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
+    let record = src
+        .get("ax_locator")
+        .and_then(Value::as_str)
+        // Whole-file code and its symbol records share file-global lines.
+        // Other locators (rows, pages, sections, ...) are independent spaces.
+        .filter(|loc| {
+            !loc.is_empty() && *loc != "file" && *loc != "code" && !loc.starts_with("code:")
+        })
+        .map(str::to_owned);
+    let source = HitSource {
+        index: text(hit.get("_index")),
+        file,
+        content_id: text(src.get("ax_file")),
+        record,
+    };
 
     let start = src
         .get("start_line")
@@ -169,7 +198,7 @@ fn hit_span(hit: &Value) -> Option<(String, u64, u64)> {
     if let Some(lines) = passage_line_count(hit) {
         end = end.max(start + lines);
     }
-    Some((file, start, end))
+    Some((source, start, end))
 }
 
 /// Lines in the hit's shown `_passage` text, when it has one.
@@ -183,7 +212,7 @@ fn passage_line_count(hit: &Value) -> Option<u64> {
     )
 }
 
-fn spans_overlap(a: &(String, u64, u64), b: &(String, u64, u64)) -> bool {
+fn spans_overlap<T: PartialEq>(a: &(T, u64, u64), b: &(T, u64, u64)) -> bool {
     a.0 == b.0 && a.1 <= b.2 && b.1 <= a.2
 }
 
@@ -198,7 +227,14 @@ fn locator_stub(hit: &Value) -> Value {
         }
     }
     if let Some(src) = hit.get("_source") {
-        for k in ["ax_path", "path", "start_line", "line"] {
+        for k in [
+            "ax_path",
+            "ax_file",
+            "ax_locator",
+            "path",
+            "start_line",
+            "line",
+        ] {
             if let Some(v) = src.get(k).filter(|v| !v.is_null()) {
                 if v.is_string() || v.is_number() {
                     stub.insert(k.to_string(), v.clone());
@@ -271,7 +307,7 @@ pub fn budget_json_response(engine_text: &str, max_tokens: usize) -> String {
     // 1. Dedup: a hit overlapping the span of an already-SHOWN passage is
     //    skipped entirely. Locator-only hits show no passage, so they claim
     //    no span — a later overlap through them is not a duplicate read.
-    let mut kept_spans: Vec<(String, u64, u64)> = Vec::new();
+    let mut kept_spans: Vec<HitSpan> = Vec::new();
     let mut deduped = 0usize;
     let mut full: Vec<Value> = Vec::new();
     let mut locators: Vec<Value> = Vec::new();
@@ -348,7 +384,7 @@ pub fn budget_json_response(engine_text: &str, max_tokens: usize) -> String {
 /// nothing-binding early exit, where every hit is shown, so pairwise overlap
 /// among all of them is exactly the dedup condition.
 fn any_overlaps(hits: &[Value]) -> bool {
-    let mut spans: Vec<(String, u64, u64)> = Vec::new();
+    let mut spans: Vec<HitSpan> = Vec::new();
     for hit in hits {
         if let Some(s) = hit_span(hit) {
             if spans.iter().any(|k| spans_overlap(k, &s)) {
@@ -812,6 +848,69 @@ mod tests {
             v["_token_budget"]["deduped_overlapping"], 1,
             "same ordinal = same passage"
         );
+    }
+
+    #[test]
+    fn json_budget_keeps_distinct_record_locators() {
+        for (first, second) in [
+            ("b0", "b100"),
+            ("r1", "r2"),
+            ("Sheet1!r1", "Sheet1!r2"),
+            ("items:e0", "items:e1"),
+            ("d0", "d1"),
+        ] {
+            let row = |id: &str, locator: &str| {
+                json!({
+                    "_index": "ax-data", "_id": id,
+                    "_source": {"ax_path": "records.jsonl", "ax_file": "file-hash", "ax_locator": locator},
+                    "fields": {"_passage": [{"field": "body", "ordinal": 0, "text": "independent record"}]}
+                })
+            };
+            let resp = search_response(vec![row("1", first), row("2", second)]);
+            assert_eq!(
+                budget_json_response(&resp, 10_000),
+                resp,
+                "{first}, {second}"
+            );
+            assert_never_exceeds(&resp, &[32, 64, 128, 256, 10_000], true);
+            let duplicate = search_response(vec![row("1", first), row("2", first)]);
+            let out: Value =
+                serde_json::from_str(&budget_json_response(&duplicate, 10_000)).unwrap();
+            assert_eq!(out["_token_budget"]["deduped_overlapping"], 1);
+        }
+    }
+
+    #[test]
+    fn json_budget_scopes_relative_paths_to_their_source() {
+        let first = code_hit("src/lib.rs", 10, 4);
+        for field in ["_index", "ax_file"] {
+            let mut a = first.clone();
+            let mut b = first.clone();
+            b["_id"] = json!("second");
+            if field == "_index" {
+                b[field] = json!("other-code");
+            } else {
+                a["_source"][field] = json!("content-a");
+                b["_source"][field] = json!("content-b");
+            }
+            let resp = search_response(vec![a, b]);
+            assert_eq!(budget_json_response(&resp, 10_000), resp, "{field}");
+            assert_never_exceeds(&resp, &[32, 64, 128, 256, 10_000], true);
+        }
+    }
+
+    #[test]
+    fn json_budget_dedupes_file_and_symbol_records_in_the_same_line_space() {
+        let mut file = code_hit("src/lib.rs", 10, 4);
+        file["_source"]["ax_file"] = json!("content-a");
+        file["_source"]["ax_locator"] = json!("code");
+        let mut symbol = file.clone();
+        symbol["_id"] = json!("symbol");
+        symbol["_source"]["ax_locator"] = json!("code:10:example");
+        let resp = search_response(vec![file, symbol]);
+        let out: Value = serde_json::from_str(&budget_json_response(&resp, 10_000)).unwrap();
+        assert_eq!(out["_token_budget"]["deduped_overlapping"], 1);
+        assert_eq!(out["hits"]["hits"].as_array().unwrap().len(), 1);
     }
 
     #[test]
