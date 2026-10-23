@@ -193,6 +193,15 @@ pub(crate) fn hit_location(hit: &Value) -> String {
         .or_else(|| src.get("path"))
         .and_then(Value::as_str)
         .unwrap_or("?");
+    // #2266: the line of the matched term, when the response was annotated.
+    // `start_line` / `line` stay the passage or declaration start.
+    if let Some(n) = hit
+        .get("match_line")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        return xerj_common::xccode::passage::cite_path_line(path, n);
+    }
     if let Some(n) = src
         .get("line")
         .or_else(|| src.get("start_line"))
@@ -793,6 +802,10 @@ pub fn run_search_cli() -> i32 {
     if let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) {
         rank_plain_search_hits(hits, code_corpus, k);
     }
+    // Same annotation `xerj_search` adds (#2266), so `--json` and the printed
+    // header cite the matched line. `xerj code --json` is the raw server
+    // body and does not share this hit post-pass.
+    xerj_common::xccode::passage::annotate_search_match_lines(&mut resp, &query);
     if as_json {
         println!(
             "{}",
@@ -1273,6 +1286,30 @@ mod tests {
             "fields": { "_passage": [{ "field": "body", "ordinal": 0 }] }
         });
         assert_eq!(hit_location(&hit), "guide.md:169");
+    }
+
+    /// #2266: once the response carries `match_line`, the header cites that
+    /// line. `start_line` stays the passage start for hits that have no match.
+    #[test]
+    fn hit_location_cites_match_line_ahead_of_the_passage_start() {
+        let mut hit = json!({
+            "_source": {
+                "ax_path": "guide.md",
+                "ax_locator": "s2",
+                "start_line": 169
+            },
+            "fields": { "_passage": [{
+                "field": "body",
+                "ordinal": 0,
+                "text": "Intro.\nThe token is required when unbound."
+            }] }
+        });
+        assert_eq!(hit_location(&hit), "guide.md:169");
+        let mut resp = json!({ "hits": { "hits": [hit] } });
+        xerj_common::xccode::passage::annotate_search_match_lines(&mut resp, "unbound");
+        hit = resp["hits"]["hits"][0].clone();
+        assert_eq!(hit["match_line"], 170);
+        assert_eq!(hit_location(&hit), "guide.md:170");
     }
 
     /// #1934: two JSONL rows both printed as `xerj-prs.jsonl:1` because the

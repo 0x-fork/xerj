@@ -206,6 +206,14 @@ fn locator_stub(hit: &Value) -> Value {
             }
         }
     }
+    // #2266: the citation line is computed on the hit, not stored. A locator
+    // that drops it puts the agent back to counting lines in a passage the
+    // budget just removed.
+    for k in ["match_line", "match_lines"] {
+        if let Some(v) = hit.get(k).filter(|v| !v.is_null()) {
+            stub.insert(k.to_string(), v.clone());
+        }
+    }
     Value::Object(stub)
 }
 
@@ -686,6 +694,51 @@ mod tests {
         assert_eq!(
             v["_token_budget"]["deduped_overlapping"], 0,
             "distinct files"
+        );
+    }
+
+    /// #2266: `match_line` is how an agent cites the hit. A budget that keeps
+    /// the passage keeps the field; a budget that reduces the hit to a
+    /// locator keeps it there too.
+    #[test]
+    fn match_line_survives_token_budget_trimming() {
+        let passage = "intro\nslot filling binds the token\noutro";
+        // Fat stored body so the full hit cannot fit a locator-sized budget.
+        // The stub copies match_line and drops the body.
+        let body = format!("{passage}\n{}", "filler word ".repeat(400));
+        let hit = json!({
+            "_index": "docs",
+            "_id": "guide",
+            "_score": 3.0,
+            "_source": {
+                "ax_path": "guide.md",
+                "start_line": 169,
+                "body": body
+            },
+            "match_line": 170,
+            "match_lines": [170],
+            "fields": { "_passage": [{ "field": "body", "ordinal": 0, "text": passage }] }
+        });
+        let resp = search_response(vec![hit.clone()]);
+
+        let kept: Value = serde_json::from_str(&budget_json_response(&resp, 100_000)).unwrap();
+        assert_eq!(kept["hits"]["hits"][0]["match_line"], 170);
+        assert_eq!(kept["hits"]["hits"][0]["match_lines"], json!([170]));
+
+        let tight: Value = serde_json::from_str(&budget_json_response(&resp, 200)).unwrap();
+        assert_eq!(tight["_token_budget"]["hits_full"], 0, "{tight}");
+        let stubs = tight["_token_budget"]["hits_locator_only"]
+            .as_array()
+            .unwrap();
+        assert_eq!(stubs.len(), 1, "{stubs:?}");
+        assert_eq!(stubs[0]["match_line"], 170, "{stubs:?}");
+        assert_eq!(stubs[0]["match_lines"], json!([170]));
+        assert_eq!(stubs[0]["ax_path"], "guide.md");
+        assert_eq!(stubs[0]["start_line"], 169);
+        assert!(stubs[0].get("body").is_none(), "locator drops the passage");
+        assert!(
+            stubs[0].get("fields").is_none(),
+            "locator drops the passage"
         );
     }
 

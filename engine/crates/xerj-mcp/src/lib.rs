@@ -521,7 +521,9 @@ fn initialize_result(msg: &Value) -> Value {
             "XERJ tools proxy to a running XERJ engine (ES-compatible). Use \
              xerj_search for retrieval — pass `query` as a plain string for \
              definition-first code search (ranks the defining file first, \
-             returns the matching passage instead of whole files), or as an \
+             returns the matching passage instead of whole files, and adds \
+             `match_line` for the source line of the match inside that passage), \
+             or as an \
              ES query-DSL object for structured queries, \
              xerj_semantic_search for meaning-based recall over a semantic_text \
              field (embedding is server-side, no key), xerj_vector_search for \
@@ -768,6 +770,12 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                  hits LOCALLY (zero tokens, nothing leaves the node) and adds a \
                  `_p_relevant` probability per hit — see that argument's description \
                  for its honest ceiling. \
+                 Each hit carries `match_line` when a query term sits in the passage: \
+                 the absolute 1-based source line of the best-scoring match (a tie \
+                 takes the earliest line), and `match_lines` for every matched line \
+                 (capped). Cite `path:match_line`. Both are omitted when no term is \
+                 located or the passage start line is unknown. `start_line` remains \
+                 the passage start. \
                  Pass `max_tokens` to cap the response at a token budget (never exceeded; \
                  see that argument for the tokenizer and the locator-only rule).",
             "inputSchema": {
@@ -1937,7 +1945,17 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
 
     match result {
         Ok((method, path, body)) => {
-            engine_request(ctx, method, &path, body, budget, demote_page).await
+            let match_query = search_match_query(name, &args);
+            engine_request(
+                ctx,
+                method,
+                &path,
+                body,
+                budget,
+                demote_page,
+                match_query.as_deref(),
+            )
+            .await
         }
         Err(msg) => tool_text(msg, true),
     }
@@ -3077,6 +3095,20 @@ fn error_detail(err: &reqwest::Error) -> String {
     out
 }
 
+/// The query `xerj_search` should locate inside each passage (#2266).
+/// Other tools do not get the annotation: a semantic/vector ordinal is a
+/// chunk index, and `xerj_def` already returns the declaration's `line`.
+fn search_match_query(name: &str, args: &Value) -> Option<String> {
+    if name != "xerj_search" {
+        return None;
+    }
+    match args.get("query") {
+        Some(Value::String(q)) if !q.trim().is_empty() => Some(q.clone()),
+        Some(v @ (Value::Object(_) | Value::Array(_))) => Some(v.to_string()),
+        _ => None,
+    }
+}
+
 async fn engine_request(
     ctx: &Ctx,
     method: Method,
@@ -3084,6 +3116,7 @@ async fn engine_request(
     body: Option<Value>,
     budget: Option<usize>,
     demote_page: Option<usize>,
+    match_query: Option<&str>,
 ) -> Value {
     let url = format!("{}{}", ctx.base_url, path);
     let mut req = match method {
@@ -3106,6 +3139,12 @@ async fn engine_request(
                 let text = match demote_page {
                     Some(page) => apply_search_path_demotion(&text, page),
                     None => text,
+                };
+                let text = match match_query {
+                    Some(query) if !query.trim().is_empty() => {
+                        xerj_common::xccode::passage::annotate_search_response(&text, query)
+                    }
+                    _ => text,
                 };
                 match budget {
                     Some(max_tokens) => {
@@ -5145,6 +5184,21 @@ mod tests {
         }
         let at = |name: &str| names.iter().position(|n| *n == name).unwrap();
         assert!(at("xerj_plan") < at("xerj_field_report"));
+        let search = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "xerj_search")
+            .unwrap();
+        let desc = search["description"].as_str().unwrap();
+        assert!(
+            desc.contains("match_line") && desc.contains("match_lines"),
+            "xerj_search must tell the agent where the matched line is: {desc}"
+        );
+        assert!(
+            desc.contains("omitted when no term is located"),
+            "a missing match_line is not a line number: {desc}"
+        );
         assert!(at("xerj_field_report") < at("xerj_corpus_feedback"));
         assert!(at("xerj_corpus_feedback") < at("xerj_hub_find"));
         let field = specs

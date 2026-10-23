@@ -181,7 +181,10 @@ each a *thin proxy*: they build exactly the request the ES-compatible surface al
 (`xerj_plan` is `POST /_ask`, the deterministic rule-based planner) and hand back
 whatever the engine returned, errors and refusals verbatim — no capability of
 their own, so anything you can do over MCP you can also do with `curl`, and vice
-versa. `xerj_map` (#1055) reads the autoindex catalog and returns its per-index
+versa. `xerj_search` adds `match_line` and capped `match_lines` on each hit: the
+absolute 1-based source line of the best-scoring query term inside the passage.
+Cite `ax_path:match_line`. Both fields are omitted when no term is located or the
+passage start line is unknown. `start_line` stays the passage start. `xerj_map` (#1055) reads the autoindex catalog and returns its per-index
 field map, trimmed to a byte cap but otherwise verbatim. `xerj_code_search`
 (#977) is deliberately not a thin proxy: it runs
 the `xerj code` reference-coding pipeline ([`tools/xerj-code/`](tools/xerj-code/))
