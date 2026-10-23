@@ -1438,42 +1438,99 @@ impl Engine {
     /// The cluster proposer calls this once and replicates the effective
     /// schema. The applier must not call it again: nodes can have different
     /// local templates, and a second pass would diverge.
+    ///
+    /// `semantic_text` stays a text field with an embedding contract. It used
+    /// to fall through to `object` here, so a template that matched (its
+    /// `keyword` fields appeared) still could not embed (#2281). The raw ES
+    /// mapping and settings are merged separately by
+    /// [`Engine::merge_index_template`] — this pass only builds the native
+    /// schema, and `schema_to_es_properties` cannot spell `semantic_text`.
     pub(crate) fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
         let mut effective_schema = schema;
+        let mut new_semantic_targets = Vec::new();
         if let Some(tmpl) = self.best_matching_template(name) {
-            if let Some(props) = tmpl.mappings.get("properties") {
-                if let Some(obj) = props.as_object() {
-                    for (field_name, field_def) in obj {
-                        let es_type = field_def
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("object");
-                        let native_type = es_type_to_field_type(es_type);
-                        if !effective_schema
-                            .fields
-                            .iter()
-                            .any(|f| &f.name == field_name)
-                        {
-                            let mut fc = xerj_common::types::FieldConfig::new(
-                                field_name.clone(),
-                                native_type,
-                            );
-                            // #790: a template's `date_nanos` keeps nanosecond
-                            // precision; `FieldConfig::new` already made a
-                            // plain `date` millisecond-scaled.
-                            if native_type == xerj_common::types::FieldType::Date
-                                && es_type == "date_nanos"
-                            {
-                                fc.options.date_precision =
-                                    Some(xerj_common::types::DatePrecision::Nanos);
-                            }
-                            let _ = effective_schema.add_field(fc);
-                        }
+            if let Some(props) = tmpl.mappings.get("properties").and_then(Value::as_object) {
+                for (field_name, field_def) in props {
+                    if effective_schema
+                        .fields
+                        .iter()
+                        .any(|f| &f.name == field_name)
+                    {
+                        continue;
                     }
+                    let fc = field_from_template_property(field_name, field_def);
+                    if let Some(embedding) = fc.embedding.as_ref() {
+                        new_semantic_targets.push(
+                            embedding
+                                .target_field
+                                .clone()
+                                .unwrap_or_else(|| format!("{field_name}_vector")),
+                        );
+                    }
+                    let _ = effective_schema.add_field(fc);
                 }
             }
         }
+        // Only companions of fields this pass added. A caller that already
+        // built the schema (the ES create handler) has its own companions;
+        // adding them again would fail the duplicate-name check, and running
+        // this for every create would change indexes that have no template.
+        for target in new_semantic_targets {
+            if effective_schema.fields.iter().any(|f| f.name == target) {
+                continue;
+            }
+            let source = effective_schema.fields.iter().find(|f| {
+                f.embedding.as_ref().and_then(|e| e.target_field.as_deref())
+                    == Some(target.as_str())
+            });
+            let Some(source) = source else {
+                continue;
+            };
+            let mut companion =
+                xerj_common::types::FieldConfig::new(target, xerj_common::types::FieldType::Vector);
+            companion.options.dimensions = source.options.dimensions;
+            companion.options.similarity = source.options.similarity.clone();
+            let _ = effective_schema.add_field(companion);
+        }
         effective_schema
+    }
+
+    /// Merge the highest-priority matching template into a create body.
+    ///
+    /// Request mappings and settings win where both sides name the same field
+    /// or setting. Template values fill the gaps. With no matching template
+    /// the inputs are returned unchanged.
+    ///
+    /// Callers that persist the ES mapping blob and `index_settings` must use
+    /// this result. [`Engine::apply_index_template`] only updates the native
+    /// schema, which cannot round-trip `semantic_text` or
+    /// `index.default_pipeline` (#2281).
+    pub fn merge_index_template(
+        &self,
+        index_name: &str,
+        mappings: Value,
+        settings: Value,
+    ) -> (Value, Value) {
+        let Some(tmpl) = self.best_matching_template(index_name) else {
+            return (mappings, settings);
+        };
+        (
+            merge_template_mappings(&tmpl.mappings, mappings),
+            merge_template_settings(&tmpl.settings, settings),
+        )
+    }
+
+    /// `true` when `index` does not exist yet and a matching template declares
+    /// `semantic_text`. Bulk classifies the embed path before auto-create, so
+    /// a template-only field would otherwise take the turbo path and never be
+    /// embedded (#2281).
+    pub(crate) fn absent_index_template_has_semantic_text(&self, index: &str) -> bool {
+        if self.indices.contains_key(index) || self.failed_indices.contains_key(index) {
+            return false;
+        }
+        self.best_matching_template(index)
+            .and_then(|t| t.mappings.get("properties").cloned())
+            .is_some_and(|props| json_properties_have_semantic_text(&props))
     }
 
     /// Create a new index with explicit settings (e.g. custom analysis configuration).
@@ -3563,8 +3620,19 @@ impl Engine {
                 xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
             ));
         }
-        // Auto-create with empty schema.
-        self.create_index(name, Schema::empty())?;
+        // Auto-create. A matching template supplies the mapping and settings
+        // an explicit `PUT /{index}` would have merged in (#2281). The schema
+        // is filled by `apply_index_template` inside `create_index_with_settings`;
+        // the raw mapping and the display settings are what `GET /_mapping`
+        // and `default_pipeline_for` read, and neither is implied by the schema.
+        let (mappings, settings) = self.merge_index_template(name, Value::Null, Value::Null);
+        self.create_index_with_settings(name, Schema::empty(), settings.clone())?;
+        if mappings.as_object().is_some_and(|m| !m.is_empty()) {
+            self.put_index_mapping(name, mappings)?;
+        }
+        if settings.as_object().is_some_and(|m| !m.is_empty()) {
+            self.index_settings.insert(name.to_string(), settings);
+        }
         self.get_index(name)
     }
 
@@ -4361,14 +4429,22 @@ impl Engine {
     /// write addressed to an alias does not pick up its backing index's default
     /// pipeline. That is a known gap, identical on every write path.
     pub fn default_pipeline_for(&self, index: &str) -> Option<String> {
-        self.index_settings.get(index).and_then(|v| {
-            v.get("index")
-                .and_then(|ix| ix.get("default_pipeline"))
-                .or_else(|| v.get("index.default_pipeline"))
-                .or_else(|| v.get("default_pipeline"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        if let Some(p) = self
+            .index_settings
+            .get(index)
+            .and_then(|v| pipeline_setting(v.value()))
+        {
+            return Some(p);
+        }
+        // A write that auto-creates the index resolves the pipeline before
+        // that create (#2281). The template's default applies only then: an
+        // index that already exists keeps whatever it was created with, even
+        // when this in-memory map was not rehydrated after a restart.
+        if self.indices.contains_key(index) || self.failed_indices.contains_key(index) {
+            return None;
+        }
+        self.best_matching_template(index)
+            .and_then(|t| pipeline_setting(&t.settings))
     }
 
     /// Compile and register a typed transform pipeline from a JSON config,
@@ -5120,11 +5196,236 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     dp[m][n]
 }
 
+/// `index.default_pipeline` in any of the three spellings settings arrive in.
+fn pipeline_setting(v: &Value) -> Option<String> {
+    v.get("index")
+        .and_then(|ix| ix.get("default_pipeline"))
+        .or_else(|| v.get("index.default_pipeline"))
+        .or_else(|| v.get("default_pipeline"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn value_is_empty_object(v: &Value) -> bool {
+    v.is_null() || v.as_object().is_some_and(|m| m.is_empty())
+}
+
+/// Template mappings fill fields the request did not declare. A request
+/// property replaces the template's property of the same name. Other mapping
+/// keys (`dynamic`, `_source`, …) follow the same rule.
+fn merge_template_mappings(template: &Value, request: Value) -> Value {
+    let Some(template_obj) = template.as_object().filter(|m| !m.is_empty()) else {
+        return request;
+    };
+    let Some(request_obj) = request.as_object().filter(|m| !m.is_empty()) else {
+        return template.clone();
+    };
+    let mut out = template_obj.clone();
+    for (key, value) in request_obj {
+        if key == "properties" {
+            let mut props = out
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(req_props) = value.as_object() {
+                for (field, def) in req_props {
+                    props.insert(field.clone(), def.clone());
+                }
+                out.insert("properties".to_string(), Value::Object(props));
+            } else {
+                out.insert(key.clone(), value.clone());
+            }
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// Deep-merge `over` onto `base`. Objects combine; `over` wins on a leaf.
+fn deep_merge_request_wins(base: &Value, over: &Value) -> Value {
+    match (base.as_object(), over.as_object()) {
+        (Some(base), Some(over)) => {
+            let mut out = base.clone();
+            for (k, v) in over {
+                match out.get(k) {
+                    Some(existing) if existing.is_object() && v.is_object() => {
+                        out.insert(k.clone(), deep_merge_request_wins(existing, v));
+                    }
+                    _ => {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        _ => over.clone(),
+    }
+}
+
+/// Write `pipeline` in both spellings `default_pipeline_for` and
+/// `GET /_settings` read. Nested `index.default_pipeline` is what the settings
+/// response shows once an `index` object exists; a sibling dotted key is
+/// dropped by that response, which is how a template pipeline disappeared
+/// beside `xerj autoindex`'s `index.xerj_ingest_shards` (#2281).
+fn write_default_pipeline(settings: &mut Value, pipeline: &str) {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let Some(obj) = settings.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "index.default_pipeline".to_string(),
+        Value::String(pipeline.to_string()),
+    );
+    let index = obj
+        .entry("index".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(index_obj) = index.as_object_mut() {
+        index_obj.insert(
+            "default_pipeline".to_string(),
+            Value::String(pipeline.to_string()),
+        );
+    }
+}
+
+/// Copy single-segment `index.<key>` entries into the nested `index` object
+/// when that object does not already name them. Keys with a further dot
+/// (`index.query.strict_unknown_fields`) stay as dotted keys: that is a
+/// spelling the reader looks up literally, and folding it would hide it.
+fn hoist_single_segment_index_keys(mut settings: Value) -> Value {
+    let dotted: Vec<(String, Value)> = {
+        let Some(obj) = settings.as_object() else {
+            return settings;
+        };
+        obj.iter()
+            .filter_map(|(k, v)| {
+                let rest = k.strip_prefix("index.")?;
+                if rest.is_empty() || rest.contains('.') {
+                    return None;
+                }
+                Some((rest.to_string(), v.clone()))
+            })
+            .collect()
+    };
+    if dotted.is_empty() {
+        return settings;
+    }
+    let Some(obj) = settings.as_object_mut() else {
+        return settings;
+    };
+    let index = obj
+        .entry("index".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(index_obj) = index.as_object_mut() {
+        for (k, v) in dotted {
+            index_obj.entry(k).or_insert(v);
+        }
+    }
+    settings
+}
+
+fn merge_template_settings(template: &Value, request: Value) -> Value {
+    let request_pipeline = pipeline_setting(&request);
+    let template_pipeline = pipeline_setting(template);
+    let Some(template_obj) = template.as_object().filter(|m| !m.is_empty()) else {
+        return request;
+    };
+    let mut merged = if value_is_empty_object(&request) {
+        Value::Object(template_obj.clone())
+    } else {
+        deep_merge_request_wins(&Value::Object(template_obj.clone()), &request)
+    };
+    // The request's spelling wins over the template's, whichever of the two
+    // forms each side used. Filling gaps via deep-merge alone keeps a
+    // template nested value when the request only set the dotted key.
+    if let Some(pipeline) = request_pipeline.or(template_pipeline) {
+        write_default_pipeline(&mut merged, &pipeline);
+    }
+    hoist_single_segment_index_keys(merged)
+}
+
+/// One template property, in the same native shape `es_properties_to_fields`
+/// builds for an explicit mapping. `semantic_text` is text plus an embedding
+/// contract — not `object` (#2281).
+fn field_from_template_property(name: &str, field_def: &Value) -> xerj_common::types::FieldConfig {
+    use xerj_common::types::{EmbeddingConfig, FieldConfig, FieldType};
+    let es_type = field_def
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("object");
+    let native_type = es_type_to_field_type(es_type);
+    let mut fc = FieldConfig::new(name.to_string(), native_type);
+    // #790: a template's `date_nanos` keeps nanosecond precision;
+    // `FieldConfig::new` already made a plain `date` millisecond-scaled.
+    if native_type == FieldType::Date && es_type == "date_nanos" {
+        fc.options.date_precision = Some(xerj_common::types::DatePrecision::Nanos);
+    }
+    if es_type == "semantic_text" {
+        // Same default as `es_properties_to_fields`: analyzed text has no
+        // doc values unless the mapping asks. An explicit `true` is kept.
+        fc.options.doc_values = field_def
+            .get("doc_values")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let dims = field_def
+            .get("dimensions")
+            .or_else(|| field_def.get("dims"))
+            .and_then(Value::as_u64)
+            .map(|d| d as usize)
+            .unwrap_or(xerj_ai::local::DEFAULT_DIMS);
+        fc.options.dimensions = Some(dims);
+        fc.options.similarity = Some(
+            field_def
+                .get("similarity")
+                .and_then(Value::as_str)
+                .unwrap_or("cosine")
+                .to_string(),
+        );
+        let target_field = field_def
+            .get("target_field")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{name}_vector"));
+        fc.embedding = Some(EmbeddingConfig {
+            endpoint: field_def
+                .get("inference_endpoint")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: field_def
+                .get("inference_id")
+                .or_else(|| field_def.get("model_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            target_field: Some(target_field),
+        });
+    }
+    fc
+}
+
+fn json_properties_have_semantic_text(props: &Value) -> bool {
+    let Some(obj) = props.as_object() else {
+        return false;
+    };
+    obj.values().any(|spec| {
+        spec.get("type").and_then(Value::as_str) == Some("semantic_text")
+            || spec
+                .get("properties")
+                .is_some_and(json_properties_have_semantic_text)
+    })
+}
+
 /// Convert an ES field type string to a native FieldType.
 fn es_type_to_field_type(es_type: &str) -> xerj_common::types::FieldType {
     use xerj_common::types::FieldType;
     match es_type {
-        "text" => FieldType::Text,
+        // `semantic_text` carries the source text. The embedding lives on the
+        // companion vector. Falling through to `Object` is what made a
+        // template field report `type: object` (#2281).
+        "text" | "semantic_text" => FieldType::Text,
         "keyword" | "constant_keyword" | "wildcard" => FieldType::Keyword,
         "long" | "integer" | "short" | "byte" | "unsigned_long" => FieldType::Long,
         "double" | "float" | "half_float" | "scaled_float" => FieldType::Double,
@@ -5587,6 +5888,137 @@ mod governor_thread_spawn_tests {
             || {},
         );
         assert!(!started);
+    }
+}
+
+#[cfg(test)]
+mod index_template_merge_tests {
+    //! #2281: a template's `semantic_text` and `index.default_pipeline` have
+    //! to survive the merge with the body `xerj autoindex` actually sends.
+    use super::{field_from_template_property, merge_template_mappings, merge_template_settings};
+    use serde_json::json;
+
+    #[test]
+    fn dotted_template_pipeline_survives_an_autoindex_settings_body() {
+        let template = json!({ "index.default_pipeline": "jsqlite-copy" });
+        let request = json!({
+            "index": { "xerj_ingest_shards": 1 },
+            "index.query.strict_unknown_fields": true,
+            "analysis": { "analyzer": { "default": { "type": "code" } } }
+        });
+        let merged = merge_template_settings(&template, request);
+        assert_eq!(
+            merged.pointer("/index/default_pipeline"),
+            Some(&json!("jsqlite-copy")),
+            "{merged}"
+        );
+        assert_eq!(
+            merged.get("index.default_pipeline"),
+            Some(&json!("jsqlite-copy")),
+            "{merged}"
+        );
+        assert_eq!(
+            merged.pointer("/index/xerj_ingest_shards"),
+            Some(&json!(1)),
+            "{merged}"
+        );
+        assert_eq!(
+            merged.get("index.query.strict_unknown_fields"),
+            Some(&json!(true)),
+            "{merged}"
+        );
+        assert!(
+            merged
+                .pointer("/index/query.strict_unknown_fields")
+                .is_none(),
+            "a multi-dot key must stay dotted: {merged}"
+        );
+        assert_eq!(
+            merged.pointer("/analysis/analyzer/default/type"),
+            Some(&json!("code")),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn the_request_pipeline_wins_in_either_spelling() {
+        let dotted_request = merge_template_settings(
+            &json!({ "index": { "default_pipeline": "from-template" } }),
+            json!({ "index.default_pipeline": "from-request" }),
+        );
+        assert_eq!(
+            dotted_request.pointer("/index/default_pipeline"),
+            Some(&json!("from-request")),
+            "{dotted_request}"
+        );
+        let nested_request = merge_template_settings(
+            &json!({ "index.default_pipeline": "from-template" }),
+            json!({ "index": { "default_pipeline": "from-request" } }),
+        );
+        assert_eq!(
+            nested_request.pointer("/index/default_pipeline"),
+            Some(&json!("from-request")),
+            "{nested_request}"
+        );
+        assert_eq!(
+            nested_request.get("index.default_pipeline"),
+            Some(&json!("from-request")),
+            "{nested_request}"
+        );
+    }
+
+    #[test]
+    fn request_properties_replace_template_properties_of_the_same_name() {
+        let merged = merge_template_mappings(
+            &json!({
+                "properties": {
+                    "diagnostic_semantic": { "type": "semantic_text" },
+                    "diagnostic_template_marker": { "type": "keyword" }
+                }
+            }),
+            json!({
+                "properties": {
+                    "impl": { "type": "text" },
+                    "diagnostic_semantic": { "type": "keyword" }
+                }
+            }),
+        );
+        assert_eq!(
+            merged.pointer("/properties/diagnostic_semantic/type"),
+            Some(&json!("keyword"))
+        );
+        assert_eq!(
+            merged.pointer("/properties/diagnostic_template_marker/type"),
+            Some(&json!("keyword"))
+        );
+        assert_eq!(
+            merged.pointer("/properties/impl/type"),
+            Some(&json!("text"))
+        );
+    }
+
+    #[test]
+    fn semantic_text_is_text_with_an_embedding_contract() {
+        use xerj_common::types::FieldType;
+        let semantic = field_from_template_property(
+            "diagnostic_semantic",
+            &json!({ "type": "semantic_text" }),
+        );
+        assert_eq!(semantic.field_type, FieldType::Text);
+        assert!(!semantic.options.doc_values);
+        let embedding = semantic.embedding.expect("embedding");
+        assert_eq!(
+            embedding.target_field.as_deref(),
+            Some("diagnostic_semantic_vector")
+        );
+        assert_eq!(semantic.options.dimensions, Some(384));
+
+        let keyword = field_from_template_property(
+            "diagnostic_template_marker",
+            &json!({ "type": "keyword" }),
+        );
+        assert_eq!(keyword.field_type, FieldType::Keyword);
+        assert!(keyword.embedding.is_none());
     }
 }
 

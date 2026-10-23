@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A matching index template's `semantic_text` properties and
+  `index.default_pipeline` are applied when an index is created, including
+  the body `xerj autoindex` sends and the first bulk or single-document
+  write that auto-creates the index. The template already matched (a
+  `keyword` field from it was mapped), but `semantic_text` was stored as
+  `object` and the default pipeline was dropped, so the pipeline never ran
+  ([#2281](https://github.com/xerj-org/xerj/issues/2281)).
+
 - `POST /{index}/_count` honours `min_score`. The handler rebuilds a `size: 0`
   search body from the query alone, so the threshold used to be dropped: for
   `{"query":{"match":…},"min_score":10}` `_search` returned 0 while `_count`

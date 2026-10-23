@@ -1504,9 +1504,23 @@ pub async fn create_index(
         return refusal;
     }
 
+    // A matching index template contributes mappings and settings the request
+    // did not set. The request wins on a field or setting it names. Merged
+    // before validation and schema build so `semantic_text` is parsed by the
+    // same mapper as an explicit mapping, and `index.default_pipeline` is
+    // stored where `default_pipeline_for` and `GET /_settings` read it
+    // (#2281). A schema-only pass cannot: the stored mapping was the request
+    // body, so a template `semantic_text` was rendered back as `object`, and
+    // the template's settings were never copied.
+    let (mappings_val, merged_settings) = state.engine.merge_index_template(
+        &index,
+        body.get("mappings").cloned().unwrap_or(Value::Null),
+        body.get("settings").cloned().unwrap_or(Value::Null),
+    );
+    let settings_ref = (!merged_settings.is_null()).then_some(&merged_settings);
+
     // Validate mapping field types before creating — ES returns
     // mapper_parsing_exception for unsupported types.
-    let mappings_val = body.get("mappings").cloned().unwrap_or(Value::Null);
     if let Some(props) = mappings_val.get("properties").and_then(Value::as_object) {
         if let Some(refusal) = empty_field_name_refusal(props) {
             return refusal;
@@ -1557,8 +1571,7 @@ pub async fn create_index(
     // @timestamp heuristic. Mirror the field + order into the
     // `__xy_index_sort_*` internal keys so the search handler's
     // default-sort hook picks them up.
-    let explicit_sort_field: Option<String> = body
-        .get("settings")
+    let explicit_sort_field: Option<String> = settings_ref
         .and_then(|s| {
             s.pointer("/index/sort/field")
                 .or_else(|| s.pointer("/index/sort.field"))
@@ -1570,8 +1583,7 @@ pub async fn create_index(
             Value::Array(mut a) => a.first_mut().and_then(|x| x.as_str().map(String::from)),
             _ => None,
         });
-    let explicit_sort_order: String = body
-        .get("settings")
+    let explicit_sort_order: String = settings_ref
         .and_then(|s| {
             s.pointer("/index/sort/order")
                 .or_else(|| s.pointer("/index/sort.order"))
@@ -1585,14 +1597,17 @@ pub async fn create_index(
         })
         .unwrap_or_else(|| "asc".to_string());
 
-    // Thread the request's `settings` into the store config at create time
-    // (custom analysis config, and the per-index `index.xerj_ingest_shards` WAL
-    // shard override that `xerj autoindex` uses to keep each of its hundreds of
-    // indices at a single WAL file descriptor). create_index_with_settings
-    // applies index templates identically to create_index.
-    let create_settings = body.get("settings").cloned().unwrap_or(Value::Null);
+    // Thread the merged `settings` into the store config at create time
+    // (custom analysis config, the template's `index.default_pipeline`, and
+    // the per-index `index.xerj_ingest_shards` WAL shard override that
+    // `xerj autoindex` uses to keep each of its hundreds of indices at a
+    // single WAL file descriptor). create_index_with_settings applies index
+    // templates to the schema; the mapping blob and display settings below
+    // are the merged body, so a template field is not re-derived from the
+    // native type.
+    let create_settings = merged_settings;
     let display_settings = create_time_index_settings(
-        body.get("settings"),
+        (!create_settings.is_null()).then_some(&create_settings),
         &explicit_sort_field,
         &explicit_sort_order,
         declared_timestamp_date,

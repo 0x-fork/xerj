@@ -1375,7 +1375,12 @@ pub async fn process_bulk_with_opts(
                 });
                 mapping_has_semantic_text(&props.unwrap_or(Value::Null))
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // The index does not exist yet. A matching template's
+            // `semantic_text` is applied by the auto-create this batch is
+            // about to do; classifying from the absent mapping sent the
+            // first write down the turbo path, which never embeds (#2281).
+            || engine.absent_index_template_has_semantic_text(target);
         cache.insert(target.to_string(), has);
         has
     };

@@ -125,12 +125,20 @@ impl Engine {
         if self.get_index(name).is_ok() {
             return Ok(());
         }
+        // Same template merge as `PUT /{index}` (#2281). Peers apply this
+        // spec as given and do not re-read their own templates.
+        let (mappings, settings) = self.merge_index_template(name, Value::Null, Value::Null);
+        let index_settings = if settings.as_object().is_some_and(|m| !m.is_empty()) {
+            settings.clone()
+        } else {
+            Value::Null
+        };
         let spec = ReplicatedIndexSpec {
             name: name.to_string(),
             schema: Schema::empty(),
-            settings: Value::Null,
-            mappings: Value::Null,
-            index_settings: Value::Null,
+            settings,
+            mappings,
+            index_settings,
             aliases: Value::Null,
         };
         match self.replicate_index_create(spec).await {
