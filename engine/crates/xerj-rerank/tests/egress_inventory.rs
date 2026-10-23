@@ -139,6 +139,14 @@ const KNOWN: &[(&str, Role)] = &[
     // accept loop on drop, label_http_tests.rs is a #[cfg(test)] module.
     ("xerj-autoindex/src/label.rs", Role::TestOnly),
     ("xerj-autoindex/src/label_http_tests.rs", Role::TestOnly),
+    // #2222's finalize-verify deletion test: production verify talks to the
+    // node through the shared Es client (esclient.rs, already classified as
+    // `xerj autoindex`). The only `TcpStream::connect` is inside `#[cfg(test)]`,
+    // a connect to that test's own `127.0.0.1` listener so a parked `accept`
+    // wakes after the index is "deleted". Nothing in this file is a node or
+    // client path, so the published list, DATA_EGRESS and the air-gapped
+    // recipe stay as they are.
+    ("xerj-autoindex/src/sync_executor.rs", Role::TestOnly),
     // #1055's xerj_map module: the tool itself reuses the proxy's shared
     // client (xerj-mcp/src/lib.rs, already classified); only its unit tests
     // construct one, to point at an unroutable address.

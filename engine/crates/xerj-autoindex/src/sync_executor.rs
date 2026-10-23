@@ -791,7 +791,11 @@ impl<'a> EsSyncBackend<'a> {
             let mut filter = Vec::with_capacity(1 + extra_filters.len());
             filter.push(serde_json::json!({"terms": {field: window}}));
             filter.extend(extra_filters.iter().cloned());
-            let response = self.es.search(
+            // #2222: `search_for_verify`, not `search`. A DELETE of this
+            // index while the window is in flight used to leave the caller
+            // parked on it (`waiting_on` the deleted name) until the
+            // transport budget ran out, and the generation never committed.
+            let response = self.es.search_for_verify(
                 index,
                 &serde_json::json!({
                     "size": 0,
@@ -5822,6 +5826,215 @@ mod tests {
             err.contains("continuation sort key"),
             "a full page with no sort key is a loud failure: {err}"
         );
+    }
+
+    /// #2222: deleting a finalize-verify target while its window search is in
+    /// flight must end the wait. The search connection is held open on purpose
+    /// — that is the in-flight request whose handle the node already resolved,
+    /// so it does not become a 404 — and `HEAD` starts answering 404 once the
+    /// index is "deleted". Verify has to return the deleted-index error while
+    /// that search is still unanswered.
+    #[test]
+    fn finalize_verify_stops_when_its_target_index_is_deleted() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const INDEX: &str = "xc-elastic-charts-cpu-profile-tree-mock";
+
+        fn read_http(stream: &mut std::net::TcpStream) -> String {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        fn write_status(stream: &mut std::net::TcpStream, status: &str) {
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // Accepted sockets inherit non-blocking from the listener. Put each
+        // one back into blocking mode inside its handler. The accept loop
+        // itself stays non-blocking so a parked `_search` — handled on its
+        // own thread — cannot stop a later `HEAD` from being answered.
+        listener.set_nonblocking(true).unwrap();
+        let deleted = std::sync::Arc::new(AtomicBool::new(false));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let heads = std::sync::Arc::new(AtomicUsize::new(0));
+        let deleted_srv = std::sync::Arc::clone(&deleted);
+        let release_srv = std::sync::Arc::clone(&release);
+        let heads_srv = std::sync::Arc::clone(&heads);
+        let server = std::thread::spawn(move || {
+            // Hold the search well past the test's own deadline so a client
+            // that waits for the response fails the test instead of passing
+            // by accident. `release` lets the passing path close the socket.
+            let hold_until = std::time::Instant::now() + Duration::from_secs(45);
+            let started = std::time::Instant::now();
+            let mut handlers = Vec::new();
+            while started.elapsed() < Duration::from_secs(60) {
+                if release_srv.load(Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let deleted_one = std::sync::Arc::clone(&deleted_srv);
+                        let release_one = std::sync::Arc::clone(&release_srv);
+                        let heads_one = std::sync::Arc::clone(&heads_srv);
+                        handlers.push(std::thread::spawn(move || {
+                            let mut stream = stream;
+                            stream.set_nonblocking(false).unwrap();
+                            let request = read_http(&mut stream);
+                            if request.starts_with("HEAD ") {
+                                heads_one.fetch_add(1, Ordering::SeqCst);
+                                let status = if deleted_one.load(Ordering::SeqCst) {
+                                    "404 Not Found"
+                                } else {
+                                    "200 OK"
+                                };
+                                write_status(&mut stream, status);
+                            } else if request.contains("_search") {
+                                while !release_one.load(Ordering::SeqCst)
+                                    && std::time::Instant::now() < hold_until
+                                {
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                write_status(&mut stream, "200 OK");
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for handler in handlers {
+                let _ = handler.join();
+            }
+        });
+
+        let deleted_watch = std::sync::Arc::clone(&deleted);
+        let heads_watch = std::sync::Arc::clone(&heads);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while heads_watch.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            deleted_watch.store(true, Ordering::SeqCst);
+        });
+
+        let url = format!("http://{address}");
+        let (tx, rx) = mpsc::channel();
+        // Release the parked search even if an assertion panics, so the
+        // server thread does not sit out the rest of its hold.
+        struct ReleaseOnDrop(std::sync::Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release_on_drop = ReleaseOnDrop(std::sync::Arc::clone(&release));
+        std::thread::spawn(move || {
+            let es = crate::esclient::Es::new(&url, None).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let pr = crate::progress::Progress::silent();
+            let backend = EsSyncBackend::new(&es, dir.path(), 8 * 1024 * 1024, &pr);
+            let result = backend.windowed_value_counts(INDEX, "ax_file", &["digest".into()], &[]);
+            let _ = tx.send(result.map_err(|error| format!("{error:#}")));
+        });
+
+        let message = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("finalize-verify hung on an index that was deleted during verify")
+            .expect_err("a deleted verify target must fail that item");
+        assert!(
+            !release.load(Ordering::SeqCst),
+            "verify returned only after the hung search was released"
+        );
+        assert!(message.contains("was deleted during verify"), "{message}");
+        assert!(message.contains(INDEX), "{message}");
+
+        release.store(true, Ordering::SeqCst);
+        // Unblock `accept` if it is parked, then let the held search finish.
+        let _ = std::net::TcpStream::connect(address);
+        server.join().unwrap();
+    }
+
+    /// The same window, when the index stays and the search answers, still
+    /// returns the bucket counts. The deletion check must not fire on a live
+    /// target.
+    #[test]
+    fn finalize_verify_window_counts_a_live_index() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let body =
+                br#"{"aggregations":{"values":{"buckets":[{"key":"digest-a","doc_count":3}]}}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let es = crate::esclient::Es::new(&format!("http://{address}"), None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pr = crate::progress::Progress::silent();
+        let backend = EsSyncBackend::new(&es, dir.path(), 8 * 1024 * 1024, &pr);
+        let counts = backend
+            .windowed_value_counts(
+                "xc-live",
+                "ax_file",
+                &["digest-a".into(), "digest-b".into()],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(counts.get("digest-a"), Some(&3));
+        assert_eq!(counts.get("digest-b"), Some(&0));
+        server.join().unwrap();
     }
 }
 

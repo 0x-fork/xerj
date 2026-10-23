@@ -234,6 +234,11 @@ Three rules that keep the choice honest:
   answers during a rebuild.
 - **During a rebuild both builds exist**, so the node briefly holds the corpus
   twice. Budget disk for it on a large corpus.
+- **Wait for `xerj-done` before deleting an index a mapping scan flagged.**
+  A JSON fixture the tabular sniffer turned into its own index is removed with
+  `DELETE /{exact-name}` after `finalize-verify` has finished. Deleting one
+  while that phase is still reading it ends the run with
+  `index <name> was deleted during verify`, and the generation does not commit.
 - Always verify: `curl -s "$URL/xc-<corpus>*/_count"` must be > 0. The command
   does this itself and says so; do it again if you are scripting around it.
 

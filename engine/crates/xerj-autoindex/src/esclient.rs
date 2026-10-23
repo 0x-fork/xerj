@@ -2158,6 +2158,90 @@ impl Es {
         Ok(v)
     }
 
+    /// How often [`Es::search_for_verify`] re-checks that its target still
+    /// exists while the window search is in flight (#2222). A fast window
+    /// returns before the first check, so the common path adds no request.
+    const VERIFY_INDEX_POLL: Duration = Duration::from_millis(500);
+
+    /// Bound on one existence probe. A probe that does not answer is "still
+    /// there": only a real 404 ends the wait, so a busy node cannot be read
+    /// as a deleted index.
+    const VERIFY_INDEX_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// The search [`crate::sync_executor`] finalize-verify issues per window.
+    ///
+    /// `search` blocks the caller for the whole request. The engine resolves
+    /// the index when the request arrives, so a `DELETE` that lands while
+    /// that search is running does not turn it into a 404 — the handle is
+    /// already taken, and the client sits in `waiting_on` that index until
+    /// the transport budget (300 s, six attempts on a 5xx) runs out. The
+    /// generation never commits (#2222). This call keeps the search in flight
+    /// and, beside it, asks `HEAD /{index}`. The moment that answers 404 —
+    /// or the search itself does — it returns
+    /// `index {name} was deleted during verify` and the caller stops waiting.
+    /// A live index is unchanged: the search result comes back as `search`
+    /// would have returned it.
+    pub(crate) fn search_for_verify(&self, index: &str, body: &Value) -> Result<Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let es = self.clone();
+        let index_owned = index.to_owned();
+        let body = body.clone();
+        std::thread::Builder::new()
+            .name("xerj-verify-search".to_owned())
+            .spawn(move || {
+                let _ = tx.send(es.search(&index_owned, &body));
+            })
+            .context("spawn finalize-verify search")?;
+        loop {
+            match rx.recv_timeout(Self::VERIFY_INDEX_POLL) {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(error)) => {
+                    if Self::verify_search_says_index_missing(&error)
+                        || self.verify_index_present(index) == Some(false)
+                    {
+                        anyhow::bail!("index {index} was deleted during verify");
+                    }
+                    return Err(error);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.verify_index_present(index) == Some(false) {
+                        anyhow::bail!("index {index} was deleted during verify");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("finalize-verify search for {index} ended without a result");
+                }
+            }
+        }
+    }
+
+    /// `Some(true)` the index is there, `Some(false)` the node answered 404,
+    /// `None` when this probe learned nothing (timeout, transport error, or
+    /// any other status). `None` must not be read as gone.
+    fn verify_index_present(&self, index: &str) -> Option<bool> {
+        match self
+            .req(reqwest::Method::HEAD, &format!("/{index}"))
+            .timeout(Self::VERIFY_INDEX_PROBE_TIMEOUT)
+            .send()
+        {
+            Ok(resp) => match resp.status().as_u16() {
+                404 => Some(false),
+                200..=299 => Some(true),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Whether `search`'s error is the node saying the index is not there.
+    ///
+    /// `search` renders a non-2xx as `search /{index} HTTP {status}: {body}`.
+    /// 404 on `_search` is `index_not_found`; an empty index is HTTP 200.
+    fn verify_search_says_index_missing(error: &anyhow::Error) -> bool {
+        let text = format!("{error:#}");
+        text.contains("HTTP 404") || text.to_ascii_lowercase().contains("index_not_found")
+    }
+
     /// `search`, but a missing index is an answer rather than a failure.
     ///
     /// A probe whose whole job is to decide "does the server still hold what
