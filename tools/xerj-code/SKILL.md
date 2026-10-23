@@ -80,6 +80,8 @@ of question:
 | add it | `xerj corpus add --from ./<slug>.json`, then `xerj corpus index <slug>` | `xerj autoindex <folder>` |
 | query it | `xerj code <slug> "<question>"` · MCP `xerj_code_search` | `xerj search "<words>"` · `xerj def "<symbol>"` · MCP `xerj_search` |
 
+A folder indexed with `xerj autoindex --prefix <p>` is the local path in that table, not a `xerj code` corpus: `xerj corpus list` reads `~/.xerj-code` and does not list `<p>` until `xerj corpus add` registers the folder, and the commands that search it are `xerj search --prefix <p>` and `xerj def --prefix <p>`.
+
 Use neither for a fact you can already state exactly: on memorised content
 retrieval is overhead (see the status note above).
 

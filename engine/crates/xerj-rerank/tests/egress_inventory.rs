@@ -84,6 +84,14 @@ const KNOWN: &[(&str, Role)] = &[
         "xerj-autoindex/src/esclient.rs",
         Role::Client("`xerj autoindex`"),
     ),
+    // #2181: when `xerj code` / `xerj corpus list` find an empty ledger they
+    // POST one catalog search to the node URL those commands already use
+    // (`--url`, `XERJ_URL`, else localhost:9200). The body is a fixed
+    // `doc_kind: run` prefix query; the API key goes only when one is
+    // configured. No document text and no user query leave, and the peer is
+    // the operator's own node, so DATA_EGRESS and the air-gapped rows do
+    // not change.
+    ("xerj-autoindex/src/xc.rs", Role::Client("`xerj code`")),
     (
         "xerj-autoindex/src/feedback.rs",
         Role::Client("`xerj feedback --open-pr`"),

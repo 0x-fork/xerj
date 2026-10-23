@@ -8,9 +8,10 @@
 //! (`xerj corpus index`). Exit codes: 0 hits / 1 no-match-or-incomplete /
 //! 2 usage-transport-stale / 3 corpus-in-state-but-not-loaded-here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -109,6 +110,183 @@ fn emit(out: &CodeOutcome) {
     }
 }
 
+// ── empty ledger, but the node already has autoindex prefixes (#2181) ──────
+//
+// `xerj code` / `xerj corpus` read `~/.xerj-code`. `xerj autoindex --prefix`
+// writes the node's catalog and does not touch that directory, so an empty
+// ledger used to read as "nothing is indexed" on a node that already answers
+// `xerj search --prefix`. The hint names those prefixes. It is one short
+// request: [`Es::search`] retries a dead node for ~8s of backoff, and this
+// path must stay quiet instead.
+
+/// How long the hint waits for a connect. A refused port returns at once;
+/// a blackhole must not hold `xerj corpus list`.
+const CATALOG_HINT_CONNECT: Duration = Duration::from_millis(800);
+/// Whole-request budget, connect included. One attempt, no retry.
+const CATALOG_HINT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Catalog replies larger than this are not a prefix list. Ignore them.
+const CATALOG_HINT_BODY_CAP: usize = 1024 * 1024;
+/// How many prefix names the hint prints before it says "N more".
+const CATALOG_HINT_PREFIX_CAP: usize = 8;
+
+/// `{root}/state` has no `*.json` ledger. A missing directory is empty.
+fn ledger_is_empty(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root.join("state")) else {
+        return true;
+    };
+    !entries
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+}
+
+/// A prefix safe to paste into the hint's command. Anything else (spaces,
+/// quotes, a newline) is dropped so a catalog value cannot forge a line.
+fn hintable_prefix(prefix: &str) -> bool {
+    (1..=128).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The lines to print. `None` when nothing safe remains.
+fn format_autoindex_prefix_hint(prefixes: &[String]) -> Option<String> {
+    let mut names: Vec<&str> = prefixes
+        .iter()
+        .map(String::as_str)
+        .filter(|prefix| hintable_prefix(prefix))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let example = *names.first()?;
+    let shown = if names.len() <= CATALOG_HINT_PREFIX_CAP {
+        names.join(", ")
+    } else {
+        format!(
+            "{}, … ({} more)",
+            names[..CATALOG_HINT_PREFIX_CAP].join(", "),
+            names.len() - CATALOG_HINT_PREFIX_CAP
+        )
+    };
+    let each = if names.len() > 1 {
+        " (same --prefix for each)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "this node's autoindex catalog has prefixes: {shown}\n\
+         search them with `xerj search --prefix {example}` or `xerj def --prefix {example}`{each}; \
+         register a folder for `xerj code` with `xerj corpus add <name> <path>`"
+    ))
+}
+
+/// Explicit key, else `XERJ_API_KEY`, else the loopback admin key. Silent:
+/// the hint must not announce a key and then say nothing when the node is down.
+fn resolve_hint_key(url: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(key) = explicit.filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+    if let Some(key) = std::env::var("XERJ_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key);
+    }
+    if url_is_loopback(url) {
+        discover_local_admin_key_for_url(url).map(|(key, _path)| key)
+    } else {
+        None
+    }
+}
+
+/// Distinct `prefix` values on catalog run documents.
+///
+/// Same query as `catalog_run_prefixes` in `search.rs`: `doc_kind: run`,
+/// `_source: prefix`, size 200. `None` when `/hits/hits` is absent — that is
+/// not an empty catalog.
+fn prefixes_from_catalog_hits(v: &Value) -> Option<Vec<String>> {
+    let hits = v.pointer("/hits/hits")?.as_array()?;
+    let mut prefixes = BTreeSet::new();
+    for hit in hits {
+        if let Some(prefix) = hit.pointer("/_source/prefix").and_then(Value::as_str) {
+            if !prefix.is_empty() {
+                prefixes.insert(prefix.to_string());
+            }
+        }
+    }
+    Some(prefixes.into_iter().collect())
+}
+
+/// One catalog read. `None` on any failure, including a node that is not
+/// there: callers print nothing in that case.
+fn fetch_catalog_run_prefixes(url: &str, explicit_key: Option<&str>) -> Option<Vec<String>> {
+    let http = reqwest::blocking::Client::builder()
+        .connect_timeout(CATALOG_HINT_CONNECT)
+        .timeout(CATALOG_HINT_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok()?;
+    let body = json!({
+        "size": 200,
+        "query": { "term": { "doc_kind": "run" } },
+        "_source": ["prefix"]
+    });
+    let endpoint = format!(
+        "{}/{}/_search",
+        url.trim_end_matches('/'),
+        xerj_common::AUTOINDEX_CATALOG_INDEX
+    );
+    let mut req = http.post(endpoint).json(&body);
+    if let Some(key) = resolve_hint_key(url, explicit_key) {
+        req = req.header("Authorization", format!("ApiKey {key}"));
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?;
+    if bytes.len() > CATALOG_HINT_BODY_CAP {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(&bytes).ok()?;
+    prefixes_from_catalog_hits(&parsed)
+}
+
+/// Hint text, or `None` when the node did not answer or has no safe prefix.
+fn catalog_prefix_hint(url: &str, explicit_key: Option<&str>) -> Option<String> {
+    format_autoindex_prefix_hint(&fetch_catalog_run_prefixes(url, explicit_key)?)
+}
+
+/// After a not-indexed refusal, when the ledger itself is empty. A stale
+/// index, a bad state file, or a transport error already names its own next
+/// step, and those ledgers are not empty.
+fn append_autoindex_prefix_hint(
+    out: &mut CodeOutcome,
+    root: &Path,
+    url: &str,
+    api_key: Option<&str>,
+) {
+    if out.exit != 2 || !out.to_stderr || !ledger_is_empty(root) {
+        return;
+    }
+    let Some(hint) = catalog_prefix_hint(url, api_key) else {
+        return;
+    };
+    if !out.text.is_empty() && !out.text.ends_with('\n') {
+        out.text.push('\n');
+    }
+    out.text.push_str(&hint);
+}
+
+fn push_prefix_hint(stderr: &mut String, url: &str) {
+    if let Some(hint) = catalog_prefix_hint(url, None) {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&hint);
+        stderr.push('\n');
+    }
+}
+
 // ── xerj code ───────────────────────────────────────────────────────────────
 
 const CODE_USAGE: &str =
@@ -136,16 +314,33 @@ retrieval over a reference corpus (see `xerj corpus list`):
 
 /// `xerj code …` — returns the process exit code.
 pub fn run_code_cli(args: &[String]) -> i32 {
+    match code_cli_outcome(args) {
+        CodeCliDone::Printed(code) => code,
+        CodeCliDone::Outcome(out) => {
+            let code = out.exit;
+            emit(&out);
+            code
+        }
+    }
+}
+
+enum CodeCliDone {
+    /// Usage and client-build failures already printed their own lines.
+    Printed(i32),
+    Outcome(CodeOutcome),
+}
+
+fn code_cli_outcome(args: &[String]) -> CodeCliDone {
     let mut corpus: Option<String> = None;
     let mut query: Option<String> = None;
     let mut url: Option<String> = None;
     let mut api_key: Option<String> = None;
     let mut p = CodeParams::new("", "");
     let mut i = 0;
-    let bad = |msg: String| -> i32 {
+    let bad = |msg: String| -> CodeCliDone {
         eprintln!("{msg}\n");
         eprintln!("{CODE_USAGE}");
-        2
+        CodeCliDone::Printed(2)
     };
     while i < args.len() {
         let a = &args[i];
@@ -163,7 +358,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{CODE_USAGE}");
-                return 0;
+                return CodeCliDone::Printed(0);
             }
             "-k" => {
                 let v = val!("-k");
@@ -214,18 +409,19 @@ pub fn run_code_cli(args: &[String]) -> i32 {
         return bad("xerj code: both <corpus> and \"<query>\" are required".to_string());
     };
     let url = resolve_url(url.as_deref());
-    let es = match build_es(&url, api_key) {
+    let es = match build_es(&url, api_key.clone()) {
         Ok(es) => es,
         Err(e) => {
             eprintln!("xerj code: cannot reach {url}: {e:#}");
-            return 2;
+            return CodeCliDone::Printed(2);
         }
     };
     p.corpus = corpus;
     p.query = query;
-    let out = xccode::run_code_query(&code_root(), &EsXc(&es), &url, &p, "`--stale-ok`");
-    emit(&out);
-    out.exit
+    let root = code_root();
+    let mut out = xccode::run_code_query(&root, &EsXc(&es), &url, &p, "`--stale-ok`");
+    append_autoindex_prefix_hint(&mut out, &root, &url, api_key.as_deref());
+    CodeCliDone::Outcome(out)
 }
 
 // ── xerj corpus add ─────────────────────────────────────────────────────────
@@ -2813,14 +3009,42 @@ fn stamp_secs() -> i64 {
 
 // ── xerj corpus list ────────────────────────────────────────────────────────
 
+struct Captured {
+    stdout: String,
+    stderr: String,
+}
+
+fn push_line(buf: &mut String, line: &str) {
+    buf.push_str(line);
+    buf.push('\n');
+}
+
 fn run_corpus_list(args: &[String]) -> i32 {
+    let (code, text) = corpus_list_text(args);
+    if !text.stdout.is_empty() {
+        print!("{}", text.stdout);
+    }
+    if !text.stderr.is_empty() {
+        eprint!("{}", text.stderr);
+    }
+    code
+}
+
+fn corpus_list_text(args: &[String]) -> (i32, Captured) {
     let mut url: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                println!("{CORPUS_USAGE}");
-                return 0;
+                let mut stdout = String::new();
+                push_line(&mut stdout, CORPUS_USAGE);
+                return (
+                    0,
+                    Captured {
+                        stdout,
+                        stderr: String::new(),
+                    },
+                );
             }
             "--url" => match args.get(i + 1) {
                 Some(v) => {
@@ -2828,13 +3052,33 @@ fn run_corpus_list(args: &[String]) -> i32 {
                     i += 1;
                 }
                 None => {
-                    eprintln!("xerj corpus list: --url needs a value\n\n{CORPUS_USAGE}");
-                    return 2;
+                    let mut stderr = String::new();
+                    push_line(
+                        &mut stderr,
+                        &format!("xerj corpus list: --url needs a value\n\n{CORPUS_USAGE}"),
+                    );
+                    return (
+                        2,
+                        Captured {
+                            stdout: String::new(),
+                            stderr,
+                        },
+                    );
                 }
             },
             a => {
-                eprintln!("xerj corpus list: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
+                let mut stderr = String::new();
+                push_line(
+                    &mut stderr,
+                    &format!("xerj corpus list: unexpected argument '{a}'\n\n{CORPUS_USAGE}"),
+                );
+                return (
+                    2,
+                    Captured {
+                        stdout: String::new(),
+                        stderr,
+                    },
+                );
             }
         }
         i += 1;
@@ -2842,18 +3086,41 @@ fn run_corpus_list(args: &[String]) -> i32 {
     let root = code_root();
     let state_dir = root.join("state");
     if !state_dir.is_dir() {
-        eprintln!(
-            "no state directory at {} — nothing has been indexed on this machine",
-            state_dir.display()
+        let mut stderr = String::new();
+        push_line(
+            &mut stderr,
+            &format!(
+                "no state directory at {} — nothing has been indexed on this machine",
+                state_dir.display()
+            ),
         );
-        return 2;
+        // The ledger is empty. A node that already has autoindex prefixes
+        // should say so; a node that does not answer adds nothing.
+        push_prefix_hint(&mut stderr, &resolve_url(url.as_deref()));
+        return (
+            2,
+            Captured {
+                stdout: String::new(),
+                stderr,
+            },
+        );
     }
     let url = resolve_url(url.as_deref());
     let es = match build_es(&url, None) {
         Ok(es) => es,
         Err(e) => {
-            eprintln!("xerj corpus list: cannot reach {url}: {e:#}");
-            return 2;
+            let mut stderr = String::new();
+            push_line(
+                &mut stderr,
+                &format!("xerj corpus list: cannot reach {url}: {e:#}"),
+            );
+            return (
+                2,
+                Captured {
+                    stdout: String::new(),
+                    stderr,
+                },
+            );
         }
     };
     let mut names: Vec<String> = std::fs::read_dir(&state_dir)
@@ -2869,12 +3136,13 @@ fn run_corpus_list(args: &[String]) -> i32 {
         })
         .collect();
     names.sort();
+    let mut stdout = String::new();
     let mut loaded = 0usize;
     for name in &names {
         let st = match state::load_state(&root, name) {
             Ok(st) => st,
             Err(e) => {
-                println!("{name}: unreadable state ({e})");
+                push_line(&mut stdout, &format!("{name}: unreadable state ({e})"));
                 continue;
             }
         };
@@ -2899,32 +3167,39 @@ fn run_corpus_list(args: &[String]) -> i32 {
             .and_then(|k| uses.get(k).map(|u| format!("\n  use: {u}")))
             .unwrap_or_default();
         match live {
-            usize::MAX => println!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}"),
+            usize::MAX => push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}")),
             0 => {
-                println!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}");
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"));
                 // #1846: a name the index prefix rewrites (`curl_cffi`) was
                 // indexed under another spelling, so "0 indices" is not the
                 // whole story — say which name to move it to.
                 if let Err(why) = xccode::pathgate::valid_corpus_name(name) {
-                    println!("  {why}");
+                    push_line(&mut stdout, &format!("  {why}"));
                 }
             }
             n => {
                 loaded += 1;
-                println!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}");
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}"));
             }
         }
         if let Some(w) = state::incomplete_coverage(&st) {
-            println!("  {w}");
+            push_line(&mut stdout, &format!("  {w}"));
         }
     }
-    println!();
-    println!(
-        "{} of {} corpora are actually loaded on {url}.",
-        loaded,
-        names.len()
+    stdout.push('\n');
+    push_line(
+        &mut stdout,
+        &format!(
+            "{} of {} corpora are actually loaded on {url}.",
+            loaded,
+            names.len()
+        ),
     );
-    0
+    let mut stderr = String::new();
+    if names.is_empty() {
+        push_prefix_hint(&mut stderr, &url);
+    }
+    (0, Captured { stdout, stderr })
 }
 
 // ── dispatch ────────────────────────────────────────────────────────────────
@@ -5125,6 +5400,456 @@ precedence = ["a", "b"]
             !pinned.join(".xerjignore").exists(),
             "a pinned rebuild stays at the recorded sha and does not copy the working tree's .xerjignore"
         );
+    }
+
+    // ── empty ledger vs autoindex prefixes (#2181) ──────────────────────────
+
+    fn catalog_hits(prefixes: &[&str]) -> String {
+        let hits: Vec<Value> = prefixes
+            .iter()
+            .map(|prefix| json!({"_source": {"doc_kind": "run", "prefix": prefix}}))
+            .collect();
+        json!({"hits": {"hits": hits}}).to_string()
+    }
+
+    /// One-shot JSON stand-in for the node. Records each request so a test
+    /// can see that a path with corpora never asked the catalog.
+    struct JsonServer {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl JsonServer {
+        fn start(handler: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::Ordering;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_t = std::sync::Arc::clone(&seen);
+            let stop_t = std::sync::Arc::clone(&stop);
+            let handler = std::sync::Arc::new(handler);
+            let join = std::thread::spawn(move || {
+                while !stop_t.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let mut buf = [0u8; 8192];
+                            let mut req = String::new();
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                        if let Some(end) = req.find("\r\n\r\n") {
+                                            let header_end = end + 4;
+                                            let need = req[..header_end].lines().find_map(|line| {
+                                                let (name, value) = line.split_once(':')?;
+                                                if name.eq_ignore_ascii_case("content-length") {
+                                                    value.trim().parse::<usize>().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            match need {
+                                                Some(need) if req.len() - header_end >= need => {
+                                                    break
+                                                }
+                                                None => break,
+                                                Some(_) => {}
+                                            }
+                                        }
+                                        if req.len() > 64 * 1024 {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            seen_t.lock().unwrap().push(req.clone());
+                            let (status, body) = handler(&req);
+                            let reason = match status {
+                                200 => "OK",
+                                401 => "Unauthorized",
+                                404 => "Not Found",
+                                _ => "Error",
+                            };
+                            let bytes = format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(bytes.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                url,
+                seen,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for JsonServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    fn assert_fast(started: std::time::Instant, what: &str) {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "{what} took {elapsed:?}; a dead node must not go through Es::search's six retries"
+        );
+    }
+
+    #[test]
+    fn prefix_hint_names_the_search_and_def_commands_and_corpus_add() {
+        let one = format_autoindex_prefix_hint(&["proj".into()]).unwrap();
+        assert!(one.contains("prefixes: proj\n"), "{one}");
+        assert!(one.contains("`xerj search --prefix proj`"), "{one}");
+        assert!(one.contains("`xerj def --prefix proj`"), "{one}");
+        assert!(one.contains("`xerj corpus add <name> <path>`"), "{one}");
+        assert!(!one.contains("same --prefix"), "{one}");
+        assert_eq!(one.lines().count(), 2, "{one}");
+
+        let many = format_autoindex_prefix_hint(&["refs".into(), "proj".into()]).unwrap();
+        assert!(many.contains("prefixes: proj, refs"), "{many}");
+        assert!(many.contains("`xerj search --prefix proj`"), "{many}");
+        assert!(many.contains("same --prefix for each"), "{many}");
+
+        let mut nine: Vec<String> = (b'a'..=b'i').map(|c| (c as char).to_string()).collect();
+        nine.push("bad name".into());
+        nine.push("has\nnewline".into());
+        let capped = format_autoindex_prefix_hint(&nine).unwrap();
+        assert!(capped.contains("… (1 more)"), "{capped}");
+        assert!(capped.contains("`xerj search --prefix a`"), "{capped}");
+        assert!(!capped.contains("bad name"), "{capped}");
+        assert!(!capped.contains("has\nnewline"), "{capped}");
+        assert_eq!(capped.lines().count(), 2, "{capped}");
+
+        assert!(format_autoindex_prefix_hint(&[]).is_none());
+        assert!(format_autoindex_prefix_hint(&["bad name".into()]).is_none());
+    }
+
+    #[test]
+    fn catalog_hit_prefixes_are_deduped_and_a_non_search_body_is_not_empty() {
+        let v = json!({"hits": {"hits": [
+            {"_source": {"prefix": "b"}},
+            {"_source": {"prefix": ""}},
+            {"_source": {"prefix": "a"}},
+            {"_source": {"prefix": "a"}},
+            {"_source": {"other": 1}}
+        ]}});
+        assert_eq!(
+            prefixes_from_catalog_hits(&v).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(prefixes_from_catalog_hits(&json!({})).is_none());
+        assert_eq!(
+            prefixes_from_catalog_hits(&json!({"hits": {"hits": []}})).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_unreachable_catalog_is_silence_not_an_error() {
+        let url = closed_port_url();
+        let started = std::time::Instant::now();
+        assert!(fetch_catalog_run_prefixes(&url, None).is_none());
+        assert_fast(started, "closed port");
+
+        let server = JsonServer::start(|_| (500, "{\"error\":\"down\"}".into()));
+        assert!(catalog_prefix_hint(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (200, "not-json".into()));
+        assert!(fetch_catalog_run_prefixes(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (200, "{\"hits\":{\"hits\":[]}}".into()));
+        assert!(catalog_prefix_hint(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (401, "{}".into()));
+        assert!(catalog_prefix_hint(&server.url, Some("nope")).is_none());
+    }
+
+    fn request_has_api_key(req: &str, key: &str) -> bool {
+        let want = format!("ApiKey {key}");
+        req.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("authorization") && value.trim() == want
+        })
+    }
+
+    #[test]
+    fn the_hint_sends_the_explicit_api_key() {
+        let server = JsonServer::start(|req| {
+            if request_has_api_key(req, "secret-key") {
+                (200, catalog_hits(&["proj"]))
+            } else {
+                (401, "{}".into())
+            }
+        });
+        let hint = catalog_prefix_hint(&server.url, Some("secret-key")).unwrap();
+        assert!(hint.contains("prefixes: proj"), "{hint}");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|req| request_has_api_key(req, "secret-key")),
+            "{:?}",
+            server.requests()
+        );
+    }
+
+    #[test]
+    fn corpus_list_with_no_ledger_names_catalog_prefixes() {
+        let server = JsonServer::start(|_| (200, catalog_hits(&["refs", "proj", "proj"])));
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 2);
+        assert!(text.stdout.is_empty(), "{}", text.stdout);
+        assert!(
+            text.stderr
+                .contains("nothing has been indexed on this machine"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("prefixes: proj, refs"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj search --prefix proj`"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj def --prefix proj`"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj corpus add <name> <path>`"),
+            "{}",
+            text.stderr
+        );
+
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(
+            text.stdout.contains("0 of 0 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(
+            text.stderr.contains("prefixes: proj, refs"),
+            "{}",
+            text.stderr
+        );
+    }
+
+    #[test]
+    fn corpus_list_stays_quiet_when_the_node_is_down() {
+        let url = closed_port_url();
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let started = std::time::Instant::now();
+        let (code, text) = corpus_list_text(&["--url".into(), url.clone()]);
+        assert_fast(started, "corpus list, no state dir");
+        assert_eq!(code, 2);
+        assert!(
+            text.stderr
+                .contains("nothing has been indexed on this machine"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            !text.stderr.contains("autoindex catalog"),
+            "{}",
+            text.stderr
+        );
+        assert!(!text.stderr.contains("cannot reach"), "{}", text.stderr);
+
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        let started = std::time::Instant::now();
+        let (code, text) = corpus_list_text(&["--url".into(), url]);
+        assert_fast(started, "corpus list, empty state dir");
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(
+            text.stdout.contains("0 of 0 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(text.stderr.is_empty(), "{}", text.stderr);
+    }
+
+    #[test]
+    fn corpus_list_with_a_corpus_does_not_mention_autoindex_prefixes() {
+        let server = JsonServer::start(|req| {
+            if req.contains("/_cat/indices/") {
+                (200, r#"[{"index":"xc-demo-b1-docs"}]"#.into())
+            } else if req.contains("autoindex-catalog") {
+                (200, catalog_hits(&["proj"]))
+            } else {
+                (404, "{}".into())
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let state = home.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("demo.json"),
+            r#"{"corpus":"demo","indexed_at":"2026-01-02T03:04:05Z","prefix":"xc-demo","autoindex_exit":0,"salvaged":false}"#,
+        )
+        .unwrap();
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(text.stdout.contains("demo"), "{}", text.stdout);
+        assert!(text.stdout.contains("loaded — 1 index"), "{}", text.stdout);
+        assert!(
+            text.stdout.contains("1 of 1 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(
+            !text.stderr.contains("autoindex catalog"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            !text.stdout.contains("autoindex catalog"),
+            "{}",
+            text.stdout
+        );
+        let seen = server.requests();
+        assert!(
+            seen.iter().all(|req| !req.contains("autoindex-catalog")),
+            "a ledger that has a corpus must not read the catalog: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn xerj_code_on_an_empty_ledger_names_catalog_prefixes() {
+        let server = JsonServer::start(|_| (200, catalog_hits(&["proj"])));
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            server.url.clone(),
+        ]);
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(out.to_stderr);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj search --prefix proj`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj def --prefix proj`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj corpus add <name> <path>`"),
+            "{}",
+            out.text
+        );
+
+        // A different registered corpus means the ledger is not empty: the
+        // missing name keeps its own refusal and the catalog is not read.
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        std::fs::write(
+            home.path().join("state/other.json"),
+            r#"{"corpus":"other","indexed_at":"2026-01-02T03:04:05Z","prefix":"xc-other"}"#,
+        )
+        .unwrap();
+        let before = server.requests().len();
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            server.url.clone(),
+        ]);
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("autoindex catalog"), "{}", out.text);
+        assert_eq!(
+            server.requests().len(),
+            before,
+            "a non-empty ledger must not probe the catalog"
+        );
+        drop(_hold);
+
+        let url = closed_port_url();
+        let empty = tempfile::tempdir().unwrap();
+        let _hold_empty = code_home(empty.path());
+        let started = std::time::Instant::now();
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            url,
+        ]);
+        assert_fast(started, "xerj code, dead node");
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("autoindex catalog"), "{}", out.text);
     }
 
     fn worktree_files(root: &Path) -> Vec<String> {
