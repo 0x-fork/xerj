@@ -2,12 +2,19 @@
 //!
 //! With a cluster handle attached, a replicated index carries a primary plan
 //! in the same Raft entry as the create. [`dispatch_index`] forwards a
-//! document to the owner [`Engine::route_write`] names. [`fanout_search`]
-//! asks every owner and merges hits. Single-node mode (`has_cluster` false)
-//! never enters these paths.
+//! document to the owner [`Engine::route_write`] names. The primary then
+//! copies an acknowledged index or delete onto the replicas named by
+//! `index.number_of_replicas` at create time, and the caller is not
+//! acknowledged until those copies confirm. [`fanout_search`] asks every
+//! primary and merges hits. If a primary does not answer, a GET or a search
+//! of that shard reads a replica copy. Single-node mode (`has_cluster`
+//! false) returns before any of this.
 //!
-//! The owner's handler writes local storage only. It does not route again.
+//! Replica bytes live in a hidden per-shard index, not in the user index, so
+//! a primary search does not count them twice. The owner's handler does not
+//! route a `replica` apply again.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
@@ -114,18 +121,38 @@ pub(crate) async fn dispatch_index(
             return Dispatch::Done(engine_error_response(err));
         }
     }
+    let source_json = doc.to_string();
+    if state.engine.owns_shard(index, id) {
+        let result = local_index(
+            state,
+            index,
+            id,
+            &source_json,
+            op,
+            if_seq_no,
+            if_primary_term,
+            version,
+            version_type.as_deref(),
+            false,
+            0,
+        )
+        .await;
+        return Dispatch::Done(http_result(result));
+    }
     let Some(owner) = state.engine.route_write(index, id) else {
         return Dispatch::Local;
     };
     let shard_op = ShardOp::IndexDoc {
         index: index.to_string(),
         id: id.to_string(),
-        source_json: doc.to_string(),
+        source_json,
         op: op.to_string(),
         if_seq_no,
         if_primary_term,
         version,
         version_type,
+        replica: false,
+        shard: 0,
     };
     Dispatch::Done(forward_retrying(state, &owner, shard_op).await)
 }
@@ -139,17 +166,57 @@ pub(crate) async fn dispatch_get(
     if !state.engine.has_cluster() {
         return Dispatch::Local;
     }
-    let Some(owner) = state.engine.route_write(index, id) else {
+    let Some((shard, owner)) = state.engine.primary_of(index, id) else {
         return Dispatch::Local;
     };
+    if owner == state.engine.routing_node_id() {
+        return Dispatch::Local;
+    }
     let op = ShardOp::GetDoc {
         index: index.to_string(),
         id: id.to_string(),
         source: params.source.clone(),
         source_includes: params.source_includes.clone(),
         source_excludes: params.source_excludes.clone(),
+        replica: false,
+        shard: 0,
     };
-    Dispatch::Done(forward_retrying(state, &owner, op).await)
+    if let Some(response) = forward_primary(state, &owner, op).await {
+        return Dispatch::Done(response);
+    }
+    for replica in state.engine.replica_nodes(index, shard) {
+        let op = ShardOp::GetDoc {
+            index: index.to_string(),
+            id: id.to_string(),
+            source: params.source.clone(),
+            source_includes: params.source_includes.clone(),
+            source_excludes: params.source_excludes.clone(),
+            replica: true,
+            shard,
+        };
+        match state.engine.forward_shard(&replica, op).await {
+            Ok(result) if !is_shard_not_ready(&result) => {
+                return Dispatch::Done(http_result(result));
+            }
+            _ => continue,
+        }
+    }
+    Dispatch::Done(shard_not_ready_response(index))
+}
+
+/// `Some` when the primary answered (including a 404). `None` when the
+/// primary could not be reached, so the caller may read a replica.
+async fn forward_primary(state: &AppState, owner: &str, op: ShardOp) -> Option<Response> {
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        match state.engine.forward_shard(owner, op.clone()).await {
+            Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(result) => return Some(http_result(result)),
+            Err(_) => return None,
+        }
+    }
 }
 
 pub(crate) async fn dispatch_delete(
@@ -162,6 +229,10 @@ pub(crate) async fn dispatch_delete(
     if !state.engine.has_cluster() {
         return Dispatch::Local;
     }
+    if state.engine.owns_shard(index, id) {
+        let result = local_delete(state, index, id, if_seq_no, if_primary_term, false, 0).await;
+        return Dispatch::Done(http_result(result));
+    }
     let Some(owner) = state.engine.route_write(index, id) else {
         return Dispatch::Local;
     };
@@ -170,6 +241,8 @@ pub(crate) async fn dispatch_delete(
         id: id.to_string(),
         if_seq_no,
         if_primary_term,
+        replica: false,
+        shard: 0,
     };
     Dispatch::Done(forward_retrying(state, &owner, op).await)
 }
@@ -284,7 +357,19 @@ pub(crate) async fn fanout_search(
                     let value = serde_json::from_str(&result.body).unwrap_or(Value::Null);
                     (result.status, value)
                 }
-                Err(err) => return Some(engine_error_response(err)),
+                Err(err) => match replica_search_for_primary(
+                    state,
+                    index,
+                    target,
+                    &shard_body,
+                    &shard_params,
+                    principal,
+                )
+                .await
+                {
+                    Some(value) => (200, value),
+                    None => return Some(engine_error_response(err)),
+                },
             }
         };
         if !(200..300).contains(&status) {
@@ -432,6 +517,8 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                 if_primary_term,
                 version,
                 version_type,
+                replica,
+                shard,
             } => {
                 local_index(
                     &self.state,
@@ -443,6 +530,8 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                     if_primary_term,
                     version,
                     version_type.as_deref(),
+                    replica,
+                    shard,
                 )
                 .await
             }
@@ -452,6 +541,8 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                 source,
                 source_includes,
                 source_excludes,
+                replica,
+                shard,
             } => {
                 local_get(
                     &self.state,
@@ -460,6 +551,8 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                     source,
                     source_includes,
                     source_excludes,
+                    replica,
+                    shard,
                 )
                 .await
             }
@@ -468,7 +561,20 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                 id,
                 if_seq_no,
                 if_primary_term,
-            } => local_delete(&self.state, &index, &id, if_seq_no, if_primary_term).await,
+                replica,
+                shard,
+            } => {
+                local_delete(
+                    &self.state,
+                    &index,
+                    &id,
+                    if_seq_no,
+                    if_primary_term,
+                    replica,
+                    shard,
+                )
+                .await
+            }
             ShardOp::Search {
                 index,
                 body_json,
@@ -498,8 +604,14 @@ async fn local_index(
     if_primary_term: Option<u64>,
     version: Option<u64>,
     version_type: Option<&str>,
+    replica: bool,
+    shard: u32,
 ) -> ShardResult {
-    if state.engine.get_index(index).is_err() {
+    let store = match doc_store(index, replica, shard) {
+        Ok(store) => store,
+        Err(result) => return result,
+    };
+    if open_store(state, &store).await.is_err() {
         return ShardResult::http(503, shard_not_ready_body(index));
     }
     let doc: Value = match serde_json::from_str(source_json) {
@@ -518,7 +630,7 @@ async fn local_index(
             );
         }
     };
-    let idx = match state.engine.get_index(index) {
+    let idx = match open_store(state, &store).await {
         Ok(idx) => idx,
         Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
     };
@@ -551,15 +663,41 @@ async fn local_index(
                     201,
                 )
             };
-            ShardResult::http(
+            let result = ShardResult::http(
                 status,
                 serde_json::to_string(&body).unwrap_or_else(|_| "{}".into()),
+            );
+            if replica {
+                return result;
+            }
+            if let Err(nack) = replicate_write(
+                state,
+                index,
+                id,
+                ShardOp::IndexDoc {
+                    index: index.to_string(),
+                    id: id.to_string(),
+                    source_json: source_json.to_string(),
+                    op: op.to_string(),
+                    if_seq_no,
+                    if_primary_term,
+                    version,
+                    version_type: version_type.map(str::to_string),
+                    replica: false,
+                    shard: 0,
+                },
             )
+            .await
+            {
+                return nack;
+            }
+            result
         }
         Err(err) => response_to_result(engine_error_response(err)).await,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn local_get(
     state: &AppState,
     index: &str,
@@ -567,11 +705,17 @@ async fn local_get(
     source: Option<String>,
     source_includes: Option<String>,
     source_excludes: Option<String>,
+    replica: bool,
+    shard: u32,
 ) -> ShardResult {
-    if state.engine.closed_indices.contains_key(index) {
+    if !replica && state.engine.closed_indices.contains_key(index) {
         return response_to_result(crate::es_compat::closed_index_error(index)).await;
     }
-    let idx = match state.engine.get_index(index) {
+    let store = match doc_store(index, replica, shard) {
+        Ok(store) => store,
+        Err(result) => return result,
+    };
+    let idx = match open_store(state, &store).await {
         Ok(idx) => idx,
         Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
     };
@@ -603,14 +747,21 @@ async fn local_get(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn local_delete(
     state: &AppState,
     index: &str,
     id: &str,
     if_seq_no: Option<u64>,
     if_primary_term: Option<u64>,
+    replica: bool,
+    shard: u32,
 ) -> ShardResult {
-    let idx = match state.engine.get_index(index) {
+    let store = match doc_store(index, replica, shard) {
+        Ok(store) => store,
+        Err(result) => return result,
+    };
+    let idx = match open_store(state, &store).await {
         Ok(idx) => idx,
         Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
     };
@@ -625,10 +776,7 @@ async fn local_delete(
                 outcome.version,
                 outcome.seq_no.saturating_sub(1),
             );
-            ShardResult::http(
-                200,
-                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
-            )
+            finish_delete(state, index, id, replica, 200, &resp).await
         }
         Ok(outcome) => {
             let resp = EsDeleteDocResponse::not_found(
@@ -637,12 +785,268 @@ async fn local_delete(
                 outcome.version,
                 outcome.seq_no.saturating_sub(1),
             );
-            ShardResult::http(
-                404,
-                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
-            )
+            finish_delete(state, index, id, replica, 404, &resp).await
         }
         Err(err) => response_to_result(engine_error_response(err)).await,
+    }
+}
+
+async fn finish_delete(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    replica: bool,
+    status: u16,
+    resp: &EsDeleteDocResponse,
+) -> ShardResult {
+    if !replica {
+        if let Err(nack) = replicate_write(
+            state,
+            index,
+            id,
+            ShardOp::DeleteDoc {
+                index: index.to_string(),
+                id: id.to_string(),
+                if_seq_no: None,
+                if_primary_term: None,
+                replica: false,
+                shard: 0,
+            },
+        )
+        .await
+        {
+            return nack;
+        }
+    }
+    ShardResult::http(
+        status,
+        serde_json::to_string(resp).unwrap_or_else(|_| "{}".into()),
+    )
+}
+
+/// Replica stores are cluster-internal. A caller's index ACL must not hide
+/// them. A failover search of a replica that lives on this node runs on the
+/// caller's task, and that task's visibility guard would otherwise 404 the
+/// copy. The in-process shard thread has no request guard (it stands in for
+/// a TCP handler); this still covers the local path.
+struct OpenReplicaStore(String);
+
+impl xerj_engine::index_guard::IndexVisibility for OpenReplicaStore {
+    fn visible(&self, index: &str) -> bool {
+        index == self.0
+    }
+}
+
+async fn open_store(
+    state: &AppState,
+    name: &str,
+) -> Result<Arc<xerj_engine::Index>, xerj_engine::EngineError> {
+    if name.starts_with(".xerj_replica_") {
+        let engine = Arc::clone(&state.engine);
+        let owned = name.to_string();
+        let guard = Arc::new(OpenReplicaStore(owned.clone()));
+        return xerj_engine::index_guard::scoped(guard, async move { engine.get_index(&owned) })
+            .await;
+    }
+    state.engine.get_index(name)
+}
+
+fn doc_store(index: &str, replica: bool, shard: u32) -> Result<String, ShardResult> {
+    if !replica {
+        return Ok(index.to_string());
+    }
+    xerj_cluster::replica_index_name(index, shard).ok_or_else(|| {
+        ShardResult::http(
+            400,
+            json!({
+                "error": {
+                    "type": "invalid_index_name_exception",
+                    "reason": format!("replica store name for [{index}] shard {shard} is not valid")
+                },
+                "status": 400
+            })
+            .to_string(),
+        )
+    })
+}
+
+fn replica_nack(index: &str, replica: &str, detail: &str) -> ShardResult {
+    ShardResult::http(
+        503,
+        json!({
+            "error": {
+                "type": "replica_not_acknowledged",
+                "reason": format!(
+                    "primary applied the write on [{index}] but replica [{replica}] did not acknowledge it: {detail}. The primary has the write; retry the index so the copy can catch up"
+                )
+            },
+            "status": 503
+        })
+        .to_string(),
+    )
+}
+
+/// Copy `op` onto every replica. An empty replica list returns immediately.
+///
+/// The copy is an upsert or a delete without the caller's sequence check:
+/// the replica's own sequence numbers are not the primary's.
+async fn replicate_write(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    op: ShardOp,
+) -> Result<(), ShardResult> {
+    let Some((shard, _)) = state.engine.primary_of(index, id) else {
+        return Ok(());
+    };
+    let replicas = state.engine.replica_nodes(index, shard);
+    if replicas.is_empty() {
+        return Ok(());
+    }
+    let op = replica_copy(op, shard);
+    for replica in &replicas {
+        let deadline = Instant::now() + OWNER_READY_WAIT;
+        loop {
+            match state.engine.forward_shard(replica, op.clone()).await {
+                Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(result) if replica_confirmed(&op, &result) => break,
+                Ok(result) => return Err(replica_nack(index, replica, &result.body)),
+                Err(err) => return Err(replica_nack(index, replica, &err.to_string())),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replica_copy(op: ShardOp, shard: u32) -> ShardOp {
+    match op {
+        ShardOp::IndexDoc {
+            index,
+            id,
+            source_json,
+            ..
+        } => ShardOp::IndexDoc {
+            index,
+            id,
+            source_json,
+            op: "index".to_string(),
+            if_seq_no: None,
+            if_primary_term: None,
+            version: None,
+            version_type: None,
+            replica: true,
+            shard,
+        },
+        ShardOp::DeleteDoc { index, id, .. } => ShardOp::DeleteDoc {
+            index,
+            id,
+            if_seq_no: None,
+            if_primary_term: None,
+            replica: true,
+            shard,
+        },
+        other => other,
+    }
+}
+
+fn replica_confirmed(op: &ShardOp, result: &ShardResult) -> bool {
+    match op {
+        // A delete of a copy that is already gone is still in sync.
+        ShardOp::DeleteDoc { .. } => result.status == 200 || result.status == 404,
+        _ => (200..300).contains(&result.status),
+    }
+}
+
+/// Search the shards `primary` owns by reading one replica copy of each.
+///
+/// `None` when this index has no replica for that primary, or none of them
+/// answered. The caller then fails the search the way it did before replicas
+/// existed.
+async fn replica_search_for_primary(
+    state: &AppState,
+    index: &str,
+    primary: &str,
+    body: &EsSearchBody,
+    params: &EsSearchQueryParams,
+    principal: &crate::auth::Principal,
+) -> Option<Value> {
+    let shards = state.engine.shards_owned_by(index, primary);
+    if shards.is_empty() {
+        return None;
+    }
+    let window = body.size;
+    let mut parts = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let store = xerj_cluster::replica_index_name(index, shard)?;
+        let mut found = None;
+        for replica in state.engine.replica_nodes(index, shard) {
+            if let Some(mut value) =
+                search_replica(state, &replica, &store, body, params, principal).await
+            {
+                rewrite_hit_index(&mut value, &store, index);
+                found = Some(value);
+                break;
+            }
+        }
+        parts.push(found?);
+    }
+    Some(merge_hits(&parts, 0, window, false, 0))
+}
+
+async fn search_replica(
+    state: &AppState,
+    replica: &str,
+    store: &str,
+    body: &EsSearchBody,
+    params: &EsSearchQueryParams,
+    principal: &crate::auth::Principal,
+) -> Option<Value> {
+    if replica == state.engine.routing_node_id() {
+        let engine_store = store.to_string();
+        let guard = Arc::new(OpenReplicaStore(engine_store.clone()));
+        let response = xerj_engine::index_guard::scoped(guard, async move {
+            search_shard_local(
+                state.clone(),
+                engine_store,
+                params.clone(),
+                principal.clone(),
+                body.clone(),
+            )
+            .await
+        })
+        .await;
+        let (status, value) = response_value(response).await.ok()?;
+        return (200..300).contains(&status).then_some(value);
+    }
+    let op = match (serde_json::to_string(body), serde_json::to_string(params)) {
+        (Ok(body_json), Ok(params_json)) => ShardOp::Search {
+            index: store.to_string(),
+            body_json,
+            params_json,
+        },
+        _ => return None,
+    };
+    match state.engine.forward_shard(replica, op).await {
+        Ok(result) if (200..300).contains(&result.status) => {
+            serde_json::from_str(&result.body).ok()
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_hit_index(value: &mut Value, from: &str, to: &str) {
+    let Some(hits) = value
+        .pointer_mut("/hits/hits")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for hit in hits {
+        if hit.get("_index").and_then(Value::as_str) == Some(from) {
+            hit["_index"] = json!(to);
+        }
     }
 }
 
@@ -672,13 +1076,28 @@ async fn local_search(
     // The accepting node already passed its auth middleware. This RPC is the
     // cluster transport, not a second client. The local shard of the
     // coordinator still runs under the caller's principal.
-    let response = Box::pin(search_shard_local(
-        state.clone(),
-        index.to_string(),
-        params,
-        crate::auth::Principal::Superuser,
-        body,
-    ))
-    .await;
+    let response = if index.starts_with(".xerj_replica_") {
+        let guard = Arc::new(OpenReplicaStore(index.to_string()));
+        xerj_engine::index_guard::scoped(guard, async move {
+            search_shard_local(
+                state.clone(),
+                index.to_string(),
+                params,
+                crate::auth::Principal::Superuser,
+                body,
+            )
+            .await
+        })
+        .await
+    } else {
+        Box::pin(search_shard_local(
+            state.clone(),
+            index.to_string(),
+            params,
+            crate::auth::Principal::Superuser,
+            body,
+        ))
+        .await
+    };
     response_to_result(response).await
 }

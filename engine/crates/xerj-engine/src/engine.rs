@@ -3648,7 +3648,35 @@ impl Engine {
         router.clear_index(index);
         for assignment in plan {
             router.assign(index, assignment.shard, &assignment.node_id);
+            for replica in &assignment.replicas {
+                if replica != &assignment.node_id {
+                    router.add_replica(index, assignment.shard, replica);
+                }
+            }
         }
+    }
+
+    /// `(shard, primary node)` for `doc_id`, when the index has a plan.
+    pub fn primary_of(&self, index: &str, doc_id: &str) -> Option<(u32, String)> {
+        let router = self.shard_router.read();
+        let (shard, owner) = router.route_doc(index, doc_id);
+        owner.map(|owner| (shard, owner.to_string()))
+    }
+
+    /// Replica node ids for one shard, excluding the primary.
+    pub fn replica_nodes(&self, index: &str, shard: u32) -> Vec<String> {
+        self.shard_router.read().get_replicas(index, shard)
+    }
+
+    /// Primary shards of `index` owned by `node_id`, sorted.
+    pub fn shards_owned_by(&self, index: &str, node_id: &str) -> Vec<u32> {
+        self.shard_router.read().shards_owned_by(index, node_id)
+    }
+
+    /// Shards of `index` for which this node is a replica, sorted.
+    pub fn local_replica_shards(&self, index: &str) -> Vec<u32> {
+        let me = self.routing_node_id();
+        self.shard_router.read().replica_shards_for(index, &me)
     }
 
     /// Record one primary without dropping the index's other shards.

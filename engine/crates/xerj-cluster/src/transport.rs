@@ -597,6 +597,10 @@ impl ShardRpc for TcpShardRpc {
     fn set_handler(&self, handler: Arc<dyn ShardHandler>) {
         *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
     }
+
+    fn clear_handler(&self) {
+        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 async fn shard_exchange(

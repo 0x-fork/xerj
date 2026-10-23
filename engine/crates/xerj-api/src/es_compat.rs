@@ -12605,6 +12605,10 @@ async fn search_dispatch(
 }
 
 /// One shard's search, used by the cluster fan-out. Does not fan out again.
+///
+/// `Box::pin` keeps this future pointer-sized. `search_impl`'s state is
+/// enormous, and a fan-out that awaited it by value would embed a second
+/// copy inside the coordinator's already-boxed search future.
 pub(crate) async fn search_shard_local(
     state: AppState,
     index: String,
@@ -12612,7 +12616,14 @@ pub(crate) async fn search_shard_local(
     principal: crate::auth::Principal,
     body: EsSearchBody,
 ) -> Response {
-    search_impl(state, index, params, principal, EsSearchJson(Some(body))).await
+    Box::pin(search_impl(
+        state,
+        index,
+        params,
+        principal,
+        EsSearchJson(Some(body)),
+    ))
+    .await
 }
 
 async fn search_impl(

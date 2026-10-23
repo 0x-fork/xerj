@@ -19,17 +19,34 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 /// One primary-shard assignment carried in a committed index-create entry.
+///
+/// `replicas` are other members that hold a copy of this shard. Empty when
+/// the index was created with `number_of_replicas` 0 (the default) or when
+/// the entry predates replica placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardAssignment {
     pub shard: u32,
     pub node_id: String,
+    #[serde(default)]
+    pub replicas: Vec<String>,
 }
 
 /// One primary per member, shard `i` on the `i`th member id in sorted order.
 ///
+/// No replicas. Equivalent to [`shard_plan`] with `number_of_replicas` 0.
 /// The plan is computed by the node that proposes the create and stored in
 /// the log entry. Every member applies that list; nobody recomputes it.
 pub fn primary_shard_plan(members: &[String]) -> Vec<ShardAssignment> {
+    shard_plan(members, 0)
+}
+
+/// Primary plan plus up to `number_of_replicas` copies of each shard.
+///
+/// Replicas are the next members in the sorted ring, wrapping, never the
+/// primary. The count is capped at `members - 1`: a node does not hold a
+/// replica of a shard it already owns. The proposer stores this list in the
+/// create entry. Every member applies it; nobody recomputes it.
+pub fn shard_plan(members: &[String], number_of_replicas: u32) -> Vec<ShardAssignment> {
     let mut members: Vec<&str> = members
         .iter()
         .map(String::as_str)
@@ -40,12 +57,59 @@ pub fn primary_shard_plan(members: &[String]) -> Vec<ShardAssignment> {
     if members.is_empty() {
         return Vec::new();
     }
+    let cap = (members.len() - 1) as u32;
+    let replicas = number_of_replicas.min(cap);
     (0..members.len() as u32)
-        .map(|shard| ShardAssignment {
-            shard,
-            node_id: members[shard as usize].to_string(),
+        .map(|shard| {
+            let mut copies = Vec::with_capacity(replicas as usize);
+            for offset in 1..=replicas {
+                let idx = (shard as usize + offset as usize) % members.len();
+                copies.push(members[idx].to_string());
+            }
+            ShardAssignment {
+                shard,
+                node_id: members[shard as usize].to_string(),
+                replicas: copies,
+            }
         })
         .collect()
+}
+
+/// Hidden index that stores one shard's replica documents on the replica node.
+///
+/// Replica bytes are not written into the user index. That index is what a
+/// primary search reads, and a node is primary for some shards and replica
+/// for others — mixing the copies would make a fan-out count every document
+/// twice. The name is a `.xerj_*` system index so the default catalogue hides
+/// it. `None` when the name would not pass [`xerj_common`] index rules; the
+/// caller refuses the create instead of truncating.
+pub fn replica_index_name(index: &str, shard: u32) -> Option<String> {
+    let name = format!(".xerj_replica_{index}_{shard}");
+    if name.len() > 255 || name.contains("..") {
+        return None;
+    }
+    Some(name)
+}
+
+/// `index.number_of_replicas` from a create-settings object.
+///
+/// Accepts the nested form (`{"index": {"number_of_replicas": 1}}`), the
+/// flat form, and the dotted key. Strings and numbers both count. Absent or
+/// unreadable means 0, which places no copies.
+pub fn number_of_replicas_from_settings(settings: &serde_json::Value) -> u32 {
+    fn parse(value: &serde_json::Value) -> Option<u32> {
+        match value {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+    settings
+        .pointer("/index/number_of_replicas")
+        .or_else(|| settings.get("number_of_replicas"))
+        .or_else(|| settings.get("index.number_of_replicas"))
+        .and_then(parse)
+        .unwrap_or(0)
 }
 
 /// Assignments embedded in a `CreateIndex` schema envelope, if any.
@@ -67,9 +131,22 @@ pub fn shard_plan_from_schema_json(schema_json: &str) -> Vec<ShardAssignment> {
             if node_id.is_empty() || shard > u32::MAX as u64 {
                 return None;
             }
+            let replicas = item
+                .get("replicas")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|id| !id.is_empty() && *id != node_id)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(ShardAssignment {
                 shard: shard as u32,
                 node_id,
+                replicas,
             })
         })
         .collect()
@@ -91,6 +168,15 @@ pub enum ShardOp {
         if_primary_term: Option<u64>,
         version: Option<u64>,
         version_type: Option<String>,
+        /// Apply on the replica store for [`ShardOp::IndexDoc::shard`] and
+        /// do not replicate further. The primary sets this when it copies
+        /// an acknowledged write.
+        #[serde(default)]
+        replica: bool,
+        /// Shard id. Meaningful when `replica` is set; the primary's own
+        /// apply ignores it and routes by document id.
+        #[serde(default)]
+        shard: u32,
     },
     GetDoc {
         index: String,
@@ -98,12 +184,22 @@ pub enum ShardOp {
         source: Option<String>,
         source_includes: Option<String>,
         source_excludes: Option<String>,
+        /// Read the replica store instead of the primary index.
+        #[serde(default)]
+        replica: bool,
+        #[serde(default)]
+        shard: u32,
     },
     DeleteDoc {
         index: String,
         id: String,
         if_seq_no: Option<u64>,
         if_primary_term: Option<u64>,
+        /// Apply on the replica store and do not replicate further.
+        #[serde(default)]
+        replica: bool,
+        #[serde(default)]
+        shard: u32,
     },
     /// Search this member's local shard only. The caller merges hits.
     Search {
@@ -155,6 +251,12 @@ pub trait ShardHandler: Send + Sync {
 pub trait ShardRpc: Send + Sync {
     async fn call(&self, to: &str, op: ShardOp) -> Result<ShardResult, ShardError>;
     fn set_handler(&self, handler: Arc<dyn ShardHandler>);
+
+    /// Drop this node's handler so later calls fail instead of applying.
+    ///
+    /// The in-process ring uses this to stand in for a dead member. A TCP
+    /// node that has stopped accepting is already [`ShardError::Unavailable`].
+    fn clear_handler(&self) {}
 }
 
 /// Transport that has no data plane. Calls fail; nothing is written locally.
@@ -170,6 +272,8 @@ impl ShardRpc for NullShardRpc {
     }
 
     fn set_handler(&self, _handler: Arc<dyn ShardHandler>) {}
+
+    fn clear_handler(&self) {}
 }
 
 /// Handler map shared by every in-process member of one ring.
@@ -190,7 +294,16 @@ impl MemoryShardDir {
     }
 }
 
-/// In-process [`ShardRpc`]. A call invokes the target's handler directly.
+/// In-process [`ShardRpc`]. A call runs the target's handler on a fresh
+/// stack and waits for it.
+///
+/// The handler is not polled on the caller's task. A search coordinator is
+/// already inside `search_impl`, whose future is large enough that building
+/// a second copy on that same stack overflows. A TCP shard call arrives on
+/// its own task; this thread is the in-process equivalent. The caller's
+/// index-visibility guard is intentionally not carried across: a TCP handler
+/// has none, and an absent guard is how cluster-internal replica stores stay
+/// reachable.
 pub struct MemoryShardRpc {
     node_id: String,
     dir: Arc<MemoryShardDir>,
@@ -209,17 +322,38 @@ impl MemoryShardRpc {
 impl ShardRpc for MemoryShardRpc {
     async fn call(&self, to: &str, op: ShardOp) -> Result<ShardResult, ShardError> {
         let handler = self.dir.lock().get(to).cloned();
-        match handler {
-            Some(handler) => Ok(handler.handle(op).await),
-            None => Err(ShardError::Unavailable {
+        let Some(handler) = handler else {
+            return Err(ShardError::Unavailable {
                 to: to.to_string(),
                 reason: "no shard handler registered on that member".to_string(),
-            }),
-        }
+            });
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let target = to.to_string();
+        std::thread::Builder::new()
+            .name("xerj-shard".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let result = runtime.block_on(handler.handle(op));
+                let _ = tx.send(result);
+            })
+            .map_err(|err| ShardError::Unavailable {
+                to: target.clone(),
+                reason: format!("could not start the shard call: {err}"),
+            })?;
+        rx.await.map_err(|_| ShardError::Unavailable {
+            to: target,
+            reason: "shard call stopped before answering".to_string(),
+        })
     }
 
     fn set_handler(&self, handler: Arc<dyn ShardHandler>) {
         self.dir.lock().insert(self.node_id.clone(), handler);
+    }
+
+    fn clear_handler(&self) {
+        self.dir.lock().remove(&self.node_id);
     }
 }
 
@@ -235,18 +369,49 @@ mod tests {
             vec![
                 ShardAssignment {
                     shard: 0,
-                    node_id: "n1".into()
+                    node_id: "n1".into(),
+                    replicas: Vec::new(),
                 },
                 ShardAssignment {
                     shard: 1,
-                    node_id: "n2".into()
+                    node_id: "n2".into(),
+                    replicas: Vec::new(),
                 },
                 ShardAssignment {
                     shard: 2,
-                    node_id: "n3".into()
+                    node_id: "n3".into(),
+                    replicas: Vec::new(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn replicas_walk_the_sorted_ring_and_cap_at_other_members() {
+        let plan = shard_plan(&["n3".into(), "n1".into(), "n2".into()], 1);
+        assert_eq!(plan[0].node_id, "n1");
+        assert_eq!(plan[0].replicas, vec!["n2".to_string()]);
+        assert_eq!(plan[1].replicas, vec!["n3".to_string()]);
+        assert_eq!(plan[2].replicas, vec!["n1".to_string()]);
+
+        let full = shard_plan(&["n1".into(), "n2".into(), "n3".into()], 9);
+        assert_eq!(full[0].replicas, vec!["n2".to_string(), "n3".to_string()]);
+        assert!(!full[0].replicas.iter().any(|id| id == "n1"));
+        assert!(shard_plan(&["only".into()], 3)[0].replicas.is_empty());
+    }
+
+    #[test]
+    fn settings_read_number_of_replicas_or_zero() {
+        let nested = serde_json::json!({"index": {"number_of_replicas": "2"}});
+        assert_eq!(number_of_replicas_from_settings(&nested), 2);
+        let flat = serde_json::json!({"number_of_replicas": 1});
+        assert_eq!(number_of_replicas_from_settings(&flat), 1);
+        assert_eq!(number_of_replicas_from_settings(&serde_json::json!({})), 0);
+        assert_eq!(
+            replica_index_name("orders", 1).as_deref(),
+            Some(".xerj_replica_orders_1")
+        );
+        assert!(replica_index_name(&"o".repeat(250), 1).is_none());
     }
 
     #[test]
@@ -260,7 +425,8 @@ mod tests {
             parsed,
             vec![ShardAssignment {
                 shard: 1,
-                node_id: "n2".into()
+                node_id: "n2".into(),
+                replicas: Vec::new(),
             }]
         );
     }

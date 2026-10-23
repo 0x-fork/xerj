@@ -126,6 +126,12 @@ impl ClusterHandle {
         self.inner.shard.set_handler(handler);
     }
 
+    /// Stop serving shard calls on this node. In-process tests use this as
+    /// the stand-in for a member that has stopped.
+    pub fn clear_shard_handler(&self) {
+        self.inner.shard.clear_handler();
+    }
+
     /// Forward `op` to `to` and wait for that member's result.
     pub async fn shard_call(&self, to: &str, op: ShardOp) -> Result<ShardResult, ShardError> {
         self.inner.shard.call(to, op).await

@@ -101,7 +101,10 @@ impl Engine {
             "index_settings": spec.index_settings,
             "aliases": spec.aliases,
         });
-        let plan = xerj_cluster::primary_shard_plan(&handle.members());
+        let replicas = xerj_cluster::number_of_replicas_from_settings(&spec.index_settings).max(
+            xerj_cluster::number_of_replicas_from_settings(&spec.settings),
+        );
+        let plan = xerj_cluster::shard_plan(&handle.members(), replicas);
         if !plan.is_empty() {
             envelope["shard_plan"] = serde_json::to_value(&plan)?;
         }
@@ -340,6 +343,9 @@ async fn apply_committed(engine: &Engine, command: &ClusterCommand) -> ApplyEffe
             effect
         }
         ClusterCommand::DeleteIndex { name } => {
+            if let Err(reason) = delete_local_replica_stores(engine, name).await {
+                return ApplyEffect::Failed(reason.to_string());
+            }
             let effect = apply_delete(engine, name).await;
             engine.clear_shard_plan(name);
             effect
@@ -382,11 +388,19 @@ async fn apply_create(engine: &Engine, name: &str, schema_json: &str) -> ApplyEf
         ));
     }
     if engine.get_index(name).is_ok() {
-        return ApplyEffect::AlreadyExists;
+        return match ensure_local_replica_stores(engine, name, &envelope.settings).await {
+            Ok(()) => ApplyEffect::AlreadyExists,
+            Err(reason) => ApplyEffect::Failed(reason.to_string()),
+        };
     }
-    if let Err(e) = engine.create_index_exact(name, envelope.schema, envelope.settings) {
+    if let Err(e) =
+        engine.create_index_exact(name, envelope.schema.clone(), envelope.settings.clone())
+    {
         return if is_already_exists(&e) {
-            ApplyEffect::AlreadyExists
+            match ensure_local_replica_stores(engine, name, &envelope.settings).await {
+                Ok(()) => ApplyEffect::AlreadyExists,
+                Err(reason) => ApplyEffect::Failed(reason.to_string()),
+            }
         } else {
             ApplyEffect::Failed(e.to_string())
         };
@@ -412,7 +426,63 @@ async fn apply_create(engine: &Engine, name: &str, schema_json: &str) -> ApplyEf
             .insert(name.to_string(), envelope.aliases);
         engine.flush_alias_metadata();
     }
+    if let Err(reason) = ensure_local_replica_stores(engine, name, &envelope.settings).await {
+        return ApplyEffect::Failed(reason.to_string());
+    }
     ApplyEffect::Applied
+}
+
+/// Open a hidden replica index on this node for every shard it copies.
+///
+/// The schema is the user index's schema. `settings` is the create body the
+/// primary index was built with, so a custom analyser on that index is the
+/// one a failover search uses. Replica placement does not run again: this
+/// path calls `create_index_exact`, not the replicated create.
+async fn ensure_local_replica_stores(
+    engine: &Engine,
+    name: &str,
+    settings: &Value,
+) -> std::result::Result<(), String> {
+    let shards = engine.local_replica_shards(name);
+    if shards.is_empty() {
+        return Ok(());
+    }
+    let idx = engine
+        .get_index(name)
+        .map_err(|err| format!("replica store for [{name}]: {err}"))?;
+    let schema = idx.schema().await;
+    for shard in shards {
+        let Some(store) = xerj_cluster::replica_index_name(name, shard) else {
+            return Err(format!(
+                "replica index name for [{name}] shard {shard} is not a valid index name"
+            ));
+        };
+        if engine.get_index(&store).is_ok() {
+            continue;
+        }
+        engine
+            .create_index_exact(&store, schema.clone(), settings.clone())
+            .map_err(|err| format!("replica store [{store}]: {err}"))?;
+    }
+    Ok(())
+}
+
+/// Drop this node's replica stores for `name` while the plan is still installed.
+async fn delete_local_replica_stores(
+    engine: &Engine,
+    name: &str,
+) -> std::result::Result<(), String> {
+    for shard in engine.local_replica_shards(name) {
+        let Some(store) = xerj_cluster::replica_index_name(name, shard) else {
+            continue;
+        };
+        match engine.delete_index_local(&store).await {
+            Ok(()) => {}
+            Err(err) if is_not_found(&err) => {}
+            Err(err) => return Err(format!("removing replica store [{store}]: {err}")),
+        }
+    }
+    Ok(())
 }
 
 async fn apply_delete(engine: &Engine, name: &str) -> ApplyEffect {

@@ -125,6 +125,7 @@ impl ShardRouter {
     /// index assignments.
     pub fn update_from_metadata(&mut self, metadata: &ClusterMetadata) {
         self.routing_table.clear();
+        self.replica_table.clear();
         let mut max_shards: u32 = 0;
         for ((index, shard), node_id) in &metadata.shard_assignments {
             self.routing_table
@@ -149,10 +150,38 @@ impl ShardRouter {
     /// The replica list is separate from the primary routing table — a node can
     /// be added here without changing which node is the primary owner.
     pub fn add_replica(&mut self, index: &str, shard: u32, node_id: &str) {
-        self.replica_table
+        let replicas = self
+            .replica_table
             .entry((index.to_string(), shard))
-            .or_default()
-            .push(node_id.to_string());
+            .or_default();
+        if !replicas.iter().any(|id| id == node_id) {
+            replicas.push(node_id.to_string());
+        }
+    }
+
+    /// Primary shard ids of `index` owned by `node_id`, sorted.
+    pub fn shards_owned_by(&self, index: &str, node_id: &str) -> Vec<u32> {
+        let mut shards: Vec<u32> = self
+            .routing_table
+            .iter()
+            .filter(|((idx, _), owner)| idx == index && owner.as_str() == node_id)
+            .map(|((_, shard), _)| *shard)
+            .collect();
+        shards.sort_unstable();
+        shards
+    }
+
+    /// Shard ids of `index` for which `node_id` is a replica, sorted.
+    pub fn replica_shards_for(&self, index: &str, node_id: &str) -> Vec<u32> {
+        let mut shards: Vec<u32> = self
+            .replica_table
+            .iter()
+            .filter(|((idx, _), replicas)| idx == index && replicas.iter().any(|id| id == node_id))
+            .map(|((_, shard), _)| *shard)
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
     }
 
     /// Return all replica node IDs for a shard, **excluding the primary owner**.

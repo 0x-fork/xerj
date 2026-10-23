@@ -320,6 +320,198 @@ async fn cluster_disabled_create_stays_on_the_node_that_received_it() {
         Some(1),
         "single-node search total: {body}"
     );
+
+    let (status, body) = put_json(
+        &a,
+        "/solo",
+        json!({ "settings": { "index": { "number_of_replicas": 1 } } }),
+    )
+    .await;
+    assert!(status.is_success(), "single-node create: {status} {body}");
+    let (status, body) = put_json(&a, "/solo/_doc/1", json!({ "title": "solo" })).await;
+    assert!(status.is_success(), "single-node write: {status} {body}");
+    let (status, _) = get(&b, "/solo/_doc/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get(&a, "/.xerj_replica_solo_0/_doc/1").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "single-node mode does not open a replica store"
+    );
+    let (status, body) = post_json(
+        &a,
+        "/solo/_search",
+        json!({ "query": { "match_all": {} }, "size": 10 }),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(|v| v.as_u64()),
+        Some(1),
+        "single-node search stays one document: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_write_is_on_the_replica_and_readable_after_the_primary_stops() {
+    let members = ring(true).await;
+    let dead = [false, false, false];
+    let _leader = wait_leader(&members, &dead).await;
+
+    let (status, body) = put_json(
+        &members[0].app,
+        "/orders",
+        json!({ "settings": { "index": { "number_of_replicas": 1 } } }),
+    )
+    .await;
+    assert!(status.is_success(), "create: {status} {body}");
+    for member in &members {
+        wait_status(&member.app, "/orders", StatusCode::OK).await;
+    }
+
+    let mut placed = None;
+    for n in 0..64 {
+        let id = format!("r{n}");
+        let primary = members
+            .iter()
+            .position(|member| member.engine.owns_shard("orders", &id));
+        let Some(primary) = primary else {
+            continue;
+        };
+        let (shard, _) = members[primary]
+            .engine
+            .primary_of("orders", &id)
+            .expect("primary placement");
+        let replicas = members[primary].engine.replica_nodes("orders", shard);
+        assert_eq!(replicas.len(), 1, "one replica for shard {shard}");
+        let replica = members
+            .iter()
+            .position(|member| member.handle.node_id() == replicas[0])
+            .expect("replica is a member");
+        assert_ne!(replica, primary);
+        placed = Some((id, primary, replica, shard));
+        break;
+    }
+    let (id, primary, replica, shard) = placed.expect("an id with a primary and a replica");
+    let writer = (0..3)
+        .find(|n| *n != primary)
+        .expect("a non-primary writer");
+    let other = (0..3)
+        .find(|n| *n != primary && *n != replica)
+        .expect("a third member");
+
+    let (status, body) = put_json(
+        &members[writer].app,
+        &format!("/orders/_doc/{id}"),
+        json!({ "title": "copied" }),
+    )
+    .await;
+    assert!(status.is_success(), "write: {status} {body}");
+
+    let on_primary = members[primary]
+        .engine
+        .get_index("orders")
+        .expect("primary index")
+        .get_document(&id)
+        .await
+        .expect("primary get");
+    assert!(on_primary.is_some(), "primary stores the document");
+
+    let store = xerj_cluster::replica_index_name("orders", shard).expect("store name");
+    let on_replica = members[replica]
+        .engine
+        .get_index(&store)
+        .expect("replica store")
+        .get_document(&id)
+        .await
+        .expect("replica get");
+    assert_eq!(
+        on_replica
+            .as_ref()
+            .and_then(|doc| doc.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("copied"),
+        "replica stores the acknowledged write: {on_replica:?}"
+    );
+    let mixed = members[replica]
+        .engine
+        .get_index("orders")
+        .expect("user index")
+        .get_document(&id)
+        .await
+        .expect("user get");
+    assert!(
+        mixed.is_none(),
+        "the replica copy is not written into the user index"
+    );
+    assert!(
+        members[other].engine.get_index(&store).is_err(),
+        "a node that is not the replica does not open {store}"
+    );
+
+    let (status, body) = post_json(
+        &members[other].app,
+        "/orders/_search",
+        json!({ "query": { "match_all": {} }, "size": 10 }),
+    )
+    .await;
+    assert!(status.is_success(), "search: {status} {body}");
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(|v| v.as_u64()),
+        Some(1),
+        "a live primary search must not count the replica: {body}"
+    );
+
+    members[primary].handle.clear_shard_handler();
+
+    let (status, body) = get(&members[other].app, &format!("/orders/_doc/{id}")).await;
+    assert!(
+        status.is_success(),
+        "GET after the primary stops: {status} {body}"
+    );
+    assert_eq!(
+        body.pointer("/_source/title").and_then(|v| v.as_str()),
+        Some("copied"),
+        "{body}"
+    );
+
+    let (status, body) = post_json(
+        &members[other].app,
+        "/orders/_search",
+        json!({ "query": { "match_all": {} }, "size": 10 }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "search after the primary stops: {status} {body}"
+    );
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(|v| v.as_u64()),
+        Some(1),
+        "{body}"
+    );
+    let hit_index = body.pointer("/hits/hits/0/_index").and_then(|v| v.as_str());
+    assert_eq!(
+        hit_index,
+        Some("orders"),
+        "hits keep the user index name: {body}"
+    );
+
+    let (status, body) = put_json(
+        &members[other].app,
+        &format!("/orders/_doc/{id}"),
+        json!({ "title": "again" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a write still needs the primary: {status} {body}"
+    );
+
+    for member in &members {
+        let _ = member.shutdown.send(true);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -332,11 +524,19 @@ async fn a_document_is_stored_on_its_shard_owner_and_search_sees_it_from_any_mem
     assert!(status.is_success(), "create: {status} {body}");
     for member in &members {
         wait_status(&member.app, "/orders", StatusCode::OK).await;
+        let targets = member.engine.shard_search_targets("orders");
         assert_eq!(
-            member.engine.shard_search_targets("orders").len(),
+            targets.len(),
             3,
             "create installs one primary on each member"
         );
+        for shard in 0..3 {
+            let store = xerj_cluster::replica_index_name("orders", shard).expect("name");
+            assert!(
+                member.engine.get_index(&store).is_err(),
+                "number_of_replicas defaults to 0, so {store} is not created"
+            );
+        }
     }
 
     let mut owner_of: Vec<(String, usize)> = Vec::new();
