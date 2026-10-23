@@ -144,6 +144,48 @@ pub(crate) fn validate_namespace(ns: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A memory write that failed because the data-dir disk is at the flood-stage
+/// watermark (#2284).
+///
+/// The document API answers that with a `cluster_block_exception`, and this
+/// module used to stringify that JSON into `error.reason` — the nested blob
+/// the CLI and MCP showed. The replacement is the same sentence autoindex
+/// prints for the watermark (#2077): free space, used percent, threshold,
+/// and the `limits.disk_flood_stage_percent` override — plus the data-dir
+/// path and the `--data-dir` move. Any other failure keeps `wrapped`.
+fn memory_failure(status: StatusCode, body: &Value, data_dir: &str, wrapped: String) -> Response {
+    error_response(status, memory_failure_reason(body, data_dir, &wrapped))
+}
+
+fn memory_failure_reason(body: &Value, data_dir: &str, wrapped: &str) -> String {
+    let (free, used_live) = disk_sample(data_dir);
+    let flood_live = xerj_engine::governor::global().and_then(|governor| {
+        let pct = governor.disk_flood_admission().flood_pct;
+        (pct > 0).then_some(pct)
+    });
+    let facts = xerj_autoindex::flood::DiskFacts {
+        data_dir: data_dir.to_string(),
+        free_bytes: free,
+        used_pct: used_live,
+        flood_pct: flood_live,
+    };
+    xerj_autoindex::flood::explain_memory_flood(body, Some(&facts))
+        .unwrap_or_else(|| wrapped.to_string())
+}
+
+/// `(free bytes, used percent)` for the filesystem holding `data_dir`.
+/// `None` when the probe fails — the message then says unknown, it does not
+/// invent a zero.
+fn disk_sample(data_dir: &str) -> (Option<u64>, Option<u64>) {
+    match xerj_engine::governor::disk_stats(data_dir) {
+        Some((total, avail)) if total > 0 => {
+            let used = ((total.saturating_sub(avail) as u128 * 100) / total as u128) as u64;
+            (Some(avail), Some(used))
+        }
+        _ => (None, None),
+    }
+}
+
 /// Emit a uniform ES-shaped error response.
 fn error_response(status: StatusCode, reason: impl Into<String>) -> Response {
     (
@@ -251,8 +293,10 @@ async fn ensure_backing_index(
     if status.is_success() || index_exists(state, index) {
         return Ok(());
     }
-    Err(error_response(
+    Err(memory_failure(
         status,
+        &body,
+        &state.config.server.data_dir,
         format!("failed to create memory namespace backing index: {body}"),
     ))
 }
@@ -425,7 +469,14 @@ pub async fn store(
 
     let (status, body) = drain_json(resp).await;
     if !status.is_success() {
-        return error_response(status, format!("failed to store memory: {body}"));
+        // #2284: a flood-stage block arrives as a nested
+        // `cluster_block_exception`. Say the disk is nearly full instead.
+        return memory_failure(
+            status,
+            &body,
+            &state.config.server.data_dir,
+            format!("failed to store memory: {body}"),
+        );
     }
 
     (
@@ -1521,7 +1572,12 @@ pub async fn forget_one(
             .into_response();
     }
     if !status.is_success() {
-        return error_response(status, format!("forget failed: {body}"));
+        return memory_failure(
+            status,
+            &body,
+            &state.config.server.data_dir,
+            format!("forget failed: {body}"),
+        );
     }
     Json(json!({ "id": id, "namespace": namespace, "forgotten": true })).into_response()
 }
@@ -1625,6 +1681,54 @@ mod tests {
             validate_namespace("kb-edges").unwrap_err(),
             "namespace suffix '-edges' is reserved for graph edge indices"
         );
+    }
+
+    /// #2284: the flood-stage block is a nested `cluster_block_exception`
+    /// inside `failed to store memory: {json}`. The reason the CLI and MCP
+    /// print is the disk sentence, with this process's free space and the
+    /// data-dir path. A mapping error stays the raw body.
+    #[test]
+    fn a_flood_stage_store_failure_names_the_disk_and_the_data_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy();
+        let inner = crate::error::ApiError::new(xerj_common::XerjError::index_blocked(
+            ".xerj-memory-notes",
+            "read_only_allow_delete (disk usage 96% exceeded flood-stage watermark [95%])",
+        ))
+        .into_value();
+        let wrapped_body = json!({
+            "error": {
+                "type": "memory_error",
+                "reason": format!("failed to store memory: {inner}")
+            },
+            "status": 429
+        });
+        let unused = "failed to store memory: {raw}".to_string();
+        let reason = memory_failure_reason(&wrapped_body, &path, &unused);
+        assert!(
+            reason.contains("the disk holding the data dir is nearly full"),
+            "{reason}"
+        );
+        assert!(reason.contains("96% used"), "{reason}");
+        assert!(reason.contains("threshold 95%"), "{reason}");
+        assert!(reason.contains(path.as_ref()), "{reason}");
+        assert!(
+            reason.contains("Free space on that drive, or restart the node with --data-dir"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("limits.disk_flood_stage_percent"),
+            "{reason}"
+        );
+        assert!(!reason.contains("cluster_block_exception"), "{reason}");
+        assert!(reason.contains("free "), "{reason}");
+        assert!(!reason.contains("free unknown"), "{reason}");
+
+        let other = json!({
+            "error": { "type": "mapper_parsing_exception", "reason": "bad field" }
+        });
+        let wrapped = format!("failed to store memory: {other}");
+        assert_eq!(memory_failure_reason(&other, &path, &wrapped), wrapped);
     }
 
     #[tokio::test]

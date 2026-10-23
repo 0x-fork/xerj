@@ -35546,6 +35546,9 @@ pub async fn cat_allocation(
             "host": "127.0.0.1",
             "ip": "127.0.0.1",
             "node": "xerj-node-1",
+            // #2284: memory writes name this directory when the flood-stage
+            // block fires. Not a cat column — the text table below is unchanged.
+            "path.data": state.config.server.data_dir,
         });
         // #2077: effective flood-stage gate, so autoindex can refuse before
         // it walks. Not cat columns — the text table below is unchanged.

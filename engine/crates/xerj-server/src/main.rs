@@ -179,6 +179,7 @@ fn is_top_level_command(arg: &str) -> bool {
             | "brain"
             | "share"
             | "feedback"
+            | "memory"
             | "code"
             | "corpus"
             | "hub"
@@ -458,6 +459,9 @@ fn help_text(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20log — searches, hit rate, latency (xerj gain --help)\n\
          \x20\x20\x20\x20xerj brain      <folder>        one command: index a folder into a running, browsable\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20second brain in your browser (see xerj brain --help)\n\
+         \x20\x20\x20\x20xerj memory     store <ns> --text <t>\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20store one agent memory on a running node\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(see xerj memory --help)\n\
          \x20\x20\x20\x20xerj mcp        [opts]          Model Context Protocol stdio server: exposes {mcp_tools} tools\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(search, semantic, vector, hybrid, memory, second-brain,\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20map, plan, code-search, Corpus Hub) to any MCP client.\n\
@@ -3697,6 +3701,12 @@ async fn async_main() -> Result<()> {
     if matches!(argv1.as_deref(), Some("index")) {
         let cmd = parse_index_args();
         return run_cli_index(cmd).await;
+    }
+    if matches!(argv1.as_deref(), Some("memory")) {
+        let code = tokio::task::spawn_blocking(xerj_autoindex::memory_cli::run_memory_cli)
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
     }
     if matches!(argv1.as_deref(), Some("search")) {
         let code = tokio::task::spawn_blocking(xerj_autoindex::search::run_search_cli)
