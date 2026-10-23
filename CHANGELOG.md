@@ -64,6 +64,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deduplicate. Plain-string `xerj_search` requests the
   provenance fields needed for this distinction by default.
 
+- SIGTERM and SIGINT keep the HTTP ports bound until the final memtable
+  flush has finished writing the data directory. New HTTP requests during
+  that window get 503, except `/health/live`, which stays 200 so a liveness
+  probe does not restart the process mid-flush. Connection refusal is the
+  signal that the process is done with the data directory; closing the port
+  first let a wipe that keys off that signal delete a segment the flush was
+  still publishing.
+
+- A `node.lock` left by a process that is no longer running no longer blocks
+  the next start
+  ([#2233](https://github.com/xerj-org/xerj/issues/2233)). The data-directory
+  lock is still the OS file lock, so a live node blocks a second start. When
+  that lock is busy and the PID recorded in the file is not running — a
+  Windows crash can leave `LockFileEx` stuck after the process is gone — the
+  file is replaced and the reclaim is logged. A PID that cannot be read or
+  checked is left alone. `--auto-port` does not treat that stale lock as a
+  reason to start on an empty sibling directory.
+
 - `xerj corpus index` killed mid-index resumes that build's journal instead of
   starting a legacy index under a new prefix. When the journal still has a
   generation in progress, indexing continues at the uncommitted operations and

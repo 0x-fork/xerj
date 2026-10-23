@@ -48,3 +48,113 @@ async fn second_engine_on_same_data_dir_fails_fast_with_holder_pid() {
         reopened.err()
     );
 }
+
+/// A `node.lock` left by a process that has exited must not block the next
+/// boot, and the reclaim is logged. This is the file `kill -9` leaves once
+/// the kernel has dropped `flock`, and the file a crashed Windows process
+/// leaves behind when `LockFileEx` does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_node_lock_from_a_dead_pid_is_reclaimed_on_start() {
+    let dir = TempDir::new().unwrap();
+    let dead = reaped_pid();
+    std::fs::write(dir.path().join("node.lock"), format!("{dead}\n")).unwrap();
+
+    let logs = capture_warns(|| {
+        let engine = Engine::new(config_for(&dir)).expect("dead pid lock file must be reclaimed");
+        let stamped = std::fs::read_to_string(dir.path().join("node.lock")).unwrap();
+        assert_eq!(
+            stamped.trim().parse::<u32>().ok(),
+            Some(std::process::id()),
+            "the live process stamps node.lock, got {stamped:?}"
+        );
+
+        // The reclaimed lock is the real exclusive lock: a second start blocks.
+        let err = match Engine::new(config_for(&dir)) {
+            Ok(_) => panic!("second engine on the reclaimed data dir must fail fast"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("already in use"), "{err}");
+        assert!(
+            err.contains(&std::process::id().to_string()),
+            "lock error should name the holding pid: {err}"
+        );
+        drop(engine);
+    });
+    assert!(
+        logs.contains(&format!(
+            "reclaimed stale node.lock left by pid {dead} (process is not running)"
+        )),
+        "reclaim must be logged: {logs}"
+    );
+}
+
+fn reaped_pid() -> u32 {
+    for _ in 0..20 {
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "exit", "0"]);
+            cmd
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = cmd.spawn().expect("spawn a process that exits");
+        let pid = child.id();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        // The child has been waited on, so it is not a zombie. `ps` exiting
+        // non-zero is "no such process". A recycled pid is still running;
+        // try another one. `ps` missing (Windows) skips the probe.
+        if !pid_still_listed(pid) {
+            return pid;
+        }
+    }
+    panic!("could not observe a reaped pid");
+}
+
+fn pid_still_listed(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[derive(Clone)]
+struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
+
+fn capture_warns(body: impl FnOnce()) -> String {
+    let buffer = LogBuffer(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(buffer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    body();
+    let bytes = buffer.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}

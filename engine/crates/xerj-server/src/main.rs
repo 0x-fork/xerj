@@ -116,8 +116,13 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use tokio::net::TcpListener;
@@ -1284,8 +1289,9 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let sigterm = std::future::pending::<()>();
 
-    // `shutdown_signal()` is awaited once per listener (native REST, ES-compat,
-    // gRPC), so all of them wake on the same Ctrl-C. Log the banner only once.
+    // Awaited once, from `async_main`. The listeners wait on `ShutdownPhase`
+    // instead, so they do not close their ports before the final flush. Log
+    // the banner only once.
     static SHUTDOWN_LOGGED: std::sync::Once = std::sync::Once::new();
     tokio::select! {
         _ = ctrl_c  => { SHUTDOWN_LOGGED.call_once(|| info!("SIGINT received — shutting down")); }
@@ -1355,7 +1361,108 @@ async fn serve(
     name: &'static str,
     tls: Option<RustlsConfig>,
 ) -> Result<()> {
-    serve_on(router, bind_listener(addr, name)?, name, tls).await
+    // Unit tests stop the server by dropping the runtime, not by signalling.
+    // Holding the sender keeps the phase at `Serving` for the life of `serve`.
+    let (tx, rx) = tokio::sync::watch::channel(ShutdownPhase::Serving);
+    let _hold = tx;
+    serve_on(router, bind_listener(addr, name)?, name, tls, rx).await
+}
+
+/// How far shutdown has gotten.
+///
+/// Listeners used to stop accepting on the signal itself, and the final flush
+/// ran only after those tasks returned. `/health/ready` then refused
+/// connections while `flush_all_force` was still publishing segments. A caller
+/// that treats connection refusal as "the process is done with the data
+/// directory" — the use-case harness wipes the data dir at that moment —
+/// deleted those segments out from under the flush (`Directory not empty`,
+/// then `Segment … not found` on the next open).
+///
+/// `Draining` rejects new HTTP work and stops gRPC, but the HTTP ports stay
+/// bound so a connect still succeeds. `Released` is after the flush; only
+/// then do the HTTP listeners close.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShutdownPhase {
+    Serving,
+    Draining,
+    Released,
+}
+
+/// New HTTP requests are refused once shutdown starts, and counted until they
+/// finish, so the final flush does not race a request that was allowed in.
+/// `/health/live` stays 200: a liveness 5xx restarts the process (see
+/// `native::liveness`).
+#[derive(Clone)]
+struct DrainGate {
+    draining: Arc<AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl DrainGate {
+    fn new() -> Self {
+        Self {
+            draining: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn begin(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+}
+
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn hold_port_while_draining(router: Router, gate: DrainGate) -> Router {
+    router.layer(axum::middleware::from_fn(move |req, next| {
+        let gate = gate.clone();
+        async move { reject_when_draining(req, next, gate).await }
+    }))
+}
+
+async fn reject_when_draining(req: Request, next: Next, gate: DrainGate) -> Response {
+    // Liveness must keep answering 200 for the whole process lifetime. A 503
+    // here is what makes kubelet kill the pod, which would cut the flush off.
+    if req.uri().path() == "/health/live" {
+        return next.run(req).await;
+    }
+    if gate.draining.load(Ordering::SeqCst) {
+        return shutting_down_response();
+    }
+    gate.in_flight.fetch_add(1, Ordering::SeqCst);
+    let _guard = InFlightGuard(Arc::clone(&gate.in_flight));
+    if gate.draining.load(Ordering::SeqCst) {
+        return shutting_down_response();
+    }
+    next.run(req).await
+}
+
+fn shutting_down_response() -> Response {
+    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response()
+}
+
+async fn wait_for_phase(
+    mut rx: tokio::sync::watch::Receiver<ShutdownPhase>,
+    ready: impl Fn(ShutdownPhase) -> bool,
+) {
+    loop {
+        if ready(*rx.borrow()) {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Bind one listener, or fail.
@@ -1550,15 +1657,15 @@ fn resolve_available_data_dir(requested: &str) -> String {
 /// How many `<dir>-N` siblings [`resolve_available_data_dir`] will try.
 const MAX_DATA_DIR_SIBLINGS: usize = 64;
 
-/// Is `dir/node.lock` currently locked by a live process? A missing or
-/// unopenable lock file is "not held" — the engine's own lock acquisition is
-/// the authority and reports anything stranger.
+/// Is `dir/node.lock` currently locked by a live process?
+///
+/// A missing file, a free OS lock, or a busy lock whose recorded PID is not
+/// running is not held. The engine reclaims the stale case itself; treating
+/// it as held here would make `--auto-port` start on an empty sibling and
+/// leave the real data directory behind. A PID that cannot be read still
+/// counts as held.
 fn data_dir_held(dir: &Path) -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join("node.lock"))
-        .is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    xerj_engine::data_dir_lock_held(dir)
 }
 
 /// Bind one listener, attempting consecutive ports if `auto_port` is true and
@@ -1617,6 +1724,7 @@ async fn serve_on(
     listener: std::net::TcpListener,
     name: &'static str,
     tls: Option<RustlsConfig>,
+    release: tokio::sync::watch::Receiver<ShutdownPhase>,
 ) -> Result<()> {
     let addr = listener
         .local_addr()
@@ -1631,13 +1739,16 @@ async fn serve_on(
     // caller from the PEM files that `ensure_tls_cert` generated/validated.
     if let Some(tls) = tls {
         // axum-server drives shutdown through a `Handle` rather than a
-        // graceful-shutdown future, so bridge our SIGINT/SIGTERM signal to
-        // it: on signal, stop accepting and drain in-flight connections
-        // (10 s grace) so ongoing requests finish cleanly.
+        // graceful-shutdown future, so bridge the post-flush release to it:
+        // stop accepting and drain in-flight connections (10 s grace) only
+        // after the final flush has finished writing the data directory.
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
+            // The port stays bound through the final flush. Closing it on the
+            // signal itself is what let a concurrent wipe remove segments the
+            // flush was still writing.
+            wait_for_phase(release, |phase| phase == ShutdownPhase::Released).await;
             shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
         });
 
@@ -1664,11 +1775,12 @@ async fn serve_on(
     // round-trips can stall on the delayed-ACK/Nagle interaction, which
     // shows up as a fixed per-request latency tax on trivial reads.
     //
-    // Bounded drain (#1635): `with_graceful_shutdown` stops accepting on
-    // signal but then waits forever for in-flight connections to drain.  A
-    // request parked on a wedged flush never drains, so SIGTERM would hang
-    // the process until SIGKILL.  Mirror the TLS path's 10 s grace: once the
-    // signal fires, give drainers 10 s, then force the listener down.
+    // Bounded drain (#1635): `with_graceful_shutdown` stops accepting once
+    // the shutdown flush has released the listener, then waits forever for
+    // in-flight connections to drain.  A request parked on a wedged flush
+    // never drains, so shutdown would hang the process until SIGKILL.
+    // Mirror the TLS path's 10 s grace: once the flush releases the port,
+    // give drainers 10 s, then force the listener down.
     let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
     let serve = axum::serve(
         listener,
@@ -1676,7 +1788,7 @@ async fn serve_on(
     )
     .tcp_nodelay(true)
     .with_graceful_shutdown(async move {
-        shutdown_signal().await;
+        wait_for_phase(release, |phase| phase == ShutdownPhase::Released).await;
         let _ = drain_tx.send(());
     });
     // `with_graceful_shutdown` yields an `IntoFuture`, not a `Future`; the
@@ -1689,7 +1801,7 @@ async fn serve_on(
             let _ = drain_rx.await;
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         } => {
-            warn!("{name}: in-flight connections did not drain within 10s of signal; forcing shutdown");
+            warn!("{name}: in-flight connections did not drain within 10s of the shutdown flush; forcing shutdown");
         }
     }
 
@@ -4338,6 +4450,13 @@ async fn async_main() -> Result<()> {
         native_router = native_router.merge(xerj_console_router.clone());
         es_router = es_router.merge(xerj_console_router);
     }
+    // Outermost, so it runs before auth: once shutdown starts, new HTTP work
+    // is refused while the listening socket stays open. `/health/live` is
+    // exempt inside the layer.
+    let drain = DrainGate::new();
+    native_router = hold_port_while_draining(native_router, drain.clone());
+    es_router = hold_port_while_draining(es_router, drain.clone());
+    let (phase_tx, phase_rx) = tokio::sync::watch::channel(ShutdownPhase::Serving);
 
     // 10/10a. Bind addresses + listeners: moved up to step 8c, ahead of the
     //         console bootstrap at step 9, so the setup link it prints is
@@ -4403,70 +4522,108 @@ async fn async_main() -> Result<()> {
     }
 
     let _ingest_memory_trace = storage_available.then(|| ingest_memory_trace::spawn(&state.engine));
-    // 13. Start servers concurrently
+    // 13. Start servers concurrently. Their sockets stay open until
+    // `phase_tx` says the final flush has finished; see `ShutdownPhase`.
     let rest_tls = tls_config.clone();
-    let rest = tokio::spawn(async move {
-        if let Err(e) = serve_on(native_router, rest_listener, "native REST", rest_tls).await {
+    let rest_phase = phase_rx.clone();
+    let mut rest = tokio::spawn(async move {
+        if let Err(e) = serve_on(
+            native_router,
+            rest_listener,
+            "native REST",
+            rest_tls,
+            rest_phase,
+        )
+        .await
+        {
             error!("native REST: {e:#}");
         }
     });
 
     let es_tls = tls_config.clone();
-    let es = tokio::spawn(async move {
-        if let Err(e) = serve_on(es_router, es_listener, "ES-compat", es_tls).await {
+    let es_phase = phase_rx.clone();
+    let mut es = tokio::spawn(async move {
+        if let Err(e) = serve_on(es_router, es_listener, "ES-compat", es_tls, es_phase).await {
             error!("ES-compat: {e:#}");
         }
     });
 
-    // Real tonic XerjSearch service. Exits on the same SIGTERM/SIGINT as the
-    // REST listeners so `tokio::join!` below returns and the shutdown flush
-    // hook runs. The bind already succeeded above — a *later* transport
-    // failure is logged rather than fatal, because by then the process has
-    // made no false claim: it did hold the port.
+    // gRPC closes when draining starts, before the flush. It is not the port
+    // a readiness probe uses. The bind already succeeded above — a *later*
+    // transport failure is logged rather than fatal, because by then the
+    // process has made no false claim: it did hold the port.
     let grpc_state = state.clone();
-    let grpc = tokio::spawn(async move {
-        if let Err(e) =
-            grpc::serve_grpc_on(grpc_listener, grpc_state, hub_shared, shutdown_signal()).await
+    let grpc_phase = phase_rx;
+    let mut grpc = tokio::spawn(async move {
+        if let Err(e) = grpc::serve_grpc_on(
+            grpc_listener,
+            grpc_state,
+            hub_shared,
+            wait_for_phase(grpc_phase, |phase| phase != ShutdownPhase::Serving),
+        )
+        .await
         {
             error!("gRPC server: {e:#}");
         }
     });
 
-    // 14. Wait for all servers (they exit together on shutdown)
-    let _ = tokio::join!(rest, es, grpc);
+    // 14. Park until the signal, or until a listener task returns on its own
+    // (a transport error). Do not join the HTTP listeners here: they are what
+    // keeps the port bound through the flush below.
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = &mut rest => {}
+        _ = &mut es => {}
+        _ = &mut grpc => {}
+    }
 
-    // Servers are down — stop the periodic flusher BEFORE the final
-    // synchronous flush below so its next tick can't race
-    // `flush_all_force` during shutdown.
+    drain.begin();
+    // gRPC stops accepting now. HTTP keeps the socket and answers 503.
+    let _ = phase_tx.send(ShutdownPhase::Draining);
+    let _ = grpc.await;
+
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while drain.in_flight() > 0 && std::time::Instant::now() < drain_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if drain.in_flight() > 0 {
+        warn!("in-flight HTTP requests did not finish within 10s of shutdown; flushing anyway");
+    }
+
+    // Stop the periodic flusher BEFORE the final synchronous flush so its
+    // next tick can't race `flush_all_force`.
     //
-    // RC4 W2 #20: this abort used to sit ABOVE the `join!`, killing the
-    // flusher milliseconds after it was spawned.  `flush_interval_secs`
-    // was inert for the entire life of the server: an over-threshold
-    // memtable that the write-path flush scheduler missed (WAL replay at
-    // boot, flush-permit exhaustion on the last write) sat in memory —
-    // pinning its WAL generations on disk — until shutdown or the next
-    // explicit `_flush`.
+    // RC4 W2 #20: this abort used to sit at startup, above the `join!`,
+    // killing the flusher milliseconds after it was spawned.
+    // `flush_interval_secs` was inert for the entire life of the server: an
+    // over-threshold memtable that the write-path flush scheduler missed
+    // (WAL replay at boot, flush-permit exhaustion on the last write) sat in
+    // memory — pinning its WAL generations on disk — until shutdown or the
+    // next explicit `_flush`. Aborting here is after the server has been
+    // serving; the signal is what reached this line.
     if let Some(flusher) = flusher {
         flusher.abort();
     }
 
-    // 15. Final synchronous flush across every index.
+    // 15. Final synchronous flush across every index, WHILE the HTTP ports
+    // are still bound.
     //
-    // The graceful-shutdown future fires on SIGTERM/SIGINT and stops axum
-    // from accepting new connections, but it does NOT drain the engine's
-    // in-memory memtables to durable segments.  Without this final pass,
-    // any docs that were bulk-ingested after the last auto-flush threshold
-    // crossing live only in the WAL until the next startup — and an index
-    // whose memtable never reached that threshold (small batches, brief
-    // sessions) loses 100 % of its data on restart because startup index
-    // discovery looks for segment-bearing directories first.  See POV
-    // report 2026-04-24T23-58-00 (B-2) for the full failure mode.
+    // The flush has to land memtables as segments before the process exits.
+    // Without it, anything bulk-ingested after the last auto-flush threshold
+    // lives only in the WAL until the next startup — and an index whose
+    // memtable never reached that threshold loses its data on restart because
+    // startup index discovery looks for segment-bearing directories first.
+    // See POV report 2026-04-24T23-58-00 (B-2).
+    //
+    // The port stays open across this flush. Closing it first made connection
+    // refusal mean "still writing", and a wipe that started at that signal
+    // deleted the segment files the flush was creating.
     if storage_available {
         info!("flushing in-memory state before exit…");
         let flush_started = std::time::Instant::now();
-        // Bounded (#1635): a wedged memtable flush must not re-hang shutdown
-        // after the listeners drained.  Docs live in the WAL and replay on the
-        // next boot, so a skipped final flush is non-destructive.
+        // Bounded (#1635): a wedged memtable flush must not re-hang shutdown.
+        // Docs live in the WAL and replay on the next boot, so a skipped
+        // final flush is non-destructive.
         let flush_budget = std::time::Duration::from_secs(10);
         match tokio::time::timeout(flush_budget, state.engine.flush_all_force()).await {
             Ok(()) => info!("final flush complete in {:.0?}", flush_started.elapsed()),
@@ -4476,6 +4633,10 @@ async fn async_main() -> Result<()> {
         }
     }
 
+    let _ = phase_tx.send(ShutdownPhase::Released);
+    let _ = rest.await;
+    let _ = es.await;
+
     info!("xerj v{} stopped. Goodbye.", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
@@ -4483,6 +4644,113 @@ async fn async_main() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shutdown_port_tests {
+    use super::*;
+
+    /// The use-case harness (and anything else that wipes a data directory
+    /// when connect() fails) must still be able to connect while the shutdown
+    /// flush would be running, and must fail only after the flush releases
+    /// the listener.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_port_stays_bound_until_the_shutdown_flush_releases_it() {
+        let (tx, rx) = tokio::sync::watch::channel(ShutdownPhase::Serving);
+        let gate = DrainGate::new();
+        let app = hold_port_while_draining(
+            Router::new().route("/health/ready", axum::routing::get(|| async { "ready" })),
+            gate.clone(),
+        );
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), "test-shutdown").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve_on(app, listener, "test-shutdown", None, rx)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/health/ready");
+        let mut saw_ok = false;
+        for _ in 0..50 {
+            if let Ok(resp) = client.get(&url).send().await {
+                assert_eq!(resp.status(), 200);
+                saw_ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_ok, "listener did not answer before shutdown");
+
+        gate.begin();
+        let draining = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            draining.status(),
+            503,
+            "new HTTP work is refused once draining starts"
+        );
+        // The socket is still ours: connect succeeds. This is the window the
+        // harness used to treat as "process exited".
+        std::net::TcpStream::connect(addr).expect("port stays bound while draining");
+
+        tx.send(ShutdownPhase::Released).unwrap();
+        server.await.unwrap();
+
+        let mut refused = false;
+        for _ in 0..20 {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
+                .is_err()
+            {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            refused,
+            "port must close once the shutdown flush releases it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn liveness_stays_200_while_other_routes_refuse() {
+        let gate = DrainGate::new();
+        let app = hold_port_while_draining(
+            Router::new()
+                .route("/health/live", axum::routing::get(|| async { "live" }))
+                .route("/health/ready", axum::routing::get(|| async { "ready" })),
+            gate.clone(),
+        );
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), "test-live").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(ShutdownPhase::Serving);
+        let server = tokio::spawn(async move {
+            serve_on(app, listener, "test-live", None, rx)
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let live = format!("http://{addr}/health/live");
+        let ready = format!("http://{addr}/health/ready");
+        for _ in 0..50 {
+            if client.get(&live).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        gate.begin();
+        assert_eq!(client.get(&live).send().await.unwrap().status(), 200);
+        assert_eq!(client.get(&ready).send().await.unwrap().status(), 503);
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "a refused request must not be counted in flight"
+        );
+        tx.send(ShutdownPhase::Released).unwrap();
+        server.await.unwrap();
+    }
+}
+
 //
 // These live as an in-crate unit test module (not `tests/tls.rs`) because
 // `serve` / `build_tls_config` / `ensure_tls_cert` are private items of a
@@ -4982,6 +5250,49 @@ mod auto_port_tests {
         std::fs::create_dir_all(d).unwrap();
         std::fs::write(Path::new(d).join("node.lock"), "12345").unwrap();
         assert_eq!(resolve_available_data_dir(d), d);
+    }
+
+    #[test]
+    fn a_busy_lock_recorded_against_a_dead_pid_does_not_move_when_readable() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("data");
+        std::fs::create_dir_all(&d).unwrap();
+        let dead = reaped_pid();
+        let lock_path = d.join("node.lock");
+        std::fs::write(&lock_path, format!("{dead}\n")).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().unwrap();
+        let readable = std::fs::read_to_string(&lock_path)
+            .ok()
+            .is_some_and(|text| text.trim().parse::<u32>().ok() == Some(dead));
+        let ds = d.to_str().unwrap();
+        if readable {
+            // Advisory lock: the PID can be shown to be dead, so --auto-port
+            // stays on this directory and the engine reclaims the lock.
+            assert_eq!(resolve_available_data_dir(ds), ds);
+        } else {
+            // Mandatory lock hides the PID. A live handle still counts as held.
+            assert_eq!(resolve_available_data_dir(ds), format!("{ds}-2"));
+        }
+        drop(holder);
+    }
+
+    fn reaped_pid() -> u32 {
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "exit", "0"]);
+            cmd
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = cmd.spawn().expect("spawn a process that exits");
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
     }
 
     #[test]
