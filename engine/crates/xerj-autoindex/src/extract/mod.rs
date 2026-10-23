@@ -88,6 +88,15 @@ pub struct ExtractStats {
     /// sampler stops, so a 100_000-row array sampled at 500 still reports
     /// 100_000. Empty for families that do not know a length.
     pub populations: Vec<(Option<String>, u64)>,
+    /// JSON values that were not indexed because one document would have
+    /// exceeded [`xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES`]
+    /// (#1122). Not a junk count: the rest of the file is still indexed.
+    pub oversize_values: u64,
+    /// Set when nothing from this file was indexed because of that ceiling,
+    /// or because the file is larger than [`MAX_WHOLE_FILE`]. Phase A prints
+    /// this instead of the generic "no records" line. `None` when the file
+    /// produced records (an oversize value is then only counted above).
+    pub refusal: Option<String>,
 }
 
 /// Sink returns false to stop extraction early (sampling).

@@ -775,6 +775,19 @@ fn block_on_backend<T>(
 }
 
 /// The off-runtime driver described on [`block_on_backend`].
+/// `true` when opening `path` fails because it is not there.
+///
+/// Any other error (permission, I/O) leaves the snapshot entry in place
+/// so a later open reports that error instead of dropping a segment whose
+/// file may still exist.
+fn segment_file_missing(path: &Path) -> bool {
+    match std::fs::File::open(path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 fn object_io_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -788,6 +801,24 @@ fn object_io_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 const WAL_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
+
+/// Refuse one raw document before `IgnoredAny` or `from_slice` builds a DOM
+/// (#1122). Bulk filters the same ceiling per item so a mixed batch does not
+/// reach here; this is the backstop for `index_batch_turbo_raw`.
+fn reject_oversized_indexed_document(
+    doc_id: &str,
+    position: usize,
+    source_bytes: &[u8],
+) -> Result<()> {
+    if xerj_common::document_limit::indexed_document_too_large(source_bytes.len()) {
+        return Err(StorageError::RawBatchValidation {
+            doc_id: doc_id.to_string(),
+            position,
+            reason: xerj_common::document_limit::indexed_document_refusal(source_bytes.len()),
+        });
+    }
+    Ok(())
+}
 
 impl IndexStore {
     /// Open (or create) an index at `data_dir`.
@@ -915,6 +946,12 @@ impl IndexStore {
 
         // Rebuild version map from flushed segments first (so WAL replay can
         // correctly override segment entries for recently re-indexed docs).
+        //
+        // Do this only after a missing local segment file has been taken
+        // out of the snapshot. A surviving `.ids` sidecar is enough for the
+        // rebuild to point live docs at that id, and the next `_search`
+        // then fails the whole query with `Segment … not found`.
+        store.drop_local_segments_missing_files()?;
         store.rebuild_version_map_from_segments()?;
 
         // V4 M4.5 — snapshot GC on open.  Any file in the segments directory
@@ -1032,6 +1069,94 @@ impl IndexStore {
 
         info!(data_dir = ?data_dir, "IndexStore opened");
         Ok(store)
+    }
+
+    /// Remove snapshot entries whose segment file is already gone.
+    ///
+    /// Orphan recovery covers the opposite hole: a `.seg` that exists but
+    /// was never named by `snapshot.json`. This is the hole a partial
+    /// delete leaves behind. `snapshot.json` still names the segment, and
+    /// often the `.ids` sidecar does too, but the `.seg` was unlinked.
+    /// The live case is `xerj brain --fresh` after the data directory was
+    /// wiped while the previous process was still creating files: `rm`
+    /// removes `autoindex-catalog/<id>.seg` and then fails with "Directory
+    /// not empty", the new process opens that directory, and the catalog
+    /// read-back searches a snapshot that still lists the missing id.
+    /// `open_segment_arc` maps the missing file to `SegmentNotFound`, and
+    /// the search path treats that as a query error so it does not
+    /// undercount. Retries cannot help — the id stays in the snapshot.
+    ///
+    /// The bytes are already gone. Keeping the id makes every search fail,
+    /// including one whose new rows sit in a segment that is present.
+    /// Drop the id before the version map is rebuilt, and persist the
+    /// repaired snapshot so the next open does not rediscover it. Local
+    /// mode only: object-store boot hydrates a missing family from the
+    /// bucket, and a catalogue whose bundle is gone refuses to open
+    /// rather than shrinking the view.
+    ///
+    /// `max_seq_no` is not lowered. Sequence numbers from the missing
+    /// segment stay reserved so a later write does not reuse them.
+    fn drop_local_segments_missing_files(&self) -> Result<usize> {
+        if self.is_object_store_mode() {
+            return Ok(0);
+        }
+        let snap = self.snapshot.load();
+        if snap.segments.is_empty() {
+            return Ok(0);
+        }
+        let segments_dir = self.data_dir.join("segments");
+        let missing: Vec<String> = snap
+            .segments
+            .iter()
+            .filter(|meta| segment_file_missing(&segments_dir.join(&meta.seg_path)))
+            .map(|meta| meta.id.clone())
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let missing_set: std::collections::HashSet<&str> =
+            missing.iter().map(String::as_str).collect();
+        let segments: Vec<SegmentMeta> = snap
+            .segments
+            .iter()
+            .filter(|meta| !missing_set.contains(meta.id.as_str()))
+            .cloned()
+            .collect();
+        // Keep the previous high-water mark. The missing segment's seqs
+        // must not be handed out again.
+        let max_seq_no = segments
+            .iter()
+            .map(|meta| meta.max_seq_no)
+            .max()
+            .unwrap_or(0)
+            .max(snap.max_seq_no);
+        let removed = missing.len();
+        let generation = snap.generation.saturating_add(1);
+        drop(snap);
+        self.snapshot.store(Arc::new(IndexSnapshot {
+            segments,
+            generation,
+            max_seq_no,
+        }));
+        if let Err(error) = self.save_snapshot() {
+            // The in-memory view is already repaired. Failing open would
+            // refuse the index, which is the 500 this pass exists to
+            // avoid. The on-disk manifest is unchanged, so the next open
+            // runs the same pass again.
+            warn!(
+                error = %error,
+                removed,
+                segments = ?missing,
+                "dropped snapshot segments whose files are gone, but could not persist the repaired snapshot"
+            );
+            return Ok(removed);
+        }
+        warn!(
+            removed,
+            segments = ?missing,
+            "dropped snapshot segments whose files are gone; searches no longer fail closed on them"
+        );
+        Ok(removed)
     }
 
     /// Try to add orphan segment files back to the snapshot before
@@ -4850,6 +4975,7 @@ impl IndexStore {
         docs.par_iter()
             .enumerate()
             .map(|(position, (doc_id, source_bytes))| {
+                reject_oversized_indexed_document(doc_id, position + 1, source_bytes)?;
                 validate_raw_json_nesting(source_bytes).map_err(|reason| {
                     StorageError::RawBatchValidation {
                         doc_id: doc_id.clone(),
@@ -4877,6 +5003,7 @@ impl IndexStore {
             .par_iter()
             .enumerate()
             .map(|(position, (doc_id, source_bytes))| {
+                reject_oversized_indexed_document(doc_id, position + 1, source_bytes)?;
                 validate_raw_json_nesting(source_bytes).map_err(|reason| {
                     StorageError::RawBatchValidation {
                         doc_id: doc_id.clone(),
@@ -6658,6 +6785,90 @@ mod tests {
         let snap = store2.snapshot();
         // Segments from the persisted snapshot should be loaded back
         assert_eq!(snap.segments.len(), 1);
+    }
+
+    /// A partial delete of the index directory leaves `snapshot.json` naming
+    /// a segment whose `.seg` is gone and whose `.ids` sidecar survived.
+    /// Reopening used to rebuild the version map from that sidecar and then
+    /// fail every `_search` with `Segment … not found` — the `--fresh`
+    /// catalog read-back after a wiped brain data dir. The missing id is
+    /// dropped; a sibling segment that is still on disk stays readable.
+    #[test]
+    fn reopen_drops_a_snapshot_segment_whose_file_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept_id;
+        let missing_id;
+        {
+            let store = open_test_store(dir.path());
+            store.index("kept", serde_json::json!({"k": 1})).unwrap();
+            kept_id = store.flush().unwrap().unwrap().id;
+            store.index("gone", serde_json::json!({"k": 2})).unwrap();
+            let gone = store.flush().unwrap().unwrap();
+            missing_id = gone.id.clone();
+            store.force_wal_maintenance().unwrap();
+            let snap = store.snapshot();
+            assert!(
+                snap.segments.iter().any(|meta| meta.id == missing_id),
+                "the segment must be published before its file is removed"
+            );
+            let seg_path = dir.path().join("segments").join(&gone.seg_path);
+            std::fs::remove_file(&seg_path).unwrap();
+            assert!(
+                dir.path()
+                    .join("segments")
+                    .join(format!("{missing_id}.ids"))
+                    .exists(),
+                "the sidecar that used to resurrect the dangling id must still be there"
+            );
+        }
+
+        let store = open_test_store(dir.path());
+        {
+            let snap = store.snapshot();
+            let ids: Vec<&str> = snap.segments.iter().map(|meta| meta.id.as_str()).collect();
+            assert!(
+                ids.iter().all(|id| *id != missing_id.as_str()),
+                "a missing segment file must not stay in the snapshot: {ids:?}"
+            );
+            assert!(
+                snap.segments.iter().any(|meta| meta.id == kept_id),
+                "a sibling segment whose file is present must stay"
+            );
+        }
+        let kept = store.version_map.get("kept").expect("kept doc");
+        assert_eq!(&*kept.segment_id, kept_id.as_str());
+        assert!(!kept.deleted, "the surviving document must still be live");
+        match store.version_map.get("gone") {
+            None => {}
+            Some(entry) => {
+                assert_ne!(
+                    &*entry.segment_id,
+                    missing_id.as_str(),
+                    "the version map must not point at the missing segment"
+                );
+            }
+        }
+        store
+            .open_segment_arc(&kept_id)
+            .expect("the surviving segment file opens");
+        store.index("fresh", serde_json::json!({"k": 3})).unwrap();
+        let fresh = store.flush().unwrap().unwrap();
+        store
+            .open_segment_arc(&fresh.id)
+            .expect("a segment written after the repair opens");
+
+        drop(store);
+        let again = open_test_store(dir.path());
+        assert!(
+            again
+                .snapshot()
+                .segments
+                .iter()
+                .all(|meta| meta.id != missing_id),
+            "the repaired snapshot must stay repaired across a second open"
+        );
+        assert!(again.version_map.get("kept").is_some());
+        assert!(again.version_map.get("fresh").is_some());
     }
 
     #[test]

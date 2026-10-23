@@ -906,6 +906,31 @@ pub async fn process_bulk_with_opts(
                             );
                         }
                     };
+                    // One document over the fixed ceiling is refused before
+                    // `IgnoredAny`, `Value`, or tokenization. `Token` owns a
+                    // `String` per word, and `panic = "abort"` dies on that
+                    // allocation before the RSS governor samples (#1122).
+                    // 413, not 429:
+                    // the item is settled. Neighbours in the same bulk still
+                    // index. A lone 413 is not the whole-request action-count
+                    // refusal (`is_whole_request_too_large` requires more than
+                    // one sent action).
+                    if xerj_common::document_limit::indexed_document_too_large(dl.len()) {
+                        return ParseOutcome::Err(
+                            BulkItemResult {
+                                action: action_type.to_string(),
+                                index: target_index,
+                                id: doc_id.unwrap_or_default(),
+                                status: 413,
+                                result: None,
+                                error: Some(xerj_common::document_limit::indexed_document_refusal(
+                                    dl.len(),
+                                )),
+                                get_source: None,
+                            },
+                            *item_index,
+                        );
+                    }
                     // M5.11 — SKIP the doc-body JSON parse for `index`
                     // actions.  The turbo-raw ingest path accepts the raw
                     // NDJSON bytes and defers the parse to drain-for-flush

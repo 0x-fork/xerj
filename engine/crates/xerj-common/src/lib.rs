@@ -32,6 +32,8 @@
 //!   same-machine CLI/MCP commands (`xerj mcp`, `xerj autoindex`, `xerj init`)
 //! - [`xccode`]  — the reference-coding semantics shared by `xerj code`,
 //!   `xerj corpus`, and the `xerj_code_search` MCP tool (issue #977)
+//! - [`document_limit`] — the fixed per-document byte ceiling that keeps one
+//!   JSON value from being tokenized into an unbounded `String` per word (#1122)
 //! - [`thread_spawn`] — spawning helper threads without aborting the node
 //!   on a failed spawn (#1122): Unix threads are created with `pthread_create`
 //!   so a signal-stack allocation failure is an error instead of a panic in
@@ -45,6 +47,7 @@ pub mod calibration;
 pub mod code_query;
 pub mod config;
 pub mod corpus_feedback;
+pub mod document_limit;
 pub mod error;
 pub mod feedback;
 pub mod field_coercion;

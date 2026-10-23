@@ -3432,14 +3432,18 @@ fn scan_file(
         Ok(stats) => {
             populations = stats.populations;
             if groups.is_empty() {
-                out.junk = Some((
-                    "junk".into(),
-                    format!(
-                        "no records extracted ({} candidate family, {} junk lines)",
-                        sn.family.as_str(),
-                        stats.junk
-                    ),
-                ));
+                if let Some(reason) = stats.refusal {
+                    out.junk = Some(("skipped".into(), reason));
+                } else {
+                    out.junk = Some((
+                        "junk".into(),
+                        format!(
+                            "no records extracted ({} candidate family, {} junk lines)",
+                            sn.family.as_str(),
+                            stats.junk
+                        ),
+                    ));
+                }
             }
         }
         Err(e) => {
@@ -9759,6 +9763,23 @@ fn run_index_report_inner(
                         file_junk += stats.junk;
                         if stats.truncated {
                             truncated_files.lock().unwrap().push(f.rel.clone());
+                        }
+                        if stats.oversize_values > 0 {
+                            if stats.records > 0 {
+                                pr.note(&format!(
+                                    "{}: {} JSON value(s) were not indexed (over the {}-byte limit for one document). The rest of the file was indexed.",
+                                    f.rel,
+                                    stats.oversize_values,
+                                    xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
+                                ));
+                            } else {
+                                pr.note(&format!(
+                                    "{}: {} JSON value(s) were not indexed (over the {}-byte limit for one document).",
+                                    f.rel,
+                                    stats.oversize_values,
+                                    xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
+                                ));
+                            }
                         }
                     }
                     Err(e) => {

@@ -10859,6 +10859,18 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
+        // Already-parsed bodies (PUT `/_doc/{id}` builds a `Value` in the
+        // extractor) still have to be refused before semantic embedding and
+        // `analyze_doc`. Bulk NDJSON is refused on the raw bytes earlier.
+        if let Some(seen) =
+            xerj_common::document_limit::json_value_exceeds_indexed_document_limit(&source)
+        {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::invalid_document_json(
+                    xerj_common::document_limit::indexed_document_refusal_at_least(seen),
+                ),
+            ));
+        }
         let index_start = std::time::Instant::now();
         let doc_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
 

@@ -3828,6 +3828,12 @@ pub async fn index_doc_auto(
     Query(params): Query<IndexDocAutoParams>,
     body: bytes::Bytes,
 ) -> impl IntoResponse {
+    if xerj_common::document_limit::indexed_document_too_large(body.len()) {
+        return ApiError::new(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::indexed_document_refusal(body.len()),
+        ))
+        .into_response();
+    }
     // Parse the raw body directly — avoids the axum Json extractor's extra
     // content-type enforcement and serde_json::from_str double-pass.
     let doc: Value = match serde_json::from_slice(&body) {

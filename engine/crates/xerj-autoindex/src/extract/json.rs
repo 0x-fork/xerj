@@ -11,21 +11,50 @@
 //! - a Google Keep note (Takeout `Keep/*.json`) → a DOCUMENT: `title`/`body`
 //!   plus labels and dates — see [`keep_note`]
 //! - anything else → a single record
+//!
+//! A file larger than [`xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES`]
+//! (and still within [`MAX_WHOLE_FILE`]) is not parsed into one `Value`.
+//! Record arrays are streamed one element at a time. A single document, or
+//! one element, over that ceiling is skipped and named — it is not indexed
+//! (#1122). Files at or under the ceiling keep the DOM path so existing
+//! locators stay byte-identical.
 
 use super::{
     emit_document_with_fields, ensure_text_passage, flatten_object, ExtractStats, FieldOrigin,
     RawRecord, Sink, MAX_LINE, MAX_WHOLE_FILE,
 };
 use anyhow::Result;
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
+    extract_limited(
+        path,
+        gzip,
+        sink,
+        xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
+    )
+}
+
+fn extract_limited(path: &Path, gzip: bool, sink: Sink, limit: usize) -> Result<ExtractStats> {
     let mut stats = ExtractStats::default();
     let Some(bytes) = super::read_whole(path, gzip, MAX_WHOLE_FILE)? else {
         stats.junk += 1;
+        stats.refusal = Some(format!(
+            "{} is larger than {} bytes; a JSON file over that size is not read. Split it into smaller files",
+            file_label(path),
+            MAX_WHOLE_FILE
+        ));
         return Ok(stats);
     };
+    if bytes.len() > limit {
+        return stream_large(&bytes, path, limit, sink);
+    }
     let v: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
@@ -41,7 +70,7 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
             // a success. A file that is neither one JSON value nor a
             // sequence of JSON lines junks exactly as before — every
             // line fails the per-line parse too.
-            return jsonl_fallback(&bytes, sink);
+            return jsonl_fallback(&bytes, limit, path, sink);
         }
     };
     match v {
@@ -398,7 +427,7 @@ fn emit_fields(
 /// byte-offset locator, anything else junks. No `limit_bytes` exists here
 /// (the family reads the whole file), so there is no truncated-tail
 /// exemption to carry over.
-fn jsonl_fallback(bytes: &[u8], sink: Sink) -> Result<ExtractStats> {
+fn jsonl_fallback(bytes: &[u8], limit: usize, path: &Path, sink: Sink) -> Result<ExtractStats> {
     let mut stats = ExtractStats::default();
     let mut offset: u64 = 0;
     for line in bytes.split(|&b| b == b'\n') {
@@ -410,6 +439,12 @@ fn jsonl_fallback(bytes: &[u8], sink: Sink) -> Result<ExtractStats> {
         }
         if line.len() >= MAX_LINE {
             stats.junk += 1;
+            continue;
+        }
+        // The 8–16 MiB gap under MAX_LINE used to be parsed and tokenized
+        // as one document (#1122).
+        if trimmed.len() > limit {
+            stats.oversize_values += 1;
             continue;
         }
         match serde_json::from_slice::<Value>(trimmed) {
@@ -431,7 +466,443 @@ fn jsonl_fallback(bytes: &[u8], sink: Sink) -> Result<ExtractStats> {
             }
         }
     }
+    finish_empty_refusal(path, bytes.len(), limit, &mut stats);
     Ok(stats)
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn finish_empty_refusal(path: &Path, nbytes: usize, limit: usize, stats: &mut ExtractStats) {
+    if stats.records == 0 && stats.oversize_values > 0 && stats.refusal.is_none() {
+        stats.refusal = Some(format!(
+            "{} is {nbytes} bytes; {} JSON value(s) were not indexed (over the {limit}-byte limit for one document). Split the file into smaller documents",
+            file_label(path),
+            stats.oversize_values,
+        ));
+    }
+}
+
+fn stream_large(bytes: &[u8], path: &Path, limit: usize, sink: Sink) -> Result<ExtractStats> {
+    let mut stats = ExtractStats::default();
+    match first_significant(bytes) {
+        Some(b'[') => {
+            if let Err(error) = stream_top_array(bytes, limit, sink, &mut stats) {
+                if stats.records == 0 && stats.oversize_values == 0 && stats.junk == 0 {
+                    return jsonl_fallback(bytes, limit, path, sink);
+                }
+                stats.junk += 1;
+                let _ = error;
+            }
+        }
+        Some(b'{') => {
+            if let Err(error) = stream_top_object(bytes, path, limit, sink, &mut stats) {
+                if stats.records == 0 && stats.oversize_values == 0 && stats.junk == 0 {
+                    return jsonl_fallback(bytes, limit, path, sink);
+                }
+                stats.junk += 1;
+                let _ = error;
+            }
+        }
+        _ => return jsonl_fallback(bytes, limit, path, sink),
+    }
+    finish_empty_refusal(path, bytes.len(), limit, &mut stats);
+    Ok(stats)
+}
+
+fn first_significant(bytes: &[u8]) -> Option<u8> {
+    bytes
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
+/// Byte range of `raw` inside `input`.
+///
+/// `serde_json`'s `&RawValue`, deserialized from a slice, borrows that slice.
+/// The pointer difference is only used after a byte-for-byte check that the
+/// range really is `raw`. A mismatch copies nothing and fails the value, so a
+/// future serde that copies `RawValue` cannot silently read the wrong bytes.
+fn raw_span(input: &[u8], raw: &str) -> Option<Range<usize>> {
+    let raw_bytes = raw.as_bytes();
+    let input_addr = input.as_ptr() as usize;
+    let raw_addr = raw_bytes.as_ptr() as usize;
+    if raw_addr < input_addr {
+        return None;
+    }
+    let start = raw_addr - input_addr;
+    let end = start.checked_add(raw_bytes.len())?;
+    if end > input.len() || input.get(start..end) != Some(raw_bytes) {
+        return None;
+    }
+    Some(start..end)
+}
+
+fn object_spans(input: &[u8]) -> Result<Vec<(String, Range<usize>)>, serde_json::Error> {
+    struct SpanVisitor<'a> {
+        input: &'a [u8],
+    }
+    impl<'de> Visitor<'de> for SpanVisitor<'de> {
+        type Value = Vec<(String, Range<usize>)>;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut spans: Vec<(String, Range<usize>)> = Vec::new();
+            let mut at: HashMap<String, usize> = HashMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let raw = map.next_value::<&RawValue>()?;
+                let range = raw_span(self.input, raw.get()).ok_or_else(|| {
+                    serde::de::Error::custom("JSON value is not a slice of the input")
+                })?;
+                if let Some(slot) = at.get(&key).copied() {
+                    spans[slot].1 = range;
+                } else {
+                    at.insert(key.clone(), spans.len());
+                    spans.push((key, range));
+                }
+            }
+            Ok(spans)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(input);
+    let spans = de.deserialize_any(SpanVisitor { input })?;
+    de.end()?;
+    Ok(spans)
+}
+
+fn looks_like_array(bytes: &[u8]) -> bool {
+    first_significant(bytes) == Some(b'[')
+}
+
+/// `Some(len)` when `input` is an array of at least two objects.
+fn record_array_len(input: &[u8]) -> Result<Option<u64>, serde_json::Error> {
+    struct ShapeVisitor;
+    impl<'de> Visitor<'de> for ShapeVisitor {
+        type Value = Option<u64>;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a JSON array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut count = 0u64;
+            let mut objects = true;
+            while let Some(raw) = seq.next_element::<&RawValue>()? {
+                count += 1;
+                if objects && !raw.get().trim_start().starts_with('{') {
+                    objects = false;
+                }
+            }
+            Ok(if objects && count >= 2 {
+                Some(count)
+            } else {
+                None
+            })
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(input);
+    let len = de.deserialize_any(ShapeVisitor)?;
+    de.end()?;
+    Ok(len)
+}
+
+struct Field {
+    key: String,
+    range: Range<usize>,
+    record_len: Option<u64>,
+}
+
+fn stream_top_object(
+    bytes: &[u8],
+    path: &Path,
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), serde_json::Error> {
+    let spans = object_spans(bytes)?;
+    let mut fields = Vec::with_capacity(spans.len());
+    for (key, range) in spans {
+        let record_len = if looks_like_array(&bytes[range.clone()]) {
+            record_array_len(&bytes[range.clone()])?
+        } else {
+            None
+        };
+        fields.push(Field {
+            key,
+            range,
+            record_len,
+        });
+    }
+    let mut arrays: Vec<usize> = (0..fields.len())
+        .filter(|&i| fields[i].record_len.is_some())
+        .collect();
+    arrays.sort_by(|&a, &b| {
+        let la = fields[a].record_len.unwrap_or(0);
+        let lb = fields[b].record_len.unwrap_or(0);
+        lb.cmp(&la).then_with(|| fields[a].key.cmp(&fields[b].key))
+    });
+    if arrays.len() >= 2
+        && fields[arrays[0]].record_len.unwrap_or(0) >= MULTI_ARRAY_SPLIT_MIN as u64
+    {
+        let skip: HashSet<&str> = arrays.iter().map(|&i| fields[i].key.as_str()).collect();
+        let shared = parse_shared_fields(bytes, &fields, &skip, limit, stats)?;
+        let (small, sidecars) = partition_shared(shared);
+        for (idx, field_i) in arrays.iter().copied().enumerate() {
+            let group = if idx == 0 {
+                None
+            } else {
+                Some(fields[field_i].key.clone())
+            };
+            let len = fields[field_i].record_len.unwrap_or(0);
+            stats.populations.push((group.clone(), len));
+            emit_record_array(
+                &bytes[fields[field_i].range.clone()],
+                &fields[field_i].key,
+                group,
+                &small,
+                limit,
+                sink,
+                stats,
+            )?;
+        }
+        emit_sidecars_bounded(sidecars, limit, sink, stats);
+    } else if let Some(field_i) = arrays.into_iter().next() {
+        let key = fields[field_i].key.clone();
+        let range = fields[field_i].range.clone();
+        let len = fields[field_i].record_len.unwrap_or(0);
+        let mut skip = HashSet::new();
+        skip.insert(key.as_str());
+        let shared = parse_shared_fields(bytes, &fields, &skip, limit, stats)?;
+        let (small, sidecars) = partition_shared(shared);
+        stats.populations.push((None, len));
+        emit_record_array(&bytes[range], &key, None, &small, limit, sink, stats)?;
+        emit_sidecars_bounded(sidecars, limit, sink, stats);
+    } else {
+        emit_single_object(bytes, path, &fields, limit, sink, stats)?;
+    }
+    Ok(())
+}
+
+fn parse_shared_fields(
+    bytes: &[u8],
+    fields: &[Field],
+    skip: &HashSet<&str>,
+    limit: usize,
+    stats: &mut ExtractStats,
+) -> Result<Map<String, Value>, serde_json::Error> {
+    let mut obj = Map::new();
+    for field in fields {
+        if skip.contains(field.key.as_str()) {
+            continue;
+        }
+        if field.range.len() > limit {
+            stats.oversize_values += 1;
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&bytes[field.range.clone()])?;
+        obj.insert(field.key.clone(), value);
+    }
+    Ok(obj)
+}
+
+fn emit_sidecars_bounded(
+    sidecars: Vec<(String, Value)>,
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) {
+    let mut kept = Vec::new();
+    for (key, value) in sidecars {
+        let raw_len = match &value {
+            Value::String(text) => text.len(),
+            other => serde_json::to_string(other)
+                .map(|text| text.len())
+                .unwrap_or(usize::MAX),
+        };
+        if raw_len.saturating_add(key.len()).saturating_add(8) > limit {
+            stats.oversize_values += 1;
+            continue;
+        }
+        kept.push((key, value));
+    }
+    emit_sidecars(kept, sink, stats);
+}
+
+fn emit_single_object(
+    bytes: &[u8],
+    path: &Path,
+    fields: &[Field],
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), serde_json::Error> {
+    let mut skipped = 0u64;
+    let mut kept = Vec::new();
+    let mut sum = 2usize;
+    for field in fields {
+        if field.range.len() > limit {
+            skipped += 1;
+            continue;
+        }
+        sum = sum.saturating_add(field.key.len() + field.range.len() + 4);
+        kept.push(field);
+    }
+    if (skipped > 0 && kept.is_empty()) || sum > limit {
+        stats.oversize_values += 1 + skipped;
+        stats.refusal = Some(format!(
+            "{} is {} bytes; a JSON document over {limit} bytes is not indexed. Split the file into smaller documents",
+            file_label(path),
+            bytes.len(),
+        ));
+        return Ok(());
+    }
+    stats.oversize_values += skipped;
+    let mut obj = Map::new();
+    for field in kept {
+        let value: Value = serde_json::from_slice(&bytes[field.range.clone()])?;
+        obj.insert(field.key.clone(), value);
+    }
+    emit(Value::Object(obj), "doc", sink, stats);
+    Ok(())
+}
+
+fn stream_top_array(
+    bytes: &[u8],
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), serde_json::Error> {
+    struct TopVisitor<'a> {
+        limit: usize,
+        sink: Sink<'a>,
+        stats: &'a mut ExtractStats,
+    }
+    impl<'de> Visitor<'de> for TopVisitor<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a JSON array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let TopVisitor { limit, sink, stats } = self;
+            let mut count = 0u64;
+            let mut live = true;
+            loop {
+                let raw = match seq.next_element::<&RawValue>() {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) => break,
+                    Err(error) => {
+                        if count > 0 {
+                            stats.populations.push((None, count));
+                        }
+                        return Err(error);
+                    }
+                };
+                let i = count;
+                count += 1;
+                if raw.get().len() > limit {
+                    stats.oversize_values += 1;
+                    continue;
+                }
+                if !live {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(raw.get()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stats.junk += 1;
+                        continue;
+                    }
+                };
+                if !emit(value, &format!("e{i}"), sink, stats) {
+                    live = false;
+                }
+            }
+            if count > 0 {
+                stats.populations.push((None, count));
+            }
+            Ok(())
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    de.deserialize_any(TopVisitor { limit, sink, stats })?;
+    de.end()?;
+    Ok(())
+}
+
+fn emit_record_array<'a>(
+    input: &'a [u8],
+    key: &'a str,
+    group: Option<String>,
+    shared: &'a Map<String, Value>,
+    limit: usize,
+    sink: Sink<'a>,
+    stats: &'a mut ExtractStats,
+) -> Result<(), serde_json::Error> {
+    struct RecVisitor<'a> {
+        key: &'a str,
+        group: Option<String>,
+        shared: &'a Map<String, Value>,
+        limit: usize,
+        sink: Sink<'a>,
+        stats: &'a mut ExtractStats,
+    }
+    impl<'de> Visitor<'de> for RecVisitor<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a JSON array of objects")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let RecVisitor {
+                key,
+                group,
+                shared,
+                limit,
+                sink,
+                stats,
+            } = self;
+            let mut live = true;
+            let mut index = 0u64;
+            while let Some(raw) = seq.next_element::<&RawValue>()? {
+                let i = index;
+                index += 1;
+                if raw.get().len() > limit {
+                    stats.oversize_values += 1;
+                    continue;
+                }
+                if !live {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(raw.get()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stats.junk += 1;
+                        continue;
+                    }
+                };
+                let Value::Object(element) = value else {
+                    continue;
+                };
+                let fields = merge_shared(shared, element);
+                if !emit_fields(fields, format!("{key}:e{i}"), group.clone(), sink, stats) {
+                    live = false;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(input);
+    de.deserialize_any(RecVisitor {
+        key,
+        group,
+        shared,
+        limit,
+        sink,
+        stats,
+    })?;
+    de.end()?;
+    Ok(())
 }
 
 fn emit(v: Value, locator: &str, sink: Sink, stats: &mut ExtractStats) -> bool {
@@ -951,6 +1422,164 @@ mod tests {
             *n += 1;
             *n < 2
         })
+        .unwrap();
+        assert_eq!(seen.get(&None).copied(), Some(2));
+        assert_eq!(seen.get(&Some("runs".into())).copied(), Some(2));
+        assert!(stats
+            .populations
+            .contains(&(None, MULTI_ARRAY_SPLIT_MIN as u64)));
+        assert!(stats.populations.contains(&(Some("runs".into()), 3)));
+    }
+
+    fn run_limited(text: &str, limit: usize) -> (ExtractStats, Vec<RawRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        std::fs::write(&path, text).unwrap();
+        let mut recs = Vec::new();
+        let stats = extract_limited(
+            &path,
+            false,
+            &mut |r| {
+                recs.push(r);
+                true
+            },
+            limit,
+        )
+        .unwrap();
+        (stats, recs)
+    }
+
+    fn assert_same_records(dom: &[RawRecord], streamed: &[RawRecord]) {
+        assert_eq!(dom.len(), streamed.len());
+        for (left, right) in dom.iter().zip(streamed) {
+            assert_eq!(left.locator, right.locator);
+            assert_eq!(left.group, right.group);
+            assert_eq!(left.origin, right.origin);
+            assert_eq!(left.fields, right.fields);
+        }
+    }
+
+    /// A file past the per-document ceiling must emit the same locators as the
+    /// DOM path when every element itself fits. This is the 50 MB array of
+    /// small objects: the DOM path is what shipped, the stream is what runs
+    /// once the file is larger than the ceiling.
+    #[test]
+    fn a_file_over_the_document_limit_streams_the_same_records() {
+        let mut functions = Vec::new();
+        for i in 0..MULTI_ARRAY_SPLIT_MIN {
+            functions.push(format!(r#"{{"name":"f{i}","addr":{i}}}"#));
+        }
+        let split = format!(
+            r#"{{"generated":"2026-01-01","functions":[{}],"runs":[{{"label":"boot","start":1}},{{"label":"loop","start":9}}]}}"#,
+            functions.join(",")
+        );
+        let array = r#"[{"id":1,"user":{"name":"ann"}},{"id":2}]"#;
+        let wrapper = r#"{"generated":"2026-01-01","count":2,"items":[{"id":1},{"id":2,"generated":"per-item"}],"errors":[{"e":1}]}"#;
+        // Each limit is under the file and over every element, so the stream
+        // emits the same records the DOM path would.
+        for (text, limit) in [
+            (split.as_str(), 256usize),
+            (array, 36),
+            (wrapper, 80),
+            ("[1,2,3]", 4),
+        ] {
+            assert!(
+                text.len() > limit,
+                "the fixture must take the streaming path ({})",
+                text.len()
+            );
+            let (dom_stats, dom) = run_limited(text, usize::MAX);
+            let (stream_stats, streamed) = run_limited(text, limit);
+            assert_eq!(dom_stats.records, stream_stats.records, "{text}");
+            assert_eq!(dom_stats.populations, stream_stats.populations, "{text}");
+            assert_same_records(&dom, &streamed);
+            assert_eq!(stream_stats.oversize_values, 0, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_single_object_over_the_document_limit_names_the_file_and_is_not_indexed() {
+        let blob = "x".repeat(80);
+        let text = format!(r#"{{"blob":"{blob}"}}"#);
+        let (stats, recs) = run_limited(&text, 32);
+        assert!(recs.is_empty());
+        assert_eq!(stats.records, 0);
+        assert!(stats.oversize_values >= 1);
+        let reason = stats.refusal.expect("a refusal naming the file");
+        assert!(reason.contains("t.json"), "{reason}");
+        assert!(reason.contains("32"), "{reason}");
+        assert!(reason.contains("not indexed"), "{reason}");
+        assert!(!stats.truncated, "this is not the section cap");
+    }
+
+    #[test]
+    fn a_huge_shared_string_is_skipped_and_the_record_array_is_indexed() {
+        let blob = "x".repeat(80);
+        let text = format!(r#"{{"name":"n","items":[{{"id":1}},{{"id":2}}],"blob":"{blob}"}}"#);
+        let (stats, recs) = run_limited(&text, 40);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].locator, "items:e0");
+        assert_eq!(recs[1].locator, "items:e1");
+        assert!(recs.iter().all(|r| r.fields.get("blob").is_none()));
+        assert_eq!(recs[0].fields["name"], serde_json::json!("n"));
+        assert!(stats.oversize_values >= 1);
+        assert!(stats.refusal.is_none(), "the records were indexed");
+    }
+
+    #[test]
+    fn an_oversized_array_element_keeps_its_siblings_and_its_index() {
+        let blob = "y".repeat(80);
+        let text = format!(r#"[{{"id":1}},{{"blob":"{blob}"}},{{"id":2}}]"#);
+        let (stats, recs) = run_limited(&text, 40);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].locator, "e0");
+        assert_eq!(recs[1].locator, "e2", "the skipped element keeps its index");
+        assert_eq!(recs[1].fields["id"], serde_json::json!(2));
+        assert_eq!(stats.oversize_values, 1);
+        assert_eq!(
+            stats.populations,
+            vec![(None, 3)],
+            "the population is the whole array, including the skipped element"
+        );
+    }
+
+    #[test]
+    fn a_jsonl_line_over_the_document_limit_is_not_indexed() {
+        let blob = "z".repeat(80);
+        let text = format!("{{\"id\":\"small\"}}\n{{\"blob\":\"{blob}\"}}\n");
+        let (stats, recs) = run_limited(&text, 40);
+        assert_eq!(stats.records, 1);
+        assert_eq!(recs[0].fields["id"], serde_json::json!("small"));
+        assert_eq!(stats.oversize_values, 1);
+        assert_eq!(stats.junk, 0);
+        assert!(stats.refusal.is_none());
+    }
+
+    #[test]
+    fn stopping_a_streamed_array_keeps_its_population_and_the_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        let mut functions = Vec::new();
+        for i in 0..MULTI_ARRAY_SPLIT_MIN {
+            functions.push(format!(r#"{{"name":"f{i}"}}"#));
+        }
+        let text = format!(
+            r#"{{"functions":[{}],"runs":[{{"label":"a"}},{{"label":"b"}},{{"label":"c"}}]}}"#,
+            functions.join(",")
+        );
+        assert!(text.len() > 64);
+        std::fs::write(&path, &text).unwrap();
+        let mut seen = std::collections::HashMap::<Option<String>, usize>::new();
+        let stats = extract_limited(
+            &path,
+            false,
+            &mut |r| {
+                let n = seen.entry(r.group.clone()).or_insert(0);
+                *n += 1;
+                *n < 2
+            },
+            64,
+        )
         .unwrap();
         assert_eq!(seen.get(&None).copied(), Some(2));
         assert_eq!(seen.get(&Some("runs".into())).copied(), Some(2));
