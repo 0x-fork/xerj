@@ -45,7 +45,7 @@ pub fn resolve_reporting(
     files: Vec<FileEntry>,
     hashed: &(dyn Fn(u64) + Sync),
 ) -> Result<Inventory> {
-    resolve_reporting_carried(files, &|_| None, &|_, _, _| {}, hashed)
+    resolve_reporting_carried(files, &|_| None, &|_, _, _| {}, hashed, None)
 }
 
 /// As [`resolve_reporting`], with a caller-supplied digest cache.
@@ -67,11 +67,18 @@ pub fn resolve_reporting(
 /// carries an assignment forward only on a match, so a stale carried digest
 /// looks like "unchanged" — the failure mode is a missed update, not a bad
 /// document — and the next event or fingerprint change repairs it.
+///
+/// `blocking`, when set, names each file on the progress line for the duration
+/// of its read. macOS passes the run's progress handle so a read that blocks
+/// on a dataless placeholder says which path (#2058). The guard credits
+/// nothing; `hashed` still does, once, on completion. Other targets ignore the
+/// handle even if it is passed.
 pub fn resolve_reporting_carried(
     files: Vec<FileEntry>,
     carried: &(dyn Fn(&FileEntry) -> Option<String> + Sync),
     observed: &(dyn Fn(&FileEntry, &str, bool) + Sync),
     hashed: &(dyn Fn(u64) + Sync),
+    blocking: Option<&crate::progress::Progress>,
 ) -> Result<Inventory> {
     // Phase A belongs to the run's scan pool, not to rayon's global pool:
     // `--workers` has to bound the CPU-bound phase to mean anything (#240 §2).
@@ -102,7 +109,13 @@ pub fn resolve_reporting_carried(
                     // would push the percent past 100 and invent a rate.
                     Some(digest) => (Ok(digest), false),
                     None => {
-                        let digest = full_digest(&file.path, file.size);
+                        // Held across the read and dropped before the byte
+                        // credit, so a blocked `read` is visible and a finished
+                        // one is not counted twice.
+                        let digest = {
+                            let _blocking = crate::dataless::watch_blocking_hash(blocking, file);
+                            full_digest(&file.path, file.size)
+                        };
                         hashed(file.size);
                         (digest, true)
                     }

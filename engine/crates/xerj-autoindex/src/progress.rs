@@ -97,6 +97,15 @@ const ETA_GOOD_FRACTION: f64 = 0.10;
 const ETA_MAX_STEP: f64 = 0.20;
 /// Name at most this many still-running files when the tail goes quiet.
 const STRAGGLER_MAX: usize = 3;
+/// How long one hash read may sit in flight before its path is named, even
+/// while the pool still holds more than [`STRAGGLER_MAX`] files (#2058).
+///
+/// A dataless placeholder blocks inside a single `read`. The tail rule above
+/// stays silent until every other worker has finished, so a wide hash reports
+/// a stall with no path. A few seconds is long enough that an ordinary file
+/// does not flicker onto the line, and short enough that the next progress
+/// tick (default 5s) can say which file has not returned.
+const HASH_BLOCKING_AFTER: Duration = Duration::from_secs(5);
 /// Fallback terminal width when `COLUMNS` is unset.
 const DEFAULT_COLUMNS: usize = 100;
 /// Cells in the drawn bar on the stream surface.
@@ -338,7 +347,9 @@ struct State {
     last_advance_at: Instant,
     rate: Option<f64>,
     shown_eta: Option<f64>,
-    in_flight: Vec<(u64, String, u64)>,
+    /// `(seq, path, bytes, started)`. `started` is when the file was registered,
+    /// which is what the hash-phase blocker rule compares against.
+    in_flight: Vec<(u64, String, u64, Instant)>,
     next_seq: u64,
     tty_width: usize,
     /// When the last `xerj-bar` display line was written; `None` before the
@@ -499,22 +510,37 @@ impl Progress {
     /// someone else's tree, and it is re-rendered on every tick until the file
     /// finishes. It is [`sanitize`]d here, once, on the way in.
     pub fn file(&self, rel: &str, bytes: u64) -> FileGuard<'_> {
-        let seq = if self.enabled() {
-            let safe = sanitize(rel, SAFE_PATH_MAX);
-            let mut state = self.state.lock().unwrap();
-            let seq = state.next_seq;
-            state.next_seq += 1;
-            state.in_flight.push((seq, safe, bytes));
-            seq
-        } else {
-            0
-        };
+        let seq = self.begin_file(rel, bytes);
         FileGuard {
             progress: self,
             seq,
             bytes,
             credited: AtomicU64::new(0),
         }
+    }
+
+    /// Register a file as in flight without crediting it on drop.
+    ///
+    /// Hashing credits bytes from its own completion callback. Using [`Self::file`]
+    /// there would count every file twice. This guard only keeps the path on
+    /// the in-flight list so a read that does not return can be named.
+    pub fn watch_file(&self, rel: &str, bytes: u64) -> WatchGuard<'_> {
+        WatchGuard {
+            progress: self,
+            seq: self.begin_file(rel, bytes),
+        }
+    }
+
+    fn begin_file(&self, rel: &str, bytes: u64) -> u64 {
+        if !self.enabled() {
+            return 0;
+        }
+        let safe = sanitize(rel, SAFE_PATH_MAX);
+        let mut state = self.state.lock().unwrap();
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.in_flight.push((seq, safe, bytes, Instant::now()));
+        seq
     }
 
     /// `bytes` is what is still UNcredited for this file — all of it unless
@@ -526,7 +552,7 @@ impl Progress {
             let mut state = self.state.lock().unwrap();
             state
                 .in_flight
-                .retain(|(candidate, _, _)| *candidate != seq);
+                .retain(|(candidate, _, _, _)| *candidate != seq);
         }
         self.item_done(bytes);
     }
@@ -771,13 +797,30 @@ impl Progress {
 
         // Name the tail. Once the queue is nearly drained the run looks hung
         // while one worker chews through the biggest file in the corpus.
+        //
+        // The hash phase also names a single file that has been in flight for
+        // longer than [`HASH_BLOCKING_AFTER`], even when more than
+        // [`STRAGGLER_MAX`] files are still open. A dataless placeholder blocks
+        // one worker inside `read` while the rest of the pool is also busy, so
+        // the tail rule never fires and the stall has no path (#2058). Other
+        // phases keep the tail-only rule.
         let mut waiting_on = Vec::new();
         if !state.in_flight.is_empty() && state.in_flight.len() <= STRAGGLER_MAX {
             waiting_on = state
                 .in_flight
                 .iter()
-                .map(|(_, rel, bytes)| (rel.clone(), *bytes))
+                .map(|(_, rel, bytes, _)| (rel.clone(), *bytes))
                 .collect();
+        } else if state.phase == "hash" {
+            if let Some((_, rel, bytes, started)) = state
+                .in_flight
+                .iter()
+                .min_by_key(|(_, _, _, started)| *started)
+            {
+                if now.duration_since(*started) >= HASH_BLOCKING_AFTER {
+                    waiting_on.push((rel.clone(), *bytes));
+                }
+            }
         }
 
         Snapshot {
@@ -994,6 +1037,25 @@ impl Drop for FileGuard<'_> {
             .bytes
             .saturating_sub(self.credited.load(Ordering::Relaxed));
         self.progress.file_finished_partial(self.seq, remainder);
+    }
+}
+
+/// Removes its file from the in-flight list on drop and credits nothing.
+///
+/// See [`Progress::watch_file`].
+pub struct WatchGuard<'a> {
+    progress: &'a Progress,
+    seq: u64,
+}
+
+impl Drop for WatchGuard<'_> {
+    fn drop(&mut self) {
+        if self.progress.enabled() {
+            let mut state = self.progress.state.lock().unwrap();
+            state
+                .in_flight
+                .retain(|(candidate, _, _, _)| *candidate != self.seq);
+        }
     }
 }
 
@@ -2270,6 +2332,108 @@ mod tests {
         // only a third of the bytes are.
         assert!(line.contains("pct=32.9"), "{line}");
         drop(big);
+    }
+
+    /// #2058: a hash read that has not returned for a few seconds is named even
+    /// when the pool still holds more files than the tail rule will list. A
+    /// scan or index phase with the same shape stays unnamed — that rule did
+    /// not change.
+    #[test]
+    fn a_hash_read_blocking_for_a_few_seconds_names_its_path() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("hash", 8, 80);
+        let _others: Vec<_> = (0..4)
+            .map(|i| progress.watch_file(&format!("local-{i}.txt"), 10))
+            .collect();
+        let blocked = progress.watch_file("cloud/Notes.txt", 10);
+        {
+            let mut state = progress.state.lock().unwrap();
+            for entry in &mut state.in_flight {
+                if entry.1 == "cloud/Notes.txt" {
+                    entry.3 = Instant::now() - HASH_BLOCKING_AFTER - Duration::from_secs(1);
+                }
+            }
+        }
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(
+            line.contains("waiting_on=cloud/Notes.txt"),
+            "the file that has not returned is the one to name: {line}"
+        );
+        drop(blocked);
+
+        // The same pile of in-flight files during index is not a hash read.
+        // Naming them would change every busy scan.
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("index", 8, 80);
+        let _busy: Vec<_> = (0..5)
+            .map(|i| progress.watch_file(&format!("doc-{i}.txt"), 10))
+            .collect();
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.in_flight[0].3 = Instant::now() - Duration::from_secs(30);
+        }
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(
+            !line.contains("waiting_on="),
+            "only the hash phase names a blocker before the tail: {line}"
+        );
+    }
+
+    /// Young hash reads are not blockers. Five files that just started must
+    /// not grow a `waiting_on` the tail rule would have omitted.
+    #[test]
+    fn a_busy_hash_does_not_name_a_file_that_just_started() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("hash", 8, 80);
+        let _guards: Vec<_> = (0..5)
+            .map(|i| progress.watch_file(&format!("f{i}.txt"), 10))
+            .collect();
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(!line.contains("waiting_on="), "{line}");
+    }
+
+    /// The hash callback credits the bytes. The watch guard must not credit
+    /// them again when the read returns.
+    #[test]
+    fn watch_file_names_the_path_and_credits_nothing() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(3600));
+        progress.phase("hash", 1, 10);
+        let guard = progress.watch_file("a.txt", 10);
+        progress.tick();
+        assert!(
+            captured(&buffer).contains("waiting_on=a.txt"),
+            "{}",
+            captured(&buffer)
+        );
+        drop(guard);
+        assert_eq!(progress.items_done.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 0);
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(!line.contains("waiting_on="), "{line}");
     }
 
     /// An empty sample must not drag the measured rate down either — the rate

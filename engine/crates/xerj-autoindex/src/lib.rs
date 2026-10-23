@@ -9,6 +9,7 @@ pub mod cli;
 pub mod coerce;
 mod content;
 pub mod correlate;
+mod dataless;
 pub mod dataset;
 pub mod def;
 pub mod detect;
@@ -1579,7 +1580,7 @@ pub(crate) fn outcome_headline(
 /// commit — the one place the two landed changes could contradict each other.
 /// Exit 3 is success ("completed, some input was unusable"), so it is spelled
 /// out in words rather than left as a bare number.
-fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
+fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_dataless: u64) {
     let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
     // Read back from the committed generation's own run document, exactly like
     // every other number on this line — a resumed or no-op run therefore
@@ -1616,6 +1617,11 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
     // `max_body_bytes` is worth knowing about even when the run finished.
     if count("bulk_splits") > 0 {
         extra.push(("bulk_splits", count("bulk_splits")));
+    }
+    // #2058: present only when this run left out dataless placeholders, so a
+    // corpus with none prints the line it always did.
+    if skipped_dataless > 0 {
+        extra.push(("skipped_dataless", skipped_dataless));
     }
     extra.extend(coverage.fields());
     pr.finish(
@@ -5531,6 +5537,76 @@ impl UnsupportedInventoryDelta {
     }
 }
 
+/// [`UnsupportedInventoryDelta::between`], plus dataless placeholders this run
+/// deliberately did not hash (#2058).
+///
+/// Those files are still on disk. Leaving them out of `files` makes the delta
+/// call them exclusions, and the exclusion sweep deletes documents that were
+/// indexed the last time the bytes were local. An empty `dataless_still_present`
+/// takes the original path and clones nothing.
+fn inventory_delta(
+    root: &Path,
+    files: &[walk::FileEntry],
+    keys: &[String],
+    plan: &Plan,
+    dataless_still_present: &[walk::FileEntry],
+) -> UnsupportedInventoryDelta {
+    if dataless_still_present.is_empty() {
+        return UnsupportedInventoryDelta::between(root, files, keys, plan);
+    }
+    let mut files = files.to_vec();
+    let mut keys = keys.to_vec();
+    for file in dataless_still_present {
+        files.push(file.clone());
+        keys.push(String::new());
+    }
+    UnsupportedInventoryDelta::between(root, &files, &keys, plan)
+}
+
+/// Hash-phase denominator on macOS. Carried placeholders are in `files` but
+/// are not read, so they are not part of the work the bar describes.
+#[cfg(target_os = "macos")]
+fn hash_phase_totals(
+    files: &[walk::FileEntry],
+    carry: &std::collections::HashMap<String, String>,
+    all_bytes: u64,
+) -> (u64, u64) {
+    if carry.is_empty() {
+        return (files.len() as u64, all_bytes);
+    }
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for file in files {
+        if !carry.contains_key(&file.rel_id) {
+            count += 1;
+            bytes += file.size;
+        }
+    }
+    (count, bytes)
+}
+
+/// Watch-pass hash totals, minus placeholders whose previous digest is carried
+/// instead of read. An empty carry map returns the watch plan's own totals.
+#[cfg(target_os = "macos")]
+fn watch_hash_totals(
+    plan: &watch::PassPlan,
+    files: &[walk::FileEntry],
+    carry: &std::collections::HashMap<String, String>,
+) -> (u64, u64) {
+    if carry.is_empty() {
+        return (plan.hash_files, plan.hash_bytes);
+    }
+    let mut hash_files = plan.hash_files;
+    let mut hash_bytes = plan.hash_bytes;
+    for file in files {
+        if carry.contains_key(&file.rel_id) && plan.carried(file).is_none() {
+            hash_files = hash_files.saturating_sub(1);
+            hash_bytes = hash_bytes.saturating_sub(file.size);
+        }
+    }
+    (hash_files, hash_bytes)
+}
+
 fn alias_keys_to_reindex(
     previous: &[state::DuplicateFile],
     current: &[state::DuplicateFile],
@@ -7179,7 +7255,7 @@ fn run_index_report_inner(
         pr.note("autoindex: resumed and committed pending corpus generation from durable source");
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
         let code = generated_exit_code(&summary);
-        finish_generated_progress(&pr, code, &summary);
+        finish_generated_progress(&pr, code, &summary, 0);
         return Ok((code, Some(summary)));
     }
     // #585 case 2: a --no-graph generation's genesis bootstrap (sync_bootstrap
@@ -7298,11 +7374,32 @@ fn run_index_report_inner(
             cfg.exclude_rels.join(", ")
         ));
     }
-    let (mut discovered_files, data_files, data_bytes) = if cfg.skip_corpus_data {
+    let (discovered_files, data_files, data_bytes) = if cfg.skip_corpus_data {
         without_corpus_data_files(discovered_files)
     } else {
         (discovered_files, 0, 0)
     };
+    // #2058: a dataless File Provider placeholder (iCloud and other cloud
+    // volumes) has a directory entry but no local bytes. Hashing it blocks
+    // inside `read` until the download finishes, and the progress line used
+    // to name nothing. `stat` sees `SF_DATALESS` without downloading. On
+    // macOS those files are skipped, or carried from the previous digest when
+    // one exists so an evicted file is not treated as deleted. Every other
+    // target gets the walked list back unchanged and does not stat.
+    #[cfg(target_os = "macos")]
+    let dataless_split = dataless::split(
+        discovered_files,
+        &dataless::prior_digests(preflight.plan.as_ref()),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let dataless_split = dataless::Split::unchanged(discovered_files);
+    let mut discovered_files = dataless_split.files;
+    let dataless_skipped_files = dataless_split.skipped_files;
+    let dataless_skipped = dataless_skipped_files.len() as u64;
+    #[cfg(target_os = "macos")]
+    let dataless_carry = dataless_split.carry;
+    #[cfg(not(target_os = "macos"))]
+    let _ = dataless_split.carry;
     if data_files > 0 {
         let size = if data_bytes >= 1 << 20 {
             format!("{:.1} MB", data_bytes as f64 / (1u64 << 20) as f64)
@@ -7321,6 +7418,13 @@ fn run_index_report_inner(
         discovered_bytes / (1 << 20),
         root_str
     ));
+    if let Some(line) = dataless::skip_note(dataless_skipped) {
+        pr.note(&format!("autoindex: {line}"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(line) = dataless::carry_note(dataless_carry.len() as u64) {
+        pr.note(&format!("autoindex: {line}"));
+    }
     // "Where did my files go?" is answered here, on every run — the rules are
     // named, not just the totals (#276).
     for line in ignore_report.summary_lines() {
@@ -7342,20 +7446,24 @@ fn run_index_report_inner(
         pr.note(
             "(walk-only — stopped before hashing; file contents were not hashed and nothing was indexed)",
         );
+        let mut walk_done = vec![
+            ("files", summary.files),
+            ("bytes", summary.bytes),
+            ("ignored_files", ignore_report.files_skipped),
+            ("ignored_dirs", ignore_report.dirs_pruned),
+            (
+                "ignored_files_in_pruned_dirs",
+                ignore_report.files_inside_pruned_dirs,
+            ),
+        ];
+        if dataless_skipped > 0 {
+            walk_done.push(("skipped_dataless", dataless_skipped));
+        }
         pr.finish_with_flags(
             true,
             0,
             "walk-only",
-            &[
-                ("files", summary.files),
-                ("bytes", summary.bytes),
-                ("ignored_files", ignore_report.files_skipped),
-                ("ignored_dirs", ignore_report.dirs_pruned),
-                (
-                    "ignored_files_in_pruned_dirs",
-                    ignore_report.files_inside_pruned_dirs,
-                ),
-            ],
+            &walk_done,
             &[(
                 "ignored_files_in_pruned_dirs_exact",
                 ignore_report.files_inside_pruned_dirs_is_exact(),
@@ -7367,8 +7475,22 @@ fn run_index_report_inner(
     // state: with a journal present, zero files is a deletion of the whole
     // corpus and has to be reconciled, not shrugged off.
     if discovered_files.is_empty() && !preflight.journal_exists {
-        println!("no files found under {root_str}");
-        pr.finish(true, 0, "no-files", &[]);
+        if dataless_skipped > 0 {
+            println!(
+                "no indexable files under {root_str} ({dataless_skipped} dataless placeholder{} \
+                 skipped)",
+                if dataless_skipped == 1 { "" } else { "s" }
+            );
+            pr.finish(
+                true,
+                0,
+                "no-files",
+                &[("skipped_dataless", dataless_skipped)],
+            );
+        } else {
+            println!("no files found under {root_str}");
+            pr.finish(true, 0, "no-files", &[]);
+        }
         return Ok((0, None));
     }
     // Count, estimate, and — when the default plan does not fit the disk
@@ -7508,8 +7630,28 @@ fn run_index_report_inner(
         // A plain run hashes the whole corpus, every time, on purpose: see
         // `content::resolve_reporting`.
         None => {
-            pr.phase("hash", discovered_files.len() as u64, discovered_bytes);
-            content::resolve_reporting(discovered_files, &|bytes| pr.item_done(bytes))?
+            // macOS names each file for the duration of its read and does not
+            // read a dataless placeholder (#2058). Other targets hash the way
+            // they always have: every admitted byte, no in-flight registration
+            // on this phase.
+            #[cfg(target_os = "macos")]
+            {
+                let (hash_files, hash_bytes) =
+                    hash_phase_totals(&discovered_files, &dataless_carry, discovered_bytes);
+                pr.phase("hash", hash_files, hash_bytes);
+                content::resolve_reporting_carried(
+                    discovered_files,
+                    &|entry| dataless_carry.get(&entry.rel_id).cloned(),
+                    &|_, _, _| {},
+                    &|bytes| pr.item_done(bytes),
+                    Some(pr.as_ref()),
+                )?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                pr.phase("hash", discovered_files.len() as u64, discovered_bytes);
+                content::resolve_reporting(discovered_files, &|bytes| pr.item_done(bytes))?
+            }
         }
         // A `--watch` pass hashes what the watcher could not prove unchanged.
         // The phase's totals are the files this pass will actually read, so the
@@ -7517,20 +7659,35 @@ fn run_index_report_inner(
         // a full run would have done.
         Some(pass) => {
             let plan = pass.plan(&discovered_files);
+            #[cfg(target_os = "macos")]
+            let (hash_files, hash_bytes) =
+                watch_hash_totals(&plan, &discovered_files, &dataless_carry);
+            #[cfg(not(target_os = "macos"))]
+            let (hash_files, hash_bytes) = (plan.hash_files, plan.hash_bytes);
             let (carried_files, carried_bytes) = (plan.carried_files, plan.carried_bytes);
-            pr.phase("hash", plan.hash_files, plan.hash_bytes);
+            pr.phase("hash", hash_files, hash_bytes);
             pr.note(&format!(
                 "autoindex: --watch: re-hashing {} file(s) ({} MB); {carried_files} file(s) \
                  ({} MB) carried from the previous pass",
-                plan.hash_files,
-                plan.hash_bytes >> 20,
+                hash_files,
+                hash_bytes >> 20,
                 carried_bytes >> 20,
             ));
             let inventory = content::resolve_reporting_carried(
                 discovered_files,
-                &|entry| plan.carried(entry),
+                &|entry| {
+                    #[cfg(target_os = "macos")]
+                    if let Some(digest) = dataless_carry.get(&entry.rel_id) {
+                        return Some(digest.clone());
+                    }
+                    plan.carried(entry)
+                },
                 &|entry, digest, fresh| plan.observe(entry, digest, fresh),
                 &|bytes| pr.item_done(bytes),
+                #[cfg(target_os = "macos")]
+                Some(pr.as_ref()),
+                #[cfg(not(target_os = "macos"))]
+                None,
             )?;
             pass.commit(plan);
             inventory
@@ -7572,19 +7729,23 @@ fn run_index_report_inner(
             ));
             // `ignored_files_in_pruned_dirs` is budget-capped, so the flag
             // saying whether it is a total or a floor travels with it (#279).
+            let mut dry_done = vec![
+                ("files", inventory.files.len() as u64),
+                ("ignored_files", ignore_report.files_skipped),
+                ("ignored_dirs", ignore_report.dirs_pruned),
+                (
+                    "ignored_files_in_pruned_dirs",
+                    ignore_report.files_inside_pruned_dirs,
+                ),
+            ];
+            if dataless_skipped > 0 {
+                dry_done.push(("skipped_dataless", dataless_skipped));
+            }
             pr.finish_with_flags(
                 true,
                 0,
                 "dry-run",
-                &[
-                    ("files", inventory.files.len() as u64),
-                    ("ignored_files", ignore_report.files_skipped),
-                    ("ignored_dirs", ignore_report.dirs_pruned),
-                    (
-                        "ignored_files_in_pruned_dirs",
-                        ignore_report.files_inside_pruned_dirs,
-                    ),
-                ],
+                &dry_done,
                 &[(
                     "ignored_files_in_pruned_dirs_exact",
                     ignore_report.files_inside_pruned_dirs_is_exact(),
@@ -7665,7 +7826,7 @@ fn run_index_report_inner(
             }
             let summary = finish_generated_run(&es, &mut journal, &cfg)?;
             let code = generated_exit_code(&summary);
-            finish_generated_progress(&pr, code, &summary);
+            finish_generated_progress(&pr, code, &summary, dataless_skipped);
             return Ok((code, Some(summary)));
         }
         begin_non_graph_generation(
@@ -7693,7 +7854,7 @@ fn run_index_report_inner(
         )?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
         let code = generated_exit_code(&summary);
-        finish_generated_progress(&pr, code, &summary);
+        finish_generated_progress(&pr, code, &summary, dataless_skipped);
         return Ok((code, Some(summary)));
     }
     if cfg.no_graph && preflight.plan.is_some() && !genesis_recovery {
@@ -7757,11 +7918,12 @@ fn run_index_report_inner(
         // `--fresh` is checked here too: discarding the plan does not delete
         // the documents already published for a file that is now gone, so a
         // removal is unsafe in place whether or not the plan is kept.
-        let delta = UnsupportedInventoryDelta::between(
+        let delta = inventory_delta(
             &cfg.root,
             &inventory.files,
             &comparison_keys,
             prior_plan,
+            &dataless_skipped_files,
         );
         if delta.refuses() {
             return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, prior_plan)));
@@ -7813,8 +7975,22 @@ fn run_index_report_inner(
     sync_executor::gc_snapshots(&state_dir, &journal)?;
     let resumed_with_plan = journal.plan.is_some() && !genesis_recovery;
     if inventory.files.is_empty() && !resumed_with_plan {
-        println!("no files found under {root_str}");
-        pr.finish(true, 0, "no-files", &[]);
+        if dataless_skipped > 0 {
+            println!(
+                "no indexable files under {root_str} ({dataless_skipped} dataless placeholder{} \
+                 skipped)",
+                if dataless_skipped == 1 { "" } else { "s" }
+            );
+            pr.finish(
+                true,
+                0,
+                "no-files",
+                &[("skipped_dataless", dataless_skipped)],
+            );
+        } else {
+            println!("no files found under {root_str}");
+            pr.finish(true, 0, "no-files", &[]);
+        }
         return Ok((0, None));
     }
     let run_id = journal.run_id.clone();
@@ -8069,7 +8245,7 @@ fn run_index_report_inner(
     // this is set (see `carry_over_unread_mail`).
     let mut swept_excluded = false;
     if resumed_with_plan {
-        let delta = UnsupportedInventoryDelta::between(&cfg.root, &files, &keys, &plan);
+        let delta = inventory_delta(&cfg.root, &files, &keys, &plan, &dataless_skipped_files);
         if delta.refuses() {
             return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, &plan)));
         }
@@ -8306,19 +8482,23 @@ fn run_index_report_inner(
         println!("{}", serde_json::to_string_pretty(&plan)?);
         pr.note("(dry run — nothing indexed)");
         // As above: the count is capped, so the completeness flag ships with it.
+        let mut dry_done = vec![
+            ("files", files.len() as u64),
+            ("ignored_files", ignore_report.files_skipped),
+            ("ignored_dirs", ignore_report.dirs_pruned),
+            (
+                "ignored_files_in_pruned_dirs",
+                ignore_report.files_inside_pruned_dirs,
+            ),
+        ];
+        if dataless_skipped > 0 {
+            dry_done.push(("skipped_dataless", dataless_skipped));
+        }
         pr.finish_with_flags(
             true,
             0,
             "dry-run",
-            &[
-                ("files", files.len() as u64),
-                ("ignored_files", ignore_report.files_skipped),
-                ("ignored_dirs", ignore_report.dirs_pruned),
-                (
-                    "ignored_files_in_pruned_dirs",
-                    ignore_report.files_inside_pruned_dirs,
-                ),
-            ],
+            &dry_done,
             &[(
                 "ignored_files_in_pruned_dirs_exact",
                 ignore_report.files_inside_pruned_dirs_is_exact(),
@@ -8364,7 +8544,7 @@ fn run_index_report_inner(
         )?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
         let code = generated_exit_code(&summary);
-        finish_generated_progress(&pr, code, &summary);
+        finish_generated_progress(&pr, code, &summary, dataless_skipped);
         return Ok((code, Some(summary)));
     }
 
@@ -10753,6 +10933,9 @@ fn run_index_report_inner(
     if skipped_appeared > 0 {
         done_fields.push(("skipped_appeared", skipped_appeared as u64));
     }
+    if dataless_skipped > 0 {
+        done_fields.push(("skipped_dataless", dataless_skipped));
+    }
     pr.finish(
         true,
         code,
@@ -11702,6 +11885,25 @@ mod inventory_delta_tests {
         assert!(!added.refuses(), "an addition alone must not fail the run");
         // A removal leaves live documents with no source file behind them.
         assert!(UnsupportedInventoryDelta::between(nowhere(), &[], &[], &plan).refuses());
+    }
+
+    /// #2058: a dataless placeholder left out of the hash is still on disk.
+    /// Omitting it from the inventory would classify the previous group as an
+    /// exclusion, and the exclusion sweep would delete documents that were
+    /// indexed the last time the bytes were local.
+    #[test]
+    fn a_dataless_placeholder_kept_out_of_the_hash_is_not_an_exclusion() {
+        let mut plan = Plan::default();
+        plan.files.insert("cloud".into(), assignment("cloud.txt"));
+        let present = [file("cloud.txt")];
+        let delta = inventory_delta(nowhere(), &[], &[], &plan, &present);
+        assert!(delta.deleted_content_groups.is_empty());
+        assert!(delta.excluded_content_groups.is_empty());
+        assert!(!delta.refuses());
+        assert!(UnsupportedInventoryDelta::between(nowhere(), &[], &[], &plan).refuses());
+        let empty = inventory_delta(nowhere(), &[], &[], &plan, &[]);
+        assert!(empty.refuses());
+        assert_eq!(empty.deleted_content_groups.len(), 1);
     }
 
     #[test]
@@ -13050,6 +13252,7 @@ mod code_coverage_tests {
                 "code_files_indexed": 0,
                 "code_files_junked": 3,
             }),
+            0,
         );
         let text = captured(&buffer);
         let done = text
@@ -13092,13 +13295,45 @@ mod code_coverage_tests {
                 "code_files_indexed": 3,
                 "code_files_junked": 0,
             }),
+            0,
         );
         let text = captured(&buffer);
         assert!(
             text.contains("code_files=3 code_files_indexed=3 code_files_junked=0"),
             "{text}"
         );
+        assert!(
+            !text.contains("skipped_dataless"),
+            "a run that skipped nothing keeps the terminal line it had: {text}"
+        );
         assert!(!text.contains("warning:"), "{text}");
+    }
+
+    #[test]
+    fn skipped_dataless_placeholders_are_counted_on_the_terminal_line() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            0,
+            &json!({
+                "files_indexed": 1,
+                "records_total": 1,
+                "generation": 2,
+                "code_files": 0,
+                "code_files_indexed": 0,
+                "code_files_junked": 0,
+            }),
+            3,
+        );
+        let text = captured(&buffer);
+        let done = text
+            .lines()
+            .find(|line| line.starts_with("xerj-done "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(done.contains("skipped_dataless=3"), "{done}");
     }
 
     /// A corpus with no source code in it at all must not start warning, and a
