@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `semantic` query on a `semantic_text` field returns `highlight` fragments
+  when the request asks for them (#1947). The fragments are the field's
+  best-scoring chunks for the query embedding, in score order, limited by
+  `number_of_fragments` (default 5; `0` returns the whole field). `order:
+  none` emits that same selection in document order. `"type": "semantic"`
+  selects this highlighter, and it is the default for a `semantic_text`
+  field on a semantic query. Chunks are not wrapped in `<em>` tags. A
+  lexical `match` on the same field still highlights query terms.
+
 - A best-effort helper thread that cannot be created no longer aborts the
   process. On Unix those threads are started with `pthread_create` and do not
   map an alternate signal stack, so the allocation failure that used to panic

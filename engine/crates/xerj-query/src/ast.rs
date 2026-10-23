@@ -1426,6 +1426,17 @@ pub struct HighlightRequest {
     /// `false` keeps every matching text/keyword field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_field_match: Option<bool>,
+
+    /// Highlighter implementation (`unified`, `plain`, `fvh`, `semantic`).
+    /// Absent means the field type's default: `semantic` for `semantic_text`
+    /// on a semantic query, the lexical term highlighter otherwise.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub highlighter_type: Option<String>,
+
+    /// `score` (semantic default here) or `none` (document order). A field
+    /// that sets its own `order` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
 }
 
 /// Per-field highlight options (can override the top-level defaults).
@@ -1439,6 +1450,12 @@ pub struct HighlightFieldOptions {
     pub fragment_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number_of_fragments: Option<usize>,
+    /// Overrides [`HighlightRequest::highlighter_type`] for this field.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub highlighter_type: Option<String>,
+    /// Overrides [`HighlightRequest::order`] for this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

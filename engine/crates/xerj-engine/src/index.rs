@@ -21,9 +21,9 @@ use xerj_fts::search::{
     TermQuery as FtsTerm,
 };
 use xerj_query::ast::{
-    BoostMode, FieldValueFactor, Fuzziness, HighlightRequest, MinShouldMatch, Modifier, QueryNode,
-    RandomScore, RescoreQuery, SavingsMode, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
-    TrackTotalHits, WeightedQuery,
+    BoostMode, FieldValueFactor, Fuzziness, HighlightFieldOptions, HighlightRequest,
+    MinShouldMatch, Modifier, QueryNode, RandomScore, RescoreQuery, SavingsMode, ScoreFunction,
+    ScoreMode, SearchRequest, SourceFilter, TrackTotalHits, WeightedQuery,
 };
 use xerj_query::executor::{
     strip_internal_passage_metadata, Hit, PassageMatch, PayloadSavings, SavingsMethod,
@@ -16939,15 +16939,28 @@ impl Index {
         // them the companions are not hydrated at all. Anything else — an
         // explicit `_source`, aggregations over the neighbours, `fields`,
         // scripts, sort, collapse, rescore — gets the whole document.
+        //
+        // #1947: a semantic highlight against an active embedder scores the
+        // stored per-chunk vectors. Those columns are normally omitted (they
+        // are the expensive ones). Keep `<target>_chunks` and still omit the
+        // pooled vector. The lexical embedder re-embeds chunk text instead
+        // and does not need the columns.
+        let mut companion_omit = generated_companion_fields.clone();
+        if SEMANTIC_HIGHLIGHT_PLAN
+            .try_with(|plan| !plan.lexical)
+            .unwrap_or(false)
+        {
+            companion_omit.retain(|name| !name.ends_with("_chunks"));
+        }
         let omit_companions = (matches!(request.source, SourceFilter::Default)
-            && !generated_companion_fields.is_empty()
+            && !companion_omit.is_empty()
             && request.aggs.is_none()
             && request.fields.is_empty()
             && request.script_fields.is_none()
             && request.sort.is_empty()
             && request.collapse.is_none()
             && request.rescore.is_empty())
-        .then(|| Arc::new(generated_companion_fields.clone()));
+        .then(|| Arc::new(companion_omit));
         let mut column_hits: HashMap<(usize, usize), (String, Value)> = HashMap::new();
         for (view, positions) in by_view {
             let hydrate_started = std::time::Instant::now();
@@ -17371,6 +17384,10 @@ impl Index {
         if trace_phases {
             tracing::info!(index=%self.name, field, k, "semantic_phase=embed_start");
         }
+        // Captured before the embed so the highlighter scores chunks in the
+        // same space as `query_vec` (#1947). An active backend's vectors are
+        // already stored; the lexical fallback re-embeds chunk text.
+        let lexical_embedder = !embedder.is_active();
         let query_vec = if embedder.is_active() {
             // `embed_batch` takes Vec<String>; we only have one text but
             // batching keeps the wire format stable for callers.
@@ -17413,51 +17430,81 @@ impl Index {
             tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, "semantic_phase=embed_complete");
         }
 
+        // #1947: the semantic highlighter reads this plan from the task that
+        // runs the kNN executors. Threading it through every executor
+        // signature would touch the plain-knn call sites for a post-pass
+        // those queries do not use. The plan is set only when this request
+        // actually asks to highlight a `semantic_text` field.
+        let highlight_plan = if request.highlight.is_some() {
+            let schema = self.schema.read().await;
+            let resolved = resolve_field_alias(&schema.schema, field);
+            let fields = collect_semantic_highlight_fields(&schema.schema, field, &resolved);
+            drop(schema);
+            request.highlight.as_ref().and_then(|hl| {
+                semantic_highlight_plan(
+                    hl,
+                    fields,
+                    query_vec.clone(),
+                    dims,
+                    similarity.clone(),
+                    lexical_embedder,
+                )
+            })
+        } else {
+            None
+        };
+
         // Match the top-level kNN serving policy: plain, unfiltered semantic
         // queries may use the fully covered HNSW graph and are exact-rescored
         // against stored vectors. Filters and aggregations remain exact scans
         // so approximation cannot change filter/analytics membership.
-        let result = if filter.is_none() && request.aggs.is_none() {
-            match Box::pin(self.run_knn_hnsw(
-                request,
-                deadline,
-                &knn_field,
-                &query_vec,
-                k,
-                None,
-                &similarity,
-            ))
-            .await
-            {
-                Some(result) => Ok(result),
-                None => {
-                    Box::pin(self.run_knn_brute_force_with_deadline(
-                        request,
-                        deadline,
-                        &knn_field,
-                        &query_vec,
-                        k,
-                        filter,
-                        &similarity,
-                        None,
-                        None,
-                    ))
-                    .await
+        let searched = async {
+            if filter.is_none() && request.aggs.is_none() {
+                match Box::pin(self.run_knn_hnsw(
+                    request,
+                    deadline,
+                    &knn_field,
+                    &query_vec,
+                    k,
+                    None,
+                    &similarity,
+                ))
+                .await
+                {
+                    Some(result) => Ok(result),
+                    None => {
+                        Box::pin(self.run_knn_brute_force_with_deadline(
+                            request,
+                            deadline,
+                            &knn_field,
+                            &query_vec,
+                            k,
+                            filter,
+                            &similarity,
+                            None,
+                            None,
+                        ))
+                        .await
+                    }
                 }
+            } else {
+                Box::pin(self.run_knn_brute_force_with_deadline(
+                    request,
+                    deadline,
+                    &knn_field,
+                    &query_vec,
+                    k,
+                    filter,
+                    &similarity,
+                    None,
+                    None,
+                ))
+                .await
             }
-        } else {
-            Box::pin(self.run_knn_brute_force_with_deadline(
-                request,
-                deadline,
-                &knn_field,
-                &query_vec,
-                k,
-                filter,
-                &similarity,
-                None,
-                None,
-            ))
-            .await
+        };
+        let result = match highlight_plan {
+            Some(plan) => SEMANTIC_HIGHLIGHT_PLAN.scope(plan, searched).await,
+            None => searched.await,
         };
         if trace_phases {
             tracing::info!(index=%self.name, elapsed_ms=semantic_started.elapsed().as_millis() as u64, ok=result.is_ok(), "semantic_phase=request_complete");
@@ -37078,6 +37125,347 @@ fn field_matches(field: &str, pattern: &str) -> bool {
     }
 }
 
+/// One `semantic_text` field the semantic highlighter can read.
+///
+/// `name` is what a highlight request may say (the mapped name, or the alias
+/// the semantic query used). `source_field` is the `_source` key holding the
+/// text. `vector_field` is the companion the ingest path stored chunk vectors
+/// under.
+#[derive(Clone)]
+struct SemanticFieldRef {
+    name: String,
+    source_field: String,
+    vector_field: String,
+}
+
+/// Query embedding and field map for one semantic search that asked for
+/// highlights (#1947).
+///
+/// Lives in a task-local rather than on [`SearchRequest`]: the kNN executors
+/// already take the request, and plain `knn` must not grow a parameter it
+/// never reads. `run_semantic_with_deadline` sets the scope; result shaping
+/// reads it. A search that is not inside that scope highlights nothing here.
+#[derive(Clone)]
+struct SemanticHighlightPlan {
+    query_vec: Vec<f32>,
+    dims: usize,
+    similarity: String,
+    fields: Vec<SemanticFieldRef>,
+    /// Re-embed chunk text with the built-in lexical embedder. When `false`,
+    /// an active backend produced the stored chunk vectors and those are
+    /// scored instead — re-embedding with the lexical embedder would compare
+    /// vectors from two different spaces.
+    lexical: bool,
+}
+
+tokio::task_local! {
+    static SEMANTIC_HIGHLIGHT_PLAN: SemanticHighlightPlan;
+}
+
+fn collect_semantic_highlight_fields(
+    schema: &Schema,
+    query_field: &str,
+    resolved_field: &str,
+) -> Vec<SemanticFieldRef> {
+    let mut fields = Vec::new();
+    for fc in &schema.fields {
+        let Some(emb) = fc.embedding.as_ref() else {
+            continue;
+        };
+        let vector_field = emb
+            .target_field
+            .clone()
+            .unwrap_or_else(|| format!("{}_vector", fc.name));
+        fields.push(SemanticFieldRef {
+            name: fc.name.clone(),
+            source_field: fc.name.clone(),
+            vector_field,
+        });
+    }
+    // A query on an alias highlights either the alias or the concrete field.
+    if query_field != resolved_field {
+        if let Some(src) = fields
+            .iter()
+            .find(|f| f.source_field == resolved_field)
+            .cloned()
+        {
+            fields.push(SemanticFieldRef {
+                name: query_field.to_string(),
+                source_field: src.source_field,
+                vector_field: src.vector_field,
+            });
+        }
+    }
+    fields
+}
+
+fn semantic_highlight_plan(
+    hl: &HighlightRequest,
+    fields: Vec<SemanticFieldRef>,
+    query_vec: Vec<f32>,
+    dims: usize,
+    similarity: String,
+    lexical: bool,
+) -> Option<SemanticHighlightPlan> {
+    if fields.is_empty() || query_vec.is_empty() {
+        return None;
+    }
+    let wanted = hl.fields.iter().any(|(name, opts)| {
+        semantic_highlighter_selected(opts, hl)
+            && fields
+                .iter()
+                .any(|field| name_selects_semantic_field(name, field))
+    });
+    if !wanted {
+        return None;
+    }
+    Some(SemanticHighlightPlan {
+        query_vec,
+        dims,
+        similarity,
+        fields,
+        lexical,
+    })
+}
+
+fn name_selects_semantic_field(pattern: &str, field: &SemanticFieldRef) -> bool {
+    if pattern.contains('*') {
+        field_matches(&field.name, pattern) || field_matches(&field.source_field, pattern)
+    } else {
+        pattern == field.name || pattern == field.source_field
+    }
+}
+
+/// `None` and `"semantic"` select the semantic highlighter. Any other
+/// explicit type (`unified`, `plain`, `fvh`) stays on the lexical pass.
+fn semantic_highlighter_selected(opts: &HighlightFieldOptions, hl: &HighlightRequest) -> bool {
+    match opts
+        .highlighter_type
+        .as_deref()
+        .or(hl.highlighter_type.as_deref())
+    {
+        Some("semantic") | None => true,
+        Some(_) => false,
+    }
+}
+
+fn semantic_highlight_hit(
+    source: &Value,
+    hl: &HighlightRequest,
+    plan: &SemanticHighlightPlan,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    let mut seen = HashSet::new();
+    // Explicit names win over a pattern that covers the same field, matching
+    // `expand_highlight_field_patterns`.
+    let mut patterns = Vec::new();
+    for (name, opts) in &hl.fields {
+        if name.contains('*') {
+            patterns.push((name, opts));
+            continue;
+        }
+        if !semantic_highlighter_selected(opts, hl) {
+            continue;
+        }
+        let Some(field) = find_semantic_field(name, &plan.fields) else {
+            continue;
+        };
+        seen.insert(field.name.clone());
+        let fragments = semantic_fragments(source, field, opts, hl, plan);
+        if !fragments.is_empty() {
+            out.insert(name.clone(), fragments);
+        }
+    }
+    for (pattern, opts) in patterns {
+        if !semantic_highlighter_selected(opts, hl) {
+            continue;
+        }
+        for field in plan
+            .fields
+            .iter()
+            .filter(|field| name_selects_semantic_field(pattern, field))
+        {
+            if !seen.insert(field.name.clone()) {
+                continue;
+            }
+            let fragments = semantic_fragments(source, field, opts, hl, plan);
+            if !fragments.is_empty() {
+                out.insert(field.name.clone(), fragments);
+            }
+        }
+    }
+    out
+}
+
+fn find_semantic_field<'a>(
+    name: &str,
+    fields: &'a [SemanticFieldRef],
+) -> Option<&'a SemanticFieldRef> {
+    fields
+        .iter()
+        .find(|field| field.name == name)
+        .or_else(|| fields.iter().find(|field| field.source_field == name))
+}
+
+/// Best-scoring chunks of one `semantic_text` field.
+///
+/// Elasticsearch's semantic highlighter (the default for `semantic_text`)
+/// returns the chunks produced at ingest, ordered by similarity to the query,
+/// without `<em>` tags. Approach only — the chunk text and vectors are this
+/// engine's, scored with [`compute_vector_similarity`]. `number_of_fragments`
+/// limits how many chunks are kept (default 5; `0` is the whole field).
+/// `order: none` emits that selection in document order; anything else,
+/// including the default, emits it by score. Ties keep the earlier chunk,
+/// the same rule as [`choose_passage_winner`].
+fn semantic_fragments(
+    source: &Value,
+    field: &SemanticFieldRef,
+    opts: &HighlightFieldOptions,
+    hl: &HighlightRequest,
+    plan: &SemanticHighlightPlan,
+) -> Vec<String> {
+    let Some(text_val) = get_field_value(source, &field.source_field) else {
+        return Vec::new();
+    };
+    let Some(text) = text_val.as_str() else {
+        return Vec::new();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let n = opts
+        .number_of_fragments
+        .or(hl.number_of_fragments)
+        .unwrap_or(5);
+    if n == 0 {
+        return vec![text.to_string()];
+    }
+    let passages = semantic_passages(text, source, &field.vector_field);
+    if passages.is_empty() {
+        return Vec::new();
+    }
+    let stored = if plan.lexical {
+        Vec::new()
+    } else {
+        stored_chunk_vectors(source, &field.vector_field)
+    };
+    let mut scored: Vec<(u32, f32, String)> = passages
+        .into_iter()
+        .map(|(ordinal, raw)| {
+            let score = chunk_score(plan, &raw, ordinal, &stored);
+            (ordinal, score, raw)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.truncate(n);
+    let order = opts
+        .order
+        .as_deref()
+        .or(hl.order.as_deref())
+        .unwrap_or("score");
+    if order == "none" {
+        scored.sort_by_key(|chunk| chunk.0);
+    }
+    scored
+        .into_iter()
+        .map(|(_, _, raw)| raw.trim().to_string())
+        .filter(|fragment| !fragment.is_empty())
+        .collect()
+}
+
+fn chunk_score(plan: &SemanticHighlightPlan, text: &str, ordinal: u32, stored: &[Vec<f32>]) -> f32 {
+    let vector = if plan.lexical {
+        xerj_ai::local::local_embed(text, plan.dims)
+    } else {
+        let Some(stored) = stored.get(ordinal as usize) else {
+            return f32::NEG_INFINITY;
+        };
+        stored.clone()
+    };
+    if vector.len() != plan.query_vec.len() {
+        return f32::NEG_INFINITY;
+    }
+    compute_vector_similarity(&plan.similarity, &plan.query_vec, &vector)
+}
+
+/// Ingest chunk slices when passage metadata is present and valid, otherwise
+/// the same chunker ingest uses. A single short value is one passage covering
+/// the whole field, matching `local_chunk_vectors`.
+fn semantic_passages(text: &str, source: &Value, vector_field: &str) -> Vec<(u32, String)> {
+    if let Some(passages) = passages_from_metadata(text, source, vector_field) {
+        return passages;
+    }
+    let chunks = semantic_chunker().chunk(text, None);
+    if chunks.len() <= 1 {
+        return vec![(0, text.to_string())];
+    }
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, chunk)| (ordinal as u32, chunk.text))
+        .collect()
+}
+
+fn passages_from_metadata(
+    text: &str,
+    source: &Value,
+    vector_field: &str,
+) -> Option<Vec<(u32, String)>> {
+    let chunks = source
+        .get(passage_metadata_field(vector_field))?
+        .as_object()?
+        .get("chunks")?
+        .as_array()?;
+    if chunks.is_empty() {
+        return None;
+    }
+    let mut passages = Vec::with_capacity(chunks.len());
+    for (ordinal, pair) in chunks.iter().enumerate() {
+        let pair = pair.as_array()?;
+        if pair.len() != 2 {
+            return None;
+        }
+        let start = usize::try_from(pair[0].as_u64()?).ok()?;
+        let end = usize::try_from(pair[1].as_u64()?).ok()?;
+        if start > end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+        {
+            return None;
+        }
+        passages.push((ordinal as u32, text[start..end].to_string()));
+    }
+    Some(passages)
+}
+
+fn stored_chunk_vectors(source: &Value, vector_field: &str) -> Vec<Vec<f32>> {
+    let Some(Value::Array(rows)) = source.get(format!("{vector_field}_chunks")) else {
+        return Vec::new();
+    };
+    let mut vectors = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(vector) = json_f32_vector(row) else {
+            return Vec::new();
+        };
+        vectors.push(vector);
+    }
+    vectors
+}
+
+fn json_f32_vector(value: &Value) -> Option<Vec<f32>> {
+    let row = value.as_array()?;
+    let mut vector = Vec::with_capacity(row.len());
+    for component in row {
+        vector.push(component.as_f64()? as f32);
+    }
+    Some(vector)
+}
+
 /// Apply highlight to hits, generating fragments per requested field.
 ///
 /// For each field listed in `highlight.fields`, the stored field value is
@@ -37089,6 +37477,10 @@ fn apply_highlight(hits: Vec<Hit>, hl: &HighlightRequest, query: &QueryNode) -> 
     }
     // Pre-compute query terms ONCE before iterating hits (Opt 3).
     let query_terms = extract_highlight_terms(query);
+    // A `semantic` query has no lexical terms. Its highlights are the
+    // best-scoring chunks of the `semantic_text` field, attached in
+    // `knn_result_from_ranked` (#1947). This lexical pass correctly
+    // leaves those hits alone.
     if query_terms.is_empty() {
         return hits;
     }
@@ -41348,6 +41740,9 @@ fn knn_result_from_ranked(
         }
     });
 
+    // #1947: present only while `run_semantic_with_deadline` is scoring this
+    // request. Plain kNN leaves it unset and highlights nothing here.
+    let semantic_plan = SEMANTIC_HIGHLIGHT_PLAN.try_with(|plan| plan.clone()).ok();
     let hits: Vec<Hit> = if request.size == 0 {
         Vec::new()
     } else {
@@ -41359,6 +41754,17 @@ fn knn_result_from_ranked(
     }
     .into_iter()
     .map(|(id, score, mut source, ordinal)| {
+        // Before passage metadata is stripped and before `_source` filtering,
+        // so a highlight still resolves when the caller excluded the field.
+        let highlight = semantic_plan
+            .as_ref()
+            .and_then(|plan| {
+                request
+                    .highlight
+                    .as_ref()
+                    .map(|hl| semantic_highlight_hit(&source, hl, plan))
+            })
+            .filter(|fragments| !fragments.is_empty());
         let passage = passage_requested(request)
             .then(|| passage_match_from_source(&source, vector_field, ordinal))
             .flatten();
@@ -41380,7 +41786,7 @@ fn knn_result_from_ranked(
             version,
             sort: Vec::new(),
             explain: None,
-            highlight: None,
+            highlight,
             matched_queries: Vec::new(),
             passage,
         }

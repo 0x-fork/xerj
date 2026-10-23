@@ -8800,6 +8800,8 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
                     .get("number_of_fragments")
                     .and_then(Value::as_u64)
                     .map(|n| n as usize),
+                highlighter_type: o.get("type").and_then(Value::as_str).map(str::to_string),
+                order: o.get("order").and_then(Value::as_str).map(str::to_string),
             }
         } else {
             HighlightFieldOptions::default()
@@ -8820,6 +8822,8 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
             .and_then(Value::as_u64)
             .map(|n| n as usize),
         require_field_match: obj.get("require_field_match").and_then(Value::as_bool),
+        highlighter_type: obj.get("type").and_then(Value::as_str).map(str::to_string),
+        order: obj.get("order").and_then(Value::as_str).map(str::to_string),
     })
 }
 
