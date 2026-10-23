@@ -1415,6 +1415,62 @@ pub struct EsCreateIndexMappings {
     pub properties: Option<Value>,
 }
 
+/// Display-side settings blob stored for `GET /{index}/_settings` at create.
+///
+/// `None` when the request carried neither settings nor an index-sort
+/// decision — the single-node path then leaves `index_settings` untouched.
+fn create_time_index_settings(
+    body_settings: Option<&Value>,
+    explicit_sort_field: &Option<String>,
+    explicit_sort_order: &str,
+    declared_timestamp_date: bool,
+) -> Option<Value> {
+    if let Some(settings) = body_settings {
+        let mut s = settings.clone();
+        if let Some(f) = explicit_sort_field.as_ref() {
+            if let Some(o) = s.as_object_mut() {
+                o.insert("__xy_index_sort_field".to_string(), json!(f));
+                o.insert(
+                    "__xy_index_sort_order".to_string(),
+                    json!(explicit_sort_order),
+                );
+                o.insert("__xy_index_sort_explicit".to_string(), json!(true));
+            }
+        } else if declared_timestamp_date {
+            if let Some(o) = s.as_object_mut() {
+                o.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
+                o.insert("__xy_index_sort_order".to_string(), json!("desc"));
+            }
+        }
+        return Some(s);
+    }
+    if let Some(f) = explicit_sort_field.as_ref() {
+        return Some(json!({
+            "__xy_index_sort_field": f,
+            "__xy_index_sort_order": explicit_sort_order,
+            "__xy_index_sort_explicit": true,
+        }));
+    }
+    if declared_timestamp_date {
+        return Some(json!({
+            "__xy_index_sort_field": "@timestamp",
+            "__xy_index_sort_order": "desc",
+        }));
+    }
+    None
+}
+
+/// Alias map with date-math names resolved. `None` when the body has no
+/// `aliases` object.
+fn resolved_create_aliases(body: &Value) -> Option<serde_json::Map<String, Value>> {
+    let aliases = body.get("aliases")?.as_object()?;
+    let mut resolved = serde_json::Map::new();
+    for (alias, opts) in aliases {
+        resolved.insert(resolve_date_math_index(alias), opts.clone());
+    }
+    Some(resolved)
+}
+
 pub async fn create_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -1535,6 +1591,41 @@ pub async fn create_index(
     // indices at a single WAL file descriptor). create_index_with_settings
     // applies index templates identically to create_index.
     let create_settings = body.get("settings").cloned().unwrap_or(Value::Null);
+    let display_settings = create_time_index_settings(
+        body.get("settings"),
+        &explicit_sort_field,
+        &explicit_sort_order,
+        declared_timestamp_date,
+    );
+    let resolved_aliases = resolved_create_aliases(&body);
+
+    // Cluster members replicate the create. The accepting node evaluates
+    // templates and date-math aliases; peers apply that result. ILM attach
+    // stays on this node either way — it is not in the log.
+    if state.engine.has_cluster() {
+        let spec = xerj_engine::ReplicatedIndexSpec {
+            name: index.clone(),
+            schema,
+            settings: create_settings,
+            mappings: mappings_val,
+            index_settings: display_settings.unwrap_or(Value::Null),
+            aliases: resolved_aliases
+                .clone()
+                .map(Value::Object)
+                .unwrap_or(Value::Null),
+        };
+        return match state.engine.replicate_index_create(spec).await {
+            Ok(()) => {
+                if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
+                    let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
+                }
+                let resp = EsIndexResponse::ok(&index);
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        };
+    }
+
     match state
         .engine
         .create_index_with_settings(&index, schema, create_settings)
@@ -1543,44 +1634,8 @@ pub async fn create_index(
             // Store the raw settings / mappings / aliases blob as written.
             // These are used by `GET /{index}/_settings`, `GET /{index}/_mapping`,
             // `GET /{index}`, and cluster health replica checks.
-            if let Some(settings) = body.get("settings") {
-                let mut s = settings.clone();
-                if let Some(f) = explicit_sort_field.as_ref() {
-                    if let Some(o) = s.as_object_mut() {
-                        o.insert("__xy_index_sort_field".to_string(), json!(f));
-                        o.insert(
-                            "__xy_index_sort_order".to_string(),
-                            json!(explicit_sort_order),
-                        );
-                        // Mark this as an EXPLICIT index sort (vs the
-                        // @timestamp auto-heuristic) so the search path can
-                        // map a lone `_doc` sort onto the index-sort field.
-                        o.insert("__xy_index_sort_explicit".to_string(), json!(true));
-                    }
-                } else if declared_timestamp_date {
-                    if let Some(o) = s.as_object_mut() {
-                        o.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
-                        o.insert("__xy_index_sort_order".to_string(), json!("desc"));
-                    }
-                }
+            if let Some(s) = display_settings {
                 state.engine.index_settings.insert(index.clone(), s);
-            } else if let Some(f) = explicit_sort_field.as_ref() {
-                state.engine.index_settings.insert(
-                    index.clone(),
-                    json!({
-                        "__xy_index_sort_field": f,
-                        "__xy_index_sort_order": explicit_sort_order,
-                        "__xy_index_sort_explicit": true,
-                    }),
-                );
-            } else if declared_timestamp_date {
-                state.engine.index_settings.insert(
-                    index.clone(),
-                    json!({
-                        "__xy_index_sort_field": "@timestamp",
-                        "__xy_index_sort_order": "desc",
-                    }),
-                );
             }
             if !mappings_val.is_null() {
                 // Persists es_mapping.json into the index dir (atomic) so
@@ -1589,16 +1644,13 @@ pub async fn create_index(
                     return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                 }
             }
-            if let Some(aliases) = body.get("aliases").and_then(Value::as_object) {
+            if let Some(resolved_aliases) = resolved_aliases {
                 // Alias keys can also contain date math
                 // (`<logs_{now/d}>` → `logs_2026-04-19`). Resolve each
                 // before storing / registering. The meta map keys use the
                 // resolved name so GET /_alias round-trips correctly.
-                let mut resolved_aliases = serde_json::Map::new();
-                for (alias, opts) in aliases {
-                    let resolved = resolve_date_math_index(alias);
-                    resolved_aliases.insert(resolved.clone(), opts.clone());
-                    if let Err(error) = state.engine.add_alias(&resolved, &index) {
+                for alias in resolved_aliases.keys() {
+                    if let Err(error) = state.engine.add_alias(alias, &index) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
                 }
@@ -3221,6 +3273,19 @@ pub async fn put_mapping(
             }
         }
         plans.push((idx_name.clone(), idx, existing, additions));
+    }
+
+    if state.engine.has_cluster() {
+        for (idx_name, _, existing, additions) in plans {
+            if let Err(error) = state
+                .engine
+                .replicate_mapping(&idx_name, &existing, &additions)
+                .await
+            {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
+        }
+        return Json(json!({ "acknowledged": true })).into_response();
     }
 
     // Publication begins only after every deterministic candidate has passed.
@@ -32105,46 +32170,54 @@ pub async fn put_settings(
         return ApiError::new(e).into_response();
     }
 
-    for idx in &targets {
-        let mut existing = state
-            .engine
-            .index_settings
-            .get(idx)
-            .map(|v| v.clone())
-            .unwrap_or(json!({ "index": {} }));
-        let inner_slot = existing
-            .as_object_mut()
-            .and_then(|m| m.get_mut("index").and_then(Value::as_object_mut));
-        match (inner_slot, inner.as_object()) {
-            (Some(existing_inner), Some(new_inner)) => {
-                for (k, v) in new_inner {
-                    existing_inner.insert(k.clone(), v.clone());
+    if state.engine.has_cluster() {
+        for idx in &targets {
+            if let Err(e) = state.engine.replicate_index_settings(idx, &body).await {
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
+        }
+    } else {
+        for idx in &targets {
+            let mut existing = state
+                .engine
+                .index_settings
+                .get(idx)
+                .map(|v| v.clone())
+                .unwrap_or(json!({ "index": {} }));
+            let inner_slot = existing
+                .as_object_mut()
+                .and_then(|m| m.get_mut("index").and_then(Value::as_object_mut));
+            match (inner_slot, inner.as_object()) {
+                (Some(existing_inner), Some(new_inner)) => {
+                    for (k, v) in new_inner {
+                        existing_inner.insert(k.clone(), v.clone());
+                    }
+                }
+                _ => {
+                    // Either no existing index block or body wasn't an object —
+                    // replace wholesale.
+                    existing = json!({ "index": inner });
+                    state.engine.index_settings.insert(idx.clone(), existing);
+                    continue;
                 }
             }
-            _ => {
-                // Either no existing index block or body wasn't an object —
-                // replace wholesale.
-                existing = json!({ "index": inner });
-                state.engine.index_settings.insert(idx.clone(), existing);
-                continue;
-            }
+            state.engine.index_settings.insert(idx.clone(), existing);
         }
-        state.engine.index_settings.insert(idx.clone(), existing);
-    }
 
-    // `index.blocks.*` is not a display-only setting: it gates writes and reads
-    // in the engine, whose `Index::settings` is a different store from the
-    // `engine.index_settings` map updated above. Forward the block keys so a
-    // settings PUT can both set *and clear* a block — previously it updated only
-    // the display copy, leaving every block permanent once set.
-    for name in &targets {
-        let Ok(idx) = state.engine.get_index(name) else {
-            continue;
-        };
-        if let Err(e) = idx.apply_block_settings(&body).await {
-            return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+        // `index.blocks.*` is not a display-only setting: it gates writes and reads
+        // in the engine, whose `Index::settings` is a different store from the
+        // `engine.index_settings` map updated above. Forward the block keys so a
+        // settings PUT can both set *and clear* a block — previously it updated only
+        // the display copy, leaving every block permanent once set.
+        for name in &targets {
+            let Ok(idx) = state.engine.get_index(name) else {
+                continue;
+            };
+            if let Err(e) = idx.apply_block_settings(&body).await {
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
+            sync_display_blocks(&state, name).await;
         }
-        sync_display_blocks(&state, name).await;
     }
 
     // `PUT {index}/_settings` is the other real ILM entry point — for

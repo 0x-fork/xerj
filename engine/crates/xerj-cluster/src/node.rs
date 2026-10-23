@@ -8,13 +8,19 @@
 //! In production, the transport will be a gRPC/QUIC channel. In tests, an
 //! in-memory channel is used (see [`transport`] module).
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::metadata::ClusterMetadata;
+use crate::propose::{
+    ApplyEffect, ClusterHandle, ClusterView, MetadataApplier, ProposalRequest, ProposeError,
+};
 use crate::raft::{ClusterCommand, OutboundMessage, RaftMessage, RaftNode, RaftState};
 
 // ── Transport abstraction ─────────────────────────────────────────────────────
@@ -38,20 +44,76 @@ pub trait ClusterTransport: Send + Sync {
 ///
 /// Drives the Raft state machine forward via periodic ticks and delivers
 /// committed log entries to the local [`ClusterMetadata`] state machine.
+enum DrivePlan {
+    Proposed { index: u64, term: u64 },
+    Forward(Option<String>),
+    Wait,
+}
+
+enum WaiterState {
+    /// Not yet proposed or forwarded.
+    Pending,
+    /// Sent to `to`; do not send again until the leader changes or they reject.
+    Forwarded { to: String },
+    /// `to` rejected. `hint` is who they believe the leader is.
+    Rejected { hint: Option<String> },
+    /// Appended locally at `index`/`term`. Completed when that entry is applied.
+    Proposed { index: u64, term: u64 },
+}
+
+struct Waiter {
+    command: ClusterCommand,
+    deadline: Instant,
+    state: WaiterState,
+    ack: tokio::sync::oneshot::Sender<Result<ApplyEffect, ProposeError>>,
+}
+
 pub struct ClusterNode {
     pub raft: RaftNode,
     pub metadata: ClusterMetadata,
     transport: Box<dyn ClusterTransport>,
+    /// Cloneable proposer the engine/HTTP layer holds.
+    handle: ClusterHandle,
+    proposal_rx: mpsc::UnboundedReceiver<ProposalRequest>,
+    waiters: HashMap<u64, Waiter>,
+    applier: Option<Arc<dyn MetadataApplier>>,
+    view: Arc<RwLock<ClusterView>>,
 }
 
 impl ClusterNode {
     /// Create a new cluster node with the given identity, peers, and transport.
     pub fn new(id: String, peers: Vec<String>, transport: Box<dyn ClusterTransport>) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let view = Arc::new(RwLock::new(ClusterView {
+            node_id: id.clone(),
+            state: RaftState::Follower,
+            leader_id: None,
+        }));
+        let handle = ClusterHandle::new(id.clone(), tx, Arc::clone(&view));
         ClusterNode {
             raft: RaftNode::new(id, peers),
             metadata: ClusterMetadata::new(),
             transport,
+            handle,
+            proposal_rx: rx,
+            waiters: HashMap::new(),
+            applier: None,
+            view,
         }
+    }
+
+    /// Handle the engine layer uses to propose metadata and read leadership.
+    pub fn handle(&self) -> ClusterHandle {
+        self.handle.clone()
+    }
+
+    /// Install the engine applier. Committed entries received after this call
+    /// are applied to local storage as well as [`ClusterMetadata`].
+    ///
+    /// Must be set before the first proposal. Entries applied with no applier
+    /// update only the in-memory metadata store.
+    pub fn set_applier(&mut self, applier: Arc<dyn MetadataApplier>) {
+        self.applier = Some(applier);
     }
 
     /// Tick the Raft state machine and dispatch any outbound messages.
@@ -60,7 +122,7 @@ impl ClusterNode {
     pub async fn tick(&mut self) -> Result<()> {
         let msgs = self.raft.tick();
         self.dispatch(msgs).await?;
-        self.apply_ready();
+        self.apply_ready().await;
         Ok(())
     }
 
@@ -68,9 +130,17 @@ impl ClusterNode {
     pub async fn handle_message(&mut self, from: &str, msg: RaftMessage) -> Result<()> {
         debug!(node = %self.raft.id, %from, "Handling inbound Raft message");
         let _ = from; // currently unused directly — sender is embedded in message
+        if let RaftMessage::ForwardRejected {
+            request_id,
+            leader_id,
+            ..
+        } = &msg
+        {
+            self.note_rejection(*request_id, leader_id.clone());
+        }
         let replies = self.raft.handle_message(msg);
         self.dispatch(replies).await?;
-        self.apply_ready();
+        self.apply_ready().await;
         Ok(())
     }
 
@@ -93,22 +163,32 @@ impl ClusterNode {
     /// before it resolves only abandons an in-flight `recv`/`send`, which Raft
     /// tolerates via retransmission.
     pub async fn step(&mut self, tick_interval: Duration) -> Result<()> {
-        // Try to receive a message within the tick interval.
-        let recv_result = tokio::time::timeout(tick_interval, self.transport.recv()).await;
-
-        match recv_result {
-            Ok(Ok((from, msg))) => {
-                self.handle_message(&from, msg).await?;
+        tokio::select! {
+            biased;
+            req = self.proposal_rx.recv() => {
+                if let Some(req) = req {
+                    self.accept_proposal(req).await;
+                }
             }
-            Ok(Err(e)) => {
-                warn!(node = %self.raft.id, error = %e, "Transport recv error");
+            recv_result = self.transport.recv() => {
+                match recv_result {
+                    Ok((from, msg)) => {
+                        if let Err(e) = self.handle_message(&from, msg).await {
+                            warn!(node = %self.raft.id, error = %e, "Raft message handling error");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(node = %self.raft.id, error = %e, "Transport recv error");
+                    }
+                }
             }
-            Err(_timeout) => {
-                // Timeout is normal — just tick.
-            }
+            _ = tokio::time::sleep(tick_interval) => {}
         }
 
         self.tick().await?;
+        self.expire_waiters();
+        self.pump_waiters().await;
+        self.refresh_view();
         Ok(())
     }
 
@@ -160,7 +240,11 @@ impl ClusterNode {
     }
 
     /// Drain and apply all newly committed log entries.
-    fn apply_ready(&mut self) {
+    ///
+    /// The engine applier runs before the waiting caller is released, so a
+    /// successful return means this node has the metadata locally and a
+    /// majority has the log entry.
+    async fn apply_ready(&mut self) {
         let entries = self.raft.ready();
         for entry in entries {
             debug!(
@@ -170,6 +254,208 @@ impl ClusterNode {
                 "Applying committed entry"
             );
             self.metadata.apply(entry.index, &entry.command);
+            let effect = if let Some(applier) = &self.applier {
+                applier.apply_metadata(&entry.command).await
+            } else {
+                ApplyEffect::Applied
+            };
+            // Request ids are per accepting node. A leader applying a
+            // forwarded entry must not complete its own waiter that happens
+            // to share the number.
+            if entry.command.client_origin() == Some(self.raft.id.as_str()) {
+                if let Some(request_id) = entry.command.client_request_id() {
+                    if let Some(waiter) = self.waiters.remove(&request_id) {
+                        let _ = waiter.ack.send(Ok(effect));
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_view(&self) {
+        let mut view = self.view.write().unwrap_or_else(|e| e.into_inner());
+        view.state = self.raft.state().clone();
+        view.leader_id = self.raft.leader_id().map(|s| s.to_string());
+    }
+
+    async fn accept_proposal(&mut self, req: ProposalRequest) {
+        if Instant::now() >= req.deadline {
+            let _ = req.ack.send(Err(self.deadline_error()));
+            return;
+        }
+        self.waiters.insert(
+            req.request_id,
+            Waiter {
+                command: req.command,
+                deadline: req.deadline,
+                state: WaiterState::Pending,
+                ack: req.ack,
+            },
+        );
+        self.drive_waiter(req.request_id).await;
+    }
+
+    fn deadline_error(&self) -> ProposeError {
+        if self.raft.is_leader() || self.raft.leader_id().is_some() {
+            ProposeError::Timeout
+        } else {
+            ProposeError::NoLeader
+        }
+    }
+
+    fn note_rejection(&mut self, request_id: u64, hint: Option<String>) {
+        let Some(waiter) = self.waiters.get_mut(&request_id) else {
+            return;
+        };
+        // A rejection from the node we forwarded to. Do not forward there again.
+        if let WaiterState::Forwarded { to } = &waiter.state {
+            if hint.as_deref() == Some(to.as_str()) {
+                waiter.state = WaiterState::Rejected { hint: None };
+                return;
+            }
+        }
+        waiter.state = WaiterState::Rejected { hint };
+    }
+
+    fn expire_waiters(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .waiters
+            .iter()
+            .filter(|(_, w)| now >= w.deadline)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            let Some(waiter) = self.waiters.remove(&id) else {
+                continue;
+            };
+            let err = match waiter.state {
+                WaiterState::Proposed { index, term }
+                    if self.raft.entry_term(index) != Some(term) =>
+                {
+                    ProposeError::LeadershipLost
+                }
+                _ => self.deadline_error(),
+            };
+            let _ = waiter.ack.send(Err(err));
+        }
+    }
+
+    async fn pump_waiters(&mut self) {
+        let ids: Vec<u64> = self.waiters.keys().copied().collect();
+        for id in ids {
+            self.drive_waiter(id).await;
+        }
+    }
+
+    async fn drive_waiter(&mut self, id: u64) {
+        let snapshot = {
+            let Some(waiter) = self.waiters.get(&id) else {
+                return;
+            };
+            if Instant::now() >= waiter.deadline {
+                return;
+            }
+            match &waiter.state {
+                WaiterState::Proposed { index, term } => DrivePlan::Proposed {
+                    index: *index,
+                    term: *term,
+                },
+                WaiterState::Forwarded { .. } => DrivePlan::Wait,
+                WaiterState::Rejected { hint } => DrivePlan::Forward(hint.clone()),
+                WaiterState::Pending => {
+                    DrivePlan::Forward(self.raft.leader_id().map(|s| s.to_string()))
+                }
+            }
+        };
+        if let DrivePlan::Proposed { index, term } = snapshot {
+            // The entry was truncated (new leader overwrote it) before it
+            // committed. Fail the caller; do not append a second copy here.
+            if self.raft.entry_term(index) != Some(term) && self.raft.commit_index() < index {
+                if let Some(waiter) = self.waiters.remove(&id) {
+                    let _ = waiter.ack.send(Err(ProposeError::LeadershipLost));
+                }
+            }
+            return;
+        }
+        if self.raft.is_leader() {
+            self.propose_waiter(id).await;
+            return;
+        }
+        let DrivePlan::Forward(target) = snapshot else {
+            return;
+        };
+        let Some(leader) = target.or_else(|| self.raft.leader_id().map(|s| s.to_string())) else {
+            return;
+        };
+        if leader == self.raft.id {
+            return;
+        }
+        self.forward_waiter(id, leader).await;
+    }
+
+    async fn propose_waiter(&mut self, id: u64) {
+        let Some(waiter) = self.waiters.get(&id) else {
+            return;
+        };
+        if matches!(waiter.state, WaiterState::Proposed { .. }) {
+            return;
+        }
+        let command = waiter.command.clone();
+        match self.raft.propose(command) {
+            Ok(index) => {
+                let term = self.raft.current_term();
+                if let Some(waiter) = self.waiters.get_mut(&id) {
+                    waiter.state = WaiterState::Proposed { index, term };
+                }
+                let msgs = self.raft.force_heartbeat();
+                let _ = self.dispatch(msgs).await;
+                // Single-node clusters commit inside propose(); apply now so
+                // the caller is not waiting for the next tick.
+                self.apply_ready().await;
+            }
+            Err(e) => {
+                warn!(node = %self.raft.id, error = %e, "propose failed; will forward");
+                if let Some(waiter) = self.waiters.get_mut(&id) {
+                    waiter.state = WaiterState::Pending;
+                }
+            }
+        }
+    }
+
+    async fn forward_waiter(&mut self, id: u64, leader: String) {
+        let Some(waiter) = self.waiters.get(&id) else {
+            return;
+        };
+        if matches!(&waiter.state, WaiterState::Forwarded { to } if to == &leader) {
+            return;
+        }
+        if matches!(waiter.state, WaiterState::Proposed { .. }) {
+            return;
+        }
+        let command = waiter.command.clone();
+        let term = self.raft.current_term();
+        let from = self.raft.id.clone();
+        match self
+            .transport
+            .send(
+                &leader,
+                RaftMessage::ForwardProposal {
+                    term,
+                    from,
+                    command,
+                },
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Some(waiter) = self.waiters.get_mut(&id) {
+                    waiter.state = WaiterState::Forwarded { to: leader };
+                }
+            }
+            Err(e) => {
+                warn!(node = %self.raft.id, to = %leader, error = %e, "failed to forward metadata proposal");
+            }
         }
     }
 }

@@ -19,6 +19,7 @@
 pub mod aggs;
 pub mod audit;
 pub mod bulk;
+pub mod cluster_apply;
 mod cluster_state;
 mod code_blocks;
 mod collection_publication;
@@ -47,6 +48,7 @@ mod bounded_ingest_resources_tests;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use cluster_apply::{EngineMetadataApplier, ReplicatedIndexSpec};
 pub use cluster_state::{ClusterStateBlockKind, ClusterStateBootStatus};
 pub use engine::{EmbeddingExecutionIdentity, Engine, HealthStatus, IndexInfo};
 pub use index::{

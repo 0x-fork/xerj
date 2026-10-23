@@ -864,6 +864,11 @@ pub struct Engine {
     /// `redb/src/error.rs:65`; Apache-2.0/MIT, shape adapted, no code
     /// copied).
     cluster_state_boot: Arc<ClusterStateBootStatus>,
+    /// Raft proposer for cluster metadata. `None` unless
+    /// [`Engine::attach_cluster`] ran, which the server does only after the
+    /// cluster transport is up. Single-node boots leave this empty and every
+    /// index create/delete/mapping/settings path stays local.
+    cluster: Arc<parking_lot::Mutex<Option<xerj_cluster::ClusterHandle>>>,
 }
 
 impl Engine {
@@ -1016,6 +1021,7 @@ impl Engine {
             _node_lock: node_lock,
             cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
             cluster_state_boot: Arc::new(cluster_state_status),
+            cluster: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         // A rejected cluster-state document means this binary cannot know the
@@ -1396,7 +1402,11 @@ impl Engine {
     /// into `schema` (adding any the schema does not already define). Applied
     /// on every create path so template behavior is independent of whether the
     /// caller supplied settings.
-    fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
+    ///
+    /// The cluster proposer calls this once and replicates the effective
+    /// schema. The applier must not call it again: nodes can have different
+    /// local templates, and a second pass would diverge.
+    pub(crate) fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
         let mut effective_schema = schema;
         if let Some(tmpl) = self.best_matching_template(name) {
             if let Some(props) = tmpl.mappings.get("properties") {
@@ -1449,7 +1459,9 @@ impl Engine {
         // must reject here so HTTP, gRPC, direct CLI, and Console callers share
         // the same fail-closed boundary.
         self.ensure_cluster_state_writable()?;
-        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+        // Same rejection order as before the exact-create split: a bad name
+        // fails before the visibility and already-exists checks.
+        let _ = IndexName::new(name).map_err(EngineError::Common)?;
 
         // Per-index authorization backstop (issue #79): a caller that may not
         // see this name must not be able to bring it into existence either —
@@ -1482,9 +1494,39 @@ impl Engine {
 
         // Apply matching template (highest priority wins) on every create path.
         let effective_schema = self.apply_index_template(name, schema);
+        self.create_index_exact(name, effective_schema, settings)
+    }
+
+    /// Create `name` with `schema` exactly as given.
+    ///
+    /// Does not apply index templates and does not consult the per-request
+    /// visibility guard. The single-node create path applies the template and
+    /// checks visibility first. The cluster applier calls this so every member
+    /// materialises the schema the accepting node already resolved.
+    pub(crate) fn create_index_exact(
+        &self,
+        name: &str,
+        schema: Schema,
+        settings: serde_json::Value,
+    ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+
+        if self.indices.contains_key(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_already_exists(name),
+            ));
+        }
+
+        if let Some(f) = self.failed_indices.get(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
+            ));
+        }
+
         let idx = Index::create_with_settings(
             index_name,
-            effective_schema,
+            schema,
             settings,
             &self.config,
             &self.data_dir,
@@ -2440,6 +2482,24 @@ impl Engine {
     /// sitting in the document on disk — the same lie in a different shape.
     /// A typed 503 is the only honest answer while the node cannot see the
     /// operator's configuration.
+    /// Install the Raft handle the server built for this process.
+    ///
+    /// Called once, after console bootstrap, so system indices created during
+    /// boot stay node-local. Later calls replace the handle.
+    pub fn attach_cluster(&self, handle: xerj_cluster::ClusterHandle) {
+        *self.cluster.lock() = Some(handle);
+    }
+
+    /// `true` when metadata writes must go through the Raft log.
+    pub fn has_cluster(&self) -> bool {
+        self.cluster.lock().is_some()
+    }
+
+    /// Clone of the proposer. The lock is not held across the subsequent await.
+    pub fn cluster_handle(&self) -> Option<xerj_cluster::ClusterHandle> {
+        self.cluster.lock().clone()
+    }
+
     pub fn ensure_cluster_state_writable(&self) -> Result<()> {
         if self.cluster_state_boot.is_writable() {
             return Ok(());
@@ -3094,6 +3154,33 @@ impl Engine {
                 xerj_common::XerjError::index_not_found(name),
             ));
         }
+        if let Some(handle) = self.cluster_handle() {
+            // A name this node does not have is a local 404. Proposing it
+            // would delete the index on peers and, on the ES surface, come
+            // back as acknowledged once the not-found is swallowed.
+            if !self.indices.contains_key(name) && !self.failed_indices.contains_key(name) {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::index_not_found(name),
+                ));
+            }
+            let effect = handle
+                .propose(xerj_cluster::ClusterCommand::DeleteIndex {
+                    name: name.to_string(),
+                })
+                .await
+                .map_err(crate::cluster_apply::propose_error)?;
+            return crate::cluster_apply::effect_result(name, effect);
+        }
+        self.delete_index_local(name).await
+    }
+
+    /// Remove `name` from this node's storage.
+    ///
+    /// Does not propose. The cluster applier calls this after the delete has
+    /// committed. The single-node [`Engine::delete_index`] falls through here
+    /// after the visibility check.
+    pub(crate) async fn delete_index_local(&self, name: &str) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
         match self.indices.remove(name).map(|(_, v)| v) {
             Some(idx) => {
                 // The handle is pulled out of the map first so no write can

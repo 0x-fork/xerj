@@ -72,6 +72,54 @@ pub enum ClusterCommand {
         key: String,
         value: String,
     },
+    /// `PUT /{index}/_settings` body, applied by the engine on every member.
+    ///
+    /// `settings_json` is the request body as the accepting node validated it.
+    /// [`crate::metadata::ClusterMetadata`] records it; the engine applier is
+    /// what merges it into the live index.
+    UpdateIndexSettings {
+        index: String,
+        settings_json: String,
+    },
+    /// A client-originated metadata command.
+    ///
+    /// `request_id` is unique on the node that accepted the caller. That node
+    /// completes the waiting request when this entry is applied. Other nodes
+    /// apply `inner` and ignore the id. The wrapper is persisted with the
+    /// log entry so a restarted node (once the server opens the file log)
+    /// can still tell client entries from internal ones.
+    ClientMetadata {
+        /// Node that accepted the caller. Only that node completes a waiter.
+        origin: String,
+        request_id: u64,
+        inner: Box<ClusterCommand>,
+    },
+}
+
+impl ClusterCommand {
+    /// The originator's request id, if this entry was proposed for a waiting caller.
+    pub fn client_request_id(&self) -> Option<u64> {
+        match self {
+            ClusterCommand::ClientMetadata { request_id, .. } => Some(*request_id),
+            _ => None,
+        }
+    }
+
+    /// Node that accepted the waiting caller, if this entry is a client proposal.
+    pub fn client_origin(&self) -> Option<&str> {
+        match self {
+            ClusterCommand::ClientMetadata { origin, .. } => Some(origin.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The metadata operation, unwrapping one [`ClusterCommand::ClientMetadata`] layer.
+    pub fn as_metadata(&self) -> &ClusterCommand {
+        match self {
+            ClusterCommand::ClientMetadata { inner, .. } => inner,
+            other => other,
+        }
+    }
 }
 
 /// A single entry in the Raft replicated log.
@@ -120,6 +168,38 @@ pub enum RaftMessage {
         term: u64,
         vote_granted: bool,
     },
+    /// Follower → leader: please propose this metadata command.
+    ///
+    /// Not a Raft RPC. A follower that accepted an HTTP metadata write forwards
+    /// it here instead of appending to its own log. The leader proposes it
+    /// through the normal path; the follower completes its caller when the
+    /// committed entry is applied locally.
+    ForwardProposal {
+        term: u64,
+        from: String,
+        command: ClusterCommand,
+    },
+    /// Leader (or whoever received [`RaftMessage::ForwardProposal`]) → originator:
+    /// this node did not propose the command.
+    ForwardRejected {
+        term: u64,
+        from: String,
+        request_id: u64,
+        /// Who the rejector believes the leader is, if anyone.
+        leader_id: Option<String>,
+        reason: String,
+    },
+}
+
+fn message_term(msg: &RaftMessage) -> u64 {
+    match msg {
+        RaftMessage::AppendEntries { term, .. }
+        | RaftMessage::AppendEntriesResponse { term, .. }
+        | RaftMessage::RequestVote { term, .. }
+        | RaftMessage::RequestVoteResponse { term, .. }
+        | RaftMessage::ForwardProposal { term, .. }
+        | RaftMessage::ForwardRejected { term, .. } => *term,
+    }
 }
 
 /// An outbound message — the node ID of the recipient plus the payload.
@@ -286,12 +366,7 @@ impl RaftNode {
 
         // All servers: If RPC request or response contains term T > currentTerm:
         // set currentTerm = T, convert to follower (§5.1).
-        let msg_term = match &msg {
-            RaftMessage::AppendEntries { term, .. } => *term,
-            RaftMessage::AppendEntriesResponse { term, .. } => *term,
-            RaftMessage::RequestVote { term, .. } => *term,
-            RaftMessage::RequestVoteResponse { term, .. } => *term,
-        };
+        let msg_term = message_term(&msg);
         if msg_term > self.current_term {
             debug!(
                 node = %self.id,
@@ -349,6 +424,39 @@ impl RaftNode {
                 vote_granted,
             } => {
                 out.extend(self.handle_request_vote_response(from, term, vote_granted));
+            }
+            RaftMessage::ForwardProposal {
+                term,
+                from,
+                command,
+            } => {
+                if self.state == RaftState::Leader && term <= self.current_term {
+                    match self.propose(command) {
+                        Ok(_) => out.extend(self.force_heartbeat()),
+                        Err(e) => {
+                            warn!(node = %self.id, error = %e, "leader failed to propose forwarded command");
+                        }
+                    }
+                } else {
+                    out.push(OutboundMessage {
+                        to: from,
+                        msg: RaftMessage::ForwardRejected {
+                            term: self.current_term,
+                            from: self.id.clone(),
+                            request_id: command.client_request_id().unwrap_or(0),
+                            leader_id: self.leader_id.clone(),
+                            reason: format!(
+                                "node {} is not the raft leader (state={}, leader={:?})",
+                                self.id, self.state, self.leader_id
+                            ),
+                        },
+                    });
+                }
+            }
+            RaftMessage::ForwardRejected { .. } => {
+                // Term bookkeeping already ran above. The cluster node matches
+                // the request id to a waiting caller; the state machine has
+                // nothing else to record.
             }
         }
         out
@@ -471,7 +579,23 @@ impl RaftNode {
         self.commit_index
     }
 
+    /// Term of the log entry at `index`, if that entry is still present.
+    ///
+    /// A waiting proposer uses this to notice that its uncommitted entry was
+    /// truncated after a leadership change. `None` means the index is gone.
+    pub fn entry_term(&self, index: u64) -> Option<u64> {
+        self.log_entry(index).map(|e| e.term)
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
+
+    fn persist_commit_index(&mut self) {
+        if let Some(flog) = self.persistent.as_mut() {
+            if let Err(e) = flog.set_commit_index(self.commit_index) {
+                warn!(node = %self.id, error = %e, "failed to persist raft commit index");
+            }
+        }
+    }
 
     fn cluster_size(&self) -> usize {
         self.peers.len() + 1 // peers + self
@@ -703,6 +827,7 @@ impl RaftNode {
         //    min(leaderCommit, index of last new entry) (§5.3)
         if leader_commit > self.commit_index {
             self.commit_index = leader_commit.min(self.last_log_index());
+            self.persist_commit_index();
         }
 
         let match_index = self.last_log_index();
@@ -749,6 +874,7 @@ impl RaftNode {
             // Find the highest N such that a majority of match_index[i] ≥ N
             // and log[N].term == currentTerm (§5.4)
             let last_idx = self.last_log_index();
+            let prev_commit = self.commit_index;
             for n in (self.commit_index + 1..=last_idx).rev() {
                 if self.log_term_at(n) != self.current_term {
                     continue;
@@ -765,6 +891,14 @@ impl RaftNode {
                     self.commit_index = n;
                     break;
                 }
+            }
+            // Tell followers the new commit index now. Waiting for the next
+            // heartbeat tick leaves a committed metadata write invisible on
+            // the other members for a full tick after the caller was allowed
+            // to proceed.
+            if self.commit_index > prev_commit {
+                self.persist_commit_index();
+                return self.send_heartbeats();
             }
         } else {
             // Decrement next_index and retry

@@ -71,5 +71,6 @@ sha2         = "0.10"
 
 [dev-dependencies]
 tempfile     = { workspace = true }
+xerj-cluster = { path = "../xerj-cluster" }
 tower        = { workspace = true, features = ["util"] }
 http-body-util = "0.1"

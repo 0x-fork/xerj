@@ -150,6 +150,14 @@ pub enum XerjError {
     #[error("index [{index}] is blocked for {block_type} operations")]
     IndexBlocked { index: String, block_type: String },
 
+    // ── Cluster metadata ──────────────────────────────────────────────────
+    /// A cluster metadata write was not acknowledged.
+    ///
+    /// The change was not applied on this node. The reason is the proposal
+    /// error (no elected leader, timeout, shutdown, leadership lost).
+    #[error("{reason}")]
+    ClusterUnavailable { reason: String },
+
     // ── Catch-all ─────────────────────────────────────────────────────────
     /// An unexpected internal error. Indicates a bug.
     #[error("internal error: {reason}")]
@@ -278,6 +286,12 @@ impl XerjError {
         }
     }
 
+    pub fn cluster_unavailable(reason: impl Into<String>) -> Self {
+        Self::ClusterUnavailable {
+            reason: reason.into(),
+        }
+    }
+
     pub fn version_conflict(id: impl Into<String>, expected: u64, actual: u64) -> Self {
         Self::VersionConflict {
             id: id.into(),
@@ -317,7 +331,9 @@ impl XerjError {
             Self::IndexBlocked { .. } => 403,
             // The index exists but has no serving copy — ES answers the same
             // shape (no_shard_available_action_exception) with 503.
-            Self::IndexUnavailable { .. } | Self::ClusterStateUnavailable => 503,
+            Self::IndexUnavailable { .. }
+            | Self::ClusterStateUnavailable
+            | Self::ClusterUnavailable { .. } => 503,
             Self::AuthError { .. } => 401,
             Self::ResourceExhausted { .. } | Self::CircuitBreaking { .. } => 429,
             Self::StorageError { .. }
@@ -338,6 +354,7 @@ impl XerjError {
                 | Self::StorageError { .. }
                 | Self::WalError { .. }
                 | Self::EmbeddingError { .. }
+                | Self::ClusterUnavailable { .. }
         )
     }
 

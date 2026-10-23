@@ -184,7 +184,22 @@ pub async fn create_index(
         }
     }
 
-    if let Err(e) = state.engine.create_index(&name_str, schema) {
+    let create_result = if state.engine.has_cluster() {
+        state
+            .engine
+            .replicate_index_create(xerj_engine::ReplicatedIndexSpec {
+                name: name_str.clone(),
+                schema,
+                settings: Value::Null,
+                mappings: Value::Null,
+                index_settings: Value::Null,
+                aliases: Value::Null,
+            })
+            .await
+    } else {
+        state.engine.create_index(&name_str, schema)
+    };
+    if let Err(e) = create_result {
         let xerj_err: xerj_common::XerjError = e.into();
         return native_error(
             xerj_err,

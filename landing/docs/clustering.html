@@ -234,23 +234,24 @@
   <h1>Clustering</h1>
 
 
-  <p>XERJ ships an <strong>embedded Raft implementation</strong> — no etcd, no ZooKeeper, no Consul. One binary is still one binary; cluster mode is a config switch, not a separate process. <strong>Where the ring stands today, plainly:</strong> leader election, heartbeats, and the authenticated inter-node transport are real and tested; nothing in the production write path rides on the log yet. Indices, mappings, and documents are node-local — a document indexed on one node is not visible on another until the replication work lands (public tracking: <a href="https://github.com/xerj-org/xerj/issues/1170">xerj-org/xerj#1170</a>). If you need a second live copy of your data today, use the <a href="/docs/config#wal_tap">WAL tap</a> or per-node backups.</p>
+  <p>XERJ ships an <strong>embedded Raft implementation</strong> — no etcd, no ZooKeeper, no Consul. One binary is still one binary; cluster mode is a config switch, not a separate process. <strong>Where the ring stands today, plainly:</strong> leader election, heartbeats, and the authenticated inter-node transport are real, and <strong>index metadata</strong> (create, delete, mapping, and settings) is proposed through the Raft log and applied on every member. Documents are still node-local. A document indexed on one node is not visible on another (public tracking for the rest of the wiring: <a href="https://github.com/xerj-org/xerj/issues/1170">xerj-org/xerj#1170</a>). If you need a second live copy of your data today, use the <a href="/docs/config#wal_tap">WAL tap</a> or per-node backups.</p>
 
   <h2>What cluster mode does not give you yet</h2>
   <div class="enum-list">
-    <div class="item">No metadata replication<span class="dsc">An index created on node A does not exist on node B — no production path proposes a ClusterCommand yet.</span></div>
-    <div class="item">No document replication<span class="dsc">PUT a document on node A, GET it from node B: <code class="inline">404 index_not_found</code>. Measured on a 3-node ring.</span></div>
-    <div class="item">No shard routing<span class="dsc">No forwarding to a primary, no replica reads. Each node's API serves that node's storage only.</span></div>
+    <div class="item">No document replication<span class="dsc">The index exists on every member after create. The documents do not. <code class="inline">PUT n1/idx/_doc/1</code> then <code class="inline">GET n2/idx/_doc/1</code> is <code class="inline">404</code>. <code class="inline">GET n2/idx</code> is <code class="inline">200</code>.</span></div>
+    <div class="item">No shard routing<span class="dsc">No forwarding to a primary, no replica reads. Each node's API serves that node's storage only. <code class="inline">Engine::route_write</code> is unchanged.</span></div>
+    <div class="item">No snapshot catch-up<span class="dsc">A node that missed a metadata entry does not install it later. The server's Raft log is in memory; restart keeps indices already applied in that node's data directory and does not replay entries it never saw.</span></div>
     <div class="item">No node-lifecycle APIs<span class="dsc">There is no drain / activate / remove endpoint and no region split-merge. Earlier revisions of this page documented them; the binary has never shipped them.</span></div>
   </div>
-  <p>Treat a clustered node's data durability exactly like a single node's.</p>
+  <p>Treat a clustered node's <em>document</em> durability exactly like a single node's. Index metadata is the exception, and only while a leader can commit.</p>
 
   <h2>What you get</h2>
   <ul>
     <li><strong>Leader election</strong> — exactly one leader per term, randomized 150–300 ms election timeouts, automatic failover. Measured on a 3-node loopback ring (tick 50 ms): a new leader within ~250 ms of killing the leader, then election-stable for minutes. Leader death used to cause perpetual election churn — fixed by <a href="https://github.com/xerj-org/xerj/issues/1168">#1168</a>.</li>
     <li><strong>Authenticated transport</strong> — every inter-node connection is HMAC-SHA256 over a per-connection challenge using the cluster secret. There is no unauthenticated mode; the node refuses to start without a secret.</li>
     <li><strong>Dead-peer isolation</strong> — a hung or dead peer costs one <code class="inline">WARN</code> on the transition and a retry ladder backing off 100 ms → 6.4 s; it never delays messages to live peers.</li>
-    <li><strong>Durable local Raft log</strong> — each node persists its term, votes, and committed entries, and replays them on restart.</li>
+    <li><strong>Index metadata replication</strong> — <code class="inline">PUT /{index}</code>, <code class="inline">DELETE /{index}</code>, <code class="inline">PUT /{index}/_mapping</code>, and <code class="inline">PUT /{index}/_settings</code> are proposed on the member that received them. A follower forwards to the leader. The HTTP call succeeds only after the entry commits on a majority and this node has applied it. No elected leader, or a commit that does not land in time, is <code class="inline">503</code> and the change is not applied on the caller. With <code class="inline">[cluster] enabled = false</code> these calls stay local, as before.</li>
+    <li><strong>In-memory Raft log in the server</strong> — the on-disk log type exists and is tested, and the server does not open it. Applied indices live in each node's data directory, so a restart still has the indices it already applied. It does not catch up on a metadata change it missed.</li>
   </ul>
 
   <h2>Bootstrapping a 3-node cluster</h2>
@@ -305,7 +306,7 @@ tick_ms = 50</pre>
 $ xerj --config /etc/xerj/node-b.toml     # on 10.0.0.12
 $ xerj --config /etc/xerj/node-c.toml     # on 10.0.0.13</pre>
 
-  <p>Within a second the ring elects a leader. The honest place to watch it today is the log — the health endpoints report the node answering the request, not the ring's membership (that plumbing is part of the <a href="https://github.com/xerj-org/xerj/issues/1170">wiring work</a>):</p>
+  <p>Within a second the ring elects a leader. The log is still the place to see who won. <code class="inline">GET /_cluster/health</code> reports the <em>configured</em> membership (this node's address plus distinct peers), not a liveness probe and not a count of nodes holding your documents:</p>
 <pre class="code">$ journalctl -u xerj -f | grep xerj_cluster
 INFO xerj_cluster::transport: TCP transport listening (authenticated) node=10.0.0.11:9300
 INFO xerj_cluster::raft: Starting election node=10.0.0.12:9300 term=1
@@ -313,22 +314,29 @@ INFO xerj_cluster::raft: Became leader node=10.0.0.12:9300 term=1</pre>
 <pre class="code">$ curl -sH "Authorization: ApiKey $XERJ_API_KEY" \
     http://10.0.0.11:9200/_cluster/health | jq '.status, .number_of_nodes'
 "green"
-1</pre>
+3</pre>
 
-  <h2>Indexes and data are node-local today</h2>
-  <p>Index creation, mappings, and documents do not cross the wire — every node's API serves that node's <a href="/docs/storage">storage</a> only. There is no shard assignment to other members, no replica set, and no drain/region API; the sections that used to document them were removed because the binary has never shipped them.</p>
-  <p>For a second live copy of your data, point the <a href="/docs/config#wal_tap">WAL tap</a> at another XERJ or any ES-compatible target: it ships indexed writes near-real-time from the WAL, one-directional, without touching the write path.</p>
+  <h2>What replicates, and what stays on the node that wrote it</h2>
+  <p><code class="inline">PUT /orders</code> on any member — leader or follower — creates <code class="inline">orders</code> on every member, including its mapping and the settings and aliases in that request. <code class="inline">GET /orders</code> and <code class="inline">GET /orders/_mapping</code> on another member succeed after the call returns. <code class="inline">DELETE /orders</code> removes it on every member. A settings or mapping change is one log entry per concrete index. A follower that cannot reach a leader returns <code class="inline">503</code>; it does not create the index locally and report success.</p>
+  <p>Several things around that create stay on the accepting node, on purpose for this step:</p>
+  <ul>
+    <li><strong>Documents</strong>, including an index that a document write auto-creates, are local. The replicated create is the explicit index API.</li>
+    <li><strong>Index templates</strong> are not replicated. The accepting node applies its templates once and the effective schema is what the log carries.</li>
+    <li><strong>ILM/ISM attach</strong> from <code class="inline">index.lifecycle.name</code> runs on the accepting node only.</li>
+    <li><strong>Console system indices</strong> created at boot, before the ring is attached, stay local.</li>
+  </ul>
+  <p>There is still no shard assignment to other members and no replica set. For a second live copy of your documents, point the <a href="/docs/config#wal_tap">WAL tap</a> at another XERJ or any ES-compatible target: it ships indexed writes near-real-time from the WAL, one-directional, without touching the write path.</p>
 
   <h2>Failure modes</h2>
   <div class="enum-list">
-    <div class="item">Leader crash<span class="dsc">Followers time out and elect a new leader — measured ~250 ms on a 3-node loopback ring, including one split-vote retry. The ring stays stable with the dead member absent; its Raft log survives on disk for the rejoin.</span></div>
+    <div class="item">Leader crash<span class="dsc">Followers time out and elect a new leader — measured ~250 ms on a 3-node loopback ring, including one split-vote retry. The ring stays stable with the dead member absent. Metadata already applied on the survivors stays; the dead member's in-memory log does not.</span></div>
     <div class="item">Hung or dead peer<span class="dsc">One WARN on the down transition, then quiet: retries back off 100 ms → 6.4 s, and messages to live peers are never delayed behind a dead one. A peer that answers again logs "peer reachable again" at INFO.</span></div>
     <div class="item">Minority partition<span class="dsc">The minority side cannot reach quorum and its elections never conclude; the majority side keeps its leader. Raft safety holds — at most one leader per term.</span></div>
-    <div class="item">Node rejoin<span class="dsc">Restart with the same config: the node replays its local Raft log and re-enters the election. Catch-up from the leader's log (snapshot install) is part of the wiring roadmap.</span></div>
+    <div class="item">Node rejoin<span class="dsc">Restart with the same config: the node re-enters the election with an empty in-memory Raft log. Indices it already applied are still in its data directory. A metadata change committed while it was down is not installed. Snapshot catch-up is still open (<a href="https://github.com/xerj-org/xerj/issues/1170">#1170</a>).</span></div>
   </div>
 
   <h2>When not to cluster</h2>
-  <p>Today, almost always. Until the replication wiring lands, cluster mode gives you a leader-election ring — not copies of your data. One node avoids network round-trips, needs no quorum, and is trivial to back up; add a WAL tap to a second node if you want a live spare. The default config ships with <code class="inline">[cluster] enabled = false</code>.</p>
+  <p>When you need copies of documents. Cluster mode now keeps index metadata in step and still does not copy documents, route shards, or catch a rejoining node up. One node avoids network round-trips, needs no quorum, and is trivial to back up; add a WAL tap to a second node if you want a live spare of the data. The default config ships with <code class="inline">[cluster] enabled = false</code>.</p>
 
   <p class="source-note">Source · engine/crates/xerj-cluster/src/raft.rs · engine/crates/xerj-cluster/src/transport.rs · engine/crates/xerj-cluster/src/runner.rs</p>
   

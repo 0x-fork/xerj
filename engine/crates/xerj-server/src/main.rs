@@ -3870,6 +3870,14 @@ async fn async_main() -> Result<()> {
     } else {
         xerj_api::state::ClusterTransportStatus::Disabled
     };
+    // The runner starts only after AppState exists, so the engine applier
+    // and the propose handle are installed first. Console bootstrap (below)
+    // still runs against the unattached engine: system indices stay local.
+    let mut pending_cluster: Option<(
+        ClusterNode,
+        std::time::Duration,
+        tokio::sync::watch::Receiver<bool>,
+    )> = None;
     let _cluster_shutdown = if cfg.cluster.enabled && storage_available {
         // Fail closed (issue #75). The cluster port carries Raft control
         // messages; without a shared secret every frame on it is
@@ -3950,11 +3958,8 @@ async fn async_main() -> Result<()> {
                     .collect();
 
                 let node = ClusterNode::new(node_id.clone(), peer_ids, Box::new(transport));
-                let mut runner = ClusterRunner::new(node, tick, shutdown_rx);
-
-                info!(node = %node_id, "Starting cluster runner (Raft mode)");
                 cluster_transport_outcome = xerj_api::state::ClusterTransportStatus::Running;
-                tokio::spawn(async move { runner.run().await });
+                pending_cluster = Some((node, tick, shutdown_rx));
             }
             Err(e) => {
                 error!("Failed to start cluster TCP transport: {e:#}");
@@ -4159,6 +4164,20 @@ async fn async_main() -> Result<()> {
     //   single-node while the operator believes it is clustered — this is
     //   what lets /_cluster/health say yellow instead of green forever.
     state.cluster_transport = cluster_transport_outcome;
+
+    // Metadata writes propose through this handle. The runner applies
+    // committed entries onto `state.engine` before any router is built, so
+    // the first request already sees a node that can elect and replicate.
+    if let Some((mut node, tick, shutdown_rx)) = pending_cluster {
+        node.set_applier(std::sync::Arc::new(xerj_engine::EngineMetadataApplier {
+            engine: std::sync::Arc::clone(&state.engine),
+        }));
+        let node_id = node.raft.id.clone();
+        state.engine.attach_cluster(node.handle());
+        let mut runner = ClusterRunner::new(node, tick, shutdown_rx);
+        info!(node = %node_id, "Starting cluster runner (Raft mode)");
+        tokio::spawn(async move { runner.run().await });
+    }
 
     // 9b-iia. Decide-ladder override (#1057): `--decide-mode` /
     //   `--decide-model-dir` flags or XERJ_DECIDE_MODE / XERJ_DECIDE_MODEL_DIR

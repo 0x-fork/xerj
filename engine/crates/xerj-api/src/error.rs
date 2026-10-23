@@ -310,6 +310,7 @@ impl IntoResponse for ApiError {
 /// | `VersionConflict` | `version_conflict_engine_exception` | 409 |
 /// | `ResultWindowTooLarge` | `illegal_argument_exception` | 400 |
 /// | `IndexBlocked` | `cluster_block_exception` | 403 |
+/// | `ClusterUnavailable` | `master_not_discovered_exception` or `cluster_unavailable_exception` | 503 |
 /// | `Internal` | `internal_server_error_exception` | 500 |
 fn xerj_error_type(e: &XerjError) -> String {
     match e {
@@ -351,6 +352,16 @@ fn xerj_error_type(e: &XerjError) -> String {
         XerjError::ResultWindowTooLarge { .. } => "illegal_argument_exception",
         // ── Index blocks ──────────────────────────────────────────────────
         XerjError::IndexBlocked { .. } => "cluster_block_exception",
+        // No leader is the ES "master not discovered" case. Any other reason
+        // (timeout, leadership lost, shutting down) is a generic 503: the
+        // write was not acknowledged and was not applied on this node.
+        XerjError::ClusterUnavailable { reason } => {
+            if reason.contains("no elected raft leader") {
+                "master_not_discovered_exception"
+            } else {
+                "cluster_unavailable_exception"
+            }
+        }
         // ── Catch-all ─────────────────────────────────────────────────────
         XerjError::Internal { .. } => "internal_server_error_exception",
     }

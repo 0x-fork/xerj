@@ -50,6 +50,7 @@ pub mod auth;
 pub mod coordinator;
 pub mod metadata;
 pub mod node;
+pub mod propose;
 pub mod raft;
 pub mod raft_log;
 pub mod regions;
@@ -67,6 +68,7 @@ pub use coordinator::{
 };
 pub use metadata::{ClusterMetadata, IndexMetadata, NodeInfo, NodeState};
 pub use node::{ClusterNode, ClusterTransport};
+pub use propose::{ApplyEffect, ClusterHandle, MetadataApplier, ProposeError};
 pub use raft::{ClusterCommand, LogEntry, RaftMessage, RaftNode, RaftState};
 pub use regions::{Region, RegionManager, RegionMove};
 pub use replication::{
