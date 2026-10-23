@@ -6,7 +6,7 @@
 //! store for O(N) term/range/agg queries without JSON parsing per document.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -2826,18 +2826,25 @@ impl FrozenClaim {
             )
         });
         // Free the dead generations off the publish critical path.  If
-        // thread spawn fails the Arcs drop inline: same correctness, we
-        // only lose the async-free optimisation.  #1122: std PANICS when
-        // the new thread's alternate signal stack cannot be allocated, and
-        // the shipped profile is panic=abort, so under memory pressure the
-        // spawn is not attempted at all — the Arcs drop inline right here,
-        // on the same fallback path the comment always intended.
-        // `try_spawn` consults the governor's spawn gate (installed by
-        // `governor::init`) and hands the job back on a refusal or a failed
-        // spawn; dropping the returned job frees the Arcs inline.
+        // the thread cannot be created — the governor watermark is already
+        // engaged, `pthread_create` fails, or (the #1122 failure) the new
+        // thread's stack cannot be reserved — the Arcs drop inline: same
+        // correctness, we only lose the async-free optimisation. The spawn
+        // itself must not panic: std panics *inside* the child when its
+        // alternate signal stack cannot be mapped, and the release profile
+        // is panic=abort, so that one allocation used to kill the node.
+        // `try_spawn` uses a non-panicking spawn and hands the job back;
+        // dropping the job frees the Arcs on this thread. Logged once so a
+        // flush storm under pressure does not emit a line per generation.
+        static DRAIN_FREE_DEGRADED: AtomicBool = AtomicBool::new(false);
         if let Err(failure) =
             xerj_common::thread_spawn::try_spawn("xerj-drain-free", move || drop(dead))
         {
+            xerj_common::thread_spawn::warn_best_effort_degraded(
+                &DRAIN_FREE_DEGRADED,
+                "xerj-drain-free",
+                &failure.error,
+            );
             drop(failure.job);
         }
         guard

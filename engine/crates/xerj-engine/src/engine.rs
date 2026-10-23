@@ -5376,7 +5376,7 @@ mod governor_thread_spawn_tests {
             &self,
             _name: &str,
             _job: BoxedJob,
-        ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        ) -> std::io::Result<xerj_common::thread_spawn::SpawnedThread> {
             Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
         }
     }

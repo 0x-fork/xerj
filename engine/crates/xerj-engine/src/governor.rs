@@ -190,14 +190,16 @@ impl ResourceGovernor {
         self.memory_tripped.load(Ordering::Relaxed)
     }
 
-    /// Whether it is safe to spawn a helper thread right now (#1122).
+    /// Whether it is safe to spawn a best-effort helper thread right now (#1122).
     ///
-    /// `std::thread::Builder::spawn` **panics** — it does not return `Err` —
-    /// when the new thread's alternate signal stack cannot be mmap'd under
-    /// memory exhaustion, and the shipped profile is `panic = "abort"`, so one
-    /// ENOMEM at spawn time aborts the whole node. Callers on flush/publish
-    /// paths that have an inline fallback must check this and take the
-    /// fallback instead of spawning.
+    /// `std::thread::Builder::spawn` panics inside the new thread when the
+    /// alternate signal stack cannot be mmap'd, and the shipped profile is
+    /// `panic = "abort"`, so that panic aborts the node. The engine's helper
+    /// spawner does not use that path (a failed `pthread_create` is an
+    /// `Err`), and this gate skips the attempt entirely once the breaker is
+    /// engaged so a flush storm does not keep reserving stacks. Callers on
+    /// flush/publish paths that have an inline fallback must check this and
+    /// take the fallback instead of spawning.
     ///
     /// Reads the *live* RSS (`current_rss_bytes`), not the sampler's last
     /// value, so an RSS spike between samples cannot sneak a spawn through;

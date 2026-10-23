@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A best-effort helper thread that cannot be created no longer aborts the
+  process. On Unix those threads are started with `pthread_create` and do not
+  map an alternate signal stack, so the allocation failure that used to panic
+  inside the child (`failed to allocate an alternative stack`, os error 12)
+  comes back as an error. Drain-free drops the generation on the caller; pool
+  work runs inline; WAL fsync, background merge, and the ingest-memory trace
+  skip the thread and retry or stay off; share-tunnel and ONNX init fail that
+  startup step. Each site logs once. `panic = "abort"` is unchanged
+  ([#1122](https://github.com/xerj-org/xerj/issues/1122)).
+
 - `xerj corpus add <name> <local-path>` copies the checkout's root
   `.xerjignore` into the clone when that file is untracked or has uncommitted
   edits. `git clone` only checks out committed files, so the ignore file was

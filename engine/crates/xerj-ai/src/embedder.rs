@@ -85,54 +85,58 @@ impl<T: Send + Sync + 'static> CancellationSafeInit<T> {
             let worker_name = thread_name.clone();
             let started = std::time::Instant::now();
             tracing::info!(%thread_name, "ONNX lazy initialization scheduled");
-            let spawn = std::thread::Builder::new()
-                .name(thread_name.clone())
-                .spawn(move || {
-                    let mut completion = InitCompletionGuard {
-                        shared: std::sync::Arc::clone(&shared),
-                        armed: true,
-                    };
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match load() {
-                            Ok(value) => Ok(std::sync::Arc::new(value)),
-                            Err(error) => Err(std::sync::Arc::<str>::from(format!("{error:#}"))),
-                        }))
-                        .unwrap_or_else(|payload| {
-                            let detail = if let Some(message) = payload.downcast_ref::<&str>() {
-                                (*message).to_string()
-                            } else if let Some(message) = payload.downcast_ref::<String>() {
-                                message.clone()
-                            } else {
-                                "non-string panic payload".to_string()
-                            };
-                            Err(std::sync::Arc::<str>::from(format!(
-                                "ONNX initialization loader panicked: {detail}"
-                            )))
-                        });
-                    let elapsed_ms = started.elapsed().as_millis();
-                    let _ = shared.result.set(result);
-                    shared.notify.notify_waiters();
-                    completion.armed = false;
+            // #1122: Builder::spawn panics in the child when the alternate
+            // signal stack cannot be mapped (`panic = "abort"` kills the
+            // node). A failed spawn publishes the error on the same path
+            // an `Err` from pthread_create already took.
+            let spawn = xerj_common::thread_spawn::try_spawn_unguarded(&thread_name, move || {
+                let mut completion = InitCompletionGuard {
+                    shared: std::sync::Arc::clone(&shared),
+                    armed: true,
+                };
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match load() {
+                        Ok(value) => Ok(std::sync::Arc::new(value)),
+                        Err(error) => Err(std::sync::Arc::<str>::from(format!("{error:#}"))),
+                    }))
+                    .unwrap_or_else(|payload| {
+                        let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                            (*message).to_string()
+                        } else if let Some(message) = payload.downcast_ref::<String>() {
+                            message.clone()
+                        } else {
+                            "non-string panic payload".to_string()
+                        };
+                        Err(std::sync::Arc::<str>::from(format!(
+                            "ONNX initialization loader panicked: {detail}"
+                        )))
+                    });
+                let elapsed_ms = started.elapsed().as_millis();
+                let _ = shared.result.set(result);
+                shared.notify.notify_waiters();
+                completion.armed = false;
 
-                    let published = shared
-                        .result
-                        .get()
-                        .expect("initialization result was just published");
-                    match published {
-                        Ok(_) => tracing::info!(
-                            thread_name = %worker_name,
-                            elapsed_ms,
-                            "ONNX lazy initialization completed"
-                        ),
-                        Err(error) => tracing::error!(
-                            thread_name = %worker_name,
-                            elapsed_ms,
-                            %error,
-                            "ONNX lazy initialization failed"
-                        ),
-                    }
-                });
-            if let Err(error) = spawn {
+                let published = shared
+                    .result
+                    .get()
+                    .expect("initialization result was just published");
+                match published {
+                    Ok(_) => tracing::info!(
+                        thread_name = %worker_name,
+                        elapsed_ms,
+                        "ONNX lazy initialization completed"
+                    ),
+                    Err(error) => tracing::error!(
+                        thread_name = %worker_name,
+                        elapsed_ms,
+                        %error,
+                        "ONNX lazy initialization failed"
+                    ),
+                }
+            });
+            if let Err(failure) = spawn {
+                let error = failure.error;
+                drop(failure.job);
                 let error = std::sync::Arc::<str>::from(format!(
                     "spawn ONNX initialization thread {thread_name}: {error}"
                 ));
