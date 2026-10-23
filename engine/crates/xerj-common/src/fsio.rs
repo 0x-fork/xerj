@@ -151,9 +151,16 @@ pub fn stage_written_file(
 /// never torn, exactly as per-file durable writes did. What changes is the
 /// cost: two device flushes for the batch instead of two per file, which on
 /// Apple targets is the difference between ~250 cache drains per segment and
-/// two. If a rename fails, the files already moved stay moved and the rest are
-/// removed, which is also what a failure part-way through a loop of
-/// [`write_file_durable`] calls left behind.
+/// two.
+///
+/// If a rename fails, destinations already replaced by *this* call are
+/// removed and the remaining temps are dropped. FTS side-cars are new files
+/// under a fresh segment id, so that rollback leaves the directory empty of
+/// this batch instead of a half-published family. A later directory fsync
+/// failure does not roll those names back: the bytes are already complete,
+/// and removing them would turn a durability-confirmation error into missing
+/// files. Callers that replace a pre-existing file they still need must not
+/// use this batch helper.
 pub fn publish_staged(dir: &Path, files: Vec<StagedFile>) -> std::io::Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -166,13 +173,30 @@ pub fn publish_staged(dir: &Path, files: Vec<StagedFile>) -> std::io::Result<()>
     }
     #[cfg(target_vendor = "apple")]
     sync_file_full(&std::fs::File::open(dir)?)?;
+    let mut published_dests = Vec::with_capacity(files.len());
     for mut file in files {
-        replace_file_for_durable_write(&file.tmp, &file.dest)?;
+        if let Err(error) = replace_file_for_durable_write(&file.tmp, &file.dest) {
+            for dest in &published_dests {
+                let _ = std::fs::remove_file(dest);
+            }
+            return Err(error);
+        }
         file.published = true;
+        published_dests.push(file.dest.clone());
     }
     #[cfg(not(windows))]
     fsync_dir(dir)?;
     Ok(())
+}
+
+/// Windows `MoveFileExW` returns these when a scanner still has the temp
+/// open at the moment of the replace. They are transient for the FTS publish
+/// path (the handle is ours and already closed). `ERROR_FILE_NOT_FOUND` (2)
+/// is not: retrying it hides a missing temp.
+#[cfg(any(windows, test))]
+fn replace_lock_should_retry(os_code: Option<i32>, retries_already: u32) -> bool {
+    const REPLACE_LOCK_RETRIES: u32 = 6;
+    retries_already < REPLACE_LOCK_RETRIES && matches!(os_code, Some(5 | 32 | 33))
 }
 
 /// Windows has no supported directory-flush primitive to call here:
@@ -272,20 +296,34 @@ fn replace_file_for_durable_write(source: &Path, destination: &Path) -> std::io:
 
     let source = wide_path(source)?;
     let destination = wide_path(destination)?;
-    // SAFETY: both buffers are NUL-terminated and live through the call.
-    // The flags request replacement plus synchronous persistence; no
-    // COPY_ALLOWED flag is present, and our temp file is same-directory.
-    let succeeded = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if succeeded == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    let mut retries_already = 0u32;
+    loop {
+        // SAFETY: both buffers are NUL-terminated and live through the call.
+        // The flags request replacement plus synchronous persistence; no
+        // COPY_ALLOWED flag is present, and our temp file is same-directory.
+        let succeeded = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if replace_lock_should_retry(error.raw_os_error(), retries_already) {
+            retries_already += 1;
+            // A filter driver (Defender, DLP) often locks a just-closed file
+            // for a scan. Short backoff covers that without turning a
+            // permanent access error into a long stall: six waits are
+            // 10+20+…+60 ms.
+            std::thread::sleep(std::time::Duration::from_millis(
+                10 * u64::from(retries_already),
+            ));
+            continue;
+        }
+        return Err(error);
     }
 }
 
@@ -465,6 +503,46 @@ mod tests {
         drop(stage_file(&a, b"alpha").unwrap());
         assert!(!a.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn replace_lock_retries_sharing_violations_but_not_a_missing_temp() {
+        assert!(replace_lock_should_retry(Some(5), 0));
+        assert!(replace_lock_should_retry(Some(32), 5));
+        assert!(replace_lock_should_retry(Some(33), 0));
+        assert!(!replace_lock_should_retry(Some(32), 6));
+        assert!(!replace_lock_should_retry(Some(2), 0));
+        assert!(!replace_lock_should_retry(None, 0));
+    }
+
+    #[test]
+    fn publish_staged_rolls_back_a_partial_rename_and_a_later_publish_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let published = dir.path().join("a.post");
+        let blocked = dir.path().join("b.meta");
+        // A directory sitting on the destination makes the second replace fail
+        // after the first has already moved into place.
+        std::fs::create_dir(&blocked).unwrap();
+        let staged = vec![
+            stage_file(&published, b"alpha").unwrap(),
+            stage_file(&blocked, b"beta").unwrap(),
+        ];
+        let error = publish_staged(dir.path(), staged).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !published.exists(),
+            "a dest renamed earlier in the batch must be removed"
+        );
+        assert!(blocked.is_dir());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["b.meta".to_string()]);
+
+        let staged = vec![stage_file(&published, b"alpha-again").unwrap()];
+        publish_staged(dir.path(), staged).unwrap();
+        assert_eq!(std::fs::read(&published).unwrap(), b"alpha-again");
     }
 
     #[test]

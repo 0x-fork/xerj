@@ -2059,6 +2059,104 @@ mod flush_publication_recovery_tests {
         assert_eq!(result.hits[0].id, "survivor");
     }
 
+    /// Issue #2254. `page_Id` is a portable literal under filename layout v2,
+    /// so on NTFS it is the same file as `page_id`. The flush must publish
+    /// layout v3, keep both fields searchable, and still open after restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_case_field_flush_publishes_v3_and_restarts_searchable() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config.clone()).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("page_Id", FieldType::Text))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("page_id", FieldType::Text))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("component", FieldType::Text))
+            .unwrap();
+        engine.create_index("case-field-publish", schema).unwrap();
+        let idx = engine.get_index("case-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 1);
+        idx.index_document(
+            Some("jbar".into()),
+            json!({
+                "page_Id": "1212561321588641792",
+                "page_id": "other-page",
+                "component": "JBar3d"
+            }),
+        )
+        .await
+        .unwrap();
+        idx.index_document(
+            Some("jimg".into()),
+            json!({"component": "JImg", "page_id": "img-only"}),
+        )
+        .await
+        .unwrap();
+
+        idx.flush().await.unwrap();
+        assert_eq!(data_dir_format_version(&idx), 3);
+        assert_eq!(idx.memtable.doc_count(), 0);
+        let segment_names: Vec<String> = std::fs::read_dir(idx.data_dir.join("segments"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            segment_names
+                .iter()
+                .any(|name| name.ends_with(".fts-layout-v3")),
+            "{segment_names:?}"
+        );
+        assert!(segment_names
+            .iter()
+            .all(|name| !name.ends_with(".fts-layout-v2")));
+        let mut case_keys = std::collections::HashSet::new();
+        for name in segment_names.iter().filter(|name| name.ends_with(".fst")) {
+            assert!(
+                case_keys.insert(name.to_ascii_lowercase()),
+                "case-folded FTS sidecar collision: {name}"
+            );
+        }
+
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"component": "JBar3d"}},
+            "size": 10,
+            "track_total_hits": true
+        }))
+        .unwrap();
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "jbar");
+        let by_page = xerj_query::parse_request(&json!({
+            "query": {"match": {"page_Id": "1212561321588641792"}},
+            "size": 10
+        }))
+        .unwrap();
+        let result = idx.search(&by_page).await.unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].id, "jbar");
+        drop(idx);
+        drop(engine);
+
+        let restarted = crate::Engine::new(config).unwrap();
+        let idx = restarted.get_index("case-field-publish").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(data_dir_format_version(&idx), 3);
+        let result = idx.search(&request).await.unwrap();
+        assert_eq!(result.total.value, 1);
+        assert_eq!(result.hits[0].id, "jbar");
+        let result = idx.search(&by_page).await.unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].id, "jbar");
+    }
+
     /// Build a one-date-field index whose `ts` field carries `precision`.
     async fn date_index(
         engine: &crate::Engine,
@@ -13848,7 +13946,26 @@ impl Index {
                                         fts_writer.add_documents_parallel(&fts_input)
                                     }
                                 }
-                                if fts_writer.uses_encoded_field_filename_components() {
+                                if fts_writer
+                                    .uses_case_distinguished_field_filename_components()
+                                {
+                                    if let Err(e) = store_for_task
+                                        .ensure_fts_case_distinguished_field_component_format()
+                                    {
+                                        tracing::warn!(
+                                            "merge: case-distinguished FTS filename format preflight failed: {e:#}"
+                                        );
+                                        return Ok(());
+                                    }
+                                    if let Err(e) = fts_writer
+                                        .publish_case_distinguished_filename_layout()
+                                    {
+                                        tracing::warn!(
+                                            "merge: FTS filename-layout publication failed: {e:#}"
+                                        );
+                                        return Ok(());
+                                    }
+                                } else if fts_writer.uses_encoded_field_filename_components() {
                                     if let Err(e) = store_for_task
                                         .ensure_fts_encoded_field_component_format()
                                     {
@@ -13867,7 +13984,7 @@ impl Index {
                                     }
                                 }
                                 if let Err(e) = fts_writer.finish() {
-                                    tracing::warn!("merge: FTS build failed: {e}");
+                                    tracing::warn!("merge: FTS build failed: {e:#}");
                                 }
                                 Ok(())
                             });
@@ -34592,19 +34709,28 @@ async fn do_flush_shard(
                 fts_writer.add_documents_parallel(&drained_fts_for_build);
                 fts_add_us = t_add.elapsed().as_micros();
                 let t_fin = std::time::Instant::now();
-                if fts_writer.uses_encoded_field_filename_components() {
+                if fts_writer.uses_case_distinguished_field_filename_components() {
+                    store_for_warm.ensure_fts_case_distinguished_field_component_format()?;
+                    fts_writer
+                        .publish_case_distinguished_filename_layout()
+                        .map_err(|error| {
+                            xerj_storage::StorageError::Io(std::io::Error::other(format!(
+                                "FTS filename-layout publication failed: {error:#}"
+                            )))
+                        })?;
+                } else if fts_writer.uses_encoded_field_filename_components() {
                     store_for_warm.ensure_fts_encoded_field_component_format()?;
                     fts_writer
                         .publish_encoded_filename_layout()
                         .map_err(|error| {
                             xerj_storage::StorageError::Io(std::io::Error::other(format!(
-                                "FTS filename-layout publication failed: {error}"
+                                "FTS filename-layout publication failed: {error:#}"
                             )))
                         })?;
                 }
                 fts_writer.finish().map_err(|error| {
                     xerj_storage::StorageError::Io(std::io::Error::other(format!(
-                        "FTS side-car build failed: {error}"
+                        "FTS side-car build failed: {error:#}"
                     )))
                 })?;
                 fts_finish_us = t_fin.elapsed().as_micros();

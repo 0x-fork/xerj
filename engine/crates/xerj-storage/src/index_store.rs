@@ -39,10 +39,13 @@ use crate::{Result, SeqNo, StorageError};
 
 /// Highest on-disk data-directory format this binary can read.
 ///
-/// Version 2 reserves digest-derived FTS field filename components. A v2
-/// binary can read v1 raw side-cars, but a v1 binary must refuse a directory
-/// after the first v2 side-car can be created.
-const DATA_DIR_FORMAT_VERSION: u32 = 2;
+/// Version 2 reserves digest-derived FTS field filename components. Version 3
+/// reserves digest components for field names whose Windows case-identity is
+/// not the name itself (`page_Id` versus `page_id`, `ı` versus `i`, `ß`
+/// versus `ss`). A v3 binary reads v1 raw side-cars and v2 encoded side-cars.
+/// A v2 binary must refuse the directory once a v3 side-car can be created:
+/// it would look `page_Id` up as a literal filename and silently skip it.
+const DATA_DIR_FORMAT_VERSION: u32 = 3;
 
 /// Baseline written for fresh and pre-marker directories.
 ///
@@ -53,6 +56,10 @@ const DATA_DIR_BASE_FORMAT_VERSION: u32 = 1;
 
 /// First layout version that permits digest-derived FTS field components.
 const DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION: u32 = 2;
+
+/// First layout version that digest-encodes field names which collide under
+/// NTFS case folding but were portable literals in layout v2.
+const DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION: u32 = 3;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,10 +556,18 @@ pub struct IndexStore {
     /// directory-sync shim. The format lock serializes the false -> true
     /// transition so concurrent flush/merge retries cannot bypass confirmation.
     fts_v2_marker_durability_confirmed: AtomicBool,
+    /// Process-local proof that format version 3 has crossed the same
+    /// durable-publication boundary as the v2 flag. A confirmed v2 marker is
+    /// not proof of v3: the next case-distinguished field must still advance
+    /// 2 → 3. Confirming v3 also latches the v2 flag so a later v2 preflight
+    /// cannot rewrite the marker back down.
+    fts_v3_marker_durability_confirmed: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
     data_dir_format_write_failpoint: std::sync::atomic::AtomicU8,
     #[cfg(any(test, feature = "test-hooks"))]
     fts_v2_marker_durability_confirmations: AtomicU64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fts_v3_marker_durability_confirmations: AtomicU64,
     /// Actual memtable shard count, derived at open time from
     /// `IndexStoreConfig.num_wal_shards.max(1).next_power_of_two()`.
     num_shards: usize,
@@ -905,10 +920,13 @@ impl IndexStore {
             config,
             data_dir_format_lock: Mutex::new(()),
             fts_v2_marker_durability_confirmed: AtomicBool::new(false),
+            fts_v3_marker_durability_confirmed: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             data_dir_format_write_failpoint: std::sync::atomic::AtomicU8::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             fts_v2_marker_durability_confirmations: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fts_v3_marker_durability_confirmations: AtomicU64::new(0),
             num_shards,
             snapshot: ArcSwap::from_pointee(snapshot),
             wal_shards,
@@ -1654,7 +1672,7 @@ impl IndexStore {
     /// Unlink every on-disk file belonging to the given segment ids — the
     /// primary `.seg` plus all side-cars (`.sidx`, `.ids`, `.dv`,
     /// `.<field>.post` / `.fst` / `.meta` / `.norms`) and the optional
-    /// `.fts-layout-v2` discriminator.
+    /// `.fts-layout-v2` / `.fts-layout-v3` discriminator.
     ///
     /// Disk-space fix (2026-07): called by the engine merge task right
     /// after `apply_merge` commits, so merged-away input segments are
@@ -4292,11 +4310,31 @@ impl IndexStore {
     /// and merge callers inside that one supported writer process; opening
     /// multiple raw `IndexStore`s on the same directory remains unsupported.
     pub fn ensure_fts_encoded_field_component_format(&self) -> Result<()> {
+        self.ensure_fts_filename_component_format(DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION)
+    }
+
+    /// Durably fence a writer before it creates a case-distinguished FTS
+    /// filename (`page_Id` and the other NTFS case-fold literals layout v2
+    /// kept). Advances the marker to v3 and does not return early on a
+    /// previously confirmed v2 marker — that confirmation must not skip the
+    /// 2 → 3 upgrade. Confirming v3 latches the v2 flag as well, so a later
+    /// v2 preflight cannot rewrite the marker downwards.
+    pub fn ensure_fts_case_distinguished_field_component_format(&self) -> Result<()> {
+        self.ensure_fts_filename_component_format(
+            DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION,
+        )
+    }
+
+    fn ensure_fts_filename_component_format(&self, target: u32) -> Result<()> {
         let _format_guard = self.data_dir_format_lock.lock().unwrap();
-        if self
-            .fts_v2_marker_durability_confirmed
-            .load(Ordering::Acquire)
-        {
+        let already = if target >= DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION {
+            self.fts_v3_marker_durability_confirmed
+                .load(Ordering::Acquire)
+        } else {
+            self.fts_v2_marker_durability_confirmed
+                .load(Ordering::Acquire)
+        };
+        if already {
             return Ok(());
         }
         let path = Self::data_dir_meta_path(&self.data_dir);
@@ -4328,12 +4366,14 @@ impl IndexStore {
                     DATA_DIR_FORMAT_VERSION
                 )));
             }
-            if meta.format_version >= DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION {
+            if meta.format_version >= target {
                 // Do not trust visibility as proof of durability. A previous
-                // attempt may have renamed v2 into place and then failed its
-                // durability confirmation. Re-establish that proof now, while
-                // still holding the transition lock, before permitting any
-                // encoded FTS filename to be created.
+                // attempt may have renamed the marker into place and then
+                // failed its durability confirmation. Re-establish that proof
+                // now, while still holding the transition lock, before
+                // permitting any encoded FTS filename to be created. A higher
+                // version than `target` is confirmed and left in place — v2
+                // preflight must not downgrade a v3 marker.
                 #[cfg(not(windows))]
                 if let Some(parent) = path.parent() {
                     xerj_common::fsio::fsync_dir(parent)?;
@@ -4345,7 +4385,7 @@ impl IndexStore {
                 // Windows directory-sync shim was a no-op.
                 #[cfg(windows)]
                 xerj_common::fsio::write_file_durable(&path, &std::fs::read(&path)?)?;
-                self.note_fts_v2_marker_durability_confirmed();
+                self.note_fts_filename_format_confirmed(target);
                 return Ok(());
             }
         }
@@ -4359,7 +4399,7 @@ impl IndexStore {
         })?;
         object.insert(
             "format_version".to_string(),
-            serde_json::Value::from(DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION),
+            serde_json::Value::from(target),
         );
         object.insert(
             "xerj_version".to_string(),
@@ -4396,8 +4436,25 @@ impl IndexStore {
         }
         #[cfg(not(any(test, feature = "test-hooks")))]
         xerj_common::fsio::write_file_durable(&path, &bytes)?;
-        self.note_fts_v2_marker_durability_confirmed();
+        self.note_fts_filename_format_confirmed(target);
         Ok(())
+    }
+
+    fn note_fts_filename_format_confirmed(&self, target: u32) {
+        if target >= DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION {
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.fts_v3_marker_durability_confirmations
+                .fetch_add(1, Ordering::AcqRel);
+            self.fts_v3_marker_durability_confirmed
+                .store(true, Ordering::Release);
+            // Latch v2 without counting a v2 confirmation. The v2 counter is
+            // the number of times the v2 preflight itself proved durability;
+            // setting the flag stops that preflight from rewriting v3 as v2.
+            self.fts_v2_marker_durability_confirmed
+                .store(true, Ordering::Release);
+            return;
+        }
+        self.note_fts_v2_marker_durability_confirmed();
     }
 
     fn note_fts_v2_marker_durability_confirmed(&self) {
@@ -4420,6 +4477,12 @@ impl IndexStore {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fts_v2_marker_durability_confirmations_for_test(&self) -> u64 {
         self.fts_v2_marker_durability_confirmations
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fts_v3_marker_durability_confirmations_for_test(&self) -> u64 {
+        self.fts_v3_marker_durability_confirmations
             .load(Ordering::Acquire)
     }
 
@@ -5591,6 +5654,35 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(&format!("{segment_id}."))));
+    }
+
+    #[test]
+    fn fts_layout_v3_discriminator_is_a_valid_flush_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let segment_id = "12345678-1234-1234-1234-123456789abd";
+        let segments = dir.path().join("segments");
+        for (role, bytes) in [
+            ("seg", b"segment".as_slice()),
+            ("sidx", b"sidx".as_slice()),
+            ("ids", b"ids".as_slice()),
+            ("fts-layout-v3", b"XERJ_FTS_FILENAME_LAYOUT_V3\n".as_slice()),
+        ] {
+            std::fs::write(segments.join(format!("{segment_id}.{role}")), bytes).unwrap();
+        }
+        let meta = SegmentMeta {
+            id: segment_id.to_owned(),
+            doc_count: 1,
+            size_bytes: 7,
+            min_seq_no: 1,
+            max_seq_no: 1,
+            created_at_ms: 0,
+            has_tombstones: false,
+            seg_path: format!("{segment_id}.seg"),
+            sidx_path: format!("{segment_id}.sidx"),
+        };
+        store.write_flush_completion_manifest(&meta).unwrap();
+        assert!(store.validate_flush_completion_manifest(segment_id, 1, 1, 1));
     }
 
     #[test]
@@ -7931,6 +8023,60 @@ mod tests {
             1,
             "the format mutex must serialize visible-marker durability confirmation"
         );
+    }
+
+    #[test]
+    fn case_distinguished_fts_preflight_advances_to_v3_and_v2_does_not_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let marker = dir.path().join(DATA_DIR_META_FILE);
+
+        store
+            .ensure_fts_case_distinguished_field_component_format()
+            .unwrap();
+        store
+            .ensure_fts_case_distinguished_field_component_format()
+            .unwrap();
+        assert_eq!(store.fts_v3_marker_durability_confirmations_for_test(), 1);
+
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(
+            meta.format_version,
+            DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION
+        );
+        assert!(IndexStore::check_data_dir_version_with_max(dir.path(), 2).is_err());
+        assert!(IndexStore::check_data_dir_version(dir.path()).is_ok());
+
+        store.ensure_fts_encoded_field_component_format().unwrap();
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(
+            meta.format_version, DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION,
+            "a v2 preflight must not rewrite a v3 marker"
+        );
+        assert_eq!(
+            store.fts_v2_marker_durability_confirmations_for_test(),
+            0,
+            "latching the v2 flag from v3 is not a v2 confirmation"
+        );
+    }
+
+    #[test]
+    fn case_distinguished_fts_preflight_upgrades_a_confirmed_v2_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        store.ensure_fts_encoded_field_component_format().unwrap();
+        assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 1);
+
+        store
+            .ensure_fts_case_distinguished_field_component_format()
+            .unwrap();
+        let marker = dir.path().join(DATA_DIR_META_FILE);
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(meta.format_version, 3);
+        store.ensure_fts_encoded_field_component_format().unwrap();
+        let meta: DataDirMeta = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(meta.format_version, 3);
+        assert_eq!(store.fts_v2_marker_durability_confirmations_for_test(), 1);
     }
 
     /// THE UPGRADE PATH: an rc3-vintage data dir has NO format marker (rc3
