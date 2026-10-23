@@ -4292,9 +4292,13 @@ impl Engine {
                     Some(g) => g,
                     None => return,
                 };
-                let rss = crate::governor::current_rss_bytes();
+                // Working set on Linux and macOS. On Windows, the max of the
+                // working set and commit charge, plus available commit, so a
+                // no-pagefile box trips before VirtualAlloc aborts (#1122).
+                let observed = crate::governor::current_process_memory_bytes();
+                let available_commit = xerj_common::resource::available_commit_bytes();
                 let (disk_pct, disk_avail) = crate::governor::disk_used_pct_and_avail(&data_dir);
-                governor.refresh_memory_disk(rss, disk_pct, disk_avail);
+                governor.refresh_memory_observing(observed, disk_pct, disk_avail, available_commit);
 
                 // Issue #948 / #2238 — a breaker that only rejects never lets
                 // a memory-pinned workload finish: caches hold gigabytes of

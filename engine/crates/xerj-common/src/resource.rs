@@ -480,7 +480,7 @@ mod win_mem {
         (ok != 0 && s.ullTotalPhys > 0).then_some(s)
     }
 
-    pub fn rss() -> Option<u64> {
+    fn counters() -> Option<PROCESS_MEMORY_COUNTERS> {
         let mut counters = PROCESS_MEMORY_COUNTERS {
             cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
             PageFaultCount: 0,
@@ -496,12 +496,26 @@ mod win_mem {
         // SAFETY: K32GetProcessMemoryInfo writes cb bytes to counters for the current process.
         let ok =
             unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-        (ok != 0 && counters.WorkingSetSize > 0).then_some(counters.WorkingSetSize as u64)
+        (ok != 0).then_some(counters)
+    }
+
+    pub fn rss() -> Option<u64> {
+        counters().and_then(|c| (c.WorkingSetSize > 0).then_some(c.WorkingSetSize as u64))
+    }
+
+    /// Commit charge of this process (`PagefileUsage`). The field name is
+    /// historical: it is charged with or without a pagefile, and it is what
+    /// a later `VirtualAlloc` fails against.
+    pub fn commit_charge() -> Option<u64> {
+        counters().map(|c| c.PagefileUsage as u64)
     }
 }
 
 #[cfg(target_os = "windows")]
 fn probe_total_memory() -> Option<u64> {
+    // Physical RAM only. The AUTO tier still starts here; the commit ceiling
+    // in [`windows_commit_budget`] is what stops a no-pagefile box from being
+    // sized as if that RAM were free to commit (#1122).
     win_mem::status().map(|s| s.ullTotalPhys)
 }
 
@@ -645,6 +659,152 @@ fn safe_zone(total: u64, available: Option<u64>) -> u64 {
     let reserve = (total / 8).max(GIB);
     let headroom = available.unwrap_or(total).saturating_sub(reserve);
     headroom.min(total / 2).max(256 * MIB)
+}
+
+/// One Windows commit reading. Bytes. A zero [`WindowsCommitSample::commit_limit`]
+/// means the probe did not return commit figures — the budget must then stay
+/// on physical RAM rather than invent a tight cap from a failed read.
+///
+/// Field meanings follow `MEMORYSTATUSEX` (the struct this file already fills
+/// via `GlobalMemoryStatusEx`, #1766):
+///
+/// * `total_phys` — `ullTotalPhys`
+/// * `commit_limit` — `ullTotalPageFile`, the commit limit for the system or
+///   this process, whichever is smaller
+/// * `available_commit` — `ullAvailPageFile`, how many more bytes this process
+///   may commit before `VirtualAlloc` fails
+/// * `process_commit` — `PROCESS_MEMORY_COUNTERS::PagefileUsage`, charged with
+///   or without a pagefile
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsCommitSample {
+    pub total_phys: u64,
+    pub commit_limit: u64,
+    pub available_commit: u64,
+    pub process_commit: u64,
+}
+
+/// What the governor may treat as the machine after Windows commit charge.
+///
+/// The AUTO tier is still chosen from physical RAM (or a cgroup). This budget
+/// is a second ceiling applied afterwards: a pagefile that covers RAM must not
+/// move the 64 GiB / 128 GiB tier steps, and a commit limit a little under RAM
+/// (the kernel's own holdback, with nothing else charged) must not either.
+/// The ceiling binds when what this process can still reach, minus a reserve,
+/// is tighter than the tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsCommitBudget {
+    /// Bytes the process cap may not exceed. Equal to physical RAM when
+    /// commit is not the scarce resource.
+    pub effective_bytes: u64,
+    /// `effective_bytes` is below physical RAM because commit is scarce.
+    pub commit_bound: bool,
+    pub commit_limit: u64,
+    pub available_commit: u64,
+    pub process_commit: u64,
+    /// `min(commit_limit, process_commit + available_commit)` — the size at
+    /// which the next commit fails if nothing else allocates.
+    pub committable: u64,
+    /// Held back so a 95% watermark and one flush allocation land before the
+    /// allocator abort. Also the live threshold: available commit below this
+    /// engages the breaker. `0` when commit figures are missing.
+    pub reserve_bytes: u64,
+}
+
+/// Bytes of commit held back from the ceiling.
+///
+/// One quarter of what this process can still reach, clamped to
+/// [512 MiB, 2 GiB]. The floor covers the ~100 MiB flush allocation that
+/// aborted a 16 GiB no-pagefile run (#1122, field report #2174) plus the
+/// sampler interval. The quarter, not the watermark's own 5%, is the gap:
+/// that run died with RSS around 3.3–3.7 GiB while the engine was tracking
+/// ~0.8 GiB, so a cap sitting on the commit limit itself is already too late.
+fn windows_commit_reserve(committable: u64) -> u64 {
+    const MIN_RESERVE: u64 = 512 * MIB;
+    const MAX_RESERVE: u64 = 2 * GIB;
+    (committable / 4).clamp(MIN_RESERVE, MAX_RESERVE)
+}
+
+/// Pure commit ceiling. Tested with injected numbers; the live probe is
+/// [`windows_commit_sample`].
+pub fn windows_commit_budget(sample: WindowsCommitSample) -> WindowsCommitBudget {
+    let total = sample.total_phys.max(1);
+    if sample.commit_limit == 0 {
+        return WindowsCommitBudget {
+            effective_bytes: total,
+            commit_bound: false,
+            commit_limit: 0,
+            available_commit: sample.available_commit,
+            process_commit: sample.process_commit,
+            committable: total,
+            reserve_bytes: 0,
+        };
+    }
+    let committable = sample
+        .commit_limit
+        .min(
+            sample
+                .process_commit
+                .saturating_add(sample.available_commit),
+        )
+        .max(1);
+    let reserve = windows_commit_reserve(committable);
+    // Nothing left to give: the live available-commit check rejects writes.
+    // The floor keeps a derived memtable budget from becoming 0, which would
+    // disable that breaker rather than tighten it.
+    const FLOOR: u64 = 256 * MIB;
+    let after_reserve = if committable <= reserve {
+        FLOOR.min(committable).max(1)
+    } else {
+        committable.saturating_sub(reserve).max(1)
+    };
+    // A gap smaller than the reserve is not "the machine is full". Commit is
+    // scarce only when the post-reserve ceiling is actually under physical RAM.
+    let commit_bound = after_reserve < total;
+    WindowsCommitBudget {
+        effective_bytes: if commit_bound { after_reserve } else { total },
+        commit_bound,
+        commit_limit: sample.commit_limit,
+        available_commit: sample.available_commit,
+        process_commit: sample.process_commit,
+        committable,
+        reserve_bytes: reserve,
+    }
+}
+
+/// Live Windows commit sample, or `None` where this platform has no probe
+/// (Linux, macOS) and where `GlobalMemoryStatusEx` fails.
+pub fn windows_commit_sample() -> Option<WindowsCommitSample> {
+    #[cfg(target_os = "windows")]
+    {
+        let status = win_mem::status()?;
+        Some(WindowsCommitSample {
+            total_phys: status.ullTotalPhys,
+            commit_limit: status.ullTotalPageFile,
+            available_commit: status.ullAvailPageFile,
+            process_commit: win_mem::commit_charge().unwrap_or(0),
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// How many more bytes this process may commit, or `None` off Windows.
+pub fn available_commit_bytes() -> Option<u64> {
+    windows_commit_sample().map(|s| s.available_commit)
+}
+
+/// This process's commit charge, or `None` off Windows.
+pub fn process_commit_charge_bytes() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        win_mem::commit_charge()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
 }
 
 /// One line describing what this policy decided, for a startup log or a
@@ -847,5 +1007,132 @@ mod tests {
                 cfg!(any(target_os = "linux", target_os = "windows"))
             );
         }
+    }
+
+    #[test]
+    fn windows_commit_sample_is_absent_off_windows() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(windows_commit_sample().is_none());
+            assert!(available_commit_bytes().is_none());
+            assert!(process_commit_charge_bytes().is_none());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(sample) = windows_commit_sample() {
+                assert!(sample.total_phys >= 256 * MIB);
+                let budget = windows_commit_budget(sample);
+                assert!(budget.effective_bytes > 0);
+                assert!(budget.effective_bytes <= sample.total_phys.max(1));
+            }
+        }
+    }
+
+    /// #1122 / field report #2174: 16 GiB RAM, no pagefile (commit limit ≈
+    /// physical), ~12 GiB already charged by other processes, so about 4 GiB
+    /// is still committable. The physical-RAM tier would hand this process an
+    /// 8 GiB cap. The commit ceiling must sit under the abort line by enough
+    /// for the ~100 MiB flush that killed that run.
+    #[test]
+    fn a_pagefileless_16gib_box_is_capped_by_available_commit() {
+        let sample = WindowsCommitSample {
+            total_phys: 16 * GIB,
+            commit_limit: 16 * GIB,
+            available_commit: 4 * GIB,
+            process_commit: 200 * MIB,
+        };
+        let budget = windows_commit_budget(sample);
+        let committable = 4 * GIB + 200 * MIB;
+        assert_eq!(budget.committable, committable);
+        assert!(budget.commit_bound);
+        assert!(budget.reserve_bytes >= 512 * MIB);
+        assert!(budget.reserve_bytes <= 2 * GIB);
+        assert_eq!(budget.effective_bytes, committable - budget.reserve_bytes);
+        // Quarter of 4.2 GiB, inside the clamp: the exact reserve this case
+        // must keep, so a later edit cannot silently eat the headroom.
+        assert_eq!(budget.reserve_bytes, committable / 4);
+        assert_eq!(budget.effective_bytes, 3_378_511_872);
+        assert!(
+            budget.effective_bytes < 8 * GIB,
+            "the 8 GiB physical-RAM tier is above what Windows will commit"
+        );
+        let watermark = budget.effective_bytes * 95 / 100;
+        let headroom = budget.committable - watermark;
+        assert!(
+            headroom >= 100 * MIB,
+            "the field report's 100 MiB flush must fit under the abort line, headroom={headroom}"
+        );
+        assert!(
+            headroom >= 512 * MIB,
+            "sampler lag needs more than the watermark's own 5%, headroom={headroom}"
+        );
+    }
+
+    #[test]
+    fn ample_commit_does_not_move_the_physical_tier_input() {
+        // 64 GiB with a pagefile: commit limit and available commit both sit
+        // above RAM. The budget must hand back physical RAM unchanged so the
+        // 16 GiB AUTO step (64 GiB ≤ effective < 128 GiB) stays put.
+        let covered = windows_commit_budget(WindowsCommitSample {
+            total_phys: 64 * GIB,
+            commit_limit: 96 * GIB,
+            available_commit: 80 * GIB,
+            process_commit: 512 * MIB,
+        });
+        assert!(!covered.commit_bound);
+        assert_eq!(covered.effective_bytes, 64 * GIB);
+        assert!(covered.reserve_bytes >= 512 * MIB);
+
+        // 128 GiB, same shape: the 32 GiB step's input is physical RAM.
+        let big = windows_commit_budget(WindowsCommitSample {
+            total_phys: 128 * GIB,
+            commit_limit: 200 * GIB,
+            available_commit: 180 * GIB,
+            process_commit: GIB,
+        });
+        assert!(!big.commit_bound);
+        assert_eq!(big.effective_bytes, 128 * GIB);
+
+        // No pagefile, but the machine is otherwise idle: commit limit sits a
+        // little under RAM (kernel holdback). That gap must not by itself
+        // pull a 16 GiB box's ceiling under the 8 GiB tier.
+        let idle = windows_commit_budget(WindowsCommitSample {
+            total_phys: 16 * GIB,
+            commit_limit: 16 * GIB - 256 * MIB,
+            available_commit: 15 * GIB,
+            process_commit: 200 * MIB,
+        });
+        assert!(
+            idle.effective_bytes >= 8 * GIB,
+            "idle no-pagefile box: {:?}",
+            idle
+        );
+    }
+
+    #[test]
+    fn a_failed_commit_probe_does_not_invent_a_tight_cap() {
+        let failed = windows_commit_budget(WindowsCommitSample {
+            total_phys: 16 * GIB,
+            commit_limit: 0,
+            available_commit: 0,
+            process_commit: 0,
+        });
+        assert!(!failed.commit_bound);
+        assert_eq!(failed.effective_bytes, 16 * GIB);
+        assert_eq!(failed.reserve_bytes, 0);
+    }
+
+    #[test]
+    fn no_available_commit_engages_the_reserve_immediately() {
+        let full = windows_commit_budget(WindowsCommitSample {
+            total_phys: 16 * GIB,
+            commit_limit: 16 * GIB,
+            available_commit: 0,
+            process_commit: 300 * MIB,
+        });
+        assert!(full.commit_bound);
+        assert!(full.available_commit < full.reserve_bytes);
+        assert!(full.effective_bytes <= 300 * MIB);
+        assert!(full.effective_bytes >= 1);
     }
 }

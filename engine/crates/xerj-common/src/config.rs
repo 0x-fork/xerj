@@ -1834,6 +1834,13 @@ pub struct LimitsConfig {
     /// system RAM); capping that ONE base is what makes every dependent budget
     /// shrink coherently instead of each growing its own ceiling.
     ///
+    /// On Windows that base is then lowered to what this process can still
+    /// commit (`GlobalMemoryStatusEx` commit limit and available commit, minus
+    /// a reserve). Physical RAM alone is not a commit budget: with no pagefile
+    /// the commit limit is about RAM, and other processes' commit charge is
+    /// already spent, so an allocation aborts the process while RSS is still
+    /// under the physical-RAM tier (#1122). Linux and macOS are unchanged.
+    ///
     /// The cap only ever LOWERS the base — `min(machine, cap)`, never invented
     /// headroom: on a 40 GiB box the 8 GiB tier still yields 8, and under a
     /// smaller cgroup limit the smaller value wins. Two explicit escape hatches:
