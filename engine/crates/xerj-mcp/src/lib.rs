@@ -184,10 +184,14 @@ MCP CLIENT CONFIG (Claude Desktop, IDE agents, any mcpServers-shaped config):
       }
     }
 
-Use an ABSOLUTE path — `command -v xerj` prints it, and the installer's
-default is ~/.local/bin/xerj. An MCP host launched from a desktop icon does
-not inherit your shell's PATH, so a bare \"xerj\" fails there with no useful
-error. When the node is not running --insecure, add
+Use an ABSOLUTE path — `command -v xerj` prints it (PowerShell:
+`(Get-Command xerj).Source`). The sh installer (https://xerj.org/get,
+including Git Bash, MSYS and Cygwin) puts the binary in ~/.local/bin
+(xerj.exe on Windows) and does not edit PATH. The PowerShell installer
+(get.ps1) puts xerj.exe in %LOCALAPPDATA%\\Programs\\xerj and adds that
+directory to the user PATH (opt out: XERJ_NO_PATH=1). An MCP host launched
+from a desktop icon does not inherit your shell's PATH, so a bare \"xerj\"
+fails there with no useful error. When the node is not running --insecure, add
 \"XERJ_AUTH\": \"ApiKey <key>\" beside XERJ_URL; the key is <data-dir>/admin.key.
 For a loopback node (localhost / 127.0.0.1 / [::1]) that step is optional:
 with no XERJ_AUTH given, the server reads <data-dir>/admin.key itself (the
@@ -5286,6 +5290,30 @@ mod tests {
         assert!(help.contains("proxies 21 tools"), "{help}");
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
+    }
+
+    /// #2285: Git Bash runs the `sh` installer, which writes `~/.local/bin`.
+    /// `get.ps1` writes `%LOCALAPPDATA%\Programs\xerj`. Help that names only
+    /// one of those sends the other install looking in the wrong place.
+    #[test]
+    fn help_names_both_windows_install_locations() {
+        let help = help_text(false);
+        assert!(
+            help.contains("~/.local/bin"),
+            "sh installer directory missing:\n{help}"
+        );
+        assert!(
+            help.contains("%LOCALAPPDATA%\\Programs\\xerj"),
+            "PowerShell installer directory missing:\n{help}"
+        );
+        assert!(
+            help.contains("Git Bash"),
+            "help must say Git Bash / the sh installer uses ~/.local/bin:\n{help}"
+        );
+        assert!(
+            help.contains("get.ps1") || help.contains("PowerShell"),
+            "help must name the PowerShell installer:\n{help}"
+        );
     }
 
     /// #1055: the field map is an orientation tool an agent calls before it

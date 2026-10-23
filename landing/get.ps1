@@ -9,6 +9,8 @@
 # Environment overrides:
 #   XERJ_VERSION=v1.0.0     install a specific tag (default: latest release)
 #   XERJ_INSTALL_DIR=path   install location (default: %LOCALAPPDATA%\Programs\xerj)
+#                           The sh installer (landing/get), including Git Bash,
+#                           MSYS and Cygwin, uses ~/.local/bin instead.
 #   XERJ_REPO=owner/name    source repo (default: xerj-org/xerj)
 #   XERJ_NO_PATH=1          do not add the install dir to the user PATH
 #

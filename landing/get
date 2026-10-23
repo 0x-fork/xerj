@@ -214,6 +214,10 @@ src="${tmp}/${stage}/${bin}"
 chmod +x "$src" 2>/dev/null || true
 
 # --- choose install dir -----------------------------------------------------
+# Same default on every OS this script supports, including Windows Git Bash /
+# MSYS / Cygwin (the file there is xerj.exe). The PowerShell installer
+# (get.ps1) is the one that uses %LOCALAPPDATA%\Programs\xerj. Do not special-
+# case Windows here: a Git Bash `curl | sh` is this script, not get.ps1.
 # Re-testing -w AFTER the mkdir matters: mkdir -p on an EXISTING but
 # root-owned ~/.local/bin returns 0, and we must fall through to $(pwd)
 # instead of failing later at the copy.

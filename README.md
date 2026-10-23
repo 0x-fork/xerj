@@ -332,8 +332,7 @@ boots the same `--insecure` dev node. Drop this into your MCP client's config:
 }
 ```
 
-Use an absolute path. The installer puts `xerj` in `~/.local/bin` by default
-(`command -v xerj` confirms), and MCP hosts launched from a desktop icon do not inherit your
+Use an absolute path. The `sh` installer (Linux, macOS, and Windows Git Bash, MSYS and Cygwin) puts `xerj` in `~/.local/bin` (`xerj.exe` on Windows; `command -v xerj` confirms) and does not edit PATH. The PowerShell installer (`get.ps1`) puts `xerj.exe` in `%LOCALAPPDATA%\Programs\xerj` and adds that directory to the user PATH (`(Get-Command xerj).Source` confirms; `XERJ_NO_PATH=1` opts out). MCP hosts launched from a desktop icon do not inherit your
 shell's `PATH`. If the node is running with auth (anything but `--insecure`), add
 `"XERJ_AUTH": "ApiKey <key>"` alongside `XERJ_URL`; the key is in `<data-dir>/admin.key`.
 

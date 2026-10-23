@@ -166,7 +166,7 @@ that is already running; it does not start one.
 }
 ```
 
-Use an absolute path (`command -v xerj`): MCP hosts started from a desktop icon
+Use an absolute path (`command -v xerj`; PowerShell: `(Get-Command xerj).Source`). The `sh` installer, including Windows Git Bash, MSYS and Cygwin, puts `xerj.exe` in `~/.local/bin` and does not edit PATH. The PowerShell installer (`get.ps1`) puts `xerj.exe` in `%LOCALAPPDATA%\Programs\xerj` and adds that directory to the user PATH. MCP hosts started from a desktop icon
 do not inherit a shell `PATH`. Add `"XERJ_AUTH": "ApiKey <key>"` when the node
 is not running `--insecure` — the key is `<data-dir>/admin.key`. `--url` and
 `--auth` flags override the two environment variables.

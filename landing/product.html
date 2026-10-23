@@ -213,7 +213,7 @@
   <div class="kicker"><span class="accent">02</span><span class="dash">·</span><span>QUICKSTART</span></div>
   <h2 class="scene">INSTALL, INDEX,<br><span class="accent">ASK.</span></h2>
 
-  <p class="wide">The installer at <a href="/get">xerj.org/get</a> picks the release for your OS and CPU, checks its SHA-256, and puts <code class="inline">xerj</code> on <code class="inline">~/.local/bin</code>. On Linux the default archive is the static musl build. <code class="inline">xerj --version</code> on that binary, run 2026-10-23, printed <span class="mono">xerj v1.0.0-rc.98</span>.</p>
+  <p class="wide">The installer at <a href="/get">xerj.org/get</a> picks the release for your OS and CPU, checks its SHA-256, and puts <code class="inline">xerj</code> on <code class="inline">~/.local/bin</code> (<code class="inline">xerj.exe</code> there under Git Bash, MSYS or Cygwin). PowerShell's installer (<a href="/get.ps1">get.ps1</a>) puts <code class="inline">xerj.exe</code> in <code class="inline">%LOCALAPPDATA%\Programs\xerj</code> instead. On Linux the default archive is the static musl build. <code class="inline">xerj --version</code> on that binary, run 2026-10-23, printed <span class="mono">xerj v1.0.0-rc.98</span>.</p>
 
 <pre class="code">curl -fsSL https://xerj.org/get | sh
 xerj --insecure --data-dir ~/xerj-data &amp;          <span class="comment"># node on 127.0.0.1:9200</span>
