@@ -1341,14 +1341,26 @@ already indexed, and does not walk or index):
   OpenAI .................. https://xerj.org/docs/agents/schemas/openai-tools.json
   Anthropic ............... https://xerj.org/docs/agents/schemas/anthropic-tools.json
 The OpenAI and Anthropic files carry the six HTTP operations above; the MCP file
-carries twenty (those six plus xerj_brain_ego / _link / _unlink / _overview,
+carries twenty-one (those six plus xerj_def, xerj_brain_ego / _link / _unlink / _overview,
 xerj_map, xerj_code_search, xerj_plan, xerj_index_budget, xerj_autoindex_remove, xerj_field_report,
 xerj_corpus_feedback and the hub tools xerj_hub_find / _def / _ask) and is generated from a real
 tools/list of the server that serves them. A binary with no hub key omits the
-three hub tools and serves seventeen of the twenty. (v1.0.0-rc.97 predates xerj_corpus_feedback
+three hub tools and serves eighteen of the twenty-one. (v1.0.0-rc.97 predates xerj_corpus_feedback
 and xerj_index_budget and serves seventeen.)
+Local definition lookup over MCP: xerj_def shares the query, lexical ranking
+and location deduplication of `xerj def --json`. Example arguments:
+  {"symbol":"Cache","prefix":"project","kind":"struct","lang":"rust","k":5}
+This searches project-*; index can replace prefix, and with neither it searches
+ax-*. symbol also accepts capability phrases. k is 1–50 (default 5);
+max_tokens optionally caps the response. Declarations are in
+hits.hits[]._source.code, locations in ax_path/path and line/start_line;
+older file hits may use fields._passage. hits.total counts engine matches before
+deduplication; no match is a successful empty hit list. Kind/language filters
+are ignored when no target index maps the field or any maps it as numeric,
+matching the CLI. This queries the configured node; xerj_hub_def instead
+searches a named Hub pack.
 The three schema files are therefore NOT interchangeable, and they are not even the same shape: the MCP file
-is an object, so count `.tools` in it (`jq '.tools | length'` → 20) and the bare
+is an object, so count `.tools` in it (`jq '.tools | length'` → 21) and the bare
 array in the other two (`jq 'length'` → 6). `jq 'length'` on the MCP file returns
 1, the object's key count — not a tool count.
 If you can run a process, `xerj mcp` is that stdio server, inside the same binary

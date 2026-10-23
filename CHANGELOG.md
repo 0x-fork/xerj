@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MCP `xerj_def` exposes local definition lookup, completing #2080 after the
+  `xerj_search` prefix support. It shares `xerj def --json` query construction,
+  mapping guards, ranking and location deduplication; accepts `symbol`,
+  `prefix`/`index`, `kind`, `lang`, `k` (1–50) and `max_tokens`. No match is a
+  successful empty hit list; invalid arguments are rejected before HTTP.
+
 - MCP `xerj_search` accepts `prefix` as an alternative to `index`, matching
   `xerj search --prefix`: `project` searches `project-*`. Conflicting scope
   arguments and empty or non-string prefixes are rejected before HTTP requests.

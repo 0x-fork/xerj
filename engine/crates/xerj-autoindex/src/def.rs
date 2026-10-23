@@ -172,6 +172,46 @@ fn def_query(
     built
 }
 
+/// Build the CLI/MCP definition query, including the wider local-rerank window.
+/// An unreadable mapping keeps the historical code query; numeric fields on
+/// any index in the scope are excluded from text lookups and filters.
+pub fn definition_query(
+    query: &str,
+    kind: Option<&str>,
+    lang: Option<&str>,
+    k: usize,
+    mapping: Option<&Value>,
+) -> Value {
+    let mapped = mapping.and_then(mapped_property_names);
+    let numeric = mapped.as_ref().and(mapping.map(numeric_property_names));
+    def_query(
+        query,
+        kind,
+        lang,
+        def_collect_size(k),
+        mapped.as_ref(),
+        numeric.as_ref(),
+    )
+}
+
+/// Rank the fetched window, keep the best hit per location, and return `k`
+/// definitions. Only `hits.hits` is replaced: totals still describe engine
+/// matches before deduplication, just as in `xerj def --json`.
+pub fn finalize_definition_response(response: &mut Value, k: usize) -> Vec<Value> {
+    let mut hits = response
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rerank_def_hits(&mut hits);
+    let mut hits = unique_locations(hits);
+    hits.truncate(k);
+    if let Some(slot) = response.pointer_mut("/hits/hits") {
+        *slot = Value::Array(hits.clone());
+    }
+    hits
+}
+
 fn build_def_query(
     query: &str,
     kind: Option<&str>,
@@ -526,9 +566,6 @@ pub fn run_def_cli() -> i32 {
     let pattern = format!("{prefix}-*");
     let raw_mapping = es.get_json(&format!("/{pattern}/_mapping")).ok();
     let mapped = raw_mapping.as_ref().and_then(mapped_property_names);
-    let numeric = mapped
-        .as_ref()
-        .and(raw_mapping.as_ref().map(numeric_property_names));
     if let Some(set) = mapped.as_ref().filter(|s| !s.is_empty()) {
         if kind.is_some() && !set.contains("kind") {
             eprintln!("xerj def: --kind ignored; no index under this prefix maps `kind`");
@@ -537,17 +574,13 @@ pub fn run_def_cli() -> i32 {
             eprintln!("xerj def: --lang ignored; no index under this prefix maps `language`");
         }
     }
-    let mut body = def_query(
+    let body = definition_query(
         &query,
         kind.as_deref(),
         lang.as_deref(),
         k,
-        mapped.as_ref(),
-        numeric.as_ref(),
+        raw_mapping.as_ref(),
     );
-    // Fetch a window wider than `-k`, then rerank locally. The engine's
-    // function_score path scored every match (422ms vs 6ms on tokio).
-    body["size"] = json!(def_collect_size(k));
     let mut resp = match es.search(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
@@ -556,20 +589,7 @@ pub fn run_def_cli() -> i32 {
         }
     };
 
-    let mut hits = resp
-        .pointer("/hits/hits")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // Rerank the wide window locally, then collapse duplicate locations and
-    // trim to `-k`. Dedupe after rerank so the best-ranked hit at each
-    // path:line is the one kept.
-    rerank_def_hits(&mut hits);
-    let mut hits = unique_locations(hits);
-    hits.truncate(k);
-    if let Some(slot) = resp.pointer_mut("/hits/hits") {
-        *slot = Value::Array(hits.clone());
-    }
+    let hits = finalize_definition_response(&mut resp, k);
 
     if as_json {
         println!(

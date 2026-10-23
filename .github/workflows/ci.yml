@@ -851,6 +851,9 @@ jobs:
         working-directory: engine
         run: cargo build --profile ci-test -p xerj-server -p xerj-mcp
 
+      - name: Local definition CLI and MCP parity
+        run: python3 scripts/mcp-def-smoke.py engine/target/ci-test/xerj
+
       # Drives the demo/usecases scripts themselves, so the thing CI gates is
       # the same thing a reader runs. No browser, no model, no network.
       - name: Use-case smoke (brain transcript, MCP tools, autoindex discovery)

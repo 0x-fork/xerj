@@ -338,7 +338,7 @@ DeepSeek Harness 在它的 Cordis 补丁文件里把 MCP 作为插件加载：
 
 最初名单里有三个候选被有意排除。Aider 完全没有 MCP 客户端支持（[Aider-AI/aider#3314](https://github.com/Aider-AI/aider/issues/3314) 仍未关闭）。T3 Code 方向相反：它自己托管一个供其他智能体连接的 MCP 端点，其会话从底层 harness 继承服务配置。Grok Bot 没有文档记载的本地 stdio 注册方式；Grok CLI 有，见上表对应一行。
 
-共提供二十个工具，其中十一个是已有 XERJ 端点的薄代理：
+共提供二十一个工具，其中十一个是已有 XERJ 端点的薄代理：
 
 | 工具 | 用途 |
 |---|---|
@@ -351,6 +351,14 @@ DeepSeek Harness 在它的 Cordis 补丁文件里把 MCP 作为插件加载：
 | `xerj_plan` | 输入自然语言筛选条件，返回经过校验的查询 DSL（`POST /_ask`；确定性的规则处理，不使用 LLM） |
 
 调用 `xerj_search` 时传入 `{"prefix":"project","query":"retry policy"}` 可搜索 `project-*`，等同于 `xerj search --prefix project`。要指定具体索引名或模式，改用 `index`；`index` 和 `prefix` 不能同时非空。`prefix` 会被去掉首尾空白，且不能为空。两个参数都不传时，工具搜索 `ax-*`。
+
+`xerj_def` 查找本地定义，复用 `xerj def --json` 的查询、排序和位置去重逻辑。例如，`{"symbol":"Cache","prefix":"project","kind":"struct","lang":"rust","k":5}` 搜索 `project-*`；也可以用 `index` 替代 `prefix`，作用域规则与 `xerj_search` 相同。`symbol` 也接受描述能力的短语。`k` 必须为 1–50，默认 5；可选的 `max_tokens` 限制响应大小。
+
+结果采用 ES JSON：声明位于 `hits.hits[]._source.code`，文件位置使用 `ax_path`/`path` 和 `line`/`start_line`，旧版文件级结果可能使用 `fields._passage`。`hits.total` 是去重前的引擎匹配数；没有匹配时成功返回空列表。
+
+与 CLI 相同，如果所有目标索引都未映射筛选字段，或任一目标索引将它映射为数值类型，则忽略相应的类型或语言筛选。排序基于词法匹配。此工具查询配置的节点；`xerj_hub_def` 则在指定的 Hub 语料包中查找定义。
+
+未包含 Hub key 的二进制程序不提供三个 Hub 工具，共提供十八个工具。
 
 另外两个工具不只是简单代理：`xerj_map` 从 autoindex 目录读取各索引的字段映射，除按字节上限裁剪外原样返回；`xerj_code_search` 执行 `xerj code` 参考代码检索流程（[`tools/xerj-code/`](tools/xerj-code/)），返回渲染后的文本。`xerj_index_budget` 在 `xerj autoindex` 计算哈希之前统计文件夹，按节点的磁盘预算估算索引大小，本身不做索引。`xerj_autoindex_remove` 删除一个已 autoindex 的文件夹，删前先列出其内容，`confirm` 不为 true 时什么都不删。`xerj_corpus_feedback` 为 hub 语料评分。`xerj_field_report` 提交使用反馈；`xerj_hub_find`、`xerj_hub_def` 和 `xerj_hub_ask` 用本机已有的 Corpus Hub 语料包作答（即 `xerj ask` 流程）。
 
