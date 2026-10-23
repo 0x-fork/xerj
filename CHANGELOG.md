@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `POST /{index}/_count` honours `min_score`. The handler rebuilds a `size: 0`
+  search body from the query alone, so the threshold used to be dropped: for
+  `{"query":{"match":…},"min_score":10}` `_search` returned 0 while `_count`
+  returned every match. Both the single-index and the multi-index/alias paths
+  now set it on the request, and a non-numeric value is the same 400
+  `parse_exception` `_search` gives.
+
 - x86_64 release binaries no longer require AVX2. The build baseline is
   `x86-64-v2` (SSE4.2). The HNSW eight-accumulator dot product — the kernel
   `x86-64-v3` was actually vectorizing — compiles an AVX2+FMA variant and

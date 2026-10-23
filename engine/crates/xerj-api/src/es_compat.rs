@@ -23113,6 +23113,32 @@ pub async fn count_docs(
     Query(params): Query<CountParams>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
+    // #193-style parity: ES's `_count` body accepts `min_score` and filters the
+    // counted set by it. The handler rebuilds a `size: 0` search body from the
+    // query alone, so this field used to be dropped and `_count` answered the
+    // unfiltered total while `_search` with the same body answered 0. A
+    // non-numeric value is the same 400 parse_exception `_search` gives.
+    let min_score = match body.as_ref().and_then(|b| b.get("min_score")) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_f64() {
+            Some(ms) => Some(ms),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "type": "parse_exception",
+                            "reason": format!(
+                                "malformed JSON in request body: invalid value for [min_score]: {value}"
+                            ),
+                            "status": 400,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
     // Multi-index / all selector: sum counts from every participating index.
     //
     // An ALIAS belongs in this branch too. It used not to, so a multi-index
@@ -23182,6 +23208,7 @@ pub async fn count_docs(
             }
         }
         let has_query = !alias_filters.is_empty()
+            || min_score.is_some()
             || body
                 .as_ref()
                 .and_then(|b| b.get("query"))
@@ -23235,13 +23262,19 @@ pub async fn count_docs(
                 let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
                 // A body that does not parse is not per-index: it is the same
                 // 400 the single-index arm returns, for the same reason.
-                let req = match xerj_query::parse_request(&search_body) {
+                let mut req = match xerj_query::parse_request(&search_body) {
                     Ok(r) => r,
                     Err(e) => {
                         let ze = xerj_common::XerjError::invalid_query(e.to_string());
                         return ApiError::new(ze).into_response();
                     }
                 };
+                // `parse_request` leaves `min_score` at None (the `_search`
+                // handler fills it from `EsSearchBody`), so the count path has
+                // to set it explicitly or the threshold is silently dropped.
+                if let Some(ms) = min_score {
+                    req.min_score = Some(ms);
+                }
                 match idx.search(&req).await {
                     Ok(result) => {
                         // A script resource limit in the filter (terms_set's
@@ -23304,12 +23337,15 @@ pub async fn count_docs(
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
-    // If no query or match_all, use the stored stats for speed.
-    let has_query = body
-        .as_ref()
-        .and_then(|b| b.get("query"))
-        .map(|q| !q.is_null())
-        .unwrap_or(false);
+    // If no query or match_all, use the stored stats for speed. A body that
+    // carries `min_score` still has to run the query: match_all scores 1.0, so
+    // a threshold above it counts zero.
+    let has_query = min_score.is_some()
+        || body
+            .as_ref()
+            .and_then(|b| b.get("query"))
+            .map(|q| !q.is_null())
+            .unwrap_or(false);
 
     let count = if has_query {
         // Run a search with size=0 to get the total.
@@ -23324,15 +23360,25 @@ pub async fn count_docs(
         resolve_terms_lookups(&mut query_val, &state).await;
         let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
         match xerj_query::parse_request(&search_body) {
-            Ok(req) => match idx.search(&req).await {
-                Ok(result) => {
-                    if let Some(reason) = &result.script_failure {
-                        return script_limit_response(reason);
-                    }
-                    result.total.value
+            Ok(mut req) => {
+                // `parse_request` leaves `min_score` at None (the `_search`
+                // handler fills it from `EsSearchBody`), so the count path has
+                // to set it explicitly or the threshold is silently dropped.
+                if let Some(ms) = min_score {
+                    req.min_score = Some(ms);
                 }
-                Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-            },
+                match idx.search(&req).await {
+                    Ok(result) => {
+                        if let Some(reason) = &result.script_failure {
+                            return script_limit_response(reason);
+                        }
+                        result.total.value
+                    }
+                    Err(e) => {
+                        return ApiError::new(xerj_common::XerjError::from(e)).into_response()
+                    }
+                }
+            }
             Err(e) => {
                 let ze = xerj_common::XerjError::invalid_query(e.to_string());
                 return ApiError::new(ze).into_response();
