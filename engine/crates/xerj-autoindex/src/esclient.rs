@@ -2158,6 +2158,33 @@ impl Es {
         Ok(v)
     }
 
+    /// `POST /{index}/_mget` with the `{"ids":[...]}` short form.
+    ///
+    /// The catalog read-back uses this instead of a `run_id` + `search_after`
+    /// walk (#1267). `_id` lookup stays O(ids) when the catalog's version map
+    /// carries deletes; the sorted walk re-parsed every matching stored
+    /// document on every page.
+    pub fn mget(&self, index: &str, ids: &[String]) -> Result<Value> {
+        self.with_retry(
+            "mget",
+            || {
+                self.req(reqwest::Method::POST, &format!("/{index}/_mget"))
+                    .json(&serde_json::json!({"ids": ids}))
+                    .send()
+                    .map_err(|e| anyhow!("mget: {e}"))
+            },
+            |resp| {
+                let status = resp.status();
+                let body: Value = resp.json().unwrap_or(Value::Null);
+                if status.is_success() {
+                    Ok(body)
+                } else {
+                    Err(anyhow!("mget /{index} HTTP {status}: {body}"))
+                }
+            },
+        )
+    }
+
     /// How often [`Es::search_for_verify`] re-checks that its target still
     /// exists while the window search is in flight (#2222). A fast window
     /// returns before the first check, so the common path adds no request.

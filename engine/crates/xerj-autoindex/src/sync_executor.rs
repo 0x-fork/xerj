@@ -537,6 +537,177 @@ impl ReplayLookup {
     }
 }
 
+/// How many per-digest verify windows to issue for one semantic field, and
+/// how many to tick without asking (#1267).
+///
+/// A field whose `exists` total is zero cannot match any digest. Issuing the
+/// `term` + `exists` window anyway is the pre-#1260 brute scan: one window
+/// per [`EsSyncBackend::VERIFY_WINDOW`] digests, each walking the index, each
+/// returning no hits. `window == 0` asks for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExistsProbePlan {
+    issue_windows: u64,
+    skip_windows: u64,
+}
+
+fn plan_exists_probes(values: usize, window: usize, exists_total: u64) -> ExistsProbePlan {
+    if window == 0 {
+        return ExistsProbePlan {
+            issue_windows: 0,
+            skip_windows: 0,
+        };
+    }
+    let windows = values.div_ceil(window) as u64;
+    if exists_total == 0 {
+        ExistsProbePlan {
+            issue_windows: 0,
+            skip_windows: windows,
+        }
+    } else {
+        ExistsProbePlan {
+            issue_windows: windows,
+            skip_windows: 0,
+        }
+    }
+}
+
+/// Catalog documents whose live `_source` is not already the sealed projection.
+///
+/// A resume of the same generation re-enters publication with the same
+/// `run_id` and the same bytes (#1267). Those ids are not rewritten: the bulk
+/// that used to send every projection document is what made the following
+/// `run_id` walk match the whole catalog.
+fn catalog_docs_to_write(
+    expected: &BTreeMap<String, Value>,
+    live: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    expected
+        .iter()
+        .filter(|(id, document)| live.get(*id) != Some(*document))
+        .map(|(id, document)| ((*id).clone(), (*document).clone()))
+        .collect()
+}
+
+/// How many of the prior generation's published ids this generation kept.
+///
+/// Kept documents still carry the prior `run_id`. The live count of that
+/// `run_id` equals this number when nothing stray remains and every kept
+/// document is still there. A smaller count is the documented cross-journal
+/// collision (a kept document was overwritten elsewhere). A larger count is a
+/// stray. Equal is the fast path that does not walk.
+fn prior_run_expected_remainder(prior_written: &BTreeSet<String>, kept: &BTreeSet<String>) -> u64 {
+    prior_written.intersection(kept).count() as u64
+}
+
+/// Ids carrying one generation's `run_id`, one per line, inside that
+/// generation's already-sealed snapshot directory.
+///
+/// The manifest digest does not cover this file. Missing means "published by
+/// an older client": the next generation walks that `run_id` once. Present
+/// means the next generation's stray check is a `size: 0` count.
+const CATALOG_RUN_IDS_FILE: &str = "catalog-run.ids";
+
+fn catalog_run_ids_path(state_dir: &Path, run_id: &str) -> Result<std::path::PathBuf> {
+    validate_tx_id(run_id)?;
+    Ok(state_dir
+        .join("sync-snapshots")
+        .join(run_id)
+        .join(CATALOG_RUN_IDS_FILE))
+}
+
+fn write_catalog_run_ids<'a>(
+    state_dir: &Path,
+    run_id: &str,
+    ids: impl IntoIterator<Item = &'a String>,
+) -> Result<()> {
+    let path = catalog_run_ids_path(state_dir, run_id)?;
+    let mut lines: Vec<&str> = Vec::new();
+    for id in ids {
+        anyhow::ensure!(
+            !id.contains('\n') && !id.contains('\r'),
+            "catalog document id {id:?} contains a newline and cannot be stored one-per-line"
+        );
+        lines.push(id.as_str());
+    }
+    lines.sort_unstable();
+    let parent = path
+        .parent()
+        .context("catalog run id file has no parent directory")?;
+    let tmp = parent.join(format!("{CATALOG_RUN_IDS_FILE}.tmp"));
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        for id in &lines {
+            writeln!(file, "{id}")?;
+        }
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn read_catalog_run_ids(state_dir: &Path, run_id: &str) -> Result<Option<BTreeSet<String>>> {
+    let path = catalog_run_ids_path(state_dir, run_id)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", path.display()));
+        }
+    };
+    let mut ids = BTreeSet::new();
+    for line in text.lines() {
+        if !line.is_empty() {
+            ids.insert(line.to_owned());
+        }
+    }
+    Ok(Some(ids))
+}
+
+/// `_id -> _source` for every `found: true` entry of an `_mget` response.
+/// `found: false` is an absent id, not an error. A duplicate id is.
+fn mget_sources(response: &Value) -> Result<BTreeMap<String, Value>> {
+    let docs = response
+        .pointer("/docs")
+        .and_then(Value::as_array)
+        .context("catalog mget response has no docs")?;
+    let mut sources = BTreeMap::new();
+    for doc in docs {
+        let id = doc
+            .get("_id")
+            .and_then(Value::as_str)
+            .context("catalog mget doc has no _id")?;
+        if doc.get("found").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let source = doc
+            .get("_source")
+            .cloned()
+            .with_context(|| format!("catalog mget doc {id} is found but has no _source"))?;
+        anyhow::ensure!(
+            sources.insert(id.to_owned(), source).is_none(),
+            "catalog mget returned duplicate ID {id}"
+        );
+    }
+    Ok(sources)
+}
+
+/// Advance the current phase by `n` items. Finalize-verify and the catalog
+/// read-back call this once per window (or once per skipped window) so the
+/// ticker moves while a request is in flight only for that one window, not
+/// for the whole phase (#1267).
+fn credit_verify_items(pr: &crate::progress::Progress, n: u64) {
+    for _ in 0..n {
+        pr.item_done(0);
+    }
+}
+
 /// Production ES-compatible operation backend for graph-disabled generations.
 ///
 /// Upserts stream sealed index actions after removing both replaced and
@@ -778,12 +949,18 @@ impl<'a> EsSyncBackend<'a> {
     /// `extra_filters` are appended verbatim to the window query's
     /// `bool.filter`: the semantic leg's `exists`, the catalog leg's
     /// `run_id` term.
+    ///
+    /// `credit` ticks the current phase once per window after that window's
+    /// answer is in. The capability probe passes `false`: it is one sample,
+    /// not one of the phase's windows, and a tick there would walk the bar
+    /// past its denominator.
     fn windowed_value_counts(
         &self,
         index: &str,
         field: &str,
         values: &[String],
         extra_filters: &[Value],
+        credit: bool,
     ) -> Result<HashMap<String, u64>> {
         let mut counts: HashMap<String, u64> =
             values.iter().map(|value| (value.clone(), 0u64)).collect();
@@ -819,6 +996,9 @@ impl<'a> EsSyncBackend<'a> {
                     .and_then(Value::as_u64)
                     .context("batched validation bucket has no doc_count")?;
                 counts.insert(key.to_owned(), doc_count);
+            }
+            if credit {
+                credit_verify_items(self.pr, 1);
             }
         }
         Ok(counts)
@@ -908,6 +1088,9 @@ impl<'a> EsSyncBackend<'a> {
                 "catalog read-back counted {counted} of {} matched documents in a window",
                 window_total.unwrap_or(0)
             );
+            // One tick per window, after the window's pages have all come
+            // back. The phase denominator is windows, not pages (#1267).
+            credit_verify_items(self.pr, 1);
         }
         Ok(counts)
     }
@@ -973,17 +1156,17 @@ impl<'a> EsSyncBackend<'a> {
     /// reaching the end of the generation's documents.
     const CATALOG_WALK_PAGE: usize = 1000;
 
-    /// The phase [`Self::catalog_generation`] surfaces itself under. A resume
-    /// that rewrote the whole catalog gives this walk a `run_id` matching every
-    /// document in the index (402,814 on the cve-records node), so the
-    /// "O(changed) by construction" invariant degenerates to O(corpus): 403
-    /// sorted pages at ~5.2 s each ≈ 35 min, during which the surface used to
-    /// show the FINISHED `finalize-catalog` ticker (every dataset already
-    /// counted done) with a `since_progress_s` that only climbed — which reads
-    /// exactly like a hang, and cost an hour of "is it deadlocked?" diagnosis
-    /// on the #1267 resume. The walk is its own phase now, with the engine's
-    /// own match total as a real denominator, so the long read-back shows a
-    /// moving bar and an ETA from its first page.
+    /// The phase the catalog read-back surfaces itself under.
+    ///
+    /// Publication used to rewrite every projection document and then walk
+    /// `term run_id` + `sort _id` + `search_after`. A resume of the same
+    /// generation rewrote the catalog, so that term matched every document
+    /// (402,814 on the cve-records node): 403 sorted pages at ~5.2 s each,
+    /// behind a finished `finalize-catalog` ticker (#1267). The happy path
+    /// now opens this phase on the projection's own length and reads those
+    /// ids with `_mget`. [`Self::catalog_generation`] still opens it when a
+    /// count does not match and the sorted walk is the way to name the
+    /// difference.
     const CATALOG_READBACK_PHASE: &'static str = "finalize-catalog-readback";
 
     fn catalog_generation(&self, run_id: &str) -> Result<BTreeMap<String, Value>> {
@@ -1169,6 +1352,156 @@ impl<'a> EsSyncBackend<'a> {
             .pointer("/data/version")
             .and_then(Value::as_str)
             .map(str::to_owned)
+    }
+
+    /// Ids fetched per `_mget`. Under the engine's default
+    /// `limits.max_mget_docs` (10_000), so one window is one request.
+    const MGET_WINDOW: usize = 1000;
+
+    /// Read catalog `_source`s by id. `tick` credits one phase item per id
+    /// after that id's window returns, so a multi-window read-back moves the
+    /// bar between requests instead of once at the end.
+    fn mget_catalog(&self, ids: &[String], tick: bool) -> Result<BTreeMap<String, Value>> {
+        let mut observed = BTreeMap::new();
+        if ids.is_empty() {
+            return Ok(observed);
+        }
+        let _watching = self.pr.watch_file(crate::catalog::CATALOG_INDEX, 0);
+        for window in ids.chunks(Self::MGET_WINDOW) {
+            let response = self.es.mget(crate::catalog::CATALOG_INDEX, window)?;
+            observed.extend(mget_sources(&response)?);
+            if tick {
+                credit_verify_items(self.pr, window.len() as u64);
+            }
+        }
+        Ok(observed)
+    }
+
+    /// `hits.total` of `exists` on `field`. One query per semantic
+    /// `(index, field)`, in place of a per-digest `term` + `exists` window
+    /// that cannot match when this total is zero (#1267).
+    fn field_exists_total(&self, index: &str, field: &str) -> Result<u64> {
+        let response = self.es.search_for_verify(
+            index,
+            &serde_json::json!({
+                "size": 0,
+                "track_total_hits": true,
+                "query": {"bool": {"filter": [{"exists": {"field": field}}]}}
+            }),
+        )?;
+        response
+            .pointer("/hits/total/value")
+            .and_then(Value::as_u64)
+            .context("exists preflight has no total hit count")
+    }
+
+    /// How many live catalog documents carry `run_id`. `size: 0`, so the
+    /// answer is a count, not a page of stored sources.
+    fn catalog_run_count(&self, run_id: &str) -> Result<u64> {
+        let response = self.es.search(
+            crate::catalog::CATALOG_INDEX,
+            &serde_json::json!({
+                "size": 0,
+                "track_total_hits": true,
+                "query": {"bool": {"filter": [{"term": {"run_id": run_id}}]}}
+            }),
+        )?;
+        response
+            .pointer("/hits/total/value")
+            .and_then(Value::as_u64)
+            .context("catalog run_id count has no total hit count")
+    }
+
+    /// Live documents still carrying the prior generation's `run_id` must be
+    /// a subset of the ids this generation kept.
+    ///
+    /// When this process published that generation, `catalog-run.ids` is the
+    /// exact id set that carried the `run_id`. The live count equals the
+    /// intersection of that set with the ids kept now, or the sorted walk
+    /// names the strays. A missing file (a generation published before this
+    /// file existed) takes the walk once.
+    fn assert_no_prior_strays(
+        &self,
+        prior_run_id: &str,
+        projection: &crate::generation_catalog::CatalogProjection,
+    ) -> Result<()> {
+        let written: BTreeSet<String> = projection.documents.keys().cloned().collect();
+        let kept: BTreeSet<String> = projection
+            .managed_ids
+            .difference(&written)
+            .cloned()
+            .collect();
+        match read_catalog_run_ids(self.state_dir, prior_run_id)? {
+            Some(prior_written) => {
+                let expected = prior_run_expected_remainder(&prior_written, &kept);
+                let live = self.catalog_run_count(prior_run_id)?;
+                if live == expected {
+                    return Ok(());
+                }
+                self.pr.note(&format!(
+                    "autoindex: prior catalog generation {prior_run_id} still counts {live} \
+                     document(s) under its run_id against {expected} kept; walking them to name \
+                     any stray (#1267)"
+                ));
+            }
+            None => {
+                self.pr.note(&format!(
+                    "autoindex: prior catalog generation {prior_run_id} has no saved id list; \
+                     walking documents that still carry its run_id (#1267)"
+                ));
+            }
+        }
+        let remaining = self.catalog_generation(prior_run_id)?;
+        let strays: Vec<&String> = remaining.keys().filter(|id| !kept.contains(*id)).collect();
+        anyhow::ensure!(
+            strays.is_empty(),
+            "prior catalog generation {prior_run_id} still has {} document(s) this generation \
+             neither rewrote, deleted nor kept: {:?}",
+            strays.len(),
+            strays
+        );
+        Ok(())
+    }
+
+    /// `exists` total for one semantic field.
+    ///
+    /// The first field of the phase is the capability probe (#1267): a slow
+    /// answer is re-asked once, and a slow warm answer warns, but only when
+    /// the field actually matches documents — those are the windows about to
+    /// brute-scan. A zero total skips the windows, so a slow empty answer
+    /// must not project that one query across the whole phase. Later fields
+    /// ask once and do not warn again.
+    fn semantic_exists_total(
+        &self,
+        index: &str,
+        field: &str,
+        probe: bool,
+        windows_if_matched: u64,
+    ) -> Result<u64> {
+        let started = std::time::Instant::now();
+        let mut total = self.field_exists_total(index, field)?;
+        let first = started.elapsed();
+        if !probe || total == 0 || first <= Self::SERVER_PROBE_SLOW {
+            return Ok(total);
+        }
+        let started = std::time::Instant::now();
+        total = self.field_exists_total(index, field)?;
+        let warm = started.elapsed();
+        if total > 0 && warm > Self::SERVER_PROBE_SLOW {
+            let samples = std::cell::RefCell::new(vec![first, warm]);
+            Self::probe_server_generation(
+                self.pr,
+                windows_if_matched,
+                Self::SERVER_PROBE_SLOW,
+                || {
+                    let mut samples = samples.borrow_mut();
+                    anyhow::ensure!(!samples.is_empty(), "probe timing exhausted");
+                    Ok(samples.remove(0))
+                },
+                || self.server_xerj_version(),
+            );
+        }
+        Ok(total)
     }
 
     fn exact_dataset_catalog_stats(
@@ -1530,6 +1863,17 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             &BTreeMap::new(),
             &BTreeSet::new(),
         )?;
+        // #1267: read the projection's ids before writing. A resume of this
+        // same generation already stored these bytes under this `run_id`;
+        // sending them again is what made the old `run_id` walk match the
+        // whole catalog. The phase denominator is the projection, which is
+        // the changed set (#971) plus the documents a same-generation resume
+        // still has to confirm.
+        let ids: Vec<String> = projection.documents.keys().cloned().collect();
+        self.pr
+            .phase(Self::CATALOG_READBACK_PHASE, ids.len() as u64, 0);
+        let mut observed = self.mget_catalog(&ids, true)?;
+        let to_write = catalog_docs_to_write(&projection.documents, &observed);
         let mut body = Vec::new();
         for id in &projection.stale_ids {
             let action =
@@ -1537,7 +1881,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             body.extend_from_slice(serde_json::to_string(&action)?.as_bytes());
             body.push(b'\n');
         }
-        for (id, document) in &projection.documents {
+        for (id, document) in &to_write {
             append_index_action(crate::catalog::CATALOG_INDEX, id, document, &mut body)?;
         }
         // #955: one document per file — this body grows with the corpus. On
@@ -1547,45 +1891,49 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         // been applied. Windowed like every other bulk; deletes stay first.
         // #971: the projection is now incremental — a one-file change sends
         // that file's document (plus datasets and the run document), not one
-        // document per file in the corpus.
-        checked_bulk_windowed(self.es, body, self.bulk_bytes)?;
-        self.es.refresh(crate::catalog::CATALOG_INDEX)?;
-        // Exactly the documents this generation wrote carry its run_id (kept
-        // documents keep the run_id of the generation that last touched them),
-        // so the run_id-scoped read-back is O(changed) by construction.
-        // Re-walked while short of the projection: an unflagged truncated page
-        // (#1212) is intermittent, and validate_observed's exact equality is
-        // what should judge a COMPLETE walk, not a starved one.
-        projection.validate_observed(
-            &self.catalog_generation_complete(&snapshot.tx_id, projection.documents.len())?,
-        )?;
+        // document per file in the corpus. #1267: a document whose live
+        // source already equals that projection is not in `to_write`.
+        if !body.is_empty() {
+            checked_bulk_windowed(self.es, body, self.bulk_bytes)?;
+            self.es.refresh(crate::catalog::CATALOG_INDEX)?;
+        }
+        if !to_write.is_empty() {
+            let written_ids: Vec<String> = to_write.keys().cloned().collect();
+            for (id, source) in self.mget_catalog(&written_ids, false)? {
+                observed.insert(id, source);
+            }
+        }
+        projection.validate_observed(&observed)?;
+        // The mget above sees only the projection's ids. A document this
+        // generation did not project that still carries its `run_id` would
+        // pass that check and inflate the next generation's kept set. The
+        // count is that extra. When it disagrees, the sorted walk — retried
+        // while short (#1212) — is what names the missing and unexpected ids.
+        // A walk that then matches the projection is the publish: the count
+        // was the optimization, and a capped total must not fail a complete
+        // read-back.
+        let live = self.catalog_run_count(&snapshot.tx_id)?;
+        if live != projection.documents.len() as u64 {
+            self.pr.note(&format!(
+                "autoindex: catalog run_id {} counts {live} live documents against {} in the \
+                 projection; reading them back by the sorted walk (#1267)",
+                snapshot.tx_id,
+                projection.documents.len()
+            ));
+            projection.validate_observed(
+                &self.catalog_generation_complete(&snapshot.tx_id, projection.documents.len())?,
+            )?;
+        }
+        write_catalog_run_ids(self.state_dir, &snapshot.tx_id, projection.documents.keys())?;
         if let Some(prior_run_id) = prior_run_id {
             // #971 sweep. Documents still carrying the prior generation's
             // run_id are legitimate — they are the intentionally kept
-            // (unchanged) ones — but NOTHING ELSE may: every id the prior
-            // generation published was either rewritten (new run_id), deleted
-            // (stale), or kept, and the prior generation's own exact
-            // read-back proved its published set matched its projection. A
-            // document surviving under the prior run_id that this projection
-            // did not keep is a stray the publication failed to account for.
-            // A kept document may legitimately be absent here (a same-prefix
-            // journal on another state-dir may have overwritten it — the
-            // documented cross-journal collision), so the check is a subset
-            // check, not equality. Deliberately NOT re-walked when short: this
-            // is a subset check, and an unflagged truncated page (#1212) can
-            // only UNDER-report strays — a false pass is impossible, and a
-            // re-walk here would only re-run the sweep's deletes.
-            let remaining = self.catalog_generation(prior_run_id)?;
-            let written: BTreeSet<String> = projection.documents.keys().cloned().collect();
-            let kept: BTreeSet<&String> = projection.managed_ids.difference(&written).collect();
-            let strays: Vec<&String> = remaining.keys().filter(|id| !kept.contains(id)).collect();
-            anyhow::ensure!(
-                strays.is_empty(),
-                "prior catalog generation {prior_run_id} still has {} document(s) this generation \
-                 neither rewrote, deleted nor kept: {:?}",
-                strays.len(),
-                strays
-            );
+            // (unchanged) ones — but NOTHING ELSE may. The check itself is
+            // unchanged (subset, not equality; a kept document may have been
+            // overwritten by another journal). What changed (#1267) is that
+            // the common case is a count against the ids the prior generation
+            // saved, not another sorted walk of the catalog.
+            self.assert_no_prior_strays(prior_run_id, &projection)?;
         }
         Ok(())
     }
@@ -1718,7 +2066,10 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             readbacks += windows(values.len());
         }
         for values in semantic_wanted.values() {
-            readbacks += windows(values.len());
+            // One exists preflight per field, then its digest windows — issued
+            // when the field matches anything, ticked and skipped when it
+            // matches nothing (#1267).
+            readbacks += 1 + windows(values.len());
         }
         let catalog_wanted: Vec<String> = changed_groups
             .iter()
@@ -1729,55 +2080,71 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         }
         self.pr.phase("finalize-verify", readbacks, 0);
 
-        // #1267 operational: one representative window, timed, before the
-        // walk. The semantic leg is preferred because its `term`+`exists`
-        // shape is exactly the one a server without the #1260 exists arm
-        // brute-scans; a generation with no semantic field probes a record
-        // window instead. One digest is enough — the brute path's cost is the
-        // index size, not the window width.
-        let probe = semantic_wanted
-            .iter()
-            .find_map(|((index, field), values)| {
-                let exists = serde_json::json!({"exists": {"field": field}});
-                values.first().map(|value| (index, value, vec![exists]))
-            })
-            .or_else(|| {
-                record_wanted
-                    .iter()
-                    .find_map(|(index, values)| values.first().map(|value| (index, value, vec![])))
-            });
-        if let Some((index, value, extra)) = probe {
-            let _probing = self.pr.file(index, 0);
-            Self::probe_server_generation(
-                self.pr,
-                readbacks,
-                Self::SERVER_PROBE_SLOW,
-                || {
-                    let started = std::time::Instant::now();
-                    self.windowed_value_counts(
-                        index,
-                        "ax_file",
-                        std::slice::from_ref(value),
-                        &extra,
-                    )?;
-                    Ok(started.elapsed())
-                },
-                || self.server_xerj_version(),
-            );
+        // #1267 operational: a generation with no semantic field still times
+        // one record window, so an old server is named before the walk. The
+        // semantic leg's probe is the exists preflight below — a per-digest
+        // `term` + `exists` sample is the query this change exists to stop
+        // issuing when the field matches nothing. `watch_file` names the
+        // index and does not credit an item: the probe is not one of
+        // `readbacks`.
+        if semantic_wanted.is_empty() {
+            if let Some((index, value)) = record_wanted
+                .iter()
+                .find_map(|(index, values)| values.first().map(|value| (index.as_str(), value)))
+            {
+                let _probing = self.pr.watch_file(index, 0);
+                Self::probe_server_generation(
+                    self.pr,
+                    readbacks,
+                    Self::SERVER_PROBE_SLOW,
+                    || {
+                        let started = std::time::Instant::now();
+                        self.windowed_value_counts(
+                            index,
+                            "ax_file",
+                            std::slice::from_ref(value),
+                            &[],
+                            false,
+                        )?;
+                        Ok(started.elapsed())
+                    },
+                    || self.server_xerj_version(),
+                );
+            }
         }
 
         let mut record_counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
         for (index, values) in &record_wanted {
-            let _reading = self.pr.file(index, 0);
-            let counts = self.windowed_value_counts(index, "ax_file", values, &[])?;
+            let _reading = self.pr.watch_file(index, 0);
+            let counts = self.windowed_value_counts(index, "ax_file", values, &[], true)?;
             record_counts.insert(index.clone(), counts);
         }
         let mut semantic_counts: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
+        let mut first_semantic = true;
         for ((index, field), values) in &semantic_wanted {
-            let _reading = self.pr.file(index, 0);
-            let exists = serde_json::json!({"exists": {"field": field}});
-            let counts = self.windowed_value_counts(index, "ax_file", values, &[exists])?;
-            semantic_counts.insert((index.clone(), field.clone()), counts);
+            let _reading = self.pr.watch_file(index, 0);
+            let probe = first_semantic;
+            first_semantic = false;
+            let total = self.semantic_exists_total(index, field, probe, windows(values.len()))?;
+            credit_verify_items(self.pr, 1);
+            let plan = plan_exists_probes(values.len(), Self::VERIFY_WINDOW, total);
+            if plan.skip_windows > 0 {
+                self.pr.note(&format!(
+                    "autoindex: semantic field {field} on {index} matches no documents; skipped \
+                     {} verify window(s) (#1267)",
+                    plan.skip_windows
+                ));
+                credit_verify_items(self.pr, plan.skip_windows);
+                semantic_counts.insert(
+                    (index.clone(), field.clone()),
+                    values.iter().cloned().map(|value| (value, 0)).collect(),
+                );
+            } else {
+                let exists = serde_json::json!({"exists": {"field": field}});
+                let counts =
+                    self.windowed_value_counts(index, "ax_file", values, &[exists], true)?;
+                semantic_counts.insert((index.clone(), field.clone()), counts);
+            }
         }
         // Scoped to this generation's `run_id`, the same way the run-summary
         // read-back is (`lib.rs`). `file_key` is derived from CONTENT alone
@@ -1796,7 +2163,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         let catalog_counts = if catalog_wanted.is_empty() {
             HashMap::new()
         } else {
-            let _reading = self.pr.file(crate::catalog::CATALOG_INDEX, 0);
+            let _reading = self.pr.watch_file(crate::catalog::CATALOG_INDEX, 0);
             self.windowed_catalog_counts(&catalog_wanted, &snapshot.tx_id)?
         };
 
@@ -5960,7 +6327,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let pr = crate::progress::Progress::silent();
             let backend = EsSyncBackend::new(&es, dir.path(), 8 * 1024 * 1024, &pr);
-            let result = backend.windowed_value_counts(INDEX, "ax_file", &["digest".into()], &[]);
+            let result =
+                backend.windowed_value_counts(INDEX, "ax_file", &["digest".into()], &[], false);
             let _ = tx.send(result.map_err(|error| format!("{error:#}")));
         });
 
@@ -6030,11 +6398,146 @@ mod tests {
                 "ax_file",
                 &["digest-a".into(), "digest-b".into()],
                 &[],
+                false,
             )
             .unwrap();
         assert_eq!(counts.get("digest-a"), Some(&3));
         assert_eq!(counts.get("digest-b"), Some(&0));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_zero_exists_total_skips_the_per_digest_windows() {
+        // #1267 measured 2,619 term+exists probes, each a brute scan with zero
+        // hits. After the windowed verify those are three windows of 1,024.
+        // A field that matches nothing issues none of them.
+        let skipped = plan_exists_probes(2619, EsSyncBackend::VERIFY_WINDOW, 0);
+        assert_eq!(skipped.issue_windows, 0);
+        assert_eq!(skipped.skip_windows, 3);
+        let issued = plan_exists_probes(2619, EsSyncBackend::VERIFY_WINDOW, 1);
+        assert_eq!(issued.issue_windows, 3);
+        assert_eq!(issued.skip_windows, 0);
+        assert_eq!(
+            plan_exists_probes(0, EsSyncBackend::VERIFY_WINDOW, 0),
+            ExistsProbePlan {
+                issue_windows: 0,
+                skip_windows: 0
+            }
+        );
+        assert_eq!(plan_exists_probes(5, 0, 0).issue_windows, 0);
+    }
+
+    #[test]
+    fn skipped_exists_windows_advance_the_verify_phase() {
+        let (pr, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_millis(40),
+        );
+        let ticker = pr.spawn_ticker();
+        let plan = plan_exists_probes(2619, EsSyncBackend::VERIFY_WINDOW, 0);
+        pr.phase("finalize-verify", plan.skip_windows, 0);
+        credit_verify_items(&pr, plan.skip_windows);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let out = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            if out.contains("phase=finalize-verify") && out.contains("items=3/3") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ticker never showed the skipped windows advance to items=3/3: {out}"
+            );
+            std::thread::yield_now();
+        }
+        drop(ticker);
+    }
+
+    #[test]
+    fn an_unchanged_catalog_source_is_not_rewritten() {
+        let same = serde_json::json!({"run_id": "g1", "path": "a"});
+        let expected = BTreeMap::from([
+            ("file:same".to_owned(), same.clone()),
+            (
+                "file:changed".to_owned(),
+                serde_json::json!({"run_id": "g2", "path": "b"}),
+            ),
+            (
+                "file:missing".to_owned(),
+                serde_json::json!({"run_id": "g2", "path": "c"}),
+            ),
+        ]);
+        let live = BTreeMap::from([
+            ("file:same".to_owned(), same),
+            (
+                "file:changed".to_owned(),
+                serde_json::json!({"run_id": "g1", "path": "b"}),
+            ),
+        ]);
+        let write = catalog_docs_to_write(&expected, &live);
+        assert!(
+            !write.contains_key("file:same"),
+            "a resume that already stored this projection must not bulk it again"
+        );
+        assert_eq!(write["file:changed"]["run_id"], "g2");
+        assert!(write.contains_key("file:missing"));
+        assert_eq!(write.len(), 2);
+    }
+
+    #[test]
+    fn the_prior_run_remainder_is_the_kept_intersection() {
+        let prior = BTreeSet::from([
+            "kept".to_owned(),
+            "rewritten".to_owned(),
+            "not-kept".to_owned(),
+        ]);
+        let kept = BTreeSet::from(["kept".to_owned(), "born-kept".to_owned()]);
+        assert_eq!(prior_run_expected_remainder(&prior, &kept), 1);
+    }
+
+    #[test]
+    fn catalog_run_ids_round_trip_and_a_missing_file_is_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("sync-snapshots").join("tx-1267");
+        std::fs::create_dir_all(&snap).unwrap();
+        assert!(
+            read_catalog_run_ids(dir.path(), "tx-1267")
+                .unwrap()
+                .is_none(),
+            "a generation published before this file existed walks once"
+        );
+        let ids = ["b".to_owned(), "a".to_owned()];
+        write_catalog_run_ids(dir.path(), "tx-1267", [&ids[0], &ids[1]]).unwrap();
+        assert_eq!(
+            read_catalog_run_ids(dir.path(), "tx-1267")
+                .unwrap()
+                .unwrap(),
+            BTreeSet::from(["a".to_owned(), "b".to_owned()])
+        );
+        let bad = "a\nb".to_owned();
+        let err = write_catalog_run_ids(dir.path(), "tx-1267", [&bad]).unwrap_err();
+        assert!(
+            err.to_string().contains("newline"),
+            "a newline id must not split into two lines: {err}"
+        );
+        assert!(read_catalog_run_ids(dir.path(), "../tx").is_err());
+    }
+
+    #[test]
+    fn mget_sources_keep_found_documents_and_reject_a_duplicate_id() {
+        let body = serde_json::json!({"docs": [
+            {"_id": "a", "found": true, "_source": {"k": 1}},
+            {"_id": "b", "found": false}
+        ]});
+        let got = mget_sources(&body).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["a"]["k"], 1);
+        let dup = serde_json::json!({"docs": [
+            {"_id": "a", "found": true, "_source": {}},
+            {"_id": "a", "found": true, "_source": {}}
+        ]});
+        let err = mget_sources(&dup).unwrap_err().to_string();
+        assert!(err.contains("duplicate ID a"), "{err}");
     }
 }
 

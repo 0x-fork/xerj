@@ -140,6 +140,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<NodeState>) {
         }
     } else if method == "POST" && path == "/_bulk" {
         bulk_http(&body, state)
+    } else if method == "POST" && path.ends_with("/_mget") {
+        (200, mget_http(&path, &body, state))
     } else if method == "POST" && path.ends_with("/_search") {
         (200, search_http(&path, &body, state))
     } else if method == "POST" && path.ends_with("/_delete_by_query") {
@@ -181,6 +183,40 @@ fn serve(mut stream: TcpStream, state: &Mutex<NodeState>) {
     );
     let _ = stream.write_all(bytes.as_bytes());
     let _ = stream.flush();
+}
+
+/// `POST /{index}/_mget`. The latest bulk of an id wins: a rewrite appends
+/// another row, and the catalog read-back has to see that one.
+fn mget_http(path: &str, body: &[u8], state: &Mutex<NodeState>) -> Value {
+    let index = path
+        .trim_start_matches('/')
+        .trim_end_matches("/_mget")
+        .to_owned();
+    let query: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let ids = query
+        .get("ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let docs = state.lock().unwrap().docs.clone();
+    let out: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let Some(id) = id.as_str() else {
+                return json!({"_index": index, "found": false});
+            };
+            if let Some((_, _, doc)) = docs
+                .iter()
+                .rev()
+                .find(|(doc_index, doc_id, _)| doc_index == &index && doc_id == id)
+            {
+                json!({"_index": index, "_id": id, "found": true, "_source": doc})
+            } else {
+                json!({"_index": index, "_id": id, "found": false})
+            }
+        })
+        .collect();
+    json!({"docs": out})
 }
 
 /// A small-but-real `_search` over the captured documents. The generated
