@@ -280,9 +280,14 @@ xerj corpus add async-rust \
 ```
 
 Clones are shallow (`--depth 1`) and land in `~/.xerj-code/corpora/<name>/`.
-Every build writes a `corpus.json` beside them — URLs, full commit SHAs and
-licences, a few hundred bytes, no source. That file *is* the shareable corpus
-definition: hand it to someone else and
+A local path is a valid `<git-url>`. Its root `.xerjignore` is copied into the
+clone when that file is untracked or has uncommitted edits — `git clone` would
+drop it, and the index would then see only built-in ignore rules. Running
+`corpus add` again refreshes the copy. A pinned `--from` rebuild does not copy
+it and says so; nested `.xerjignore` files are not carried. Every build writes
+a `corpus.json` beside the clones — URLs, full commit SHAs and licences, a few
+hundred bytes, no source. That file *is* the shareable corpus definition: hand
+it to someone else and
 
 ```sh
 xerj corpus add --from their-corpus.json

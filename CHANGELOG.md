@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj corpus add <name> <local-path>` copies the checkout's root
+  `.xerjignore` into the clone when that file is untracked or has uncommitted
+  edits. `git clone` only checks out committed files, so the ignore file was
+  dropped and the index used built-in rules only (#2199). A pinned `--from`
+  rebuild stays at the recorded SHA and does not copy it; it says so when the
+  working tree's root `.xerjignore` differs. Nested `.xerjignore` files are
+  not carried.
+
 - `xerj autoindex` no longer wedges or runs out of memory on a JSON object
   made of several top-level arrays of records (#1856, #1978). When the
   largest array is longer than a config document (32 records), each top-level

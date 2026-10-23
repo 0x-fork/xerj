@@ -71,6 +71,17 @@ across two machines. A `review` block in the input manifest (see
 [`hub/README.md`](hub/README.md)) is preserved for every repo that lands at its
 recorded SHA.
 
+A local path (`/path/to/checkout` or `file:///path/to/checkout`) is cloned the
+same way. Git checks out committed files only, so a root `.xerjignore` that is
+untracked or has uncommitted edits would never reach the clone, and the index
+would apply built-in ignore rules alone. `corpus add` copies that root file
+into the clone when its bytes differ from the checkout, and says so. Running
+`corpus add` again refreshes the copy from the source working tree. A pinned
+`--from` rebuild does not copy it — the recorded SHA stays exact — and says so
+when the working tree's root `.xerjignore` differs. Nested `.xerjignore` files
+are not carried. Removing the source file does not delete a copy already in
+the clone.
+
 Pre-built *indexes* are a different question (on-disk format version, embedder
 identity, redistribution of the indexed source) and are not offered here.
 

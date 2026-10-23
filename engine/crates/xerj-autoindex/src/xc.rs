@@ -241,6 +241,9 @@ const CORPUS_USAGE: &str =
 
 a flag may precede the verb (xerj corpus --url URL index <name>);
 clone the repos, detect licences, write corpora/<name>/corpus.json;
+a local checkout's root .xerjignore is copied into the clone when it differs
+from the committed file (git clone drops an untracked or uncommitted one);
+a pinned --from rebuild stays exact and does not copy it, and says so;
 --from takes the corpus name from the manifest's 'corpus' field (or the
 pack's 'pack' field) unless <name> or --as overrides it; a harvested pack
 also checksum-verifies and materializes records per source; --verify-sig
@@ -369,6 +372,141 @@ fn dir_stats(target: &Path) -> (String, u64, u64) {
     }
     walk(target, &mut files, &mut bytes);
     (sha, files, bytes)
+}
+
+/// What to do with a local source's root `.xerjignore` once the clone exists.
+enum XerjignoreCarry {
+    /// Unpinned `corpus add <name> <path>`: the working tree is what the
+    /// caller pointed at. Copy when the clone's bytes differ.
+    Copy,
+    /// Pinned `--from`: the recorded sha is the contract. Do not copy.
+    WarnPinned,
+}
+
+/// Ignore files are a few lines. Above this, refuse rather than pour a
+/// symlink-to-a-dataset into the clone.
+const XERJIGNORE_CARRY_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Filesystem root of a local checkout named by `url`, if `url` is one.
+///
+/// `git clone` of a filesystem path or a `file://` URL checks out committed
+/// files only. A remote URL has no working tree to read. `git@host:path`
+/// is not a directory, so it falls out through `is_dir`.
+fn local_checkout_root(url: &str) -> Option<PathBuf> {
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        file_url_path(rest)?
+    } else if url.contains("://") {
+        return None;
+    } else {
+        PathBuf::from(url)
+    };
+    path.is_dir().then_some(path)
+}
+
+/// `file:///abs/path` → `/abs/path`. `file://localhost/abs/path` → `/abs/path`.
+fn file_url_path(rest: &str) -> Option<PathBuf> {
+    let path = if rest.starts_with('/') {
+        rest
+    } else {
+        let slash = rest.find('/')?;
+        &rest[slash..]
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+/// #2199: `git clone` does not carry a root `.xerjignore` that is untracked
+/// or edited and uncommitted, so the index then applies built-in rules only.
+/// For an unpinned local checkout, copy the working-tree file when its bytes
+/// differ. For a pin, leave the recorded tree alone and say the file was not
+/// copied. Remote URLs and a missing file are silent. Nested `.xerjignore`
+/// files are not carried.
+fn settle_local_xerjignore(url: &str, target: &Path, repo_name: &str, mode: XerjignoreCarry) {
+    let Some(source) = local_checkout_root(url) else {
+        return;
+    };
+    let src = source.join(crate::ignore_rules::XERJIGNORE);
+    let src_meta = match std::fs::metadata(&src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "  [ignore] {repo_name}: could not read {} ({e}); it was NOT copied into the clone, so indexing will not see those rules",
+                src.display()
+            );
+            return;
+        }
+    };
+    if !src_meta.is_file() {
+        eprintln!(
+            "  [ignore] {repo_name}: {} is not a regular file and was NOT copied into the clone, so indexing will not see those rules",
+            src.display()
+        );
+        return;
+    }
+    if src_meta.len() > XERJIGNORE_CARRY_MAX_BYTES {
+        eprintln!(
+            "  [ignore] {repo_name}: {} is {} bytes, over the {XERJIGNORE_CARRY_MAX_BYTES} byte carry limit, and was NOT copied into the clone, so indexing will not see those rules",
+            src.display(),
+            src_meta.len()
+        );
+        return;
+    }
+    let src_bytes = match std::fs::read(&src) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "  [ignore] {repo_name}: could not read {} ({e}); it was NOT copied into the clone, so indexing will not see those rules",
+                src.display()
+            );
+            return;
+        }
+    };
+    let dest = target.join(crate::ignore_rules::XERJIGNORE);
+    let same = match std::fs::metadata(&dest) {
+        Ok(m) if m.is_file() && m.len() == src_bytes.len() as u64 => {
+            std::fs::read(&dest).ok().as_deref() == Some(src_bytes.as_slice())
+        }
+        _ => false,
+    };
+    if same {
+        return;
+    }
+    match mode {
+        XerjignoreCarry::Copy => {
+            // A committed symlink must not be written through: that would
+            // change the link target instead of the clone's ignore file.
+            if std::fs::symlink_metadata(&dest)
+                .ok()
+                .is_some_and(|m| m.file_type().is_symlink())
+            {
+                if let Err(e) = std::fs::remove_file(&dest) {
+                    eprintln!(
+                        "  [ignore] {repo_name}: could not replace symlink {} ({e}); indexing will not see the source rules",
+                        dest.display()
+                    );
+                    return;
+                }
+            }
+            match std::fs::write(&dest, &src_bytes) {
+                Ok(()) => eprintln!(
+                    "  [ignore] {repo_name}: copied the source working tree's .xerjignore from {} into the clone (git clone only checks out committed files)",
+                    source.display()
+                ),
+                Err(e) => eprintln!(
+                    "  [ignore] {repo_name}: could not copy {} into the clone ({e}); indexing will not see those rules",
+                    src.display()
+                ),
+            }
+        }
+        XerjignoreCarry::WarnPinned => eprintln!(
+            "  [ignore] {repo_name}: source .xerjignore at {} differs from the pinned checkout and was NOT copied (a pinned rebuild stays at the recorded sha)",
+            src.display()
+        ),
+    }
 }
 
 /// Corpus-name resolution for `add`: an explicit <name> (positional, then
@@ -637,6 +775,20 @@ fn run_corpus_add(args: &[String]) -> i32 {
             continue;
         }
         let target = dest.join(&repo_name);
+        // After the checkout exists and before the manifest counts files.
+        // A pin warns instead of copying; an unpinned local path copies.
+        let carry_ignore = |checkout: &Path| {
+            settle_local_xerjignore(
+                &url,
+                checkout,
+                &repo_name,
+                if sha.is_empty() {
+                    XerjignoreCarry::Copy
+                } else {
+                    XerjignoreCarry::WarnPinned
+                },
+            );
+        };
         if target.join(".git").exists() && !sha.is_empty() {
             let at = git(Some(&target), &["rev-parse", "HEAD"])
                 .ok()
@@ -647,6 +799,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                     "  [ok] {repo_name} already at {}",
                     &sha[..12.min(sha.len())]
                 );
+                carry_ignore(&target);
                 record(&mut entries, &repo_name, &url, &target, &declared, &carry);
                 continue;
             }
@@ -656,11 +809,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 skipped.push(repo_name);
                 continue;
             }
+            carry_ignore(&target);
             record(&mut entries, &repo_name, &url, &target, &declared, &carry);
             continue;
         }
         if target.join(".git").exists() {
             println!("  [skip] {repo_name} already cloned");
+            carry_ignore(&target);
             record(&mut entries, &repo_name, &url, &target, &declared, &carry);
             continue;
         }
@@ -691,6 +846,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 continue;
             }
         }
+        carry_ignore(&target);
         record(&mut entries, &repo_name, &url, &target, &declared, &carry);
     }
 
@@ -3672,5 +3828,200 @@ precedence = ["a", "b"]
         let rc = run_corpus_add(&["--from".to_string(), junk.display().to_string()]);
         assert_eq!(rc, 2);
         assert!(!home.path().join("corpora/junk").exists());
+    }
+
+    // ── corpus add of a local checkout's .xerjignore (#2199) ───────────────
+
+    fn init_committed_repo(dir: &Path, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let (rc, out) = git(Some(dir), &["init", "--quiet", "-b", "main"]).unwrap();
+        assert_eq!(rc, 0, "git init: {out}");
+        for (name, body) in files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+            let (rc, out) = git(Some(dir), &["add", "--", name]).unwrap();
+            assert_eq!(rc, 0, "git add {name}: {out}");
+        }
+        let (rc, out) = git(
+            Some(dir),
+            &[
+                "-c",
+                "user.email=xerj-test@example.com",
+                "-c",
+                "user.name=xerj-test",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+        assert_eq!(rc, 0, "git commit: {out}");
+    }
+
+    fn head_sha(dir: &Path) -> String {
+        let (rc, sha) = git(Some(dir), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(rc, 0, "{sha}");
+        assert_eq!(sha.len(), 40, "{sha}");
+        sha
+    }
+
+    #[test]
+    fn local_checkout_root_is_a_directory_or_a_file_url() {
+        assert!(local_checkout_root("https://github.com/xerj-org/xerj").is_none());
+        assert!(local_checkout_root("ssh://git@github.com/xerj-org/xerj.git").is_none());
+        assert!(local_checkout_root("git@github.com:xerj-org/xerj.git").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().display().to_string();
+        assert_eq!(local_checkout_root(&path).as_deref(), Some(dir.path()));
+        assert_eq!(
+            local_checkout_root(&format!("file://{path}")).as_deref(),
+            Some(dir.path())
+        );
+        assert_eq!(
+            local_checkout_root(&format!("file://localhost{path}")).as_deref(),
+            Some(dir.path())
+        );
+        assert!(local_checkout_root("file://localhost/no/such/xerj-path-2199").is_none());
+    }
+
+    /// #2199: `git clone` of a local path checks out committed files only.
+    /// An untracked root `.xerjignore` has to be copied or the index sees
+    /// built-in rules alone. Re-adding refreshes it; `file://` is the same
+    /// local checkout; a source with no ignore file does not gain one.
+    #[test]
+    fn corpus_add_copies_an_untracked_root_xerjignore_from_a_local_path() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+        let origin = home.path().join("widget");
+        init_committed_repo(&origin, &[("keep.txt", "tracked\n")]);
+        let ignore = "secret.csv\n";
+        std::fs::write(origin.join(".xerjignore"), ignore).unwrap();
+        let (rc, status) = git(
+            Some(&origin),
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert_eq!(rc, 0, "{status}");
+        assert!(
+            status.contains("?? .xerjignore"),
+            "the fixture must be untracked, not committed: {status}"
+        );
+
+        assert_eq!(
+            run_corpus_add(&["local-ignore".into(), origin.display().to_string()]),
+            0
+        );
+        let corpus = home.path().join("corpora/local-ignore");
+        let clone = corpus.join("widget");
+        assert_eq!(
+            std::fs::read_to_string(clone.join("keep.txt")).unwrap(),
+            "tracked\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join(".xerjignore")).expect("clone .xerjignore"),
+            ignore,
+            "an untracked root .xerjignore must be copied into the clone"
+        );
+        let recorded = manifest::read_corpus_manifest(&corpus.join("corpus.json")).unwrap();
+        assert_eq!(
+            recorded.repos[0].files,
+            Some(2),
+            "the carried ignore file is part of the tree the manifest counts"
+        );
+
+        let updated = "secret.csv\nalso.csv\n";
+        std::fs::write(origin.join(".xerjignore"), updated).unwrap();
+        assert_eq!(
+            run_corpus_add(&["local-ignore".into(), origin.display().to_string()]),
+            0,
+            "re-add of an existing clone refreshes the carried file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join(".xerjignore")).unwrap(),
+            updated
+        );
+
+        let file_url = format!("file://{}", origin.display());
+        assert_eq!(run_corpus_add(&["via-file".into(), file_url]), 0);
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("corpora/via-file/widget/.xerjignore"))
+                .expect("file:// clone .xerjignore"),
+            updated
+        );
+
+        let bare = home.path().join("plainrepo");
+        init_committed_repo(&bare, &[("keep.txt", "tracked\n")]);
+        assert_eq!(
+            run_corpus_add(&["no-ignore".into(), bare.display().to_string()]),
+            0
+        );
+        assert!(
+            !home
+                .path()
+                .join("corpora/no-ignore/plainrepo/.xerjignore")
+                .exists(),
+            "a checkout with no .xerjignore must not gain one"
+        );
+    }
+
+    /// An uncommitted edit of a tracked `.xerjignore` is the same drop:
+    /// `git clone` checks out the committed bytes. A pinned `--from` rebuild
+    /// must not copy the working tree over the recorded sha.
+    #[test]
+    fn corpus_add_copies_uncommitted_xerjignore_edits_but_a_pin_does_not() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+
+        let origin = home.path().join("edited");
+        init_committed_repo(
+            &origin,
+            &[("keep.txt", "tracked\n"), (".xerjignore", "v1\n")],
+        );
+        std::fs::write(origin.join(".xerjignore"), "v2\n").unwrap();
+        assert_eq!(
+            run_corpus_add(&["edited-ignore".into(), origin.display().to_string()]),
+            0
+        );
+        let clone = home.path().join("corpora/edited-ignore/edited");
+        assert_eq!(
+            std::fs::read_to_string(clone.join(".xerjignore")).unwrap(),
+            "v2\n",
+            "the working-tree edit must overlay the committed ignore file"
+        );
+        let (rc, committed) = git(Some(&clone), &["show", "HEAD:.xerjignore"]).unwrap();
+        assert_eq!(rc, 0, "{committed}");
+        assert_eq!(committed, "v1", "the overlay is not a new commit");
+
+        let pinned_src = home.path().join("pinnedsrc");
+        init_committed_repo(&pinned_src, &[("keep.txt", "tracked\n")]);
+        std::fs::write(pinned_src.join(".xerjignore"), "secret.csv\n").unwrap();
+        let sha = head_sha(&pinned_src);
+        let manifest_path = home.path().join("pin.json");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"{{"corpus":"pinned-exact","repos":[{{"repo":"pinnedsrc","url":"{}","sha":"{sha}"}}]}}"#,
+                pinned_src.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest_path.display().to_string()]),
+            0
+        );
+        let pinned = home.path().join("corpora/pinned-exact/pinnedsrc");
+        assert_eq!(
+            std::fs::read_to_string(pinned.join("keep.txt")).unwrap(),
+            "tracked\n",
+            "the pin must still check out the recorded tree"
+        );
+        assert!(
+            !pinned.join(".xerjignore").exists(),
+            "a pinned rebuild stays at the recorded sha and does not copy the working tree's .xerjignore"
+        );
     }
 }
