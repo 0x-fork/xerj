@@ -322,18 +322,22 @@ Amp 的键带命名空间前缀，VS Code 和 Copilot 需要 `servers` 加传输
 {mcp: {servers: {xerj: {command: "/abs/path/to/xerj", args: ["mcp"], transport: "stdio"}}}}
 ```
 
-DeepSeek Harness 在它的 Cordis 补丁文件里把 MCP 作为插件加载：
+DeepSeek Harness 在 `$DSH_HOME/cordis.patch.yml`（或某个 profile 的 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`）里把一个 MCP 服务加载为一个插件。如果该文件只有 `[]`，用下面的块替换这个数组；追加在 `[]` 后面不是合法 YAML。`env` 和 `cwd` 是 stdio 的可选字段（`args` 默认 `[]`，`env` 默认 `{}`，`cwd` 默认 `""`）。节点不是以 `--insecure` 运行时，在 `env` 下加上 `XERJ_AUTH: "ApiKey <key>"`：
 
 ```yaml
+# $DSH_HOME/cordis.patch.yml
 - insert:
     - id: mcp-xerj
-      name: "@deepseek-ai/dsh-mcp-client"
+      name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: xerj
         transport: stdio
         command: /abs/path/to/xerj
         args:
           - mcp
+        env:
+          XERJ_URL: "http://localhost:9200"
+        cwd: ""
 ```
 
 最初名单里有三个候选被有意排除。Aider 完全没有 MCP 客户端支持（[Aider-AI/aider#3314](https://github.com/Aider-AI/aider/issues/3314) 仍未关闭）。T3 Code 方向相反：它自己托管一个供其他智能体连接的 MCP 端点，其会话从底层 harness 继承服务配置。Grok Bot 没有文档记载的本地 stdio 注册方式；Grok CLI 有，见上表对应一行。

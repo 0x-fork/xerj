@@ -434,18 +434,22 @@ context servers, and OpenClaw nests them under `mcp`:
 {mcp: {servers: {xerj: {command: "/abs/path/to/xerj", args: ["mcp"], transport: "stdio"}}}}
 ```
 
-DeepSeek Harness loads MCP as a plugin in its Cordis patch file:
+DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.yml`, or in a profile patch at `$DSH_HOME/profiles/<profile>/cordis.patch.yml`. If that file is only `[]`, replace the array with the block below; appending under `[]` is not valid YAML. `env` and `cwd` are optional stdio fields (`args` defaults to `[]`, `env` to `{}`, `cwd` to `""`). When the node is not running `--insecure`, add `XERJ_AUTH: "ApiKey <key>"` under `env`:
 
 ```yaml
+# $DSH_HOME/cordis.patch.yml
 - insert:
     - id: mcp-xerj
-      name: "@deepseek-ai/dsh-mcp-client"
+      name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: xerj
         transport: stdio
         command: /abs/path/to/xerj
         args:
           - mcp
+        env:
+          XERJ_URL: "http://localhost:9200"
+        cwd: ""
 ```
 
 Three candidates from the original list are deliberately absent. Aider has no MCP client support at

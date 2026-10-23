@@ -426,18 +426,22 @@ Zed는 이들을 컨텍스트 서버라 부르고, OpenClaw는 `mcp` 아래에 �
 {mcp: {servers: {xerj: {command: "/abs/path/to/xerj", args: ["mcp"], transport: "stdio"}}}}
 ```
 
-DeepSeek Harness는 Cordis 패치 파일에서 MCP를 플러그인으로 불러옵니다:
+DeepSeek Harness는 `$DSH_HOME/cordis.patch.yml` 또는 프로필 패치 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`에서 MCP 서버 하나를 플러그인 하나로 불러옵니다. 그 파일이 `[]`뿐이면 배열 아래에 붙이지 말고 아래 블록으로 바꿉니다. `[]` 아래에 붙이면 올바른 YAML이 아닙니다. `env`와 `cwd`는 stdio의 선택 필드입니다(`args` 기본값 `[]`, `env` 기본값 `{}`, `cwd` 기본값 `""`). 노드가 `--insecure`로 돌지 않으면 `env` 아래에 `XERJ_AUTH: "ApiKey <key>"`를 넣습니다:
 
 ```yaml
+# $DSH_HOME/cordis.patch.yml
 - insert:
     - id: mcp-xerj
-      name: "@deepseek-ai/dsh-mcp-client"
+      name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: xerj
         transport: stdio
         command: /abs/path/to/xerj
         args:
           - mcp
+        env:
+          XERJ_URL: "http://localhost:9200"
+        cwd: ""
 ```
 
 원래 목록의 후보 세 개는 의도적으로 빠져 있습니다. Aider는 MCP 클라이언트 지원이 아예
