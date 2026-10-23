@@ -607,6 +607,12 @@ fn record_entries(
             pack_sha256: pack.sha256,
             dependency_names: Vec::new(),
             quality_grade: None,
+            upstream: crate::catalogue::upstream_list(
+                pack.manifest
+                    .sources
+                    .iter()
+                    .map(|s| (s.url.as_str(), s.repo.as_str())),
+            ),
             term_sketch: crate::sketch::build(terms),
         });
     }
@@ -874,6 +880,7 @@ mod tests {
         assert_eq!(e.pack_sha256, hex(&Sha256::digest(&raw)));
         assert_eq!(e.quality_grade, None);
         assert!(e.ask_for.contains("block compression"));
+        assert_eq!(e.upstream, "x/lz4");
         for term in [
             "LZ4_compress_default",
             "lz4_compress_default",

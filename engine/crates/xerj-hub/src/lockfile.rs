@@ -651,6 +651,7 @@ mod tests {
             domain: "NET".to_string(),
             topics: vec!["compression".to_string()],
             ask_for: "x".to_string(),
+            upstream: String::new(),
             pin_sha: pin.to_string(),
             pin_date: "2026-10-02".to_string(),
             refresh_cadence_days: 7,

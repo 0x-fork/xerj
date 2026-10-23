@@ -51,13 +51,15 @@ pub fn specs() -> Vec<Value> {
         json!({
             "name": "xerj_hub_find",
             "description": concat!(
-                "Discover which hub corpora can answer a question. Returns candidate corpora ",
-                "with their pin, licence and whether the pack is already on this machine — not ",
-                "passages; ask one with xerj_hub_ask. Routed exactly as `xerj ask` routes: your ",
-                "project's dependencies, the signed catalogue's term sketches, and the exact ",
-                "symbol a definition question names (offline: reads the catalogue `xerj hub sync` ",
-                "cached and never fetches it; this build has no hosted search). ",
-                "Excluded-licence corpora are never listed."),
+                "Discover which hub corpora can answer a question. Each candidate names the ",
+                "upstream repo (owner/name) and a one-line description of what that pack is, plus ",
+                "its pin, licence and whether the pack is already on this machine — not passages; ",
+                "ask one with xerj_hub_ask. A query that names a different project of the same slug ",
+                "(fabric.js vs the pack's repo) is reported as a different project instead of a ",
+                "silent match. Routed exactly as `xerj ask` routes: your project's dependencies, ",
+                "the signed catalogue's term sketches, and the exact symbol a definition question ",
+                "names (offline: reads the catalogue `xerj hub sync` cached and never fetches it; ",
+                "this build has no hosted search). Excluded-licence corpora are never listed."),
             "inputSchema": {
                 "type": "object",
                 "properties": {

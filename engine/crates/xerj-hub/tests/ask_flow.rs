@@ -422,6 +422,7 @@ fn publish(src_archive: &Path, src_sig: &Path, dir: &Path, hub_home: &Path) -> P
         domain: "DEV".into(),
         topics: vec!["c".into()],
         ask_for: "a tiny C fixture corpus".into(),
+        upstream: String::new(),
         pin_sha: PIN_SHA.into(),
         pin_date: PIN_DATE.into(),
         refresh_cadence_days: 7,

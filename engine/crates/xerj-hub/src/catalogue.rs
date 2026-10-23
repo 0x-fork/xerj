@@ -31,7 +31,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use xerj_autoindex::harvest::sign::{sign_bytes, verify_bytes};
 use xerj_common::hub::{
-    hub_pubkey, Catalogue, CatalogueEntry, LicenceClass, CATALOGUE_FORMAT_VERSION,
+    catalogue_format_supported, hub_pubkey, Catalogue, CatalogueEntry, LicenceClass,
+    CATALOGUE_FORMAT_VERSION,
 };
 
 /// Path of the catalogue under the hub's API root.
@@ -109,9 +110,69 @@ struct Manifest {
 #[derive(Deserialize)]
 struct ManifestRepo {
     #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
     sha: String,
     #[serde(default)]
     review: Option<ManifestReview>,
+}
+
+/// `owner/name` from a git remote, when the URL (or the `repo` field itself)
+/// records one. A bare repo name (`fabric`) is not an owner, so it is not
+/// returned: the slug already says that, and inventing an owner is worse than
+/// leaving the field empty.
+pub fn upstream_id(url: &str, repo: &str) -> Option<String> {
+    let repo = repo.trim().trim_end_matches(".git");
+    if let Some(id) = owner_name(repo) {
+        return Some(id);
+    }
+    let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("git://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.split_once("git@github.com:").map(|(_, p)| p));
+    path.and_then(owner_name)
+}
+
+/// The first two non-empty path segments, when both look like a GitHub
+/// owner and a repo name (no spaces, no scheme).
+fn owner_name(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .take(2)
+        .collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    if parts.iter().any(|p| p.contains(' ') || p.contains(':')) {
+        return None;
+    }
+    // A path that is only `owner/name` — `owner_name` is also called on a
+    // longer URL path after the host is stripped, and extra segments (a
+    // `/tree/main` suffix) are dropped by `take(2)`.
+    Some(format!("{}/{}", parts[0], parts[1]))
+}
+
+/// `owner/name` values from `(url, repo)` pairs, first-seen order, at most four.
+pub fn upstream_list<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let mut out = Vec::new();
+    for (url, repo) in pairs {
+        if let Some(id) = upstream_id(url, repo) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        if out.len() == 4 {
+            break;
+        }
+    }
+    out.join(", ")
 }
 
 #[derive(Deserialize)]
@@ -230,12 +291,14 @@ fn build_entry(input: &CorpusBuildInput) -> Result<CatalogueEntry> {
         .unwrap_or_else(|| input.ask_for.clone());
 
     let term_sketch = crate::sketch::build(input.terms.iter().cloned());
+    let upstream = upstream_list(m.repos.iter().map(|r| (r.url.as_str(), r.repo.as_str())));
 
     Ok(CatalogueEntry {
         slug: m.corpus,
         domain: input.domain.clone(),
         topics: m.topics,
         ask_for,
+        upstream,
         pin_sha,
         pin_date,
         refresh_cadence_days: input.refresh_cadence_days,
@@ -390,13 +453,14 @@ fn read_cached(cache_file: &Path) -> Option<Catalogue> {
     parse_catalogue(&raw).ok()
 }
 
-/// Parse catalogue bytes and refuse a format version this client does not equal.
+/// Parse catalogue bytes and refuse a format version this client does not read.
 fn parse_catalogue(bytes: &[u8]) -> Result<Catalogue> {
     let cat: Catalogue = serde_json::from_slice(bytes).context("parse catalogue JSON")?;
-    if cat.format_version != CATALOGUE_FORMAT_VERSION {
+    if !catalogue_format_supported(cat.format_version) {
         bail!(
-            "catalogue format_version {} is not the supported {}",
+            "catalogue format_version {} is not a supported version ({}..={})",
             cat.format_version,
+            xerj_common::hub::CATALOGUE_FORMAT_VERSION_MIN,
             CATALOGUE_FORMAT_VERSION
         );
     }
@@ -833,6 +897,76 @@ mod tests {
         assert_eq!(e.licence_spdx, "GPL-3.0-only");
         // the pin sha still comes from the FIRST repo — unchanged by this fix.
         assert_eq!(e.pin_sha, "1111111111111111111111111111111111111111");
+    }
+
+    #[test]
+    fn upstream_is_the_github_owner_and_repo_not_the_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("fabric.json");
+        let json = serde_json::json!({
+            "corpus": "fabric",
+            "cloned_at": "2026-10-13T00:00:00Z",
+            "repos": [{
+                "repo": "fabric",
+                "url": "https://github.com/danielmiessler/fabric.git",
+                "sha": "177b3a9d284895c907d6eb3a64937d174add4cd5",
+                "review": {"spdx": "MIT", "use": "adapt-with-attribution", "at": "2026-10-13"}
+            }]
+        });
+        fs::write(&p, serde_json::to_vec(&json).unwrap()).unwrap();
+        let input = CorpusBuildInput {
+            manifest_path: p,
+            domain: "AI".into(),
+            refresh_cadence_days: 7,
+            pack_bytes: 1,
+            pack_url: "u".into(),
+            pack_sha256: "e".repeat(64),
+            sig_url: "s".into(),
+            quality_grade: None,
+            terms: vec![],
+            pin_sha: String::new(),
+            ask_for: "prompt patterns".into(),
+        };
+        let (seed, _public) = keypair();
+        let (cat, _sig) = build_catalogue(&[input], "2026-10-14T00:00:00Z", &seed).unwrap();
+        assert_eq!(cat.format_version, CATALOGUE_FORMAT_VERSION);
+        assert_eq!(cat.corpora[0].upstream, "danielmiessler/fabric");
+        // A non-github URL with no owner/name is left empty, not copied from the slug.
+        assert_eq!(upstream_id("https://example.test/fabric", "fabric"), None);
+        assert_eq!(
+            upstream_id("git@github.com:KhronosGroup/WebGL.git", "WebGL").as_deref(),
+            Some("KhronosGroup/WebGL")
+        );
+        assert_eq!(
+            upstream_list(
+                [
+                    ("https://github.com/huggingface/candle.git", "candle"),
+                    ("https://github.com/huggingface/candle", "candle"),
+                    ("https://github.com/other/extra", "extra"),
+                ]
+                .into_iter()
+            ),
+            "huggingface/candle, other/extra"
+        );
+    }
+
+    /// Format 1 has no `upstream` key. It still loads. A future version does not.
+    #[test]
+    fn format_1_without_upstream_loads_and_a_newer_version_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bytes, _sig, _public) = fixture_bytes(tmp.path());
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["format_version"] = serde_json::json!(1);
+        for entry in v["corpora"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("upstream");
+        }
+        let parsed = parse_catalogue(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(parsed.format_version, 1);
+        assert!(parsed.corpora.iter().all(|e| e.upstream.is_empty()));
+
+        v["format_version"] = serde_json::json!(CATALOGUE_FORMAT_VERSION + 1);
+        let err = parse_catalogue(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("format_version"), "{err:#}");
     }
 
     /// Build a catalogue, return `(bytes, sig, pubkey)` ready to seed a cache.

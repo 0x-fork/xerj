@@ -18,9 +18,19 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
-/// Bump when the on-the-wire catalogue shape changes. The client refuses a
-/// catalogue whose `format_version` it does not equal.
-pub const CATALOGUE_FORMAT_VERSION: u32 = 1;
+/// The catalogue shape this build writes. 2 adds optional `upstream`
+/// (`owner/name` of the pack's git remote) on each entry. Readers still load
+/// format 1 (that field is absent and reads as empty) so a cached catalogue
+/// from before this field keeps working. A newer shape is refused.
+/// See [`catalogue_format_supported`].
+pub const CATALOGUE_FORMAT_VERSION: u32 = 2;
+/// Oldest catalogue shape this build still loads.
+pub const CATALOGUE_FORMAT_VERSION_MIN: u32 = 1;
+
+/// True for a catalogue `format_version` this build can read.
+pub fn catalogue_format_supported(version: u32) -> bool {
+    (CATALOGUE_FORMAT_VERSION_MIN..=CATALOGUE_FORMAT_VERSION).contains(&version)
+}
 
 /// Bump when the pack archive layout changes. `format_version: 1` means the
 /// snapshot layout (engine `create_snapshot`/`restore_snapshot`).
@@ -135,6 +145,12 @@ pub struct CatalogueEntry {
     pub topics: Vec<String>,
     /// The registry's one-line "an agent working on ___ queries this for ___".
     pub ask_for: String,
+    /// Upstream git repo as `owner/name` (the manifest's `repos[].url`, GitHub
+    /// form). Several repos are joined with ", " (at most four). Empty on a
+    /// catalogue written before this field, or when the manifest recorded no
+    /// `owner/name` remote — never guessed from the slug.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream: String,
     /// Full 40-hex commit the pack was built at.
     pub pin_sha: String,
     /// YYYY-MM-DD the pin was taken.
@@ -481,6 +497,7 @@ mod tests {
             domain: "NET".into(),
             topics: vec!["compression".into()],
             ask_for: "fast block compression".into(),
+            upstream: "lz4/lz4".into(),
             pin_sha: "0774d05537f9762f838f7ab541b7765f1a729cb5".into(),
             pin_date: "2026-10-02".into(),
             refresh_cadence_days: 7,
@@ -511,10 +528,32 @@ mod tests {
         let back: Catalogue = serde_json::from_str(&s).unwrap();
         assert_eq!(back.corpora.len(), 1);
         assert_eq!(back.corpora[0].slug, "lz4");
+        assert_eq!(back.corpora[0].upstream, "lz4/lz4");
         assert_eq!(
             back.corpora[0].licence_class,
             LicenceClass::AdaptWithAttribution
         );
+    }
+
+    /// A catalogue written before `upstream` existed has no such key. It still
+    /// loads, and the field is empty rather than invented from the slug.
+    #[test]
+    fn a_catalogue_entry_without_upstream_loads_as_empty() {
+        let mut cat = Catalogue {
+            format_version: CATALOGUE_FORMAT_VERSION_MIN,
+            generated_at: "2026-10-14T00:00:00Z".into(),
+            corpora: vec![sample_entry()],
+        };
+        cat.corpora[0].upstream.clear();
+        let mut v = serde_json::to_value(&cat).unwrap();
+        v["corpora"][0].as_object_mut().unwrap().remove("upstream");
+        let back: Catalogue = serde_json::from_value(v).unwrap();
+        assert_eq!(back.corpora[0].upstream, "");
+        assert_eq!(back.corpora[0].slug, "lz4");
+        assert!(catalogue_format_supported(CATALOGUE_FORMAT_VERSION_MIN));
+        assert!(catalogue_format_supported(CATALOGUE_FORMAT_VERSION));
+        assert!(!catalogue_format_supported(0));
+        assert!(!catalogue_format_supported(CATALOGUE_FORMAT_VERSION + 1));
     }
 
     #[test]

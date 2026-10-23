@@ -875,6 +875,7 @@ mod tests {
             domain: "TEST".to_string(),
             topics: Vec::new(),
             ask_for: String::new(),
+            upstream: String::new(),
             pin_sha: "0".repeat(40),
             pin_date: "2026-01-01".to_string(),
             refresh_cadence_days: 7,

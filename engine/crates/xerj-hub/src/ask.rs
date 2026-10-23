@@ -847,6 +847,62 @@ fn printable_slug(s: &str) -> String {
 
 /// Step 2. `None` means `out` already holds the verdict (an exit code and its
 /// message / candidate lines). A tight group comes back as two or three slugs,
+fn catalogue_entry<'a>(cat: &'a Catalogue, slug: &str) -> Option<&'a CatalogueEntry> {
+    cat.corpora.iter().find(|e| e.slug == slug)
+}
+
+/// Candidate lines for a decision: each pack's upstream and description, plus
+/// a note when the question named a different project of the same stem.
+fn candidate_text(question: &str, cat: &Catalogue, slugs: &[String]) -> String {
+    slugs
+        .iter()
+        .map(|s| match catalogue_entry(cat, s) {
+            Some(e) => {
+                let mut line = identity_line(&e.slug, &e.upstream, &e.ask_for);
+                if let Some(token) =
+                    different_project_token(question, &e.slug, &e.upstream, &e.ask_for)
+                {
+                    line.push('\n');
+                    line.push_str(&collision_sentence(&token, &e.slug, &e.upstream));
+                }
+                line
+            }
+            None => printable(s),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `(query token, slug, upstream)` of the first listed corpus the question
+/// names as a different project.
+fn first_collision(
+    question: &str,
+    cat: &Catalogue,
+    slugs: &[String],
+) -> Option<(String, String, String)> {
+    for s in slugs {
+        let Some(e) = catalogue_entry(cat, s) else {
+            continue;
+        };
+        if let Some(token) = different_project_token(question, &e.slug, &e.upstream, &e.ask_for) {
+            return Some((token, e.slug.clone(), e.upstream.clone()));
+        }
+    }
+    None
+}
+
+fn collision_hint(token: &str, slug: &str, upstream: &str) -> String {
+    let who = if upstream.is_empty() {
+        printable(slug)
+    } else {
+        printable(upstream)
+    };
+    format!(
+        "\"{}\" is a different project than this pack ({who}); re-run with --corpus <slug> only if that is the project you meant",
+        printable(token)
+    )
+}
+
 /// best first; one confident corpus comes back as a one-element list.
 fn select_corpus(
     args: &AskArgs,
@@ -929,22 +985,29 @@ fn select_corpus(
     };
     let routing = cap_ambiguous(routing);
     match routing {
-        Routing::Confident(slug) => Some(vec![slug]),
-        Routing::Group(slugs) => Some(slugs),
+        Routing::Confident(slug) => {
+            let slugs = vec![slug];
+            if let Some((token, s, up)) = first_collision(&args.question, catalogue, &slugs) {
+                out.stdout = candidate_text(&args.question, catalogue, &slugs);
+                out.stderr.push(collision_hint(&token, &s, &up));
+                out.exit = EXIT_NEEDS_DECISION;
+                None
+            } else {
+                Some(slugs)
+            }
+        }
+        Routing::Group(slugs) => {
+            if let Some((token, s, up)) = first_collision(&args.question, catalogue, &slugs) {
+                out.stdout = candidate_text(&args.question, catalogue, &slugs);
+                out.stderr.push(collision_hint(&token, &s, &up));
+                out.exit = EXIT_NEEDS_DECISION;
+                None
+            } else {
+                Some(slugs)
+            }
+        }
         Routing::Ambiguous(slugs) => {
-            let lines: Vec<String> = slugs
-                .iter()
-                .map(|s| {
-                    let ask_for = catalogue
-                        .corpora
-                        .iter()
-                        .find(|e| &e.slug == s)
-                        .map(|e| printable(&e.ask_for))
-                        .unwrap_or_default();
-                    format!("{} — {ask_for}", printable(s))
-                })
-                .collect();
-            out.stdout = lines.join("\n");
+            out.stdout = candidate_text(&args.question, catalogue, &slugs);
             out.stderr
                 .push("more than one corpus matches; re-run with --corpus <slug>".to_string());
             out.exit = EXIT_NEEDS_DECISION;
@@ -953,13 +1016,29 @@ fn select_corpus(
         Routing::NoCorpus => {
             out.stderr.push(NO_CORPUS_MESSAGE.to_string());
             // Nothing was credible, but something may have been close: name the
-            // nearest few so the asker can pick one with `--corpus` instead of
-            // starting over from "no".
+            // nearest few, with what each pack is, so the asker can pick one
+            // with `--corpus` instead of starting over from "no".
             let closest: Vec<String> = ranked
                 .iter()
                 .filter(|(slug, _)| known(slug))
                 .take(CLOSEST_SHOWN)
-                .map(|(slug, _)| printable(slug))
+                .map(|(slug, _)| match catalogue_entry(catalogue, slug) {
+                    Some(e) => {
+                        let mut line = identity_line(&e.slug, &e.upstream, &e.ask_for);
+                        if let Some(token) = different_project_token(
+                            &args.question,
+                            &e.slug,
+                            &e.upstream,
+                            &e.ask_for,
+                        ) {
+                            line.push_str(" (");
+                            line.push_str(&collision_sentence(&token, &e.slug, &e.upstream));
+                            line.push(')');
+                        }
+                        line
+                    }
+                    None => printable(slug),
+                })
                 .collect();
             if !closest.is_empty() {
                 out.stderr.push(format!(
@@ -1785,12 +1864,26 @@ pub struct FoundCorpus {
     pub licence_spdx: String,
     pub licence_class: LicenceClass,
     pub pack_bytes: u64,
+    /// `owner/name` of the upstream repo. Empty when the catalogue has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream: String,
+    /// A query token that names a different project sharing only this slug's
+    /// stem (`fabric.js` against `danielmiessler/fabric`). Empty when the
+    /// names agree.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub different_project: String,
 }
 
 /// What [`find`] decided: the router's verdict and the candidates, best first.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FindOutcome {
-    /// `confident` | `ambiguous` | `no_corpus` — the verdict `xerj ask` would act on.
+    /// `confident` | `ambiguous` | `no_corpus` | `different_project`.
+    ///
+    /// `different_project` means the router would have answered from a slug
+    /// whose name the question only shares: the question names another project
+    /// (`fabric.js`) and this pack is a different one (`danielmiessler/fabric`).
+    /// `xerj ask` does not answer that as a silent match; it prints the pack's
+    /// identity and exits 4.
     pub routing: &'static str,
     pub corpora: Vec<FoundCorpus>,
 }
@@ -1838,26 +1931,47 @@ pub fn find(
             .map(|(_, score)| *score)
             .unwrap_or(0.0)
     };
-    let corpora = order
+    let corpora: Vec<FoundCorpus> = order
         .iter()
         .filter_map(|slug| catalogue.corpora.iter().find(|e| &e.slug == slug))
         .filter(|e| e.licence_class != LicenceClass::Excluded)
         .take(k)
-        .map(|e| FoundCorpus {
-            slug: e.slug.clone(),
-            score: score_of(&e.slug),
-            cached: cached.contains(&e.slug),
-            ask_for: e.ask_for.clone(),
-            domain: e.domain.clone(),
-            pin_sha: e.pin_sha.clone(),
-            pin_date: e.pin_date.clone(),
-            licence_spdx: e.licence_spdx.clone(),
-            licence_class: e.licence_class,
-            pack_bytes: e.pack_bytes,
+        .map(|e| {
+            let different_project =
+                different_project_token(question, &e.slug, &e.upstream, &e.ask_for)
+                    .unwrap_or_default();
+            FoundCorpus {
+                slug: e.slug.clone(),
+                score: score_of(&e.slug),
+                cached: cached.contains(&e.slug),
+                ask_for: e.ask_for.clone(),
+                domain: e.domain.clone(),
+                pin_sha: e.pin_sha.clone(),
+                pin_date: e.pin_date.clone(),
+                licence_spdx: e.licence_spdx.clone(),
+                licence_class: e.licence_class,
+                pack_bytes: e.pack_bytes,
+                upstream: e.upstream.clone(),
+                different_project,
+            }
         })
         .collect();
+    let verdict_slugs: Vec<&str> = match &routing {
+        Routing::Confident(slug) => vec![slug.as_str()],
+        Routing::Group(slugs) | Routing::Ambiguous(slugs) => {
+            slugs.iter().map(String::as_str).collect()
+        }
+        Routing::NoCorpus => Vec::new(),
+    };
+    // A confident (or grouped) name match that is actually a different project
+    // is not reported as confident: the caller must see the mismatch.
+    let collided = matches!(routing, Routing::Confident(_) | Routing::Group(_))
+        && corpora
+            .iter()
+            .any(|c| !c.different_project.is_empty() && verdict_slugs.contains(&c.slug.as_str()));
     FindOutcome {
         routing: match routing {
+            _ if collided => "different_project",
             Routing::Confident(_) | Routing::Group(_) => "confident",
             Routing::Ambiguous(_) => "ambiguous",
             Routing::NoCorpus => "no_corpus",
@@ -1899,32 +2013,150 @@ pub fn run_find(question: &str, k: usize) -> Result<FindOutcome, String> {
     Ok(find(question, k, &cwd, &hub_home, &catalogue))
 }
 
+/// One result line: slug, upstream `owner/name` when the catalogue has one, and
+/// the one-line description. Catalogue strings are made [`printable`].
+pub fn identity_line(slug: &str, upstream: &str, ask_for: &str) -> String {
+    let slug = printable(slug);
+    let ask = printable(ask_for);
+    let upstream = printable(upstream);
+    if upstream.is_empty() {
+        format!("{slug} — {ask}")
+    } else {
+        format!("{slug} — {upstream} — {ask}")
+    }
+}
+
+/// The sentence that says a query token is not this pack.
+pub fn collision_sentence(token: &str, slug: &str, upstream: &str) -> String {
+    let token = printable(token);
+    let who = if upstream.is_empty() {
+        printable(slug)
+    } else {
+        printable(upstream)
+    };
+    format!("note: \"{token}\" is a different project than this pack ({who})")
+}
+
 /// Render a [`FindOutcome`] as text, one corpus per line (catalogue strings
-/// made [`printable`]).
+/// made [`printable`]). A same-name different project gets its own note line
+/// instead of reading as a plain match.
 pub fn render_find(found: &FindOutcome) -> String {
     if found.corpora.is_empty() {
         return NO_CORPUS_MESSAGE.to_string();
     }
-    let mut lines: Vec<String> = found
-        .corpora
-        .iter()
-        .map(|c| {
-            format!(
-                "{} — {}  (score {:.2}, pin {}, {}{})",
-                printable(&c.slug),
-                printable(&c.ask_for),
-                c.score,
-                printable(&c.pin_date),
-                printable(&c.licence_spdx),
-                if c.cached { ", cached" } else { "" }
-            )
-        })
-        .collect();
-    lines.push(format!(
-        "routing: {}; ask one with xerj_hub_ask {{question, corpus}}",
-        found.routing
-    ));
+    let mut lines: Vec<String> = Vec::new();
+    for c in &found.corpora {
+        lines.push(format!(
+            "{}  (score {:.2}, pin {}, {}{})",
+            identity_line(&c.slug, &c.upstream, &c.ask_for),
+            c.score,
+            printable(&c.pin_date),
+            printable(&c.licence_spdx),
+            if c.cached { ", cached" } else { "" }
+        ));
+        if !c.different_project.is_empty() {
+            lines.push(collision_sentence(
+                &c.different_project,
+                &c.slug,
+                &c.upstream,
+            ));
+        }
+    }
+    if found.routing == "different_project" {
+        lines.push(
+            "routing: different_project; this slug is a different project than the query names. \
+             ask it with xerj_hub_ask {question, corpus} only if that pack is the one you meant"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "routing: {}; ask one with xerj_hub_ask {{question, corpus}}",
+            found.routing
+        ));
+    }
     lines.join("\n")
+}
+
+/// Suffixes that make a token a different project's name (`fabric.js`), not a
+/// file in the corpus (`lz4.h`, `lz4.c`).
+const PROJECT_SUFFIXES: &[&str] = &[
+    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".py", ".rb", ".go", ".php", ".rs",
+];
+/// Glued forms of the same idea (`fabricjs`), only for suffixes short enough to
+/// be a language tag and long enough that the stem is still a name.
+const GLUED_PROJECT_SUFFIXES: &[&str] = &["js", "py"];
+
+/// The query token that names a different project than `slug`, when the token's
+/// stem is exactly the slug and neither the upstream repo nor the one-line
+/// description contains the token. `None` when the question names this pack,
+/// or names nothing that only shares the slug.
+pub fn different_project_token(
+    question: &str,
+    slug: &str,
+    upstream: &str,
+    ask_for: &str,
+) -> Option<String> {
+    let slug_l = slug.to_ascii_lowercase();
+    if slug_l.len() < 2 {
+        return None;
+    }
+    let upstream_l = upstream.to_ascii_lowercase();
+    let ask_l = ask_for.to_ascii_lowercase();
+    for token in query_name_tokens(question) {
+        if token == slug_l {
+            continue;
+        }
+        if !upstream_l.is_empty() && upstream_l.contains(&token) {
+            continue;
+        }
+        if ask_l.contains(&token) {
+            continue;
+        }
+        if project_stem(&token).as_deref() == Some(slug_l.as_str()) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn query_name_tokens(question: &str) -> Vec<String> {
+    let lower = question.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for word in lower.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    {
+        let word = word.trim_matches(|c| c == '.' || c == '-');
+        // Same floor as the router's named-slug tokens (2): a one-letter
+        // fragment is not a project name.
+        if word.len() < 2 {
+            continue;
+        }
+        if seen.insert(word.to_string()) {
+            out.push(word.to_string());
+        }
+    }
+    out
+}
+
+fn project_stem(token: &str) -> Option<String> {
+    for suffix in PROJECT_SUFFIXES {
+        if let Some(stem) = token.strip_suffix(suffix) {
+            if stem.len() >= 2 && !stem.contains('.') && !stem.contains('/') {
+                return Some(stem.to_string());
+            }
+        }
+    }
+    for suffix in GLUED_PROJECT_SUFFIXES {
+        if token.len() <= suffix.len() + 2 {
+            continue;
+        }
+        if let Some(stem) = token.strip_suffix(suffix) {
+            if stem.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Some(stem.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1948,6 +2180,7 @@ mod tests {
             domain: "TEST".to_string(),
             topics: vec![],
             ask_for: format!("an agent working on {slug} queries this for its internals"),
+            upstream: String::new(),
             pin_sha: "0".repeat(40),
             pin_date: "2026-10-01".to_string(),
             refresh_cadence_days: 7,
@@ -3879,6 +4112,7 @@ mod tests {
         let text = render_find(&found);
         assert!(text.starts_with("lz4 — "), "{text}");
         assert!(text.contains("cached"), "{text}");
+        assert!(text.contains("routing: "), "{text}");
 
         // k is clamped to 1..=FIND_MAX_K.
         let one = find("lz4 block decoder", 0, rig.cwd.path(), rig.hub.path(), &cat);
@@ -3890,5 +4124,106 @@ mod tests {
         if none.corpora.is_empty() {
             assert_eq!(render_find(&none), NO_CORPUS_MESSAGE);
         }
+    }
+
+    /// Issue #2179: a query that names a different project of the same stem
+    /// (`fabric.js`) must not read as a silent match of the slug (`fabric`,
+    /// which is danielmiessler/fabric). The result names the upstream repo and
+    /// the one-line description, and says the names differ. An exact slug, a
+    /// header file (`lz4.h`), and a description that already contains the
+    /// token are not that case. `candle charts` is the slug plus another word:
+    /// not a suffixed project name, so the line itself has to say what the
+    /// pack is.
+    #[test]
+    fn a_same_stem_different_project_is_named_instead_of_matched_silently() {
+        let rig = Rig::new();
+        let mut fabric = entry(
+            "fabric",
+            1,
+            LicenceClass::AdaptWithAttribution,
+            &["fabric", "prompt"],
+        );
+        fabric.upstream = "danielmiessler/fabric".into();
+        fabric.ask_for =
+            "An agent building a reusable prompt library queries this for prompt patterns.".into();
+        let cat = catalogue(with_fillers(vec![fabric]));
+
+        // One token, "fabric.js": the sketch sees "fabric" and would otherwise
+        // answer from that pack. The stem is a different project, so it must not.
+        let found = find("fabric.js", 5, rig.cwd.path(), rig.hub.path(), &cat);
+        assert_eq!(found.routing, "different_project", "{found:?}");
+        assert_eq!(found.corpora[0].slug, "fabric");
+        assert_eq!(found.corpora[0].different_project, "fabric.js");
+        assert_eq!(found.corpora[0].upstream, "danielmiessler/fabric");
+        let text = render_find(&found);
+        assert!(text.contains("danielmiessler/fabric"), "{text}");
+        assert!(text.contains("prompt library"), "{text}");
+        assert!(
+            text.contains("\"fabric.js\" is a different project"),
+            "{text}"
+        );
+        assert!(text.contains("routing: different_project"), "{text}");
+
+        let out = rig.run(
+            &args("fabric.js", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_eq!(out.exit, EXIT_NEEDS_DECISION, "{out:?}");
+        assert!(
+            out.answer.is_none(),
+            "must not answer the wrong project: {out:?}"
+        );
+        let all = format!("{}\n{}", out.stdout, out.stderr.join("\n"));
+        assert!(all.contains("danielmiessler/fabric"), "{all}");
+        assert!(all.contains("fabric.js"), "{all}");
+        assert!(all.contains("--corpus"), "{all}");
+
+        let exact = find(
+            "how does fabric format a prompt",
+            5,
+            rig.cwd.path(),
+            rig.hub.path(),
+            &cat,
+        );
+        assert_eq!(exact.routing, "confident", "{exact:?}");
+        assert!(exact.corpora[0].different_project.is_empty(), "{exact:?}");
+        assert!(render_find(&exact).contains("danielmiessler/fabric"));
+
+        assert!(different_project_token("read lz4.h", "lz4", "lz4/lz4", "block format").is_none());
+        assert_eq!(
+            different_project_token(
+                "fabricjs canvas",
+                "fabric",
+                "danielmiessler/fabric",
+                "prompt library"
+            )
+            .as_deref(),
+            Some("fabricjs")
+        );
+        assert!(different_project_token(
+            "see fabric.js",
+            "fabric",
+            "danielmiessler/fabric",
+            "the fabric.js canvas library"
+        )
+        .is_none());
+
+        let mut candle = entry(
+            "candle",
+            1,
+            LicenceClass::AdaptWithAttribution,
+            &["candle", "tensor"],
+        );
+        candle.upstream = "huggingface/candle".into();
+        candle.ask_for =
+            "A Rust engine adding embeddings queries this for a tensor framework.".into();
+        let cat2 = catalogue(with_fillers(vec![candle]));
+        let charts = find("candle charts", 5, rig.cwd.path(), rig.hub.path(), &cat2);
+        assert_ne!(charts.routing, "different_project", "{charts:?}");
+        let line = render_find(&charts);
+        assert!(line.contains("huggingface/candle"), "{line}");
+        assert!(line.contains("tensor framework"), "{line}");
     }
 }

@@ -26,6 +26,7 @@ fn entry(slug: &str, spdx: &str, class: LicenceClass, terms: &[&str]) -> Catalog
         domain: "DEV".into(),
         topics: vec![],
         ask_for: format!("fixture corpus {slug}"),
+        upstream: String::new(),
         pin_sha: PIN_SHA.into(),
         pin_date: PIN_DATE.into(),
         refresh_cadence_days: 7,

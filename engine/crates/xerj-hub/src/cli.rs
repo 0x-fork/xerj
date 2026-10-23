@@ -65,6 +65,11 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
         this build has no hub public key to verify with (nothing is downloaded),
         1 for anything else (an excluded licence and a pack over the size limit
         are refused here too).
+  find \"<question>\" [--k N] [--json]
+        Which corpora could answer, best first. Each line names the upstream
+        repo (owner/name, when the catalogue has it) and the one-line description
+        of what that pack is. A query that names a different project of the same
+        slug (fabric.js) exits 4 instead of matching silently.
   feedback <slug> --usefulness <1-5> --found <yes|partial|no> [...]
         Rate a corpus after using it: one structured review (no query text) for
         its Agent score on hub.xerj.org (see `xerj hub feedback -h`).
@@ -89,6 +94,7 @@ fn hub_verb(arg: &str) -> bool {
             | "build-catalogue"
             | "sync"
             | "pull"
+            | "find"
             | "feedback"
             | "status"
             | "stop"
@@ -112,6 +118,7 @@ pub fn run_hub_cli(args: &[String]) -> i32 {
         "build-catalogue" => crate::build_catalogue::run(rest),
         "sync" => crate::sync::run_sync(rest),
         "pull" => run_pull(rest),
+        "find" => run_find_cmd(rest),
         "feedback" => crate::feedback::run_feedback(rest),
         "status" => run_status(rest),
         "stop" => run_stop(rest),
@@ -1316,6 +1323,85 @@ fn no_extra_args(cmd: &str, args: &[String]) -> Option<i32> {
     }
 }
 
+/// `xerj hub find "<question>" [--k N] [--json]`. Same decision as
+/// [`ask::run_find`] (and the MCP `xerj_hub_find` tool).
+fn run_find_cmd(args: &[String]) -> i32 {
+    let mut k = ask::FIND_DEFAULT_K;
+    let mut as_json = false;
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("{HUB_USAGE}");
+                return 0;
+            }
+            "--json" => as_json = true,
+            "--k" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("xerj hub find: --k needs a value\n\n{HUB_USAGE}");
+                    return ask::EXIT_USAGE;
+                };
+                match v.parse::<usize>() {
+                    Ok(n) if (1..=ask::FIND_MAX_K).contains(&n) => k = n,
+                    _ => {
+                        eprintln!(
+                            "xerj hub find: --k must be an integer from 1 to {}, got '{v}'\n\n{HUB_USAGE}",
+                            ask::FIND_MAX_K
+                        );
+                        return ask::EXIT_USAGE;
+                    }
+                }
+            }
+            f if f.starts_with('-') => {
+                eprintln!("xerj hub find: unknown flag '{f}'\n\n{HUB_USAGE}");
+                return ask::EXIT_USAGE;
+            }
+            word => words.push(word),
+        }
+        i += 1;
+    }
+    let question = words.join(" ");
+    if question.trim().is_empty() {
+        eprintln!("xerj hub find: a question is required\n\n{HUB_USAGE}");
+        return ask::EXIT_USAGE;
+    }
+    match ask::run_find(question.trim(), k) {
+        Ok(found) => {
+            let text = if as_json {
+                match serde_json::to_string(&found) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("xerj hub find: {e}");
+                        return 1;
+                    }
+                }
+            } else {
+                ask::render_find(&found)
+            };
+            if found.corpora.is_empty() {
+                eprintln!("{text}");
+            } else {
+                println!("{text}");
+            }
+            match found.routing {
+                "different_project" | "ambiguous" => ask::EXIT_NEEDS_DECISION,
+                "no_corpus" => ask::EXIT_NO_ANSWER,
+                _ => 0,
+            }
+        }
+        Err(e) => {
+            eprintln!("xerj hub find: {e}");
+            if xerj_common::hub::hub_key_configured() {
+                1
+            } else {
+                ask::EXIT_NO_KEY
+            }
+        }
+    }
+}
+
 /// `xerj hub config hosted on|off|auto`.
 fn run_config(args: &[String]) -> i32 {
     config_in(&hub_home(), args)
@@ -2220,7 +2306,13 @@ mod tests {
 
     #[test]
     fn hub_usage_lists_the_new_commands() {
-        for word in ["status", "stop", "config hosted", "feedback <slug>"] {
+        for word in [
+            "status",
+            "stop",
+            "config hosted",
+            "feedback <slug>",
+            "find \"<question>\"",
+        ] {
             assert!(HUB_USAGE.contains(word), "{word}");
         }
         assert_eq!(run_hub_cli(&strs(&["status", "extra"])), 2);
@@ -2261,6 +2353,7 @@ mod tests {
             domain: "TEST".to_string(),
             topics: vec![],
             ask_for: "x".to_string(),
+            upstream: String::new(),
             pin_sha: "0774d05537f9762f838f7ab541b7765f1a729cb5".to_string(),
             pin_date: "2026-10-02".to_string(),
             refresh_cadence_days: 7,

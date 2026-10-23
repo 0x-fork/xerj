@@ -66,6 +66,7 @@ fn entry(slug: &str, pin8: &str, pin_date: &str) -> CatalogueEntry {
         domain: "NET".to_string(),
         topics: vec![],
         ask_for: "x".to_string(),
+        upstream: String::new(),
         pin_sha: full_sha(pin8),
         pin_date: pin_date.to_string(),
         refresh_cadence_days: 7,

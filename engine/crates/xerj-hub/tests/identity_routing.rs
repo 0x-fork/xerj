@@ -55,6 +55,7 @@ fn catalogue() -> Catalogue {
                 domain: row["domain"].as_str().unwrap_or("").to_string(),
                 topics,
                 ask_for,
+                upstream: String::new(),
                 pin_sha: "0".repeat(40),
                 pin_date: "2026-10-21".to_string(),
                 refresh_cadence_days: 7,

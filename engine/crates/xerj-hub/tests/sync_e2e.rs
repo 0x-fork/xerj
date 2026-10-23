@@ -278,6 +278,7 @@ fn catalogue_entry(
         domain: "DEV".into(),
         topics: vec!["c".into()],
         ask_for: "a tiny C fixture corpus".into(),
+        upstream: String::new(),
         pin_sha: pin_sha.into(),
         pin_date: pin_date.into(),
         refresh_cadence_days: 7,
