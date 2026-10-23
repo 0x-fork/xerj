@@ -3538,28 +3538,90 @@ impl Engine {
 
     /// V4 M5.2 — route a document to the node that owns its shard.
     ///
-    /// Returns `Ok(None)` when the doc belongs to this node (handle it
-    /// locally via the existing `Index::index_document_with_version`
-    /// path). Returns `Ok(Some(node_id))` when the doc belongs to a
-    /// peer and must be forwarded via the cluster transport.
+    /// Returns `None` when this node should write the document itself:
+    /// there is no shard assignment (single-node mode, and any index that
+    /// was not created through the replicated shard plan), or the assigned
+    /// owner is this node. Returns `Some(node_id)` when a peer owns the
+    /// shard. Callers forward that write; they do not also store it here.
     ///
-    /// In single-node mode (`num_shards == 1` and the router has no
-    /// assignments) this always resolves to "local" and the caller
-    /// takes the existing fast path — zero overhead for single-node
-    /// deployments.
+    /// With no cluster handle the owner comparison uses `"local"`, which
+    /// no replicated plan names, and the empty routing table makes every
+    /// call `None`.
     pub fn route_write(&self, index: &str, doc_id: &str) -> Option<String> {
+        let me = self.routing_node_id();
         let router = self.shard_router.read();
-        let (_shard, owner) = router.route_doc(index, doc_id);
-        match owner {
-            // No assignment yet — treat as local. This is the
-            // single-node default path.
+        match router.route_doc(index, doc_id).1 {
             None => None,
-            Some(owner) if owner == self.node_id.as_str() => None,
+            Some(owner) if owner == me => None,
             Some(owner) => Some(owner.to_string()),
         }
     }
 
-    /// Read-only view of the local node id.
+    /// `true` when a replicated shard plan names this node as the primary
+    /// for `doc_id`. An index with no plan is `false` — that is not the
+    /// same as [`Engine::route_write`] returning `None`, which also covers
+    /// the unassigned case.
+    pub fn owns_shard(&self, index: &str, doc_id: &str) -> bool {
+        let me = self.routing_node_id();
+        let router = self.shard_router.read();
+        matches!(router.route_doc(index, doc_id).1, Some(owner) if owner == me)
+    }
+
+    /// Node ids that hold at least one primary of `index`, sorted.
+    pub fn shard_search_targets(&self, index: &str) -> Vec<String> {
+        self.shard_router.read().search_targets(index)
+    }
+
+    /// Identity [`Engine::route_write`] compares against shard owners.
+    ///
+    /// The cluster handle's node id when one is attached, otherwise the
+    /// single-node `"local"` id.
+    pub fn routing_node_id(&self) -> String {
+        self.cluster
+            .lock()
+            .as_ref()
+            .map(|handle| handle.node_id().to_string())
+            .unwrap_or_else(|| self.node_id.to_string())
+    }
+
+    /// Replace `index`'s primary assignments and widen the hash width so
+    /// every shard in `plan` is reachable.
+    pub fn install_shard_plan(&self, index: &str, plan: &[xerj_cluster::ShardAssignment]) {
+        if plan.is_empty() {
+            return;
+        }
+        let mut router = self.shard_router.write();
+        let width = plan
+            .iter()
+            .map(|assignment| assignment.shard.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        if width > router.num_shards() {
+            router.set_num_shards(width);
+        }
+        router.clear_index(index);
+        for assignment in plan {
+            router.assign(index, assignment.shard, &assignment.node_id);
+        }
+    }
+
+    /// Record one primary without dropping the index's other shards.
+    pub fn assign_one_shard(&self, index: &str, shard: u32, node_id: &str) {
+        let mut router = self.shard_router.write();
+        let width = shard.saturating_add(1);
+        if width > router.num_shards() {
+            router.set_num_shards(width);
+        }
+        router.assign(index, shard, node_id);
+    }
+
+    /// Drop `index` from the routing table. Called when a delete commits.
+    pub fn clear_shard_plan(&self, index: &str) {
+        self.shard_router.write().clear_index(index);
+    }
+
+    /// Read-only view of the single-node id (`"local"` unless a test
+    /// replaced the field). Cluster routing uses [`Engine::routing_node_id`].
     pub fn local_node_id(&self) -> &str {
         self.node_id.as_str()
     }

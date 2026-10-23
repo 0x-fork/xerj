@@ -1,0 +1,684 @@
+//! Shard routing for the ES-compat document and search handlers.
+//!
+//! With a cluster handle attached, a replicated index carries a primary plan
+//! in the same Raft entry as the create. [`dispatch_index`] forwards a
+//! document to the owner [`Engine::route_write`] names. [`fanout_search`]
+//! asks every owner and merges hits. Single-node mode (`has_cluster` false)
+//! never enters these paths.
+//!
+//! The owner's handler writes local storage only. It does not route again.
+
+use std::time::{Duration, Instant};
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde_json::{json, Value};
+use xerj_cluster::{ShardOp, ShardResult};
+
+use crate::es_compat::{
+    apply_get_doc_source_filter, search_shard_local, EsSearchBody, EsSearchJson,
+    EsSearchQueryParams, GetDocParams,
+};
+use crate::responses::{EsDeleteDocResponse, EsDocResponse, EsGetResponse};
+use crate::state::AppState;
+use crate::ApiError;
+
+/// Per-shard `from + size` cap when a search is merged across owners.
+const MAX_FANOUT_WINDOW: usize = 10_000;
+
+/// How long a forward waits for the owner to apply the index create.
+const OWNER_READY_WAIT: Duration = Duration::from_secs(2);
+
+pub(crate) enum Dispatch {
+    /// This node holds the shard (or the index has no plan). The caller
+    /// uses its existing local path.
+    Local,
+    /// The response is complete: forwarded, or refused.
+    Done(Response),
+}
+
+pub(crate) fn shard_not_ready_body(index: &str) -> String {
+    json!({
+        "error": {
+            "type": "shard_not_ready",
+            "reason": format!("index [{index}] is not on this shard yet")
+        },
+        "status": 503
+    })
+    .to_string()
+}
+
+pub(crate) fn shard_not_ready_response(index: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "type": "shard_not_ready",
+                "reason": format!("index [{index}] is not on this shard yet")
+            },
+            "status": 503
+        })),
+    )
+        .into_response()
+}
+
+fn http_result(result: ShardResult) -> Response {
+    let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let value: Value = serde_json::from_str(&result.body).unwrap_or(Value::Null);
+    (status, Json(value)).into_response()
+}
+
+fn is_shard_not_ready(result: &ShardResult) -> bool {
+    result.status == 503 && result.body.contains("shard_not_ready")
+}
+
+fn engine_error_response(err: xerj_engine::EngineError) -> Response {
+    ApiError::new(xerj_common::XerjError::from(err)).into_response()
+}
+
+async fn forward_retrying(state: &AppState, owner: &str, op: ShardOp) -> Response {
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        match state.engine.forward_shard(owner, op.clone()).await {
+            Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(result) => return http_result(result),
+            Err(err) => return engine_error_response(err),
+        }
+    }
+}
+
+/// Route a prepared document. `Ok`-shaped [`Dispatch::Local`] means index here.
+///
+/// `op` is `"index"` or `"create"`. Sequence numbers are the engine's
+/// internal (1-based) values.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_index(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    doc: &Value,
+    op: &str,
+    if_seq_no: Option<u64>,
+    if_primary_term: Option<u64>,
+    version: Option<u64>,
+    version_type: Option<String>,
+) -> Dispatch {
+    if !state.engine.has_cluster() {
+        return Dispatch::Local;
+    }
+    if state.engine.get_index(index).is_err() {
+        if let Err(err) = state.engine.ensure_replicated_index(index).await {
+            return Dispatch::Done(engine_error_response(err));
+        }
+    }
+    let Some(owner) = state.engine.route_write(index, id) else {
+        return Dispatch::Local;
+    };
+    let shard_op = ShardOp::IndexDoc {
+        index: index.to_string(),
+        id: id.to_string(),
+        source_json: doc.to_string(),
+        op: op.to_string(),
+        if_seq_no,
+        if_primary_term,
+        version,
+        version_type,
+    };
+    Dispatch::Done(forward_retrying(state, &owner, shard_op).await)
+}
+
+pub(crate) async fn dispatch_get(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    params: &GetDocParams,
+) -> Dispatch {
+    if !state.engine.has_cluster() {
+        return Dispatch::Local;
+    }
+    let Some(owner) = state.engine.route_write(index, id) else {
+        return Dispatch::Local;
+    };
+    let op = ShardOp::GetDoc {
+        index: index.to_string(),
+        id: id.to_string(),
+        source: params.source.clone(),
+        source_includes: params.source_includes.clone(),
+        source_excludes: params.source_excludes.clone(),
+    };
+    Dispatch::Done(forward_retrying(state, &owner, op).await)
+}
+
+pub(crate) async fn dispatch_delete(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    if_seq_no: Option<u64>,
+    if_primary_term: Option<u64>,
+) -> Dispatch {
+    if !state.engine.has_cluster() {
+        return Dispatch::Local;
+    }
+    let Some(owner) = state.engine.route_write(index, id) else {
+        return Dispatch::Local;
+    };
+    let op = ShardOp::DeleteDoc {
+        index: index.to_string(),
+        id: id.to_string(),
+        if_seq_no,
+        if_primary_term,
+    };
+    Dispatch::Done(forward_retrying(state, &owner, op).await)
+}
+
+fn cluster_search_unsupported(feature: &str) -> Response {
+    let reason = format!(
+        "cluster search does not merge {feature} across shards yet; the request was not executed"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "type": "illegal_argument_exception",
+                "reason": reason
+            },
+            "status": 400
+        })),
+    )
+        .into_response()
+}
+
+/// `Some` when this search was answered by fan-out (including a refusal).
+/// `None` when the caller should run the ordinary local search.
+pub(crate) async fn fanout_search(
+    state: &AppState,
+    index: &str,
+    params: &EsSearchQueryParams,
+    principal: &crate::auth::Principal,
+    body: &EsSearchJson,
+) -> Option<Response> {
+    if !state.engine.has_cluster() {
+        return None;
+    }
+    if index.contains(',') || index.contains('*') || index == "_all" {
+        return None;
+    }
+    let targets = state.engine.shard_search_targets(index);
+    let me = state.engine.routing_node_id();
+    if targets.is_empty() || (targets.len() == 1 && targets[0] == me) {
+        return None;
+    }
+    let parsed = body.0.clone().unwrap_or_default();
+    if parsed.aggs.is_some() || parsed.aggregations.is_some() {
+        return Some(cluster_search_unsupported("aggregations"));
+    }
+    if parsed.suggest.is_some() {
+        return Some(cluster_search_unsupported("suggest"));
+    }
+    if parsed.collapse.is_some() {
+        return Some(cluster_search_unsupported("collapse"));
+    }
+    if parsed.rescore.is_some() {
+        return Some(cluster_search_unsupported("rescore"));
+    }
+    if parsed.profile {
+        return Some(cluster_search_unsupported("profile"));
+    }
+    if parsed.search_after.is_some() {
+        return Some(cluster_search_unsupported("search_after"));
+    }
+    if params.scroll.is_some() {
+        return Some(cluster_search_unsupported("scroll"));
+    }
+
+    let from = parsed.from;
+    let size = parsed.size;
+    let window = from.saturating_add(size);
+    if window > MAX_FANOUT_WINDOW {
+        return Some(cluster_search_unsupported("a from+size window above 10000"));
+    }
+    let mut shard_body = parsed;
+    shard_body.from = 0;
+    shard_body.size = window;
+    let mut shard_params = params.clone();
+    shard_params.from = Some("0".to_string());
+    shard_params.size = Some(window.to_string());
+
+    let started = Instant::now();
+    let mut parts: Vec<Value> = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let (status, value) = if target == &me {
+            let response = Box::pin(search_shard_local(
+                state.clone(),
+                index.to_string(),
+                shard_params.clone(),
+                principal.clone(),
+                shard_body.clone(),
+            ))
+            .await;
+            match response_value(response).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    return Some(shard_failure(target, &err));
+                }
+            }
+        } else {
+            let op = match (
+                serde_json::to_string(&shard_body),
+                serde_json::to_string(&shard_params),
+            ) {
+                (Ok(body_json), Ok(params_json)) => ShardOp::Search {
+                    index: index.to_string(),
+                    body_json,
+                    params_json,
+                },
+                (Err(err), _) | (_, Err(err)) => {
+                    return Some(shard_failure(target, &err.to_string()));
+                }
+            };
+            match state.engine.forward_shard(target, op).await {
+                Ok(result) => {
+                    let value = serde_json::from_str(&result.body).unwrap_or(Value::Null);
+                    (result.status, value)
+                }
+                Err(err) => return Some(engine_error_response(err)),
+            }
+        };
+        if !(200..300).contains(&status) {
+            return Some(
+                (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(value),
+                )
+                    .into_response(),
+            );
+        }
+        parts.push(value);
+    }
+
+    let took_ms = started.elapsed().as_millis() as u64;
+    let as_int = matches!(
+        params.rest_total_hits_as_int.as_deref(),
+        Some("true") | Some("1")
+    );
+    let merged = merge_hits(&parts, from, size, as_int, took_ms);
+    Some(Json(merged).into_response())
+}
+
+fn shard_failure(target: &str, err: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "type": "shard_not_ready",
+                "reason": format!("search on shard owner [{target}] failed: {err}")
+            },
+            "status": 503
+        })),
+    )
+        .into_response()
+}
+
+async fn response_value(response: Response) -> Result<(u16, Value), String> {
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|err| err.to_string())?;
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    Ok((status, value))
+}
+
+fn merge_hits(
+    parts: &[Value],
+    from: usize,
+    size: usize,
+    total_as_int: bool,
+    took_ms: u64,
+) -> Value {
+    let mut hits: Vec<Value> = Vec::new();
+    let mut total: u64 = 0;
+    let mut relation = "eq";
+    let mut max_score: Option<f64> = None;
+    let mut timed_out = false;
+    for part in parts {
+        if part.get("timed_out").and_then(Value::as_bool) == Some(true) {
+            timed_out = true;
+        }
+        match part.pointer("/hits/total") {
+            Some(Value::Number(n)) => total = total.saturating_add(n.as_u64().unwrap_or(0)),
+            Some(Value::Object(_)) => {
+                total = total.saturating_add(
+                    part.pointer("/hits/total/value")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+                if part.pointer("/hits/total/relation").and_then(Value::as_str) == Some("gte") {
+                    relation = "gte";
+                }
+            }
+            _ => {}
+        }
+        if let Some(score) = part.pointer("/hits/max_score").and_then(Value::as_f64) {
+            max_score = Some(max_score.map(|current| current.max(score)).unwrap_or(score));
+        }
+        if let Some(arr) = part.pointer("/hits/hits").and_then(Value::as_array) {
+            hits.extend(arr.iter().cloned());
+        }
+    }
+    hits.sort_by(|left, right| {
+        let left_score = left.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
+        let right_score = right.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.get("_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(right.get("_id").and_then(Value::as_str).unwrap_or(""))
+            })
+    });
+    if size == 0 {
+        hits.clear();
+    } else {
+        hits = hits.into_iter().skip(from).take(size).collect();
+    }
+    let total_value = if total_as_int {
+        json!(total)
+    } else {
+        json!({ "value": total, "relation": relation })
+    };
+    json!({
+        "took": took_ms,
+        "timed_out": timed_out,
+        "_shards": {
+            "total": parts.len(),
+            "successful": parts.len(),
+            "skipped": 0,
+            "failed": 0
+        },
+        "hits": {
+            "total": total_value,
+            "max_score": max_score,
+            "hits": hits
+        }
+    })
+}
+
+/// Handler installed on the cluster handle. Runs the operation locally.
+pub struct ApiShardHandler {
+    state: AppState,
+}
+
+impl ApiShardHandler {
+    pub fn new(state: AppState) -> Self {
+        ApiShardHandler { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl xerj_cluster::ShardHandler for ApiShardHandler {
+    async fn handle(&self, op: ShardOp) -> ShardResult {
+        match op {
+            ShardOp::IndexDoc {
+                index,
+                id,
+                source_json,
+                op,
+                if_seq_no,
+                if_primary_term,
+                version,
+                version_type,
+            } => {
+                local_index(
+                    &self.state,
+                    &index,
+                    &id,
+                    &source_json,
+                    &op,
+                    if_seq_no,
+                    if_primary_term,
+                    version,
+                    version_type.as_deref(),
+                )
+                .await
+            }
+            ShardOp::GetDoc {
+                index,
+                id,
+                source,
+                source_includes,
+                source_excludes,
+            } => {
+                local_get(
+                    &self.state,
+                    &index,
+                    &id,
+                    source,
+                    source_includes,
+                    source_excludes,
+                )
+                .await
+            }
+            ShardOp::DeleteDoc {
+                index,
+                id,
+                if_seq_no,
+                if_primary_term,
+            } => local_delete(&self.state, &index, &id, if_seq_no, if_primary_term).await,
+            ShardOp::Search {
+                index,
+                body_json,
+                params_json,
+            } => local_search(&self.state, &index, &body_json, &params_json).await,
+        }
+    }
+}
+
+async fn response_to_result(response: Response) -> ShardResult {
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| "{}".to_string());
+    ShardResult::http(status, body)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn local_index(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    source_json: &str,
+    op: &str,
+    if_seq_no: Option<u64>,
+    if_primary_term: Option<u64>,
+    version: Option<u64>,
+    version_type: Option<&str>,
+) -> ShardResult {
+    if state.engine.get_index(index).is_err() {
+        return ShardResult::http(503, shard_not_ready_body(index));
+    }
+    let doc: Value = match serde_json::from_str(source_json) {
+        Ok(doc) => doc,
+        Err(err) => {
+            return ShardResult::http(
+                400,
+                json!({
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": format!("forwarded document is not JSON: {err}")
+                    },
+                    "status": 400
+                })
+                .to_string(),
+            );
+        }
+    };
+    let idx = match state.engine.get_index(index) {
+        Ok(idx) => idx,
+        Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
+    };
+    let result = if op == "create" {
+        idx.create_document(id.to_string(), doc).await
+    } else if let (Some(version), Some(version_type)) = (version, version_type) {
+        if version_type == "external" || version_type == "external_gte" {
+            idx.index_document_external(Some(id.to_string()), doc, version, version_type)
+                .await
+        } else {
+            idx.index_document_with_version(Some(id.to_string()), doc, if_seq_no, if_primary_term)
+                .await
+        }
+    } else {
+        idx.index_document_with_version(Some(id.to_string()), doc, if_seq_no, if_primary_term)
+            .await
+    };
+    match result {
+        Ok(resp) => {
+            state.metrics.record_doc_indexed(index);
+            let wire_seq = resp.seq_no.saturating_sub(1);
+            let (body, status) = if resp.result == "updated" {
+                (
+                    EsDocResponse::updated(index, &resp.id, resp.version, wire_seq),
+                    200,
+                )
+            } else {
+                (
+                    EsDocResponse::created(index, &resp.id, resp.version, wire_seq),
+                    201,
+                )
+            };
+            ShardResult::http(
+                status,
+                serde_json::to_string(&body).unwrap_or_else(|_| "{}".into()),
+            )
+        }
+        Err(err) => response_to_result(engine_error_response(err)).await,
+    }
+}
+
+async fn local_get(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    source: Option<String>,
+    source_includes: Option<String>,
+    source_excludes: Option<String>,
+) -> ShardResult {
+    if state.engine.closed_indices.contains_key(index) {
+        return response_to_result(crate::es_compat::closed_index_error(index)).await;
+    }
+    let idx = match state.engine.get_index(index) {
+        Ok(idx) => idx,
+        Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
+    };
+    match idx.get_document(id).await {
+        Ok(Some(mut doc)) => {
+            xerj_query::executor::strip_internal_passage_metadata(&mut doc);
+            let params = GetDocParams {
+                source,
+                source_includes,
+                source_excludes,
+            };
+            let filtered = apply_get_doc_source_filter(doc, &params);
+            let version = idx.lookup_version(id).unwrap_or(1);
+            let seq_no = idx.lookup_seq_no(id).unwrap_or(0);
+            let resp = EsGetResponse::found(index, id, version, seq_no, filtered);
+            ShardResult::http(
+                200,
+                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+            )
+        }
+        Ok(None) => {
+            let resp = EsGetResponse::not_found(index, id);
+            ShardResult::http(
+                404,
+                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+            )
+        }
+        Err(err) => response_to_result(engine_error_response(err)).await,
+    }
+}
+
+async fn local_delete(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    if_seq_no: Option<u64>,
+    if_primary_term: Option<u64>,
+) -> ShardResult {
+    let idx = match state.engine.get_index(index) {
+        Ok(idx) => idx,
+        Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
+    };
+    match idx
+        .delete_document_versioned(id, if_seq_no, if_primary_term)
+        .await
+    {
+        Ok(outcome) if outcome.found => {
+            let resp = EsDeleteDocResponse::deleted(
+                index,
+                id,
+                outcome.version,
+                outcome.seq_no.saturating_sub(1),
+            );
+            ShardResult::http(
+                200,
+                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+            )
+        }
+        Ok(outcome) => {
+            let resp = EsDeleteDocResponse::not_found(
+                index,
+                id,
+                outcome.version,
+                outcome.seq_no.saturating_sub(1),
+            );
+            ShardResult::http(
+                404,
+                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+            )
+        }
+        Err(err) => response_to_result(engine_error_response(err)).await,
+    }
+}
+
+async fn local_search(
+    state: &AppState,
+    index: &str,
+    body_json: &str,
+    params_json: &str,
+) -> ShardResult {
+    let params: EsSearchQueryParams = serde_json::from_str(params_json).unwrap_or_default();
+    let body: EsSearchBody = match serde_json::from_str(body_json) {
+        Ok(body) => body,
+        Err(err) => {
+            return ShardResult::http(
+                400,
+                json!({
+                    "error": {
+                        "type": "parsing_exception",
+                        "reason": format!("forwarded search body is not JSON: {err}")
+                    },
+                    "status": 400
+                })
+                .to_string(),
+            );
+        }
+    };
+    // The accepting node already passed its auth middleware. This RPC is the
+    // cluster transport, not a second client. The local shard of the
+    // coordinator still runs under the caller's principal.
+    let response = Box::pin(search_shard_local(
+        state.clone(),
+        index.to_string(),
+        params,
+        crate::auth::Principal::Superuser,
+        body,
+    ))
+    .await;
+    response_to_result(response).await
+}

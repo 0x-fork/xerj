@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::raft::{ClusterCommand, RaftState};
+use crate::shard::{ShardError, ShardHandler, ShardOp, ShardResult, ShardRpc};
 
 /// How a committed metadata command changed the local engine.
 ///
@@ -75,31 +76,59 @@ pub struct ClusterHandle {
 
 struct ClusterHandleInner {
     node_id: String,
+    /// This node plus its peers, sorted, deduped. The index-create proposal
+    /// builds the shard plan from this list.
+    members: Vec<String>,
     tx: mpsc::UnboundedSender<ProposalRequest>,
     next: AtomicU64,
     timeout_ms: AtomicU64,
     view: Arc<RwLock<ClusterView>>,
+    shard: Arc<dyn ShardRpc>,
 }
 
 impl ClusterHandle {
     pub(crate) fn new(
         node_id: String,
+        members: Vec<String>,
         tx: mpsc::UnboundedSender<ProposalRequest>,
         view: Arc<RwLock<ClusterView>>,
+        shard: Arc<dyn ShardRpc>,
     ) -> Self {
         ClusterHandle {
             inner: Arc::new(ClusterHandleInner {
                 node_id,
+                members,
                 tx,
                 next: AtomicU64::new(1),
                 timeout_ms: AtomicU64::new(5_000),
                 view,
+                shard,
             }),
         }
     }
 
     pub fn node_id(&self) -> &str {
         &self.inner.node_id
+    }
+
+    /// Members the shard plan is built from: this node and the peers it was
+    /// started with, sorted.
+    pub fn members(&self) -> Vec<String> {
+        self.inner.members.clone()
+    }
+
+    /// Install the handler that runs forwarded shard operations on this node.
+    ///
+    /// The server does this once the engine exists, before it accepts HTTP.
+    /// A call that arrives with no handler fails; it is not applied locally
+    /// on the sender.
+    pub fn set_shard_handler(&self, handler: Arc<dyn ShardHandler>) {
+        self.inner.shard.set_handler(handler);
+    }
+
+    /// Forward `op` to `to` and wait for that member's result.
+    pub async fn shard_call(&self, to: &str, op: ShardOp) -> Result<ShardResult, ShardError> {
+        self.inner.shard.call(to, op).await
     }
 
     /// How long [`ClusterHandle::propose`] waits for a commit.

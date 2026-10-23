@@ -1,6 +1,7 @@
 //! Index create, mapping, settings, and delete on one member of a 3-node
-//! ring show up on the others. Documents do not. A ring that is not running
-//! refuses the create instead of applying it locally.
+//! ring show up on the others. A document written on one member is readable
+//! from the others because it is stored on the shard owner. A ring that is
+//! not running refuses the create instead of applying it locally.
 
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tower::ServiceExt;
+use xerj_api::cluster_shard::ApiShardHandler;
 use xerj_cluster::node::in_memory::{InMemoryBus, InMemoryTransport};
 use xerj_cluster::runner::ClusterRunner;
 use xerj_cluster::{ClusterHandle, ClusterNode};
@@ -17,6 +19,7 @@ use xerj_engine::EngineMetadataApplier;
 
 struct Member {
     app: Router,
+    engine: std::sync::Arc<xerj_engine::Engine>,
     shutdown: watch::Sender<bool>,
     handle: ClusterHandle,
     /// Held when the runner is not started, so the proposal channel stays open.
@@ -48,6 +51,8 @@ async fn ring(start_runners: bool) -> Vec<Member> {
         }));
         let handle = node.handle();
         state.engine.attach_cluster(handle.clone());
+        handle.set_shard_handler(std::sync::Arc::new(ApiShardHandler::new(state.clone())));
+        let engine = std::sync::Arc::clone(&state.engine);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let kept = if start_runners {
             let mut runner = ClusterRunner::new(node, Duration::from_millis(5), shutdown_rx);
@@ -63,6 +68,7 @@ async fn ring(start_runners: bool) -> Vec<Member> {
         let app = xerj_api::router::build_es_compat_router(state);
         members.push(Member {
             app,
+            engine,
             shutdown,
             handle,
             _node: kept,
@@ -86,6 +92,17 @@ async fn put_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) 
     send(
         app,
         Request::put(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request"),
+    )
+    .await
+}
+
+async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
+    send(
+        app,
+        Request::post(path)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request"),
@@ -157,7 +174,7 @@ async fn wait_body_contains(app: &Router, path: &str, needle: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn index_metadata_propagates_documents_do_not_and_a_new_leader_still_commits() {
+async fn index_metadata_propagates_and_a_new_leader_still_commits() {
     let members = ring(true).await;
     let mut dead = [false, false, false];
     let leader = wait_leader(&members, &dead).await;
@@ -196,24 +213,22 @@ async fn index_metadata_propagates_documents_do_not_and_a_new_leader_still_commi
     let (status, body) = put_json(
         &members[follower].app,
         "/orders/_doc/1",
-        json!({ "title": "local only" }),
+        json!({ "title": "routed" }),
     )
     .await;
-    assert!(
-        status.is_success(),
-        "document write is still local: {status} {body}"
-    );
-    let (status, _) = get(&members[follower].app, "/orders/_doc/1").await;
-    assert!(status.is_success(), "writer should read its own document");
-    let other = (0..3).find(|i| *i != follower).expect("peer");
-    let (status, body) = get(&members[other].app, "/orders/_doc/1").await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "documents are not replicated yet: {body}"
-    );
-    let (status, _) = get(&members[other].app, "/orders").await;
-    assert_eq!(status, StatusCode::OK, "the index itself is on the peer");
+    assert!(status.is_success(), "document write: {status} {body}");
+    for member in &members {
+        let (status, body) = get(&member.app, "/orders/_doc/1").await;
+        assert!(
+            status.is_success(),
+            "document is readable on every member: {status} {body}"
+        );
+    }
+    let owners = members
+        .iter()
+        .filter(|member| member.engine.owns_shard("orders", "1"))
+        .count();
+    assert_eq!(owners, 1, "the document has one primary owner");
 
     let (status, body) = delete(&members[follower].app, "/orders").await;
     assert!(status.is_success(), "delete: {status} {body}");
@@ -250,6 +265,15 @@ async fn a_ring_with_no_leader_does_not_create_the_index() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     let (status, _) = get(&members[0].app, "/orders").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = put_json(
+        &members[0].app,
+        "/orders/_doc/1",
+        json!({ "title": "no leader" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let (status, _) = get(&members[0].app, "/orders/_doc/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = get(&members[1].app, "/orders").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -275,4 +299,153 @@ async fn cluster_disabled_create_stays_on_the_node_that_received_it() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = get(&b, "/local").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = put_json(&a, "/local/_doc/1", json!({ "title": "here" })).await;
+    assert!(
+        status.is_success(),
+        "single-node document write: {status} {body}"
+    );
+    let (status, _) = get(&a, "/local/_doc/1").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get(&b, "/local/_doc/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = post_json(
+        &a,
+        "/local/_search",
+        json!({ "query": { "match_all": {} }, "size": 10 }),
+    )
+    .await;
+    assert!(status.is_success(), "single-node search: {status} {body}");
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(|v| v.as_u64()),
+        Some(1),
+        "single-node search total: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_is_stored_on_its_shard_owner_and_search_sees_it_from_any_member() {
+    let members = ring(true).await;
+    let dead = [false, false, false];
+    let _leader = wait_leader(&members, &dead).await;
+
+    let (status, body) = put_json(&members[0].app, "/orders", json!({})).await;
+    assert!(status.is_success(), "create: {status} {body}");
+    for member in &members {
+        wait_status(&member.app, "/orders", StatusCode::OK).await;
+        assert_eq!(
+            member.engine.shard_search_targets("orders").len(),
+            3,
+            "create installs one primary on each member"
+        );
+    }
+
+    let mut owner_of: Vec<(String, usize)> = Vec::new();
+    for i in 0..48 {
+        let id = format!("d{i}");
+        if let Some(owner) = members
+            .iter()
+            .position(|member| member.engine.owns_shard("orders", &id))
+        {
+            if !owner_of.iter().any(|(_, seen)| *seen == owner) {
+                owner_of.push((id, owner));
+            }
+        }
+        if owner_of.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(
+        owner_of.len(),
+        3,
+        "expected the plan to place some id on each member"
+    );
+
+    for (id, _) in &owner_of {
+        let writer = (owner_of[0].1 + 1) % 3;
+        let (status, body) = put_json(
+            &members[writer].app,
+            &format!("/orders/_doc/{id}"),
+            json!({ "title": id }),
+        )
+        .await;
+        assert!(status.is_success(), "write {id}: {status} {body}");
+    }
+
+    for (id, owner) in &owner_of {
+        for (i, member) in members.iter().enumerate() {
+            let (status, body) = get(&member.app, &format!("/orders/_doc/{id}")).await;
+            assert!(
+                status.is_success(),
+                "GET {id} on member {i}: {status} {body}"
+            );
+            let local = member
+                .engine
+                .get_index("orders")
+                .expect("index")
+                .get_document(id)
+                .await
+                .expect("local get");
+            if i == *owner {
+                assert!(local.is_some(), "owner stores {id}");
+            } else {
+                assert!(local.is_none(), "non-owner does not store {id}");
+            }
+        }
+    }
+
+    let reader = (owner_of[0].1 + 2) % 3;
+    let (status, body) = post_json(
+        &members[reader].app,
+        "/orders/_search",
+        json!({ "query": { "match_all": {} }, "size": 20 }),
+    )
+    .await;
+    assert!(status.is_success(), "search: {status} {body}");
+    let hits = body
+        .pointer("/hits/hits")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let ids: Vec<&str> = hits
+        .iter()
+        .filter_map(|hit| hit.get("_id").and_then(|v| v.as_str()))
+        .collect();
+    for (id, _) in &owner_of {
+        assert!(ids.contains(&id.as_str()), "search missed {id} in {ids:?}");
+    }
+    let total = body.pointer("/hits/total/value").and_then(|v| v.as_u64());
+    assert_eq!(total, Some(owner_of.len() as u64), "merged total: {body}");
+
+    let (status, body) = post_json(
+        &members[reader].app,
+        "/orders/_search",
+        json!({ "size": 0, "aggs": { "titles": { "terms": { "field": "title" } } } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "aggregations are not merged: {body}"
+    );
+
+    let (id, owner) = &owner_of[0];
+    let deleter = (*owner + 1) % 3;
+    let (status, body) = delete(&members[deleter].app, &format!("/orders/_doc/{id}")).await;
+    assert!(status.is_success(), "delete: {status} {body}");
+    for member in &members {
+        let (status, _) = get(&member.app, &format!("/orders/_doc/{id}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    let still = members[*owner]
+        .engine
+        .get_index("orders")
+        .expect("index")
+        .get_document(id)
+        .await
+        .expect("local get");
+    assert!(still.is_none(), "delete reached the owner");
+
+    for member in &members {
+        let _ = member.shutdown.send(true);
+    }
 }

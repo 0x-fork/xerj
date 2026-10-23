@@ -21,6 +21,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::shard::{ShardOp, ShardResult};
+
 /// State a Raft node can be in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RaftState {
@@ -189,6 +191,15 @@ pub enum RaftMessage {
         leader_id: Option<String>,
         reason: String,
     },
+    /// Caller → shard owner, on its own connection. Not a Raft RPC and not
+    /// appended to the log. The owner answers with [`RaftMessage::ShardResponse`]
+    /// on the same connection.
+    ShardRequest { request_id: u64, op: ShardOp },
+    /// Shard owner → caller. See [`RaftMessage::ShardRequest`].
+    ShardResponse {
+        request_id: u64,
+        result: ShardResult,
+    },
 }
 
 fn message_term(msg: &RaftMessage) -> u64 {
@@ -199,6 +210,9 @@ fn message_term(msg: &RaftMessage) -> u64 {
         | RaftMessage::RequestVoteResponse { term, .. }
         | RaftMessage::ForwardProposal { term, .. }
         | RaftMessage::ForwardRejected { term, .. } => *term,
+        // Not a Raft term. A shard frame that reaches the state machine must
+        // not step a leader down.
+        RaftMessage::ShardRequest { .. } | RaftMessage::ShardResponse { .. } => 0,
     }
 }
 
@@ -457,6 +471,10 @@ impl RaftNode {
                 // Term bookkeeping already ran above. The cluster node matches
                 // the request id to a waiting caller; the state machine has
                 // nothing else to record.
+            }
+            RaftMessage::ShardRequest { .. } | RaftMessage::ShardResponse { .. } => {
+                // The transport answers these on the connection that carried
+                // them. They are not log entries.
             }
         }
         out

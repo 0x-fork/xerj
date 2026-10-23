@@ -32,6 +32,10 @@ xerj-rerank = { path = "../xerj-rerank" }
 xerj-hub     = { path = "../xerj-hub" }
 xerj-autoindex = { path = "../xerj-autoindex" }
 xerj-wasm    = { path = "../xerj-wasm" }
+# Shard routing: the ES document and search handlers forward to the
+# owner named by the Raft shard plan. The cluster crate does not depend
+# on this one.
+xerj-cluster = { path = "../xerj-cluster" }
 # Local decision head (feature `decide-local`); no other purpose, so the
 # dependency itself is optional.
 xerj-ai      = { path = "../xerj-ai", optional = true }
@@ -71,6 +75,5 @@ sha2         = "0.10"
 
 [dev-dependencies]
 tempfile     = { workspace = true }
-xerj-cluster = { path = "../xerj-cluster" }
 tower        = { workspace = true, features = ["util"] }
 http-body-util = "0.1"

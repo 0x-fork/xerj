@@ -58,6 +58,7 @@ pub mod replication;
 pub mod router;
 pub mod runner;
 pub mod search;
+pub mod shard;
 pub mod transport;
 
 // ── Convenience re-exports ────────────────────────────────────────────────────
@@ -78,4 +79,8 @@ pub use router::jump_hash;
 pub use router::ShardRouter;
 pub use runner::{ClusterRunner, ClusterRunnerBuilder};
 pub use search::{merge_search_responses, SearchHit, SearchMessage};
+pub use shard::{
+    primary_shard_plan, shard_plan_from_schema_json, MemoryShardDir, MemoryShardRpc, NullShardRpc,
+    ShardAssignment, ShardError, ShardHandler, ShardOp, ShardResult, ShardRpc,
+};
 pub use transport::TcpTransport;

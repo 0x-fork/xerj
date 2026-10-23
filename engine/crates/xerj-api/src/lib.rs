@@ -69,6 +69,7 @@ pub mod auth;
 pub mod authz;
 pub mod binary_protocol;
 pub mod cat;
+pub mod cluster_shard;
 pub mod error;
 pub mod es_compat;
 pub mod extract;

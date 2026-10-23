@@ -92,7 +92,7 @@ impl Engine {
             )));
         };
         spec.schema = self.apply_index_template(&spec.name, spec.schema);
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "v": 1,
             "kind": "index_create",
             "schema": spec.schema,
@@ -101,6 +101,10 @@ impl Engine {
             "index_settings": spec.index_settings,
             "aliases": spec.aliases,
         });
+        let plan = xerj_cluster::primary_shard_plan(&handle.members());
+        if !plan.is_empty() {
+            envelope["shard_plan"] = serde_json::to_value(&plan)?;
+        }
         let schema_json = serde_json::to_string(&envelope)?;
         let effect = handle
             .propose(ClusterCommand::CreateIndex {
@@ -110,6 +114,46 @@ impl Engine {
             .await
             .map_err(propose_error)?;
         effect_result(&spec.name, effect)
+    }
+
+    /// Create `name` through the log when this node does not have it yet.
+    ///
+    /// An `AlreadyExists` commit is success: a concurrent create won, and
+    /// this node applied that entry before its own. Used by document
+    /// auto-create so a clustered write does not invent a node-local index.
+    pub async fn ensure_replicated_index(&self, name: &str) -> Result<()> {
+        if self.get_index(name).is_ok() {
+            return Ok(());
+        }
+        let spec = ReplicatedIndexSpec {
+            name: name.to_string(),
+            schema: Schema::empty(),
+            settings: Value::Null,
+            mappings: Value::Null,
+            index_settings: Value::Null,
+            aliases: Value::Null,
+        };
+        match self.replicate_index_create(spec).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_already_exists(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Forward one shard operation to `owner`. A failure is not a local write.
+    pub async fn forward_shard(
+        &self,
+        owner: &str,
+        op: xerj_cluster::ShardOp,
+    ) -> Result<xerj_cluster::ShardResult> {
+        let Some(handle) = self.cluster_handle() else {
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                "forward_shard called with no cluster handle",
+            )));
+        };
+        handle.shard_call(owner, op).await.map_err(|err| {
+            EngineError::Common(xerj_common::XerjError::cluster_unavailable(err.to_string()))
+        })
     }
 
     /// Propose one index's merged mapping. Callers validate before this.
@@ -270,9 +314,28 @@ struct MappingEnvelope {
 async fn apply_committed(engine: &Engine, command: &ClusterCommand) -> ApplyEffect {
     match command {
         ClusterCommand::CreateIndex { name, schema_json } => {
-            apply_create(engine, name, schema_json).await
+            // Install owners before the index is visible. A GET that observes
+            // the new index otherwise races a router that is still empty and
+            // treats the write as local.
+            let plan = xerj_cluster::shard_plan_from_schema_json(schema_json);
+            let installed_early = !plan.is_empty() && engine.shard_search_targets(name).is_empty();
+            if installed_early {
+                engine.install_shard_plan(name, &plan);
+            }
+            let effect = apply_create(engine, name, schema_json).await;
+            if installed_early
+                && matches!(effect, ApplyEffect::Failed(_))
+                && engine.get_index(name).is_err()
+            {
+                engine.clear_shard_plan(name);
+            }
+            effect
         }
-        ClusterCommand::DeleteIndex { name } => apply_delete(engine, name).await,
+        ClusterCommand::DeleteIndex { name } => {
+            let effect = apply_delete(engine, name).await;
+            engine.clear_shard_plan(name);
+            effect
+        }
         ClusterCommand::UpdateMapping {
             index,
             mapping_json,
@@ -281,8 +344,16 @@ async fn apply_committed(engine: &Engine, command: &ClusterCommand) -> ApplyEffe
             index,
             settings_json,
         } => apply_settings(engine, index, settings_json).await,
-        // Shard assignment, membership, and generic config are stored by
-        // ClusterMetadata. They do not change this node's indices.
+        ClusterCommand::AssignShard {
+            index,
+            shard,
+            node_id,
+        } => {
+            engine.assign_one_shard(index, *shard, node_id);
+            ApplyEffect::Applied
+        }
+        // Membership and generic config are stored by ClusterMetadata.
+        // They do not change this node's indices.
         _ => ApplyEffect::Applied,
     }
 }

@@ -22,6 +22,7 @@ use crate::propose::{
     ApplyEffect, ClusterHandle, ClusterView, MetadataApplier, ProposalRequest, ProposeError,
 };
 use crate::raft::{ClusterCommand, OutboundMessage, RaftMessage, RaftNode, RaftState};
+use crate::shard::NullShardRpc;
 
 // ── Transport abstraction ─────────────────────────────────────────────────────
 
@@ -36,6 +37,12 @@ pub trait ClusterTransport: Send + Sync {
 
     /// Receive the next inbound message. Returns `(sender_id, message)`.
     async fn recv(&self) -> Result<(String, RaftMessage)>;
+
+    /// Data-plane handle for document forwarding. The default fails every
+    /// call; TCP and the in-memory bus override it.
+    fn shard_rpc(&self) -> Arc<dyn crate::shard::ShardRpc> {
+        Arc::new(NullShardRpc)
+    }
 }
 
 // ── Cluster node ──────────────────────────────────────────────────────────────
@@ -89,7 +96,12 @@ impl ClusterNode {
             state: RaftState::Follower,
             leader_id: None,
         }));
-        let handle = ClusterHandle::new(id.clone(), tx, Arc::clone(&view));
+        let shard = transport.shard_rpc();
+        let mut members = peers.clone();
+        members.push(id.clone());
+        members.sort();
+        members.dedup();
+        let handle = ClusterHandle::new(id.clone(), members, tx, Arc::clone(&view), shard);
         ClusterNode {
             raft: RaftNode::new(id, peers),
             metadata: ClusterMetadata::new(),
@@ -472,6 +484,8 @@ pub mod in_memory {
     use std::sync::Arc;
     use tokio::sync::{mpsc, Mutex};
 
+    use crate::shard::{MemoryShardDir, MemoryShardRpc};
+
     type Sender = mpsc::UnboundedSender<(String, RaftMessage)>;
     type Receiver = mpsc::UnboundedReceiver<(String, RaftMessage)>;
 
@@ -479,12 +493,14 @@ pub mod in_memory {
     #[derive(Clone)]
     pub struct InMemoryBus {
         senders: Arc<Mutex<HashMap<String, Sender>>>,
+        shards: Arc<MemoryShardDir>,
     }
 
     impl InMemoryBus {
         pub fn new() -> Self {
             InMemoryBus {
                 senders: Arc::new(Mutex::new(HashMap::new())),
+                shards: MemoryShardDir::new(),
             }
         }
 
@@ -523,15 +539,18 @@ pub mod in_memory {
         pub node_id: String,
         bus: InMemoryBus,
         receiver: Arc<Mutex<Receiver>>,
+        shard_rpc: Arc<MemoryShardRpc>,
     }
 
     impl InMemoryTransport {
         pub async fn new(node_id: String, bus: InMemoryBus) -> Self {
             let receiver = bus.register(&node_id).await;
+            let shard_rpc = MemoryShardRpc::new(node_id.clone(), Arc::clone(&bus.shards));
             InMemoryTransport {
                 node_id,
                 bus,
                 receiver: Arc::new(Mutex::new(receiver)),
+                shard_rpc,
             }
         }
     }
@@ -547,6 +566,10 @@ pub mod in_memory {
             rx.recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("channel closed"))
+        }
+
+        fn shard_rpc(&self) -> Arc<dyn crate::shard::ShardRpc> {
+            Arc::clone(&self.shard_rpc) as Arc<dyn crate::shard::ShardRpc>
         }
     }
 }

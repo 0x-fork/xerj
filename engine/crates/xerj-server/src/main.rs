@@ -4173,7 +4173,13 @@ async fn async_main() -> Result<()> {
             engine: std::sync::Arc::clone(&state.engine),
         }));
         let node_id = node.raft.id.clone();
-        state.engine.attach_cluster(node.handle());
+        let handle = node.handle();
+        state.engine.attach_cluster(handle.clone());
+        // Document and search forwarding. Installed before the runner and
+        // before HTTP accept, so a committed shard plan can be served.
+        handle.set_shard_handler(std::sync::Arc::new(
+            xerj_api::cluster_shard::ApiShardHandler::new(state.clone()),
+        ));
         let mut runner = ClusterRunner::new(node, tick, shutdown_rx);
         info!(node = %node_id, "Starting cluster runner (Raft mode)");
         tokio::spawn(async move { runner.run().await });

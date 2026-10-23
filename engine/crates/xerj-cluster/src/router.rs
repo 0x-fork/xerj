@@ -73,6 +73,20 @@ impl ShardRouter {
         self.num_shards
     }
 
+    /// Widen or set the hash width. `route_doc` uses this for every index,
+    /// so a plan that assigns shard `n` must set the width to at least `n + 1`
+    /// or that shard is unreachable.
+    pub fn set_num_shards(&mut self, num_shards: u32) {
+        assert!(num_shards > 0, "num_shards must be > 0");
+        self.num_shards = num_shards;
+    }
+
+    /// Drop every primary and replica row for `index`.
+    pub fn clear_index(&mut self, index: &str) {
+        self.routing_table.retain(|(idx, _), _| idx != index);
+        self.replica_table.retain(|(idx, _), _| idx != index);
+    }
+
     /// Route a document to its shard and owning node.
     ///
     /// Returns `(shard_id, Option<node_id>)`. `node_id` is `None` when the
