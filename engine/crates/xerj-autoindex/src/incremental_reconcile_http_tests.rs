@@ -854,6 +854,22 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
     let must_not_exists = query
         .pointer("/query/bool/must_not/0/exists/field")
         .and_then(Value::as_str);
+    // #1977: the catalog gate reads rows back with `query.ids`. Dropping that
+    // clause made the search a match-all, and `size` (the published id count)
+    // then kept the `ds:` rows plus the `file:` rows that sort between `ds:`
+    // and `run:`. The run document was in the store and still looked missing.
+    // An id that was never written stays out of the hits, which is the case
+    // the gate exists to fail.
+    let ids: Option<Vec<String>> = query
+        .pointer("/query/ids/values")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        });
     let locked = state.lock().unwrap();
     // #890: a catalog field an older build left as `text` is ANALYZED, so a
     // `term` on it matches tokens, not the raw value. `legacy` is empty for
@@ -869,8 +885,9 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
     let mut matching: Vec<_> = locked
         .docs
         .iter()
-        .filter(|((index, _), doc)| {
+        .filter(|((index, id), doc)| {
             indices.contains(&index.as_str())
+                && ids.as_ref().is_none_or(|wanted| wanted.contains(id))
                 && term
                     .map(|(field, value)| term_matches(doc, field, value, legacy_for(index)))
                     .unwrap_or(true)

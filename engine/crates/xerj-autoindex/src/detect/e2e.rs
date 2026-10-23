@@ -354,6 +354,26 @@ fn search(index: &str, body: &Value, docs: &Arc<Mutex<Docs>>) -> Value {
             .collect();
         return json!({"hits": {"total": {"value": hits.len()}, "hits": hits}});
     }
+    // #1977: the graph path reads the catalog back with `query.ids` after
+    // the write. This mock used to fall through to the size:0 stub below
+    // and answer `hits: []`, so every stored row looked missing and a
+    // healthy run failed the visibility gate. Return the requested ids that
+    // are actually in the store; an id that was never written stays absent,
+    // which is what the gate is there to catch.
+    if let Some(values) = body.pointer("/query/ids/values").and_then(Value::as_array) {
+        let wanted: Vec<&str> = values.iter().filter_map(Value::as_str).collect();
+        let size = body.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
+        let matched: Vec<(&String, &Value)> = store
+            .iter()
+            .filter(|(id, _)| wanted.contains(&id.as_str()))
+            .collect();
+        let hits: Vec<Value> = matched
+            .iter()
+            .take(size)
+            .map(|(id, source)| json!({"_id": id, "_source": source}))
+            .collect();
+        return json!({"hits": {"total": {"value": matched.len()}, "hits": hits}});
+    }
     // size:0 totals (dataset counts, map summary): total = matching docs.
     let live_only = body.pointer("/query/bool/must_not").is_some();
     let total = store

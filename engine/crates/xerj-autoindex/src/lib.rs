@@ -6087,6 +6087,94 @@ fn delete_catalog_hits_where(
     ))
 }
 
+/// The graph path's catalog gate (#1977).
+///
+/// `autoindex-catalog` is created empty during prepare, and the data indices
+/// are refreshed — and therefore searchable — before this write. The bulk that
+/// fills the catalog used to treat a per-item refusal as a warning (#955) and
+/// never read the rows back, so a response the client classified as success
+/// could leave the index at zero documents and the run at exit 0. `xerj_map`
+/// then reports no datasets. The data path already refuses that shape (the
+/// zero-live gate, #195). This is the same check for the rows `xerj_map` reads:
+/// every published dataset document and the run document, visible by `_id`
+/// with the `doc_kind` the map filters on.
+///
+/// Called only after the catalog refresh, and before the resume journal is
+/// finished, so a failure leaves the next invocation of the same command to
+/// rewrite these ids.
+fn require_visible_catalog_rows(es: &Es, ids: &[String]) -> Result<()> {
+    // One ids query stays under the default result window. 200 is also the
+    // point at which a ~210-dataset batch (the #1977 report) takes two
+    // requests instead of one oversized one.
+    const CHUNK: usize = 200;
+    let mut missing_at: Vec<usize> = Vec::new();
+    for (chunk_index, chunk) in ids.chunks(CHUNK).enumerate() {
+        let response = es
+            .search(
+                catalog::CATALOG_INDEX,
+                &json!({
+                    "size": chunk.len(),
+                    "query": {"ids": {"values": chunk}},
+                    "_source": ["doc_kind"]
+                }),
+            )
+            .context(
+                "write catalog: reading the catalog back failed, so this run cannot claim the \
+                 data map was published",
+            )?;
+        let hits = response
+            .pointer("/hits/hits")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for hit in &hits {
+            let Some(id) = hit.get("_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let kind = hit.pointer("/_source/doc_kind").and_then(Value::as_str);
+            let expected = if id.starts_with("run:") {
+                "run"
+            } else if id.starts_with("ds:") {
+                "dataset"
+            } else {
+                continue;
+            };
+            if kind == Some(expected) {
+                seen.insert(id.to_string());
+            }
+        }
+        let base = chunk_index * CHUNK;
+        for (offset, id) in chunk.iter().enumerate() {
+            if !seen.contains(id) {
+                missing_at.push(base + offset);
+            }
+        }
+    }
+    if missing_at.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = missing_at
+        .iter()
+        .take(8)
+        .map(|&index| ids[index].as_str())
+        .collect();
+    let extra = missing_at.len().saturating_sub(shown.len());
+    let extra = if extra > 0 {
+        format!(" (+{extra} more)")
+    } else {
+        String::new()
+    };
+    anyhow::bail!(
+        "write catalog: {} of {} catalog document(s) are not visible after the write ({}{extra}). \
+         The data indices are already indexed; rerun the same command to rewrite the catalog. \
+         `xerj autoindex map` stays empty until those rows exist",
+        missing_at.len(),
+        ids.len(),
+        shown.join(", "),
+    )
+}
+
 /// #589: sweep the documents an exclusion left behind. A file still on disk
 /// that a widened ignore/hidden/`.xerjignore` rule now skips must have its
 /// already-published documents removed — an exclusion that cannot remove data
@@ -10718,19 +10806,33 @@ fn run_index_report_inner(
                     .unwrap_or("unknown server error")
             );
         }
-        // A catalog document the server refused is a file or dataset that
-        // `xerj autoindex map` will not show. It has never ended a run and
-        // does not now, but it is no longer silent either (#955).
+        // A refused catalog document is a dataset or file `xerj autoindex map`
+        // will not show. Warning and exiting 0 left a ~210-index batch with
+        // an empty catalog and no signal to rerun (#1977). Same rule as the
+        // generation path's `check_bulk_outcome`: a catalog item the server
+        // refused fails the run, before the journal is finished, so the same
+        // command rewrites it.
         if outcome.item_errors > 0 {
-            pr.note(&format!(
-                "autoindex: WARNING — the server refused {} catalog document(s): {}. The \
-                 records are indexed; `xerj autoindex map` will be missing those entries",
+            anyhow::bail!(
+                "write catalog: the server refused {} catalog document(s): {}. The data indices \
+                 are already indexed, but `xerj autoindex map` would be missing those entries. \
+                 Rerun the same command to rewrite the catalog",
                 outcome.item_errors,
                 outcome.first_error.as_deref().unwrap_or("no reason given")
-            ));
+            );
         }
+        // Refresh is what makes the rows searchable. Swallowing a failure
+        // (`.ok()`) reported success over a catalog `xerj_map` could not see.
+        es.refresh(catalog::CATALOG_INDEX)
+            .context("write catalog: refresh autoindex-catalog so the new rows are searchable")?;
+        let mut published_ids: Vec<String> = plan
+            .datasets
+            .iter()
+            .map(|dataset| format!("ds:{}:{}", cfg.prefix, dataset.slug))
+            .collect();
+        published_ids.push(format!("run:{run_id}"));
+        require_visible_catalog_rows(&es, &published_ids)?;
     }
-    es.refresh(catalog::CATALOG_INDEX).ok();
     pr.item_done(0);
     // ── durable junk record, written last (#238) ─────────────────────────
     //

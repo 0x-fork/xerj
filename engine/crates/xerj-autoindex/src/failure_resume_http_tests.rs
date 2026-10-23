@@ -173,6 +173,14 @@ struct MockState {
     max_actions_per_bulk: Option<usize>,
     /// Line count of every bulk `max_actions_per_bulk` refused, in order.
     oversize_bulks_refused: Vec<usize>,
+    /// Opt-in (#1977): answer the catalog bulk `errors: false` and persist
+    /// nothing. The data path's zero-live gate already refuses this shape;
+    /// the catalog write used to exit 0 with an empty `autoindex-catalog`.
+    swallow_catalog_bulks: bool,
+    /// Opt-in (#1977): refuse every catalog action with a per-item 400 and
+    /// persist nothing. Status 400 is not a `server_error`, so it used to be
+    /// a warning on an exit-0 run.
+    reject_catalog_items: bool,
 }
 
 struct MockEndpoint {
@@ -472,6 +480,48 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 "hits": {"total": {"value": 0, "relation": "gte"}, "hits": []}
             }),
         )
+    } else if method == "POST"
+        && path.starts_with("/autoindex-catalog/")
+        && path.ends_with("/_search")
+        && serde_json::from_slice::<Value>(&body)
+            .ok()
+            .is_some_and(|query| {
+                query
+                    .pointer("/query/ids/values")
+                    .and_then(Value::as_array)
+                    .is_some()
+            })
+    {
+        // #1977: the graph path reads catalog rows back by `_id` after the
+        // write. Answer with the documents actually stored — an empty `hits`
+        // array here would fail every successful run.
+        let query: Value = serde_json::from_slice(&body).unwrap();
+        let wanted = query
+            .pointer("/query/ids/values")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let locked = state.lock().unwrap();
+        let mut hits: Vec<Value> = wanted
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|id| {
+                locked
+                    .catalog_docs
+                    .get(id)
+                    .map(|doc| json!({"_id": id, "_source": doc}))
+            })
+            .collect();
+        hits.sort_by(|left, right| left["_id"].as_str().cmp(&right["_id"].as_str()));
+        (
+            200,
+            json!({
+                "hits": {
+                    "total": {"value": hits.len(), "relation": "eq"},
+                    "hits": hits
+                }
+            }),
+        )
     } else if method == "POST" && path.ends_with("/_search") {
         // Report the REAL number of stored docs: `run_index` verifies live
         // counts against the journal (#195), so a mock that always answered 0
@@ -677,6 +727,29 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         let mut locked = state.lock().unwrap();
         if locked.catalog_preexists && !locked.catalog_mapping_upgraded {
             locked.catalog_bulk_before_upgrade = true;
+        }
+        if locked.swallow_catalog_bulks {
+            return json!({"errors": false, "items": []});
+        }
+        if locked.reject_catalog_items {
+            let mut items = Vec::new();
+            let mut line = 0;
+            while line < lines.len() {
+                let Ok(action) = serde_json::from_slice::<Value>(lines[line]) else {
+                    line += 1;
+                    continue;
+                };
+                let is_delete = action.get("delete").is_some();
+                items.push(json!({"index": {
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": "failed to parse field [time_min] of type [date]"
+                    }
+                }}));
+                line += if is_delete { 1 } else { 2 };
+            }
+            return json!({"errors": true, "items": items});
         }
         let mut line = 0;
         while line < lines.len() {
@@ -1145,6 +1218,162 @@ fn a_catalog_bulk_the_server_refuses_as_too_large_still_lands_whole() {
         done.contains(" bulk_splits="),
         "the terminal line must say the server refused a request for its size: {done}"
     );
+}
+
+/// Locks the three fixtures this module's HTTP tests share.
+fn http_test_guards() -> (
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    (
+        FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        crate::progress::SINK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// #1977: one repository per directory, the shape of the ~210-index report.
+/// Every dataset the run publishes has a catalog row before the run exits 0.
+///
+/// 201 is one past the read-back chunk of 200, so the gate's second ids
+/// query is part of the passing run and not only the failure path.
+#[test]
+fn many_datasets_in_one_run_each_get_a_catalog_row() {
+    let _guards = http_test_guards();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    const REPOS: usize = 201;
+    for n in 0..REPOS {
+        let repo = corpus.path().join(format!("repo-{n:02}"));
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            repo.join("notes.md"),
+            format!("# repo {n}\n\nnotes for repository {n}.\n"),
+        )
+        .unwrap();
+    }
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert!(
+        !config.no_graph,
+        "the empty-catalog report is the graph path"
+    );
+    let (code, _) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    let datasets = dataset_catalog_docs(&endpoint);
+    assert_eq!(
+        datasets.len(),
+        REPOS,
+        "each repository is its own dataset and must have a catalog row: {datasets:?}"
+    );
+    let runs = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .catalog_docs
+        .values()
+        .filter(|doc| doc.get("doc_kind").and_then(Value::as_str) == Some("run"))
+        .count();
+    assert_eq!(runs, 1, "the run document is part of the catalog gate");
+}
+
+/// #1977: the server answers the catalog bulk as a clean success and writes
+/// nothing. That is the data path's swallowed-bulk shape (#195). On the graph
+/// path it used to exit 0 with `autoindex-catalog` still empty, so `xerj_map`
+/// reported no datasets. The run must fail, and the same command must recover
+/// once the server accepts the write — the journal is not finished until the
+/// rows are visible.
+#[test]
+fn a_catalog_bulk_answered_success_but_not_stored_does_not_exit_zero() {
+    let _guards = http_test_guards();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("rows.csv"),
+        "id,value\n1,first\n2,second\n",
+    )
+    .unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().swallow_catalog_bulks = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let error = run_index_report(config.clone()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("not visible"),
+        "the failure must say the catalog rows are missing: {message}"
+    );
+    assert!(
+        message.contains("rerun the same command"),
+        "the failure must name the recovery: {message}"
+    );
+    {
+        let locked = endpoint.state.lock().unwrap();
+        assert!(
+            locked.catalog_docs.is_empty(),
+            "the swallowed bulk must not have stored a catalog row"
+        );
+        assert_eq!(
+            data_rows(&locked).len(),
+            2,
+            "the data indices are searchable; only the catalog write was lost"
+        );
+    }
+    assert_eq!(
+        event_count(state_dir.path(), "finish"),
+        0,
+        "a catalog the map cannot see must not finish the resume journal"
+    );
+    endpoint.state.lock().unwrap().swallow_catalog_bulks = false;
+    let (code, _) = run_index_report(config).unwrap();
+    assert_eq!(code, 0, "the same command rewrites the catalog");
+    assert_eq!(
+        dataset_catalog_docs(&endpoint).len(),
+        1,
+        "the recovered run publishes the dataset row"
+    );
+}
+
+/// #1977: a per-item 400 on every catalog action is not a `server_error`, so
+/// it used to be a warning on exit 0 while the catalog stayed empty.
+#[test]
+fn a_catalog_bulk_refused_item_by_item_does_not_exit_zero() {
+    let _guards = http_test_guards();
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("rows.csv"), "id,value\n1,first\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().reject_catalog_items = true;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let error = run_index_report(config.clone()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("refused") && message.contains("catalog"),
+        "the failure must name the refused catalog documents: {message}"
+    );
+    assert!(
+        endpoint.state.lock().unwrap().catalog_docs.is_empty(),
+        "a refused catalog bulk stores nothing"
+    );
+    assert_eq!(
+        event_count(state_dir.path(), "finish"),
+        0,
+        "a refused catalog must not finish the resume journal"
+    );
+    endpoint.state.lock().unwrap().reject_catalog_items = false;
+    let (code, _) = run_index_report(config).unwrap();
+    assert_eq!(
+        code, 0,
+        "clearing the refusal lets the same command recover"
+    );
+    assert_eq!(dataset_catalog_docs(&endpoint).len(), 1);
 }
 
 /// #944: the shape that aborted a 48,533-file run at 60% — one data bulk
