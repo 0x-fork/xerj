@@ -172,9 +172,12 @@ more than one corpus defines the name.
 
 ## When it does not answer
 
-- Exit 4: more than one corpus fits. The candidates print, one per line. Run again with
-  `--corpus <slug>`.
+- Exit 4: more than one corpus actually fits. The candidates print, one per line. Run again with
+  `--corpus <slug>`. A topic no corpus covers is not this exit.
 - Exit 1, `no hub corpus matches`: the hub does not hold it. Say so. Do not answer from memory.
+- Exit 1, `no hub corpus covers this topic`: the question names something the hub does not
+  have, or every overlap is weak. Index it locally (`xerj autoindex <path>`, then `xerj code`
+  or `xerj search`). `xerj hub find` lists what the hub does have. Do not pick a nearest corpus.
 - Exit 3: a downloaded pack failed its checksum or signature check and was discarded. Do not use it.
   Tell the user.
 - Exit 5: this build has no hub public key, so no pack can be verified and nothing was downloaded.
@@ -296,7 +299,7 @@ fn self_bin() -> String {
 /// `skill_md()` or `HUB_SKILL_MD` changes, so a file an older init wrote (and
 /// the user never edited) is upgraded on the next run. A unit test pins the
 /// texts' hashes to this number, so a text change without a bump fails CI.
-const INIT_FILES_VERSION: u32 = 5;
+const INIT_FILES_VERSION: u32 = 6;
 
 /// The marker's prefix. The full line is
 /// `<!-- xerj-init-version: <N> sha256:<16 hex> -->`: the generation, and the
@@ -1534,7 +1537,7 @@ mod tests {
                 content_hash(&skill_md()).as_str(),
                 content_hash(HUB_SKILL_MD).as_str()
             ),
-            (5, "78d8c53415efea51", "131aa9224f56d182"),
+            (6, "78d8c53415efea51", "2cdaa10f4b99c69f"),
             "a teaching text changed: bump INIT_FILES_VERSION and re-pin"
         );
     }

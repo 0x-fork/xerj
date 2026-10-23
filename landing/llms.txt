@@ -65,9 +65,9 @@ Tell the user the corpus, the pin date and the licence your answer rests on, wit
 Exit codes of `xerj ask`:
 
 - `0` answered · `2` usage error or unknown corpus
-- `1` no match. If a `closest corpora: …` line follows `no hub corpus matches`, ask again with `--corpus <slug>` for the one that fits; without it the hub does not hold the answer: say so, do not answer from memory
+- `1` no match. If a `closest corpora: …` line follows `no hub corpus matches`, ask again with `--corpus <slug>` for the one that fits; without it the hub does not hold the answer: say so, do not answer from memory. `no hub corpus covers this topic` is the same exit: a weak overlap, or a tie on some other word while the question names a project no corpus contains, is not a choice. Index it locally with `xerj autoindex <path>`, then `xerj code` or `xerj search`. `xerj hub find` lists what the hub does have
 - `3` a pack failed its checksum or signature check and was discarded
-- `4` more than one corpus fits: the candidates print, one per line; run again with `--corpus <slug>`
+- `4` more than one corpus actually fits: the candidates print, one per line; run again with `--corpus <slug>`. A topic no corpus covers is exit 1, not this
 - `5` this build has no hub public key, so nothing was downloaded: tell the user, a retry will not help
 
 XERJ uses the node at `--url`, `$XERJ_URL` or `localhost:9200` if one answers; otherwise it starts its own on a free loopback port and records its PID.

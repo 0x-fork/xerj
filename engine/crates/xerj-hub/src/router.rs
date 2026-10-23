@@ -33,10 +33,12 @@
 //!    distinctive words drive the score.
 //!
 //! The merged scores decide: a dominant, high-scoring corpus is
-//! [`Routing::Confident`]; a cluster of plausible ones is
+//! [`Routing::Confident`]; a cluster of good matches is
 //! [`Routing::Ambiguous`] (best-first; the ask path shows at most
 //! [`AMBIGUOUS_SHOWN`] after symbol evidence, and the caller disambiguates
-//! with `--corpus`); nothing credible is
+//! with `--corpus`); a cluster that only weakly overlaps the question, or a
+//! tie on some other word while the question names a project no entry
+//! contains, is [`Routing::NoCoverage`]; nothing credible is
 //! [`Routing::NoCorpus`]. A corpus already cached locally gets a small nudge so
 //! a tie breaks toward the pack the agent already has. A corpus the question
 //! names by slug still decides outright, ahead of the identity score.
@@ -86,6 +88,11 @@ pub enum Routing {
     /// [`AMBIGUOUS_SHOWN`] after symbol evidence has had a chance to narrow
     /// the list; the caller must pick one.
     Ambiguous(Vec<String>),
+    /// Several corpora overlapped the question, but none covers it: every
+    /// candidate is a weak score, or the question names a project no catalogue
+    /// entry contains and the tie is on some other word. Not a choice among
+    /// packs — the topic is absent.
+    NoCoverage,
     /// Nothing credible matched.
     NoCorpus,
 }
@@ -115,6 +122,17 @@ const CONFIDENT_MIN: f32 = 0.6;
 const DOMINANCE: f32 = 1.5;
 /// A slug must reach this to be an `Ambiguous` candidate.
 const CANDIDATE_MIN: f32 = 0.3;
+/// A multi-candidate tie whose best score is below this is a weak overlap, not
+/// a choice. It sits under a full overlap of common tokens
+/// ([`COMMON_CREDIT`] × [`SKETCH_WEIGHT`] = 0.4), which stays
+/// [`Routing::Ambiguous`], and above [`CANDIDATE_MIN`]. A minority overlap
+/// (two tokens out of five scores 0.32) is [`Routing::NoCoverage`].
+const AMBIGUOUS_GOOD_MIN: f32 = 0.35;
+/// Identity-channel scores (name weight × idf) sit above this. Sketch, hosted
+/// and dependency scores do not (those top out at 1.0, plus the cached bonus).
+/// An unknown lowercase word may break an identity tie without breaking a
+/// sketch tie.
+const IDENTITY_SCORE_FLOOR: f32 = 2.0;
 /// Score a corpus named in the question earns (it outranks everything: the
 /// asker said which corpus they mean).
 const NAMED_SCORE: f32 = 1.0;
@@ -279,7 +297,8 @@ pub fn route_ranked(
 
     let (routing, ranked) = decide(evidence, cached);
     // A slug the question spells out decides before identity scoring. "lz4 or
-    // zstd?" is the asker choosing, not a group to search together.
+    // zstd?" is the asker choosing, not a group to search together. That
+    // choice is not rewritten into a coverage gap: the asker named the packs.
     match named.len() {
         1 => return (Routing::Confident(named[0].clone()), ranked),
         n if n > 1 => {
@@ -292,10 +311,169 @@ pub fn route_ranked(
         }
         _ => {}
     }
-    if let Some(identity) = identity_route(question, cat) {
-        return identity;
+    if let Some((identity, identity_ranked)) = identity_route(question, cat) {
+        return (
+            apply_coverage(question, cat, identity, &identity_ranked),
+            identity_ranked,
+        );
     }
-    (routing, ranked)
+    (apply_coverage(question, cat, routing, &ranked), ranked)
+}
+
+/// Turn a tie or a miss into [`Routing::NoCoverage`] when the question names a
+/// project the catalogue does not contain.
+///
+/// A capitalized, underscored, or digit-bearing token (`Phaser`,
+/// `setInteractive`, `HTML5`) that no slug, topic, or description contains is
+/// that project. A lowercase word does the same to an identity tie only (those
+/// scores sit above [`IDENTITY_SCORE_FLOOR`]), so "how does phaser draw HTML?"
+/// is not a choice among the HTML packs, while a sketch tie on words the
+/// corpora actually contain stays [`Routing::Ambiguous`]. A slug the question
+/// spells out is handled before this runs.
+fn apply_coverage(
+    question: &str,
+    cat: &Catalogue,
+    routing: Routing,
+    ranked: &[(String, f32)],
+) -> Routing {
+    let proper = !uncovered_names(question, cat).is_empty();
+    let identity_tie = ranked
+        .first()
+        .is_some_and(|(_, score)| *score > IDENTITY_SCORE_FLOOR);
+    match routing {
+        Routing::NoCorpus if proper => Routing::NoCoverage,
+        Routing::Ambiguous(_) if proper || (identity_tie && has_unknown_word(question, cat)) => {
+            Routing::NoCoverage
+        }
+        other => other,
+    }
+}
+
+/// Tokens the question writes as a name — a capital, a digit, or an underscore
+/// — that no catalogue entry's slug, topics, or description contains.
+/// Lowercase how-to words are not names: "handle" must not turn a real HTML
+/// tie into a coverage gap, while "Phaser" must.
+fn uncovered_names(question: &str, cat: &Catalogue) -> Vec<String> {
+    let known = catalogue_words(cat);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in question_raw_tokens(question) {
+        let lower = raw.to_ascii_lowercase();
+        if lower.len() < IDENTITY_MIN_LEN || is_identity_stopword(&lower) {
+            continue;
+        }
+        let name_shaped = raw.contains('_')
+            || raw
+                .chars()
+                .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        if name_shaped && !known.contains(&lower) && seen.insert(lower.clone()) {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+/// A lowercase word of the question that no catalogue entry contains and that
+/// is not ordinary how-to English (`draw`, `parser`). "phaser" qualifies;
+/// "handle" does not.
+fn has_unknown_word(question: &str, cat: &Catalogue) -> bool {
+    let known = catalogue_words(cat);
+    question_raw_tokens(question).any(|raw| {
+        let lower = raw.to_ascii_lowercase();
+        lower.len() >= IDENTITY_MIN_LEN
+            && !is_identity_stopword(&lower)
+            && !is_common_question_word(&lower)
+            && raw.chars().all(|c| c.is_ascii_lowercase())
+            && !known.contains(&lower)
+    })
+}
+
+fn catalogue_words(cat: &Catalogue) -> HashSet<String> {
+    let mut known = HashSet::new();
+    for entry in &cat.corpora {
+        let profile = IdentityProfile::from_entry(entry);
+        known.extend(profile.slug);
+        known.extend(profile.tags);
+        known.extend(profile.desc);
+    }
+    known
+}
+
+fn question_raw_tokens(question: &str) -> impl Iterator<Item = &str> {
+    question
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .map(|word| word.trim_matches(|c| c == '.' || c == '-'))
+        .filter(|word| !word.is_empty())
+}
+
+/// Ordinary words of a how-to question. Not stopwords (those are dropped
+/// earlier): these are content words that are not a project name, so an
+/// unknown one does not mean the hub lacks the topic. Sorted for binary search.
+fn is_common_question_word(word: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "area",
+        "block",
+        "body",
+        "call",
+        "calls",
+        "canvas",
+        "code",
+        "compress",
+        "content",
+        "data",
+        "decoder",
+        "default",
+        "document",
+        "draw",
+        "element",
+        "engine",
+        "error",
+        "file",
+        "files",
+        "format",
+        "function",
+        "game",
+        "games",
+        "handle",
+        "handles",
+        "input",
+        "internals",
+        "level",
+        "line",
+        "lines",
+        "loop",
+        "method",
+        "mode",
+        "name",
+        "names",
+        "object",
+        "objects",
+        "parser",
+        "path",
+        "point",
+        "queries",
+        "query",
+        "read",
+        "reference",
+        "render",
+        "return",
+        "size",
+        "state",
+        "text",
+        "time",
+        "type",
+        "types",
+        "value",
+        "values",
+        "version",
+        "window",
+        "word",
+        "words",
+        "work",
+        "write",
+        "writing",
+    ];
+    WORDS.binary_search(&word).is_ok()
 }
 
 /// Shorten an [`Routing::Ambiguous`] list to [`AMBIGUOUS_SHOWN`], best first.
@@ -621,7 +799,12 @@ fn decide(evidence: Vec<Evidence>, cached: &[String]) -> (Routing, Vec<(String, 
         .map(|(slug, _)| slug.clone())
         .collect();
     if candidates.len() >= 2 {
-        return (Routing::Ambiguous(candidates), ranked);
+        // A full overlap of common tokens still scores 0.4 and is a real tie.
+        // A minority overlap clears the candidate floor and is not a choice.
+        if top_score >= AMBIGUOUS_GOOD_MIN {
+            return (Routing::Ambiguous(candidates), ranked);
+        }
+        return (Routing::NoCoverage, ranked);
     }
 
     (Routing::NoCorpus, ranked)
@@ -1070,6 +1253,84 @@ mod tests {
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_minority_overlap_is_no_coverage_not_ambiguous() {
+        // Eight corpora so a token shared by two is not common vocabulary
+        // (the quarter cut). Five query tokens, two hits each: 2/5 × 0.8 = 0.32,
+        // over the 0.3 candidate floor and under the 0.35 good-tie bar.
+        let mut entries = vec![
+            entry("alpha", &[], &["aaa", "bbb"]),
+            entry("beta", &[], &["aaa", "ccc"]),
+        ];
+        for i in 0..6 {
+            entries.push(entry(
+                &format!("other{i}"),
+                &[],
+                &[&format!("uniq{i}a"), &format!("uniq{i}b")],
+            ));
+        }
+        let cat = catalogue(entries);
+        let routing = route(
+            "aaa bbb ccc noisea noiseb",
+            empty_project().path(),
+            &cat,
+            None,
+            &[],
+        );
+        assert_eq!(routing, Routing::NoCoverage);
+    }
+
+    #[test]
+    fn a_project_the_catalogue_does_not_contain_is_no_coverage() {
+        // "html" is a language word in four descriptions. On a catalogue large
+        // enough for that to stay distinctive, the identity router used to
+        // call the tie ambiguous. The question names Phaser, which no entry
+        // contains, so the HTML packs do not cover it. A lowercase spelling
+        // is the same gap. "HTML" alone is a real tie. An exact slug still wins.
+        let mut entries = Vec::new();
+        for slug in ["whatwg-html", "lol-html", "parse5", "jsdom"] {
+            let mut e = entry(slug, &[], &[]);
+            e.ask_for = "An agent writing HTML queries this for the document format.".into();
+            entries.push(e);
+        }
+        for i in 0..(151 - entries.len()) {
+            let mut e = entry(&format!("filler-{i}"), &[], &[]);
+            e.ask_for = "an agent working on storage queries this for internals".into();
+            entries.push(e);
+        }
+        let mut lz4 = entry("lz4", &[], &["lz4", "block", "decoder"]);
+        lz4.ask_for = "an agent needing fast block compression queries this for the decoder".into();
+        entries.push(lz4);
+        let cat = catalogue(entries);
+        let proj = empty_project();
+
+        assert_eq!(
+            route("How does Phaser draw HTML?", proj.path(), &cat, None, &[]),
+            Routing::NoCoverage
+        );
+        assert_eq!(
+            route("how does phaser draw HTML?", proj.path(), &cat, None, &[]),
+            Routing::NoCoverage
+        );
+        match route("HTML document format", proj.path(), &cat, None, &[]) {
+            Routing::Ambiguous(slugs) => {
+                assert!(slugs.len() >= 2, "{slugs:?}");
+                assert!(slugs.iter().any(|s| s == "whatwg-html"), "{slugs:?}");
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        assert_eq!(
+            route(
+                "how does the lz4 decoder work",
+                proj.path(),
+                &cat,
+                None,
+                &[]
+            ),
+            Routing::Confident("lz4".to_string())
+        );
     }
 
     #[test]

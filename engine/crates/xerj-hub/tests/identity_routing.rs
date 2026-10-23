@@ -82,7 +82,7 @@ fn picked(routing: &Routing) -> Vec<String> {
     match routing {
         Routing::Confident(slug) => vec![slug.clone()],
         Routing::Group(slugs) | Routing::Ambiguous(slugs) => slugs.clone(),
-        Routing::NoCorpus => Vec::new(),
+        Routing::NoCorpus | Routing::NoCoverage => Vec::new(),
     }
 }
 

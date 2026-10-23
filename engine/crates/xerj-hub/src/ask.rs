@@ -13,7 +13,9 @@
 //!    corpus, or from a tight group of at most three which are searched
 //!    together; the answer's first line names them (`using: slug, slug`).
 //!    Genuinely ambiguous → a few candidates, best first, and exit code **4**;
-//!    nothing credible → exit **1** with the llms.txt pointer.
+//!    nothing credible → exit **1** with the llms.txt pointer. A weak overlap,
+//!    or a tie on some other word while the question names a project no corpus
+//!    contains, is the same exit **1** with [`NO_COVERAGE_MESSAGE`] — not exit 4.
 //! 3. **Cached pack** → answer locally ([`AnsweredFrom::LocalPack`]); the
 //!    network is not touched.
 //! 4. **No pack, hosted allowed** → answer through the hosted hub now, then (unless
@@ -50,10 +52,10 @@
 //! | code | meaning |
 //! |------|---------|
 //! | 0 | answered, at least one hit |
-//! | 1 | no match; no corpus; offline/no-fetch with no pack; pull or node failure |
+//! | 1 | no match; no corpus; no coverage (the topic is absent — index it locally); offline/no-fetch with no pack; pull or node failure |
 //! | 2 | usage error; unknown `--corpus`; a pull rejected the slug |
 //! | 3 | a pulled pack failed verification (sha256 / signature / format) |
-//! | 4 | ambiguous — re-run with `--corpus` (the code `xerj autoindex` uses for "needs a decision") |
+//! | 4 | ambiguous — several corpora actually match; re-run with `--corpus` (the code `xerj autoindex` uses for "needs a decision") |
 //! | 5 | this build has no hub public key, so no pack can be verified (nothing was downloaded) |
 
 use std::cell::RefCell;
@@ -97,6 +99,12 @@ pub const EXIT_HUB_UNAVAILABLE: i32 = 6;
 
 /// Printed (stderr) when the router finds nothing credible.
 pub const NO_CORPUS_MESSAGE: &str = "no hub corpus matches; see xerj.org/llms.txt";
+/// Printed (stderr) when candidates exist but none covers the question: every
+/// score is a weak overlap, or the question names a project no corpus contains.
+/// Exit [`EXIT_NO_ANSWER`], not the ambiguity exit — there is nothing to pick.
+pub const NO_COVERAGE_MESSAGE: &str = "no hub corpus covers this topic; index it locally with \
+     `xerj autoindex <path>`, then `xerj code` or `xerj search`. Discover what the hub does have \
+     with `xerj hub find`";
 /// Printed once (stderr) the first time `--hosted auto` resolves to off inside a
 /// git work tree.
 pub const HOSTED_OFF_NOTICE: &str =
@@ -808,7 +816,9 @@ fn with_symbol_evidence(routing: Routing, hits: &[String]) -> Routing {
             let both: Vec<String> = slugs.iter().filter(|s| hits.contains(s)).cloned().collect();
             pick(both).unwrap_or(Routing::Ambiguous(slugs))
         }
-        Routing::NoCorpus => pick(hits.to_vec()).unwrap_or(Routing::NoCorpus),
+        // A coverage gap names no corpus. A symbol defined in one or several
+        // corpora is still evidence: it decides, the same way it does for a miss.
+        Routing::NoCorpus | Routing::NoCoverage => pick(hits.to_vec()).unwrap_or(routing),
     }
 }
 
@@ -1011,6 +1021,13 @@ fn select_corpus(
             out.stderr
                 .push("more than one corpus matches; re-run with --corpus <slug>".to_string());
             out.exit = EXIT_NEEDS_DECISION;
+            None
+        }
+        Routing::NoCoverage => {
+            // Not a choice among the nearest packs. Discovery is `xerj hub find`;
+            // the topic itself has to be indexed locally.
+            out.stderr.push(NO_COVERAGE_MESSAGE.to_string());
+            out.exit = EXIT_NO_ANSWER;
             None
         }
         Routing::NoCorpus => {
@@ -1877,13 +1894,17 @@ pub struct FoundCorpus {
 /// What [`find`] decided: the router's verdict and the candidates, best first.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FindOutcome {
-    /// `confident` | `ambiguous` | `no_corpus` | `different_project`.
+    /// `confident` | `ambiguous` | `no_corpus` | `no_coverage` | `different_project`.
     ///
     /// `different_project` means the router would have answered from a slug
     /// whose name the question only shares: the question names another project
     /// (`fabric.js`) and this pack is a different one (`danielmiessler/fabric`).
     /// `xerj ask` does not answer that as a silent match; it prints the pack's
     /// identity and exits 4.
+    ///
+    /// `no_coverage` means candidates may be listed but none covers the topic
+    /// (weak scores, or the question names a project the catalogue does not
+    /// contain). `xerj ask` exits 1 with the local-index hint, not 4.
     pub routing: &'static str,
     pub corpora: Vec<FoundCorpus>,
 }
@@ -1917,7 +1938,7 @@ pub fn find(
     let mut order: Vec<String> = match &routing {
         Routing::Confident(slug) => vec![slug.clone()],
         Routing::Group(slugs) | Routing::Ambiguous(slugs) => slugs.clone(),
-        Routing::NoCorpus => Vec::new(),
+        Routing::NoCorpus | Routing::NoCoverage => Vec::new(),
     };
     for slug in ranked.iter().map(|(s, _)| s).chain(by_symbol.iter()) {
         if !order.contains(slug) {
@@ -1961,7 +1982,7 @@ pub fn find(
         Routing::Group(slugs) | Routing::Ambiguous(slugs) => {
             slugs.iter().map(String::as_str).collect()
         }
-        Routing::NoCorpus => Vec::new(),
+        Routing::NoCorpus | Routing::NoCoverage => Vec::new(),
     };
     // A confident (or grouped) name match that is actually a different project
     // is not reported as confident: the caller must see the mismatch.
@@ -1974,6 +1995,7 @@ pub fn find(
             _ if collided => "different_project",
             Routing::Confident(_) | Routing::Group(_) => "confident",
             Routing::Ambiguous(_) => "ambiguous",
+            Routing::NoCoverage => "no_coverage",
             Routing::NoCorpus => "no_corpus",
         },
         corpora,
@@ -2042,7 +2064,11 @@ pub fn collision_sentence(token: &str, slug: &str, upstream: &str) -> String {
 /// instead of reading as a plain match.
 pub fn render_find(found: &FindOutcome) -> String {
     if found.corpora.is_empty() {
-        return NO_CORPUS_MESSAGE.to_string();
+        return if found.routing == "no_coverage" {
+            NO_COVERAGE_MESSAGE.to_string()
+        } else {
+            NO_CORPUS_MESSAGE.to_string()
+        };
     }
     let mut lines: Vec<String> = Vec::new();
     for c in &found.corpora {
@@ -2068,6 +2094,8 @@ pub fn render_find(found: &FindOutcome) -> String {
              ask it with xerj_hub_ask {question, corpus} only if that pack is the one you meant"
                 .to_string(),
         );
+    } else if found.routing == "no_coverage" {
+        lines.push(format!("routing: no_coverage; {NO_COVERAGE_MESSAGE}"));
     } else {
         lines.push(format!(
             "routing: {}; ask one with xerj_hub_ask {{question, corpus}}",
@@ -2704,6 +2732,109 @@ mod tests {
         );
     }
 
+    /// Issue #2179. A question that names a project no corpus contains used to
+    /// exit 4 ("more than one corpus matches") when several packs shared some
+    /// other word. That is a coverage gap: exit 1, and say how to index locally.
+    /// A real tie still exits 4. An exact slug is still answered.
+    #[test]
+    fn no_coverage_exits_1_and_points_at_local_indexing() {
+        let rig = Rig::new().in_git_repo();
+        let mut entries = Vec::new();
+        for slug in ["whatwg-html", "lol-html", "parse5", "jsdom"] {
+            let mut e = entry(slug, 1, LicenceClass::AdaptWithAttribution, &[]);
+            e.ask_for = "An agent writing HTML queries this for the document format.".into();
+            entries.push(e);
+        }
+        for i in 0..(151 - entries.len()) {
+            let mut e = entry(
+                &format!("filler-{i}"),
+                1,
+                LicenceClass::AdaptWithAttribution,
+                &[],
+            );
+            e.ask_for = "an agent working on storage queries this for internals".into();
+            entries.push(e);
+        }
+        let mut lz4_entry = lz4(1024, LicenceClass::AdaptWithAttribution);
+        lz4_entry.ask_for =
+            "an agent needing fast block compression queries this for the decoder".into();
+        entries.push(lz4_entry);
+        let cat = catalogue(entries);
+
+        let backend = FakeBackend::new(true);
+        let out = rig.run(
+            &args("How does Phaser draw HTML?", None),
+            &cat,
+            None,
+            &backend,
+        );
+        assert_eq!(out.exit, EXIT_NO_ANSWER, "{out:?}");
+        assert_ne!(out.exit, EXIT_NEEDS_DECISION);
+        let err = out.stderr.join("\n");
+        assert!(err.contains(NO_COVERAGE_MESSAGE), "{err}");
+        assert!(err.contains("xerj autoindex <path>"), "{err}");
+        assert!(err.contains("xerj code"), "{err}");
+        assert!(err.contains("xerj search"), "{err}");
+        assert!(err.contains("xerj hub find"), "{err}");
+        assert!(!err.contains("more than one corpus matches"), "{err}");
+        assert!(
+            out.stdout.is_empty(),
+            "not a candidate list: {}",
+            out.stdout
+        );
+        assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+
+        let found = find(
+            "How does Phaser draw HTML?",
+            5,
+            rig.cwd.path(),
+            rig.hub.path(),
+            &cat,
+        );
+        assert_eq!(found.routing, "no_coverage", "{found:?}");
+        let text = render_find(&found);
+        assert!(text.contains("routing: no_coverage"), "{text}");
+        assert!(text.contains("no hub corpus covers this topic"), "{text}");
+        assert!(text.contains("xerj autoindex"), "{text}");
+
+        // Lowercase project name, same gap.
+        let out = rig.run(
+            &args("how does phaser draw HTML?", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_eq!(out.exit, EXIT_NO_ANSWER, "{out:?}");
+        assert!(out.stderr.iter().any(|l| l.contains(NO_COVERAGE_MESSAGE)));
+
+        // The HTML packs really do tie when the question is about HTML.
+        let out = rig.run(
+            &args("HTML document format", None),
+            &cat,
+            None,
+            &FakeBackend::new(true),
+        );
+        assert_eq!(out.exit, EXIT_NEEDS_DECISION, "{out:?}");
+        assert!(
+            out.stderr
+                .iter()
+                .any(|l| l.contains("more than one corpus matches")),
+            "{:?}",
+            out.stderr
+        );
+
+        // Exact slug.
+        let backend = FakeBackend::new(true);
+        let out = rig.run(
+            &args("how does the lz4 decoder work", None),
+            &cat,
+            None,
+            &backend,
+        );
+        assert_eq!(out.exit, EXIT_OK, "{:?}", out.stderr);
+        assert_eq!(backend.calls(), ["ready:lz4", "answer_local:lz4"]);
+    }
+
     #[test]
     fn no_corpus_exits_1_with_the_llms_txt_pointer() {
         let rig = Rig::new();
@@ -3238,10 +3369,12 @@ mod tests {
         // The sentence alone: the symbol is one of six words and its lower-case
         // twin never matches, so the score cannot reach "confident".
         let cached: Vec<String> = vec![];
+        // The identifier is a name no description contains, so the words are a
+        // coverage gap rather than a corpus choice. The symbol, below, still routes.
         assert!(
             matches!(
                 crate::router::route(q, rig.cwd.path(), &cat, None, &cached),
-                Routing::NoCorpus
+                Routing::NoCorpus | Routing::NoCoverage
             ),
             "the words alone do not route"
         );
@@ -3359,6 +3492,15 @@ mod tests {
         assert_eq!(
             with_symbol_evidence(Routing::NoCorpus, &[]),
             Routing::NoCorpus
+        );
+        assert_eq!(
+            with_symbol_evidence(Routing::NoCoverage, &["b".to_string()]),
+            Routing::Confident("b".to_string()),
+            "a symbol still routes when the words were a coverage gap"
+        );
+        assert_eq!(
+            with_symbol_evidence(Routing::NoCoverage, &[]),
+            Routing::NoCoverage
         );
     }
 

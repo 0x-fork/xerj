@@ -389,8 +389,14 @@ Order and scoring, exactly:
    lowercase words; for each corpus, score = (tokens present in its sketch) /
    (tokens total), ×0.8; tokens present in more than 25% of all sketches count half.
 4. Merge by slug taking the max score. `Confident` if top ≥ 0.6 and top ≥ 1.5 × second
-   (or no second). `Ambiguous` if two or more are ≥ 0.3. Else `NoCorpus`.
-   `--corpus` skips routing. Corpora already cached (`cached`) get +0.05.
+   (or no second). `Ambiguous` if two or more are ≥ 0.3 and the best reaches 0.35
+   (a full overlap of common tokens scores 0.4 and stays a real tie). Two or more
+   between 0.3 and 0.35 is `NoCoverage`: a weak overlap, not a choice. Else `NoCorpus`.
+   A question that names a project no entry contains (`Phaser`, `setInteractive`) is
+   `NoCoverage` even when another token ties several corpora. `xerj ask` exits 1 for
+   both `NoCorpus` and `NoCoverage` (the latter names `xerj autoindex` and `xerj hub find`);
+   exit 4 is only a real ambiguity. `--corpus` skips routing. Corpora already cached
+   (`cached`) get +0.05.
 
    A question that names a language or a technology is decided before those four
    steps, from the catalogue entry itself (slug, topics, a language word in
@@ -406,6 +412,9 @@ Order and scoring, exactly:
 2. Route. `Ambiguous` → print the candidates (`slug — ask_for`, one per line) and
    exit 4 (the same "needs a decision" code autoindex uses); the agent re-asks with
    `--corpus`. `NoCorpus` → exit 1 with `no hub corpus matches; see xerj.org/llms.txt`.
+   `NoCoverage` → exit 1 with `no hub corpus covers this topic` and the local-index
+   hint (`xerj autoindex <path>`, then `xerj code` or `xerj search`; `xerj hub find`
+   to see what the hub does have). Not exit 4.
 3. If the pack is cached locally → answer locally (`AnsweredFrom::LocalPack`).
 4. Else if hosted is allowed → answer through the hosted node now; then, unless
    `--no-fetch`/`--offline`, start the pull in the background: spawn

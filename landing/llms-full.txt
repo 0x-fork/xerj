@@ -1693,14 +1693,18 @@ looks like.
      (a pack already on this machine answers `<slug>: already present`).
 
 EXIT CODES of `xerj ask`
-  0 answered · 1 no match, or nothing to answer from · 2 usage error or unknown corpus ·
+  0 answered · 1 no match, nothing to answer from, or no hub corpus covers the topic ·
+  2 usage error or unknown corpus ·
   3 a pack failed its checksum or signature check and was discarded · 4 more than one
-  corpus matches: the candidates print one per line, run again with `--corpus <slug>` ·
+  corpus actually matches: the candidates print one per line, run again with `--corpus <slug>` ·
   5 this build has no hub public key, so no pack can be verified and nothing was
   downloaded (tell the user; a retry will not help).
   `no hub corpus matches` followed by `closest corpora: <slug>, …` means routing
   was not sure: ask again with `--corpus <slug>` for the one that fits. Without
   that line the hub does not hold the answer. Say so; do not answer from memory.
+  `no hub corpus covers this topic` is also exit 1: weak overlaps are not a choice.
+  Index it locally with `xerj autoindex <path>`, then `xerj code` or `xerj search`.
+  `xerj hub find` lists what the hub does have. Do not pick a nearest corpus.
 
 OTHER FLAGS: `--how` ranked passages · `--files` the relevant files with their
 licences · `--offline` cached catalogue and packs only · `--no-fetch` do not download

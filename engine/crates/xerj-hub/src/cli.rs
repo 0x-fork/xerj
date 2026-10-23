@@ -69,7 +69,8 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
         Which corpora could answer, best first. Each line names the upstream
         repo (owner/name, when the catalogue has it) and the one-line description
         of what that pack is. A query that names a different project of the same
-        slug (fabric.js) exits 4 instead of matching silently.
+        slug (fabric.js) exits 4 instead of matching silently. A question no
+        corpus covers exits 1 (not 4) and names `xerj autoindex`.
   feedback <slug> --usefulness <1-5> --found <yes|partial|no> [...]
         Rate a corpus after using it: one structured review (no query text) for
         its Agent score on hub.xerj.org (see `xerj hub feedback -h`).
@@ -1387,7 +1388,7 @@ fn run_find_cmd(args: &[String]) -> i32 {
             }
             match found.routing {
                 "different_project" | "ambiguous" => ask::EXIT_NEEDS_DECISION,
-                "no_corpus" => ask::EXIT_NO_ANSWER,
+                "no_corpus" | "no_coverage" => ask::EXIT_NO_ANSWER,
                 _ => 0,
             }
         }
@@ -1459,10 +1460,13 @@ options:
   --url <node>           the node that holds the packs (default: XERJ_URL, then
                          localhost:9200, else a local node is started)
 
-exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
-unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
-and none clearly wins (a few candidates are printed, best first; re-run with
---corpus <slug>); 5 this build has no hub
+exit codes: 0 answered; 1 no match, nothing to answer from, or no hub corpus
+covers the topic (index it locally: xerj autoindex <path>, then xerj code or
+xerj search; xerj hub find lists what the hub does have); 2 usage error or
+unknown corpus; 3 a pack failed verification; 4 more than one corpus actually
+matches and none clearly wins (a few candidates are printed, best first;
+re-run with --corpus <slug>). A weak overlap, or a tie while the question
+names a project no corpus contains, is exit 1, not 4; 5 this build has no hub
 public key, so no pack can be verified (nothing was downloaded); 6 the hub
 catalogue could not be loaded (hub unreachable, no signed catalogue served, or
 --offline with none cached): a hub problem, not an answer about any corpus";

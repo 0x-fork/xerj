@@ -56,7 +56,9 @@ pub fn specs() -> Vec<Value> {
                 "its pin, licence and whether the pack is already on this machine — not passages; ",
                 "ask one with xerj_hub_ask. A query that names a different project of the same slug ",
                 "(fabric.js vs the pack's repo) is reported as a different project instead of a ",
-                "silent match. Routed exactly as `xerj ask` routes: your project's dependencies, ",
+                "silent match. A question that names a project no corpus covers is no_coverage \
+                 (index it locally with xerj autoindex, then xerj code or xerj search); that is not \
+                 an ambiguous tie. Routed exactly as `xerj ask` routes: your project's dependencies, ",
                 "the signed catalogue's term sketches, and the exact symbol a definition question ",
                 "names (offline: reads the catalogue `xerj hub sync` cached and never fetches it; ",
                 "this build has no hosted search). Excluded-licence corpora are never listed."),
@@ -109,7 +111,9 @@ pub fn specs() -> Vec<Value> {
                 "Ask a hub corpus a question in one turn — no clone, no local indexing. Local packs ",
                 "first, hosted second, exactly like `xerj ask`. The corpus is optional (routed by ",
                 "the offline sketch when omitted) and is always named in the answer; when more than ",
-                "one corpus fits, the candidates come back and you re-ask with `corpus`. Never ",
+                "one corpus fits, the candidates come back and you re-ask with `corpus`. When no \
+                 corpus covers the topic, the result says so and points at local indexing instead of \
+                 asking you to pick a corpus. Never ",
                 "downloads a pack: a corpus not on this machine is answered with the `xerj hub ",
                 "pull` line to run, and never fetches the catalogue: with none cached it says to run ",
                 "`xerj hub sync`. Result text is the hub rendering (corpus, pin date, licence, ",
