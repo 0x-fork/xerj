@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now set it on the request, and a non-numeric value is the same 400
   `parse_exception` `_search` gives.
 
+- MCP `xerj_code_search` token budgets preserve adjacent definitions and distinct
+  snippets at the same citation. Rendered text is deduped only when both its
+  locator and displayed passage match an already-shown block; display labels,
+  separators and match citations no longer stand in for source ranges.
+
 - x86_64 release binaries no longer require AVX2. The build baseline is
   `x86-64-v2` (SSE4.2). The HNSW eight-accumulator dot product — the kernel
   `x86-64-v3` was actually vectorizing — compiles an AVX2+FMA variant and

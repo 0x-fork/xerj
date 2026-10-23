@@ -28,7 +28,8 @@
 //! 1. **Dedup before budgeting**: hits that resolve to an identifiable
 //!    `file:line` span and *overlap* a higher-ranked hit whose passage is
 //!    actually shown are dropped entirely (counted in the accounting block,
-//!    never re-shown).
+//!    never re-shown). Rendered code has no reliable source ranges: only
+//!    identical locators with identical displayed bodies are deduped there.
 //! 2. **Greedy keep in rank order** until the budget would break.
 //! 3. **Over-budget hits become locators only** — the citation `file:line` /
 //!    `_index`+`_id`, not the passage — while they still fit.
@@ -413,29 +414,23 @@ impl<'a> CodeBlock<'a> {
         self.lines[0]
     }
 
-    /// `(file, start_line)` from the header's locator (`─── path:line  (...)`
-    /// — the renderer's provenance format). No line number → `(file, None)`.
-    fn locator(&self) -> (String, Option<u64>) {
-        let h = self.header().strip_prefix("─── ").unwrap_or(self.header());
-        let loc = h.split("  (").next().unwrap_or(h).trim();
-        match loc.rsplit_once(':') {
-            Some((path, digits))
-                if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                (path.to_string(), digits.parse().ok())
+    /// A rendered citation is not a source range: it can point at the match
+    /// inside a window, and labels/separators are not source lines. Only an
+    /// identical locator AND displayed body prove a redundant read here.
+    fn duplicates(&self, other: &Self) -> bool {
+        let locator = |h: &'a str| h.split("  (").next().unwrap_or(h);
+        let body = |lines: &'a [&'a str]| {
+            let mut end = lines.len();
+            // The renderer separates hits and the footer with blank lines.
+            while end > 1 && lines[end - 1].is_empty() {
+                end -= 1;
             }
-            _ => (loc.to_string(), None),
-        }
-    }
-
-    /// Estimated passage span `[start, start + body lines]` — the body shown
-    /// IS the passage, so its line count bounds it. Coarse on purpose:
-    /// overlap detection, not citation.
-    fn span(&self) -> Option<(String, u64, u64)> {
-        let (file, start) = self.locator();
-        let start = start?;
-        let body_lines = self.lines.len().saturating_sub(1) as u64;
-        Some((file, start, start + body_lines))
+            &lines[1..end]
+        };
+        let passage = body(self.lines);
+        !passage.is_empty()
+            && locator(self.header()) == locator(other.header())
+            && passage == body(other.lines)
     }
 }
 
@@ -443,7 +438,8 @@ impl<'a> CodeBlock<'a> {
 /// `max_tokens` tokens. Same model as the JSON surface, adapted to the
 /// renderer's shape: blocks start at `─── ` lines; the footer is the
 /// `N passages from '…'` line and everything after it. Deduped blocks are
-/// removed entirely; over-budget blocks keep only their `─── file:line
+/// removed entirely only when locator and displayed body are identical;
+/// over-budget blocks keep only their `─── file:line
 /// (score …)` header — the locator the footer tells the agent to cite — with
 /// a visible omission marker; the trailing `[token budget …]` line accounts
 /// for every hit. Nothing to dedup and under budget → byte-identical text.
@@ -479,21 +475,11 @@ pub fn budget_code_text(rendered: &str, max_tokens: usize) -> String {
     let footer = lines[footer_start..].join("\n");
     // Nothing binding → byte-identical passthrough (the leading blank line
     // lives in the preamble, the footer is untouched).
-    let has_overlap = {
-        let mut spans: Vec<(String, u64, u64)> = Vec::new();
-        let mut hit = false;
-        for b in &blocks {
-            if let Some(s) = b.span() {
-                if spans.iter().any(|k| spans_overlap(k, &s)) {
-                    hit = true;
-                    break;
-                }
-                spans.push(s);
-            }
-        }
-        hit
-    };
-    if !has_overlap && count_tokens(rendered) <= max_tokens {
+    let has_duplicates = blocks
+        .iter()
+        .enumerate()
+        .any(|(i, block)| blocks[..i].iter().any(|earlier| block.duplicates(earlier)));
+    if !has_duplicates && count_tokens(rendered) <= max_tokens {
         return rendered.to_string();
     }
 
@@ -508,13 +494,9 @@ pub fn budget_code_text(rendered: &str, max_tokens: usize) -> String {
     let mut deduped = 0usize;
     let mut locator_only = 0usize;
     let mut dropped = 0usize;
-    let mut kept_spans: Vec<(String, u64, u64)> = Vec::new();
+    let mut kept_blocks: Vec<&CodeBlock> = Vec::new();
     for block in &blocks {
-        let span = block.span();
-        if span
-            .as_ref()
-            .is_some_and(|s| kept_spans.iter().any(|k| spans_overlap(k, s)))
-        {
+        if kept_blocks.iter().any(|kept| block.duplicates(kept)) {
             deduped += 1;
             continue;
         }
@@ -522,9 +504,7 @@ pub fn budget_code_text(rendered: &str, max_tokens: usize) -> String {
         let block_tokens = count_tokens(&block_text);
         if block_tokens <= remaining {
             out_lines.push(block_text);
-            if let Some(s) = span {
-                kept_spans.push(s);
-            }
+            kept_blocks.push(block);
             remaining -= block_tokens;
         } else {
             let omission = format!(
@@ -547,7 +527,7 @@ pub fn budget_code_text(rendered: &str, max_tokens: usize) -> String {
     }
     out_lines.push(format!(
         "[token budget: {shown_full}/{} passages full, {locator_only} locator-only, \
-         {deduped} deduped (overlapping file:line), {dropped} dropped; counted as \
+         {deduped} deduped (identical locator and passage), {dropped} dropped; counted as \
          {TOKENIZER_ID}, max_tokens {max_tokens}]",
         blocks.len(),
     ));
@@ -948,14 +928,134 @@ mod tests {
 
     // ── rendered-text surface (xerj_code_search) ───────────────────────────
 
+    fn render_symbol_hits(specs: &[(&str, u64, &str)], full: usize) -> String {
+        use std::collections::HashMap;
+        use xerj_common::xccode::render::{render, RenderOpts};
+        let hits: Vec<Value> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, (path, line, code))| {
+                json!({"_index":"repo-symbols", "_id":i.to_string(), "_score":2.0,
+                "_source":{"ax_path":path,"line":line,"name":"example",
+                    "kind":"function","code":code}})
+            })
+            .collect();
+        render(
+            &hits,
+            &HashMap::new(),
+            &RenderOpts {
+                corpus: "repo",
+                query: "fn",
+                full,
+                no_symbol: true,
+                meatl: false,
+                rrf_scores: false,
+                age_days: None,
+                strict_licence: false,
+                lexical_lines: true,
+                checkout: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn code_text_real_renderer_preserves_adjacent_definitions() {
+        for path in ["repo/src/lib.rs", "C:\\repo\\src\\lib.rs"] {
+            let rendered = render_symbol_hits(
+                &[
+                    (path, 10, "pub fn alpha() {}"),
+                    (path, 11, "pub fn beta() {}"),
+                ],
+                4096,
+            );
+            assert!(rendered.contains("pub fn beta() {}"));
+            assert_eq!(
+                budget_code_text(&rendered, 10_000),
+                rendered,
+                "a nonbinding budget must preserve adjacent definitions"
+            );
+        }
+    }
+
+    #[test]
+    fn code_text_same_citation_with_different_windows_is_not_a_duplicate() {
+        let rendered = render_symbol_hits(
+            &[
+                ("repo/lib.rs", 10, "pub fn alpha() { first(); }"),
+                ("repo/lib.rs", 10, "pub fn alpha() { second(); }"),
+            ],
+            4096,
+        );
+        assert_eq!(budget_code_text(&rendered, 10_000), rendered);
+    }
+
+    #[test]
+    fn code_text_adjacent_definitions_survive_a_binding_budget() {
+        let long = format!("pub fn large() {{ {} }}", "compute(); ".repeat(1000));
+        let rendered = render_symbol_hits(
+            &[
+                ("repo/lib.rs", 10, "pub fn alpha() {}"),
+                ("repo/lib.rs", 11, "pub fn beta() {}"),
+                ("repo/large.rs", 1, &long),
+            ],
+            20_000,
+        );
+        let out = budget_code_text(&rendered, 160);
+        assert!(out.contains("pub fn alpha() {}"), "{out}");
+        assert!(out.contains("pub fn beta() {}"), "{out}");
+        assert!(out.contains("passage omitted:"), "{out}");
+        assert!(out.contains("0 deduped"), "{out}");
+        assert_never_exceeds(&rendered, &[32, 64, 100, 160, 400, 10_000], false);
+    }
+
+    #[test]
+    fn code_text_presentation_lines_do_not_claim_source_coverage() {
+        for full in [0, 10, 4096] {
+            let rendered = render_symbol_hits(
+                &[
+                    ("repo/lib.rs", 10, "pub fn alpha() { first(); }"),
+                    ("repo/lib.rs", 11, "pub fn beta() { second(); }"),
+                ],
+                full,
+            );
+            assert_eq!(
+                budget_code_text(&rendered, 10_000),
+                rendered,
+                "file heads and window annotations must not become source lines"
+            );
+        }
+        // Partially overlapping source snippets carry different information.
+        let rendered = render_symbol_hits(
+            &[
+                ("repo/lib.rs", 10, "pub fn alpha() {\n    first();\n}"),
+                ("repo/lib.rs", 11, "    first();\n}\npub fn beta() {}"),
+            ],
+            4096,
+        );
+        assert_eq!(budget_code_text(&rendered, 10_000), rendered);
+    }
+
+    #[test]
+    fn code_text_locator_only_does_not_claim_a_duplicate_was_shown() {
+        let long = "compute(); ".repeat(1000);
+        let rendered = render_symbol_hits(
+            &[("repo/lib.rs", 10, &long), ("repo/lib.rs", 10, &long)],
+            20_000,
+        );
+        let out = budget_code_text(&rendered, 200);
+        assert_eq!(out.matches("─── repo/lib.rs:10").count(), 2, "{out}");
+        assert!(out.contains("2 locator-only, 0 deduped"), "{out}");
+        assert!(count_tokens(&out) <= 200);
+    }
+
     fn rendered_code_search() -> String {
         let mut text = String::new();
         for (path, line) in [
             ("tantivy/src/reader.rs", 30u64),
             ("quickwit/src/search.rs", 210),
-            // Same file, start line inside the first block's shown passage
-            // (span 30..35: header + label + 4 code lines).
-            ("tantivy/src/reader.rs", 33),
+            // Same displayed passage and citation from a second retrieval leg.
+            ("tantivy/src/reader.rs", 30),
             ("qdrant/src/hnsw.rs", 500),
         ] {
             text.push_str(&format!(
@@ -992,23 +1092,28 @@ mod tests {
     }
 
     #[test]
-    fn code_text_overlapping_passages_are_deduped() {
+    fn code_text_identical_passages_are_deduped() {
         let rendered = rendered_code_search();
-        // reader.rs:33 falls inside reader.rs:30's shown passage → deduped,
-        // even with no budget pressure at all.
+        // Identical locator and body are deduped, even without budget pressure.
         let out = budget_code_text(&rendered, 100_000);
         assert!(
-            !out.contains("─── tantivy/src/reader.rs:33"),
-            "the overlap is gone"
+            out.matches("─── tantivy/src/reader.rs:30").count() == 1,
+            "the duplicate is gone"
         );
-        assert!(out.contains("1 deduped (overlapping file:line)"), "{out}");
+        assert!(
+            out.contains("1 deduped (identical locator and passage)"),
+            "{out}"
+        );
         assert_never_exceeds(&rendered, &[32, 64, 100, 100_000], false);
     }
 
     #[test]
     fn code_text_with_nothing_to_do_is_byte_identical() {
-        let no_dups =
-            rendered_code_search().replace("tantivy/src/reader.rs:33", "valkey/src/listpack.c:88");
+        let no_dups = rendered_code_search().replacen(
+            "tantivy/src/reader.rs:30",
+            "valkey/src/listpack.c:88",
+            1,
+        );
         let out = budget_code_text(&no_dups, 100_000);
         assert_eq!(out, no_dups, "no overlap, under budget → untouched");
     }

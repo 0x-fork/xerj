@@ -97,7 +97,7 @@
 //! The six search tools accept `max_tokens` and are held to it: the response
 //! text NEVER exceeds the budget. Enforcement lives in [`token_budget`],
 //! counted with one named tokenizer (XERJ's `StandardTokenizer`, UAX #29
-//! words), with overlapping file:line passages deduped before budgeting and
+//! words), with duplicate passages removed before budgeting and
 //! over-budget hits reduced to locators.
 
 mod def;
@@ -724,8 +724,9 @@ fn max_tokens_arg_schema() -> Value {
              counted with {} — the same word split the engine's own analyzer uses for BM25. \
              Honest scope: that under-counts model-context subwords (snake_case is ONE token \
              here), so treat it as a deterministic proxy, not a BPE count. The budget covers \
-             the whole response text (JSON keys and syntax included). Overlapping file:line \
-             passages are deduped first (higher-ranked wins). Hits that no longer fit are \
+             the whole response text (JSON keys and syntax included). JSON responses dedupe \
+             overlapping file:line passages first (higher-ranked wins); rendered code dedupes \
+             only identical locators with identical displayed passages. Hits that no longer fit are \
              listed as LOCATORS ONLY (file:line, index/id) rather than dropped, and the \
              response's `_token_budget` block accounts for every hit: kept, locator-only, \
              deduped, dropped. Errors are never truncated — a refusal you cannot read \
