@@ -1979,6 +1979,393 @@ fn legacy_failure_verdict(before: Option<u64>, after: Option<u64>) -> LegacyFail
     }
 }
 
+/// One `autoindex-state/<corpus>/b<stamp>` directory left by a `corpus index`
+/// that was killed before the ledger recorded the build.
+#[derive(Debug, Clone)]
+struct UnfinishedBuild {
+    build: String,
+    prefix: String,
+    state_dir: PathBuf,
+    /// A `sync_begin` the journal has not closed with `sync_commit`. That is
+    /// the generation the index phase replays; autoindex does not hash the
+    /// corpus again on that path.
+    generation_pending: bool,
+}
+
+/// What a resumed build may be recorded as, once autoindex has returned and
+/// the node has been counted and searched.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeVerdict {
+    /// Clean autoindex exit, records present, search answered.
+    Verified,
+    /// Records present and searchable, but autoindex did not exit cleanly.
+    /// The build is kept and marked salvaged so status explains the gap.
+    Salvaged,
+    /// Autoindex exited cleanly and records are present, but the store did
+    /// not answer a search. Recorded as unverified, not as "no build".
+    Unverified,
+    /// Do not write a ledger. The journal stays the resume point. Writing a
+    /// ledger with no build is what made a finished resume say "no verified
+    /// build recorded".
+    KeepJournal,
+}
+
+fn resume_verdict(rc: i32, docs: Option<u64>, queryable: bool) -> ResumeVerdict {
+    let positive = matches!(docs, Some(n) if n > 0);
+    let clean = rc == 0 || rc == 3;
+    match (clean, positive, queryable) {
+        (true, true, true) => ResumeVerdict::Verified,
+        (false, true, true) => ResumeVerdict::Salvaged,
+        (true, true, false) => ResumeVerdict::Unverified,
+        _ => ResumeVerdict::KeepJournal,
+    }
+}
+
+fn resume_build_note(name: &str, unfinished: &UnfinishedBuild) -> String {
+    if unfinished.generation_pending {
+        format!(
+            "xerj corpus index: resuming build {} of '{name}' from its journal at {} — \
+             indexing continues at the operations still uncommitted, and files already \
+             applied are not hashed again",
+            unfinished.build,
+            unfinished.state_dir.display()
+        )
+    } else {
+        format!(
+            "xerj corpus index: resuming build {} of '{name}' from {} — the journal has no \
+             generation in progress, so this run re-walks and re-hashes the corpus, then \
+             reuses a sealed snapshot when one is already present",
+            unfinished.build,
+            unfinished.state_dir.display()
+        )
+    }
+}
+
+fn is_build_dir_name(name: &str) -> bool {
+    let Some(stamp) = name.strip_prefix('b') else {
+        return false;
+    };
+    !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The build id of a stamped index (`xc-<corpus>-b<stamp>-<dataset>`), or
+/// `None` for an unstamped legacy index.
+fn index_build_id(name: &str, index: &str) -> Option<String> {
+    let prefix = stamped_prefix(name, index)?;
+    prefix
+        .strip_prefix(&format!("xc-{name}-"))
+        .map(str::to_string)
+}
+
+struct BuildJournalScan {
+    runs: Vec<(String, String, String)>,
+    generation_pending: bool,
+}
+
+impl BuildJournalScan {
+    fn matches(&self, root: &str, url: &str, prefix: &str) -> bool {
+        !self.runs.is_empty()
+            && self
+                .runs
+                .iter()
+                .all(|(recorded_root, recorded_url, recorded_prefix)| {
+                    recorded_root == root && recorded_url == url && recorded_prefix == prefix
+                })
+    }
+}
+
+/// Read a build journal the way the resume journal does: a trailing line with
+/// no newline is a torn record from a kill and is discarded. A corrupt line
+/// that was newline-terminated is an error — resuming past it would guess.
+fn read_build_journal(path: &Path) -> Result<BuildJournalScan, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let mut lines: Vec<&str> = text.lines().collect();
+    if !text.ends_with('\n') {
+        lines.pop();
+    }
+    let mut scan = BuildJournalScan {
+        runs: Vec::new(),
+        generation_pending: false,
+    };
+    for (i, line) in lines.into_iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "journal line {} of {} is not valid JSON ({e})",
+                i + 1,
+                path.display()
+            )
+        })?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("run") => scan.runs.push((
+                value
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )),
+            Some("sync_begin") => scan.generation_pending = true,
+            Some("sync_commit") => scan.generation_pending = false,
+            _ => {}
+        }
+    }
+    Ok(scan)
+}
+
+/// The root string autoindex writes into the journal: the canonical corpus
+/// directory, or the path unchanged when canonicalization fails.
+fn corpus_journal_root(corpus_dir: &Path) -> String {
+    corpus_dir
+        .canonicalize()
+        .unwrap_or_else(|_| corpus_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// An unfinished build to resume, or a refusal when more than one journal
+/// could be the one a kill left behind.
+fn find_unfinished_build(
+    state_root: &Path,
+    name: &str,
+    corpus_dir: &Path,
+    url: &str,
+    live_indices: &[String],
+) -> Result<Option<UnfinishedBuild>, String> {
+    let parent = state_root.join(name);
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return Ok(None);
+    };
+    let root_str = corpus_journal_root(corpus_dir);
+    let mut matching: std::collections::BTreeMap<String, UnfinishedBuild> =
+        std::collections::BTreeMap::new();
+    // Build ids whose journal does not match this root/url/prefix, but which
+    // the node is already serving. Falling through to legacy mode would
+    // re-hash under another prefix and can retire those indices.
+    let mut foreign_live: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !is_build_dir_name(&fname) {
+            continue;
+        }
+        let dir = entry.path();
+        let journal = dir.join("journal.ndjson");
+        if !journal.is_file() {
+            continue;
+        }
+        let prefix = format!("xc-{name}-{fname}");
+        let scan = read_build_journal(&journal).map_err(|reason| {
+            format!(
+                "xerj corpus index: build {fname} of '{name}' has a journal that cannot be \
+                 resumed ({reason}). Nothing was changed. Repair the journal, or build a \
+                 verified replacement with: xerj corpus index {name} --fresh"
+            )
+        })?;
+        if scan.runs.is_empty() {
+            continue;
+        }
+        if scan.matches(&root_str, url, &prefix) {
+            matching.insert(
+                fname.clone(),
+                UnfinishedBuild {
+                    build: fname,
+                    prefix,
+                    state_dir: dir,
+                    generation_pending: scan.generation_pending,
+                },
+            );
+        } else if live_indices
+            .iter()
+            .any(|index| index_build_id(name, index).as_deref() == Some(fname.as_str()))
+        {
+            let recorded_url = scan
+                .runs
+                .first()
+                .map(|(_, recorded, _)| recorded.clone())
+                .unwrap_or_else(|| "(none)".to_string());
+            foreign_live.push((fname, recorded_url));
+        }
+    }
+    let live: std::collections::BTreeSet<String> = live_indices
+        .iter()
+        .filter_map(|index| index_build_id(name, index))
+        .collect();
+    let pool: Vec<UnfinishedBuild> = if live.is_empty() {
+        matching.into_values().collect()
+    } else {
+        matching
+            .into_values()
+            .filter(|build| live.contains(&build.build))
+            .collect()
+    };
+    if pool.is_empty() {
+        if foreign_live.is_empty() {
+            return Ok(None);
+        }
+        foreign_live.sort();
+        let listed = foreign_live
+            .iter()
+            .map(|(build, recorded_url)| format!("{build} (journal url {recorded_url})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "xerj corpus index: {url} holds indices for unfinished build(s) of '{name}' whose \
+             journal does not match this corpus directory or this url: {listed}. Refusing to \
+             continue in legacy mode — that would re-hash the corpus under another prefix and \
+             can retire this build. Nothing was changed. Re-run with the url the journal was \
+             started against, or build a verified replacement with: xerj corpus index {name} \
+             --fresh"
+        ));
+    }
+    if pool.len() == 1 {
+        return Ok(pool.into_iter().next());
+    }
+    let pending: Vec<UnfinishedBuild> = pool
+        .iter()
+        .filter(|build| build.generation_pending)
+        .cloned()
+        .collect();
+    if pending.len() == 1 {
+        return Ok(pending.into_iter().next());
+    }
+    let listed = pool
+        .iter()
+        .map(|build| build.build.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "xerj corpus index: '{name}' has unfinished builds {listed} and this run will not guess \
+         which journal to resume. Nothing was changed. Re-run `xerj corpus index {name} --fresh` \
+         to build a verified replacement beside them, or remove the state directory of the build \
+         you do not want and re-run the same command."
+    ))
+}
+
+/// Continue a build whose journal exists and whose ledger does not name it yet.
+///
+/// A kill during the index phase leaves `sync_begin` (and any committed
+/// operations) in that journal and indices under `xc-<corpus>-b<stamp>`. The
+/// ledger is written only after verification, so the next plain run used to
+/// see "indices exist, no build recorded" and take the legacy arm: a new
+/// prefix, no `--state-dir`, a full re-hash, and a ledger with no
+/// `index_prefix` — the "no verified build recorded" notice.
+fn resume_unfinished_build(
+    node: &dyn CorpusNode,
+    run_autoindex: &dyn Fn(&str, Option<&Path>) -> i32,
+    root: &Path,
+    url: &str,
+    name: &str,
+    unfinished: &UnfinishedBuild,
+) -> i32 {
+    let build = &unfinished.build;
+    let prefix = &unfinished.prefix;
+    let state_dir = &unfinished.state_dir;
+    println!("{}", resume_build_note(name, unfinished));
+    let rc = run_autoindex(prefix, Some(state_dir));
+    let docs = count_under(node, prefix);
+    let queryable = queryable_store(node, name, prefix);
+    let Some(state_dir_str) = state_dir.to_str() else {
+        eprintln!(
+            "xerj corpus index: build {build} resumed (autoindex exit {rc}) but its state \
+             directory {} is not valid Unicode, so the ledger cannot record it. The journal is \
+             unchanged.",
+            state_dir.display()
+        );
+        return if rc == 0 || rc == 3 { 1 } else { rc };
+    };
+    let verdict = resume_verdict(rc, docs, queryable);
+    let record = |salvaged: bool| {
+        let _ = state::write_state(
+            root,
+            name,
+            url,
+            rc as i64,
+            salvaged,
+            Some(build),
+            Some(prefix),
+            Some(state_dir_str),
+        );
+    };
+    match verdict {
+        ResumeVerdict::Verified => {
+            let n = docs.expect("verified verdict has a positive count");
+            warn_short_of_pack_records(name, root, Some(n));
+            record(false);
+            report_leftovers(node, name, root, prefix);
+            report(name, rc, &n.to_string());
+            0
+        }
+        ResumeVerdict::Salvaged => {
+            let n = docs.expect("salvaged verdict has a positive count");
+            eprintln!(
+                "xerj corpus index: WARNING — autoindex exited {rc}, but resumed build {build} \
+                 has {n} records and answers a search. Recording it as UNVERIFIED (salvaged)."
+            );
+            eprintln!(
+                "xerj corpus index: coverage is not guaranteed. Re-run `xerj corpus index \
+                 {name}` to resume the journal, or `xerj corpus index {name} --fresh` for a \
+                 clean build."
+            );
+            record(true);
+            report_leftovers(node, name, root, prefix);
+            report(name, rc, &n.to_string());
+            0
+        }
+        ResumeVerdict::Unverified => {
+            let n = docs.expect("unverified verdict has a positive count");
+            eprintln!(
+                "xerj corpus index: resumed build {build} finished (autoindex exit {rc}, {n} \
+                 records) but the verification search failed. Recording it as UNVERIFIED."
+            );
+            eprintln!(
+                "xerj corpus index: `xerj code` will say the index was not verified complete. \
+                 Re-run `xerj corpus index {name}` to resume the journal at {}.",
+                state_dir.display()
+            );
+            record(true);
+            1
+        }
+        ResumeVerdict::KeepJournal => {
+            let why = match docs {
+                None => "the node did not answer a record count".to_string(),
+                Some(0) => "the node reported 0 records".to_string(),
+                Some(n) => format!(
+                    "{n} records are present, but the store did not answer a search and autoindex \
+                     exited {rc}"
+                ),
+            };
+            eprintln!(
+                "xerj corpus index: resumed build {build} is not verified ({why}; autoindex exit \
+                 {rc})."
+            );
+            eprintln!(
+                "xerj corpus index: nothing was recorded as a verified build, and no ledger \
+                 without a build was written. The journal at {} is kept — re-run `xerj corpus \
+                 index {name}` to resume it. A replacement beside it is `xerj corpus index \
+                 {name} --fresh`.",
+                state_dir.display()
+            );
+            if rc != 0 && rc != 3 {
+                rc
+            } else {
+                1
+            }
+        }
+    }
+}
+
 /// The build/verify/swap flow over an injected node, autoindex runner and
 /// clock (#1004) — the destructive-operation contracts are pinned by the
 /// tests below against a [`FakeNode`](tests::FakeNode), which is why none of
@@ -2003,11 +2390,27 @@ fn corpus_index_flow(
     let old_state_dir = old.as_ref().and_then(|s| s.state_dir.clone());
     let old_url = old.as_ref().and_then(|s| s.url.clone());
 
-    // Which run is this? build (--fresh / first / ledger-names-a-build-this-
-    // node-does-not-hold), update (reconcile the recorded build in place), or
-    // legacy (a corpus indexed before builds existed).
+    // Which run is this?
+    // - build: --fresh, a first index, or a recorded build this node does not hold
+    // - update: reconcile the recorded build in place
+    // - resume: a build was killed before the ledger named it; continue its journal
+    // - legacy: indexed before builds existed (no build journal on disk)
     let mut mode = "legacy";
     let (old_indices, _listed_ok) = corpus_indices(node, name, root);
+    let corpus_dir = root.join("corpora").join(name);
+    // Look only when the ledger does not already name a build. A recorded
+    // build takes the update / #1214 refusal above; --fresh builds a new one.
+    let unfinished = if fresh || old_build.is_some() {
+        None
+    } else {
+        match find_unfinished_build(&state_root, name, &corpus_dir, url, &old_indices) {
+            Ok(found) => found,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return 2;
+            }
+        }
+    };
     if fresh {
         mode = "build";
     } else if old_build.is_some() {
@@ -2070,6 +2473,11 @@ fn corpus_index_flow(
                 mode = "build";
             }
         }
+    } else if unfinished.is_some() {
+        // Indices from the killed run must not select legacy mode. Legacy
+        // opens a different prefix with no state dir, re-hashes the corpus,
+        // and writes a ledger that names no build (#2239).
+        mode = "resume";
     } else if !state_file.exists() && old_indices.is_empty() {
         mode = "build"; // first index of this corpus: same path as --fresh
     }
@@ -2312,6 +2720,12 @@ fn corpus_index_flow(
             );
             report(name, rc, &docs);
             0
+        }
+        "resume" => {
+            let unfinished = unfinished
+                .as_ref()
+                .expect("resume mode is set only when an unfinished build was found");
+            resume_unfinished_build(node, run_autoindex, root, url, name, unfinished)
         }
         _ => {
             // Legacy: recorded before the run so a failure can tell "this run
@@ -3595,6 +4009,453 @@ mod tests {
         assert_eq!(st.index_prefix, None, "legacy state records no build");
         assert!(node.live("xc-kv-000"));
         assert!(node.ops.borrow().iter().all(|o| !o.starts_with("delete:")));
+    }
+
+    /// The journal a `corpus index` kill leaves under `autoindex-state/<name>/<build>`.
+    /// `after_run` is appended after the `run` record (include trailing newlines).
+    /// `torn` appends a partial last line with no newline — the kill's in-flight record.
+    fn write_killed_journal(
+        root: &Path,
+        name: &str,
+        build: &str,
+        url: &str,
+        after_run: &str,
+        torn: bool,
+    ) -> PathBuf {
+        let corpus = root.join("corpora").join(name);
+        let root_str = corpus
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let prefix = format!("xc-{name}-{build}");
+        let dir = root.join("autoindex-state").join(name).join(build);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({
+            "v": 1,
+            "kind": "run",
+            "root": root_str,
+            "url": url,
+            "prefix": prefix,
+            "bulk_timeout_secs": 300,
+            "run_id": format!("run-{build}"),
+            "started": "2026-10-22T00:00:00Z"
+        });
+        let mut text = format!("{run}\n{after_run}");
+        if torn {
+            text.push_str("{\"kind\":\"sync_operation_state\",\"partial\":");
+        }
+        std::fs::write(dir.join("journal.ndjson"), text).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resume_verdict_records_a_clean_build_and_explains_the_rest() {
+        use super::ResumeVerdict::*;
+        assert_eq!(resume_verdict(0, Some(10), true), Verified);
+        assert_eq!(resume_verdict(3, Some(10), true), Verified);
+        assert_eq!(resume_verdict(1, Some(10), true), Salvaged);
+        assert_eq!(resume_verdict(0, Some(10), false), Unverified);
+        // A zero or unknown count must not become a ledger with no build.
+        assert_eq!(resume_verdict(0, Some(0), true), KeepJournal);
+        assert_eq!(resume_verdict(0, None, true), KeepJournal);
+        assert_eq!(resume_verdict(1, Some(0), false), KeepJournal);
+        assert_eq!(resume_verdict(1, None, false), KeepJournal);
+    }
+
+    #[test]
+    fn resume_note_claims_no_rehash_only_when_a_generation_is_pending() {
+        let pending = UnfinishedBuild {
+            build: "b1".into(),
+            prefix: "xc-kv-b1".into(),
+            state_dir: PathBuf::from("/tmp/state"),
+            generation_pending: true,
+        };
+        let note = resume_build_note("kv", &pending);
+        assert!(note.contains("journal"), "{note}");
+        assert!(note.contains("not hashed again"), "{note}");
+        assert!(note.contains("uncommitted"), "{note}");
+
+        let sealed = UnfinishedBuild {
+            generation_pending: false,
+            ..pending
+        };
+        let note = resume_build_note("kv", &sealed);
+        assert!(
+            note.contains("re-hashes"),
+            "a journal with no in-progress generation must not claim the hash is skipped: {note}"
+        );
+        assert!(!note.contains("not hashed again"), "{note}");
+    }
+
+    /// #2239: killed mid-index. The ledger was never written (it is written
+    /// only after verification). The journal holds `sync_begin` and the node
+    /// already has this build's indices. The retry must hand that journal
+    /// back to autoindex — which replays uncommitted operations and does not
+    /// re-enter snapshot/hash — and a resume that then completes must record
+    /// the verified build. The old path took legacy mode (`xc-kv`, no state
+    /// dir) and wrote a ledger with no `index_prefix`.
+    #[test]
+    fn a_kill_mid_index_resumes_the_journal_and_records_a_verified_build() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            true,
+        );
+        let node = FakeNode::new();
+        // What the killed run had already published.
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        let (_prefix, sd) = &auto.calls.borrow()[0];
+        assert_eq!(
+            sd.as_deref(),
+            Some(state_dir.as_path()),
+            "resume must pass the killed run's state dir, not start a new journal"
+        );
+        assert!(
+            node.ops
+                .borrow()
+                .iter()
+                .all(|op| !op.starts_with("delete:")),
+            "a resume does not retire the indices the killed run already wrote"
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.build.as_deref(), Some("b1"));
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b1"));
+        assert_eq!(st.state_dir.as_deref(), state_dir.to_str());
+        assert_eq!(st.salvaged, Some(false));
+        assert_eq!(st.autoindex_exit, Some(serde_json::json!(0)));
+        assert!(
+            state::incomplete_coverage(&st).is_none(),
+            "a clean resume is a verified build"
+        );
+        // The torn tail must not have hidden sync_begin: that flag is what
+        // tells the resume it can continue mid-index instead of re-hashing.
+        let scan = read_build_journal(&state_dir.join("journal.ndjson")).unwrap();
+        assert!(
+            scan.generation_pending,
+            "a kill's torn last line is discarded; sync_begin still means the index phase"
+        );
+        assert!(scan.matches(
+            &corpus_journal_root(&root.join("corpora/kv")),
+            "http://x",
+            "xc-kv-b1"
+        ));
+    }
+
+    /// Same kill, but the store answers a count and not a search. The build
+    /// is recorded so status can explain why it is unverified, instead of
+    /// widening to "no verified build recorded".
+    #[test]
+    fn a_resumed_build_the_node_cannot_search_is_recorded_unverified() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        node.seed_search(
+            "xc-kv-b1-*",
+            Err("HTTP 500: store_exception: Segment ea12 not found".into()),
+        );
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 1, "a failed verification search is not success");
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b1"));
+        assert_eq!(st.build.as_deref(), Some("b1"));
+        assert_eq!(st.salvaged, Some(true));
+        assert_eq!(st.state_dir.as_deref(), state_dir.to_str());
+        let warning = state::incomplete_coverage(&st).expect("unverified status");
+        assert!(
+            warning.contains("NOT verified complete") && warning.contains("kept unverified"),
+            "{warning}"
+        );
+        assert!(node.live("xc-kv-b1-000"));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
+    /// Autoindex itself failed and the node has nothing new to stand on.
+    /// Do not write the legacy ledger (no build) that the notice complains about.
+    #[test]
+    fn a_failed_resume_keeps_the_journal_and_writes_no_buildless_ledger() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Zero);
+
+        let auto = FakeAuto::with_rc(&node, 1);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 1);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        assert_eq!(
+            auto.calls.borrow()[0].1.as_deref(),
+            Some(state_dir.as_path())
+        );
+        assert!(
+            state::load_state(&root, "kv").is_err(),
+            "a failed resume must not write a ledger that names no build"
+        );
+        assert!(
+            state_dir.join("journal.ndjson").is_file(),
+            "the journal remains the next resume point"
+        );
+    }
+
+    /// Killed during snapshot, before any index existed: still the same state
+    /// dir, not a freshly minted build that abandons the sealed snapshot.
+    #[test]
+    fn a_kill_before_any_index_resumes_the_same_build_directory() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(&root, "kv", "b9", "http://x", "", false);
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b9".to_string()]);
+        assert_eq!(
+            auto.calls.borrow()[0].1.as_deref(),
+            Some(state_dir.as_path())
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b9"));
+        assert_eq!(st.salvaged, Some(false));
+        let note = resume_build_note(
+            "kv",
+            &UnfinishedBuild {
+                build: "b9".into(),
+                prefix: "xc-kv-b9".into(),
+                state_dir: state_dir.clone(),
+                generation_pending: false,
+            },
+        );
+        assert!(note.contains("re-hashes"), "{note}");
+    }
+
+    #[test]
+    fn a_first_index_with_no_journal_still_mints_a_build() {
+        let root = corpus_root("kv");
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        assert_eq!(run_flow(&node, &auto, &|| T0, &root, "kv", false), 0);
+        assert_eq!(auto.prefixes(), vec![format!("xc-kv-b{T0}")]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert_eq!(st.salvaged, Some(false));
+    }
+
+    #[test]
+    fn fresh_ignores_an_unfinished_journal_and_builds_a_new_one() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec![format!("xc-kv-b{T0}")]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert!(!node.live("xc-kv-b1-000"), "fresh retires the killed build");
+    }
+
+    #[test]
+    fn two_pending_journals_are_refused_instead_of_guessing() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices
+            .borrow_mut()
+            .extend(["xc-kv-b1-000".into(), "xc-kv-b2-000".into()]);
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 2);
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+        assert!(state::load_state(&root, "kv").is_err());
+    }
+
+    #[test]
+    fn a_single_pending_journal_wins_over_another_finished_attempt() {
+        let root = corpus_root("kv");
+        let pending = write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n{\"kind\":\"sync_commit\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b2".to_string()]);
+        assert_eq!(auto.calls.borrow()[0].1.as_deref(), Some(pending.as_path()));
+    }
+
+    #[test]
+    fn live_indices_select_the_build_that_was_being_published() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let live = write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b2-000".into());
+        node.seed_count("xc-kv-b2-*", Count::Number(40));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b2".to_string()]);
+        assert_eq!(auto.calls.borrow()[0].1.as_deref(), Some(live.as_path()));
+        assert!(node.live("xc-kv-b2-000"));
+    }
+
+    #[test]
+    fn a_journal_for_another_url_is_not_resumed_over_its_live_indices() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://elsewhere",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 2, "legacy mode would re-hash and can retire this build");
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node.live("xc-kv-b1-000"));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
+    #[test]
+    fn a_corrupt_build_journal_is_refused() {
+        let root = corpus_root("kv");
+        let dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        std::fs::write(
+            dir.join("journal.ndjson"),
+            "{\"kind\":\"run\"}\n{not json}\n",
+        )
+        .unwrap();
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+        assert_eq!(rc, 2);
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
     }
 
     #[test]
