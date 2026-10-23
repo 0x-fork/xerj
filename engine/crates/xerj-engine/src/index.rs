@@ -13974,7 +13974,7 @@ impl Index {
                                         .ensure_fts_encoded_field_component_format()
                                     {
                                         tracing::warn!(
-                                            "merge: encoded FTS filename format preflight failed: {e}"
+                                            "merge: encoded FTS filename format preflight failed: {e:#}"
                                         );
                                         return Ok(());
                                     }
@@ -13982,7 +13982,7 @@ impl Index {
                                         fts_writer.publish_encoded_filename_layout()
                                     {
                                         tracing::warn!(
-                                            "merge: FTS filename-layout publication failed: {e}"
+                                            "merge: FTS filename-layout publication failed: {e:#}"
                                         );
                                         return Ok(());
                                     }
@@ -14062,7 +14062,7 @@ impl Index {
                                 &columns,
                                 merge_zstd_level,
                             ) {
-                                tracing::warn!("merge: doc-values write failed: {e}");
+                                tracing::warn!("merge: doc-values write failed: {e:#}");
                             }
                         }
                     }
@@ -34755,7 +34755,7 @@ async fn do_flush_shard(
                     write_doc_values_sidecar(&segments_dir_for_dv, meta.id.as_str(), &columns)
                         .map_err(|error| {
                             xerj_storage::StorageError::Io(std::io::Error::other(format!(
-                                "doc-values side-car write failed: {error}"
+                                "doc-values side-car write failed: {error:#}"
                             )))
                         })?;
                 }
