@@ -956,12 +956,18 @@ async fn cat_indices_inner(
             Some(idx) => content_doc_count(idx).await,
             None => info.doc_count,
         };
+        // #2140: the deleted column was a hard-coded 0 even when updates had
+        // superseded documents or deletes had tombstoned them. Report the real
+        // pre-merge count (physical minus live), the same definition ES gives
+        // `docs.deleted`.
+        let deleted = idx.as_ref().map(|idx| idx.deleted_doc_count()).unwrap_or(0);
         // Emit the stable REAL settings uuid (the same value
         // GET /{index}/_settings returns), not a fresh random one per call.
         rows.push((
             info.name.clone(),
             stable_index_uuid(&info.name),
             doc_count,
+            deleted,
             size,
             human_bytes(size),
         ));
@@ -1006,7 +1012,7 @@ async fn cat_indices_inner(
         ],
         rows: Vec::new(),
     };
-    for (name, uuid, doc_count, size, hsize) in &rows {
+    for (name, uuid, doc_count, deleted, size, hsize) in &rows {
         table.rows.push(vec![
             crate::cat::CatCell::plain("green"),
             crate::cat::CatCell::plain("open"),
@@ -1015,7 +1021,7 @@ async fn cat_indices_inner(
             crate::cat::CatCell::plain("1"),
             crate::cat::CatCell::plain("0"),
             crate::cat::CatCell::plain(doc_count.to_string()),
-            crate::cat::CatCell::plain("0"),
+            crate::cat::CatCell::plain(deleted.to_string()),
             crate::cat::CatCell::size(*size, hsize.clone()),
             crate::cat::CatCell::size(*size, hsize.clone()),
         ]);
@@ -1319,6 +1325,67 @@ mod cat_format_json_tests {
         let (status, body) = get(&app, "/cards/_search?q=ax_locator:file").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["hits"]["total"]["value"], 1);
+    }
+
+    /// A state whose merge thresholds are far above the test's segment count,
+    /// so "three flushes leave three segments" is a fact rather than a race
+    /// with a background merge.
+    fn test_state_without_merges() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        config.merge.min_merge_count = 100;
+        config.merge.max_merge_count = 100;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    /// #2140: `docs.deleted` is the pre-merge physical-minus-live count, not a
+    /// hard-coded 0. Three flushes of the same `_id` leave two superseded
+    /// versions in segments; `_cat/indices`, `_stats` and `_cluster/stats` must
+    /// all say 2, and a bare `_count` must still say 1.
+    #[tokio::test]
+    async fn deleted_doc_count_is_reported_by_cat_and_stats() {
+        let state = test_state_without_merges();
+        let app = crate::router::build_es_compat_router(state);
+        put_index(&app, "del").await;
+        for body in ["v1", "v2", "v3"] {
+            put_doc(&app, "del", "1", json!({"body": body})).await;
+            refresh(&app, "del").await;
+        }
+
+        let (status, count) = get(&app, "/del/_count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count["count"], 1, "one live _id");
+
+        let (status, body) = get(
+            &app,
+            "/_cat/indices?format=json&h=index,docs.count,docs.deleted",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = body
+            .as_array()
+            .expect("json array")
+            .iter()
+            .find(|row| row["index"] == "del")
+            .expect("del row");
+        assert_eq!(row["docs.count"], "1");
+        assert_eq!(row["docs.deleted"], "2", "two superseded versions: {body}");
+
+        let (status, stats) = get(&app, "/del/_stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stats["indices"]["del"]["primaries"]["docs"]["deleted"], 2,
+            "{stats}"
+        );
+        assert_eq!(stats["_all"]["primaries"]["docs"]["deleted"], 2, "{stats}");
+
+        let (status, cluster) = get(&app, "/_cluster/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cluster["indices"]["docs"]["deleted"], 2, "{cluster}");
     }
 }
 
@@ -24080,6 +24147,7 @@ pub async fn index_stats(
     if targets.len() > 1 || index == "_all" || index.contains('*') {
         // Aggregate across multiple indices.
         let mut all_doc_count = 0u64;
+        let mut all_deleted_doc_count = 0u64;
         let mut all_store_bytes = 0u64;
         // Aggregated so `GET /_all/_stats` carries the same
         // `primaries.mappings.schema_persist_failures` the per-index form does.
@@ -24096,6 +24164,12 @@ pub async fn index_stats(
             };
             let doc_count = stats.doc_count;
             all_doc_count += doc_count;
+            let deleted_doc_count = state
+                .engine
+                .get_index(name)
+                .map(|idx| idx.deleted_doc_count())
+                .unwrap_or(0);
+            all_deleted_doc_count += deleted_doc_count;
             // Real on-disk footprint: recursive byte sum of the index's
             // data dir (WAL + segments + everything else it persists).
             let store_size_bytes = state
@@ -24129,7 +24203,7 @@ pub async fn index_stats(
                 .unwrap_or(0);
             all_schema_persist_failures += schema_persist_failures;
             let primaries = json!({
-                "docs": { "count": doc_count, "deleted": 0 },
+                "docs": { "count": doc_count, "deleted": deleted_doc_count },
                 "store": { "size_in_bytes": store_size_bytes },
                 "dense_vector": dv,
                 "hnsw": hnsw,
@@ -24195,7 +24269,7 @@ pub async fn index_stats(
             all_dv_value_count += dv.get("value_count").and_then(Value::as_u64).unwrap_or(0);
         }
         let all_primaries = json!({
-            "docs": { "count": all_doc_count, "deleted": 0 },
+            "docs": { "count": all_doc_count, "deleted": all_deleted_doc_count },
             "store": { "size_in_bytes": all_store_bytes },
             "mappings": { "schema_persist_failures": all_schema_persist_failures },
             "dense_vector": {
@@ -24224,6 +24298,14 @@ pub async fn index_stats(
     };
 
     let doc_count = stats.doc_count;
+    // #2140: `docs.deleted` is the pre-merge physical-minus-live count, not a
+    // hard-coded 0. It also has to agree with `_cat/indices` and the
+    // cluster/node rollups below.
+    let deleted_doc_count = state
+        .engine
+        .get_index(&index)
+        .map(|idx| idx.deleted_doc_count())
+        .unwrap_or(0);
     // Real on-disk footprint: recursive byte sum of the index's data dir
     // (WAL + segments + everything else it persists).
     let store_size_bytes = state
@@ -24294,7 +24376,7 @@ pub async fn index_stats(
         .map(|idx| idx.schema_persist_failures())
         .unwrap_or(0);
     let primaries = json!({
-        "docs": { "count": doc_count, "deleted": 0 },
+        "docs": { "count": doc_count, "deleted": deleted_doc_count },
         "store": { "size_in_bytes": store_size_bytes },
         "dense_vector": dense_vector_stats,
         "hnsw": hnsw_stats,
@@ -29705,7 +29787,7 @@ mod glob_match_simple_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let (_idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
+    let (_idx_count, total_docs, total_deleted, store_bytes) = real_index_totals(&state).await;
     // Live cumulative search + indexing counters, summed across all indices.
     let (query_total, query_time_ms, index_total, index_time_ms) =
         real_node_search_index_totals(&state).await;
@@ -29804,7 +29886,7 @@ pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
                     "bulk": { "threads": cpu_threads, "queue": 0, "active": 0, "rejected": 0 },
                 },
                 "indices": {
-                    "docs": { "count": total_docs, "deleted": 0 },
+                    "docs": { "count": total_docs, "deleted": total_deleted },
                     "store": { "size_in_bytes": store_bytes },
                     // Real cumulative counters summed across all indices
                     // (RC4 W4 item 1): previously hardcoded 0, so node-stats
@@ -30045,7 +30127,7 @@ fn read_rss_bytes() -> Option<u64> {
 
 pub async fn cluster_stats(State(state): State<AppState>) -> impl IntoResponse {
     let health = state.engine.health().await;
-    let (idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
+    let (idx_count, total_docs, total_deleted, store_bytes) = real_index_totals(&state).await;
     let rss_bytes = read_rss_bytes().unwrap_or(0);
     let (mem_total, mem_avail) = read_meminfo().unwrap_or((rss_bytes * 4, rss_bytes * 3));
     let mem_used = mem_total.saturating_sub(mem_avail);
@@ -30066,7 +30148,7 @@ pub async fn cluster_stats(State(state): State<AppState>) -> impl IntoResponse {
         "indices": {
             "count": idx_count,
             "shards": { "total": idx_count, "primaries": idx_count, "replication": 0.0 },
-            "docs": { "count": total_docs, "deleted": 0 },
+            "docs": { "count": total_docs, "deleted": total_deleted },
             "store": { "size_in_bytes": store_bytes },
             "fielddata": { "memory_size_in_bytes": 0, "evictions": 0 },
             "query_cache": { "memory_size_in_bytes": 0, "total_count": 0, "hit_count": 0, "miss_count": 0 },
@@ -36459,7 +36541,7 @@ pub async fn nodes_info(
     // Same resolution `es_info` (GET /) uses.
     let compat_version = resolve_compat_version(&state, &headers);
     let reported_version = compat_version.number.clone();
-    let (_idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
+    let (_idx_count, total_docs, total_deleted, store_bytes) = real_index_totals(&state).await;
     let rss_bytes = read_rss_bytes().unwrap_or(0);
     // Real host memory total from /proc/meminfo (falls back to an RSS-derived
     // estimate if unreadable).
@@ -36569,7 +36651,7 @@ pub async fn nodes_info(
                 "plugins": [],
                 "modules": [],
                 "indices": {
-                    "docs": { "count": total_docs, "deleted": 0 },
+                    "docs": { "count": total_docs, "deleted": total_deleted },
                     "store": { "size_in_bytes": store_bytes },
                 },
         }),
@@ -47214,21 +47296,24 @@ fn closed_index_error(index: &str) -> axum::response::Response {
 
 // ── Batch C helpers ──
 
-/// Real `(index_count, total_docs, store_size_in_bytes)` sampled from the
-/// live engine: doc counts come from `list_indices()`, store size is the
-/// recursive on-disk byte sum of each index's `data_dir`. Read-only; safe
-/// to call on a live engine.
-async fn real_index_totals(state: &AppState) -> (usize, u64, u64) {
+/// Real `(index_count, total_docs, total_deleted_docs, store_size_in_bytes)`
+/// sampled from the live engine: doc counts come from `list_indices()`, store
+/// size is the recursive on-disk byte sum of each index's `data_dir`, and the
+/// deleted count is the pre-merge physical-minus-live number the per-index
+/// `_stats`/`_cat` surfaces report. Read-only; safe to call on a live engine.
+async fn real_index_totals(state: &AppState) -> (usize, u64, u64, u64) {
     let indices = state.engine.list_indices().await;
     let mut total_docs = 0u64;
+    let mut total_deleted = 0u64;
     let mut store_bytes = 0u64;
     for info in &indices {
         total_docs += info.doc_count;
         if let Ok(idx) = state.engine.get_index(&info.name) {
+            total_deleted += idx.deleted_doc_count();
             store_bytes += dir_size_bytes(idx.data_dir());
         }
     }
-    (indices.len(), total_docs, store_bytes)
+    (indices.len(), total_docs, total_deleted, store_bytes)
 }
 
 /// Sum the live per-index search + indexing counters across every index,
