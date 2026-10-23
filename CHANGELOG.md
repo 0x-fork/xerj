@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `object` and the default pipeline was dropped, so the pipeline never ran
   ([#2281](https://github.com/xerj-org/xerj/issues/2281)).
 
+- `xerj --help` lists `xerj hub` next to `xerj ask` when the build has a hub
+  signing key. The `xerj ask` line names `xerj hub stop` as the way to stop
+  the node that command started. A build with no hub key still does not
+  advertise `xerj hub`
+  ([#2280](https://github.com/xerj-org/xerj/issues/2280)).
+
 - `POST /{index}/_count` honours `min_score`. The handler rebuilds a `size: 0`
   search body from the query alone, so the threshold used to be dropped: for
   `{"query":{"match":…},"min_score":10}` `_search` returned 0 while `_count`

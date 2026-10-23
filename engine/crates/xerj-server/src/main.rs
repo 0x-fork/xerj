@@ -522,9 +522,11 @@ fn help_text(feedback: bool) -> String {
     )
 }
 
-/// The `xerj ask` usage lines. A build with no hub signing key can verify no
-/// pack, so there the line says the command is unavailable instead of
-/// promising a pull that will only ever exit 5.
+/// The `xerj ask` usage lines, and — when this build can verify a hub pack —
+/// the `xerj hub` line beside them. A build with no hub signing key can verify
+/// no pack, so there the ask line says the command is unavailable instead of
+/// promising a pull that will only ever exit 5, and `xerj hub` is left off:
+/// that build cannot start the node `xerj hub stop` would stop.
 fn ask_help_lines(hub: bool) -> &'static str {
     // A trailing `\` eats the next line's source indent. The four spaces on
     // the command, and the wrap under the description, are `\x20` so they
@@ -534,7 +536,9 @@ fn ask_help_lines(hub: bool) -> &'static str {
         "\x20\x20\x20\x20xerj ask \"<question>\"               answer a question from a hub corpus: the\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20pre-indexed pack is pulled the first time\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(see xerj ask --help); `xerj \"<question>\"`\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20is the same\n"
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20is the same. `xerj hub stop` stops the\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20node xerj ask started\n\
+         \x20\x20\x20\x20xerj hub <command>                  pull, find, stop, ... see xerj hub --help\n"
     } else {
         "\x20\x20\x20\x20xerj ask \"<question>\"              Corpus Hub answers: not available in this\n\
          \x20\x20\x20\x20build (no hub signing key; exits 5).\n\
@@ -3112,6 +3116,63 @@ mod help_text_tests {
         assert!(
             usage.contains("\n    xerj ask "),
             "xerj ask lost the indent the other commands have:\n{usage}"
+        );
+    }
+
+    /// `xerj ask` starts a node; `xerj hub stop` is how it is stopped. The
+    /// top-level usage has to name both, or an agent that only reads
+    /// `xerj --help` cannot find the stop command (#2280). A build with no
+    /// hub key still must not advertise a hub it cannot use.
+    #[test]
+    fn top_level_help_lists_hub_and_how_to_stop_the_ask_node() {
+        let with_key = super::ask_help_lines(true);
+        assert!(
+            with_key.contains("\n    xerj hub <command>"),
+            "a hub-key build must list `xerj hub <command>` in the usage block:\n{with_key}"
+        );
+        assert!(with_key.contains("pull, find, stop"), "{with_key}");
+        assert!(with_key.contains("xerj hub --help"), "{with_key}");
+        let ask_at = with_key.find("    xerj ask ").expect("ask line");
+        let hub_at = with_key.find("    xerj hub <command>").expect("hub line");
+        let ask_entry = &with_key[ask_at..hub_at];
+        assert!(
+            ask_entry.contains("xerj hub stop"),
+            "the xerj ask entry must name `xerj hub stop` before the hub command:\n{ask_entry}"
+        );
+        let hub_line = with_key
+            .lines()
+            .find(|l| l.contains("xerj hub <command>"))
+            .expect("hub line");
+        assert_eq!(
+            hub_line.find("pull, find, stop"),
+            Some(40),
+            "the hub description must start at column 40, with the other USAGE lines: {hub_line:?}"
+        );
+
+        let help = help_text(false);
+        let usage = help
+            .split_once("USAGE:")
+            .expect("USAGE")
+            .1
+            .split_once("\nOPTIONS ")
+            .expect("OPTIONS")
+            .0;
+        if xerj_common::hub::hub_key_configured() {
+            assert!(
+                usage.contains("\n    xerj hub <command>") && usage.contains("xerj hub stop"),
+                "top-level help must contain both when a hub key is configured:\n{usage}"
+            );
+        } else {
+            assert!(
+                !usage.contains("xerj hub"),
+                "a no-key process must not advertise xerj hub from the top-level help:\n{usage}"
+            );
+        }
+
+        let without = super::ask_help_lines(false);
+        assert!(
+            !without.contains("xerj hub"),
+            "a build with no hub key must not list xerj hub:\n{without}"
         );
     }
 }
