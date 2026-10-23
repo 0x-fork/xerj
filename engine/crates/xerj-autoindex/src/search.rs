@@ -508,6 +508,69 @@ pub(crate) fn query_failure_message(
 /// Default `--full` width, and the width suggested when the user asked for 0.
 const DEFAULT_FULL_CHARS: usize = 600;
 
+/// Default `--prefix` for `xerj search`, `xerj def`, and MCP `xerj_search`
+/// when the caller names neither an index nor a prefix. This is the prefix
+/// `xerj autoindex` writes when `--prefix` is omitted.
+pub const DEFAULT_SEARCH_PREFIX: &str = "ax";
+
+/// A `--prefix` the way `xerj autoindex` stored it, plus the index pattern
+/// `xerj search` and `xerj def` query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPrefix {
+    /// Prefix autoindex stored (`my-proj`, not `My_Proj`).
+    pub prefix: String,
+    /// `{prefix}-*` index pattern.
+    pub pattern: String,
+}
+
+/// Resolve a prefix the way `xerj autoindex --prefix` stores it.
+///
+/// Autoindex keeps lower-case `[a-z0-9]` runs joined by `-`
+/// ([`crate::dataset::sanitize_prefix`]) and refuses a result that cannot
+/// name an index ([`crate::dataset::index_prefix_error`]). Searching the
+/// characters the caller typed (`My_Proj-*`) misses the corpus those
+/// commands wrote (`my-proj-*`). `xerj search`, `xerj def`, and the
+/// `xerj_search` MCP tool all call this, so the three cannot drift.
+pub fn resolve_prefix(prefix: &str) -> Result<ResolvedPrefix, String> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "must contain at least one [a-z0-9] character; for example \"project\" searches project-*"
+                .into(),
+        );
+    }
+    let sanitized = crate::dataset::sanitize_prefix(trimmed);
+    if sanitized.is_empty() {
+        return Err(format!(
+            "{trimmed:?} keeps no [a-z0-9] character. xerj autoindex --prefix stores \
+             lower-case [a-z0-9] runs joined by '-'; for example \"project\" searches project-*"
+        ));
+    }
+    if let Some(err) = crate::dataset::index_prefix_error(&sanitized) {
+        // That sentence is about the walk autoindex has not started. Search
+        // and def have nothing to walk.
+        return Err(err.trim_end_matches(" Nothing was walked.").to_string());
+    }
+    Ok(ResolvedPrefix {
+        pattern: format!("{sanitized}-*"),
+        prefix: sanitized,
+    })
+}
+
+/// Stderr note when the stored prefix is not the characters the caller typed.
+/// `None` when they already match, including surrounding whitespace.
+pub fn prefix_rewrite_note(given: &str, resolved: &ResolvedPrefix) -> Option<String> {
+    let given = given.trim();
+    if given == resolved.prefix {
+        None
+    } else {
+        Some(format!(
+            "--prefix {given:?} is stored as {:?}; searching {}",
+            resolved.prefix, resolved.pattern
+        ))
+    }
+}
+
 /// `-k` / `--full`. A value that does not parse used to be consumed and
 /// dropped, so `xerj search -k abc` kept the default of 5 and never said so.
 pub(crate) fn parse_count_arg(flag: &str, next: Option<String>) -> Result<usize, String> {
@@ -555,7 +618,7 @@ fn parse_search_cli(
     mut url: String,
     mut api_key: Option<String>,
 ) -> Result<SearchCli, String> {
-    let mut prefix = "ax".to_string();
+    let mut prefix = DEFAULT_SEARCH_PREFIX.to_string();
     let mut k: usize = 5;
     let mut full: usize = DEFAULT_FULL_CHARS;
     let mut as_json = false;
@@ -637,6 +700,18 @@ pub fn run_search_cli() -> i32 {
             return 2;
         }
     };
+    let resolved = match resolve_prefix(&prefix) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("xerj search: {e}\n\n{USAGE}");
+            return 2;
+        }
+    };
+    if let Some(note) = prefix_rewrite_note(&prefix, &resolved) {
+        eprintln!("xerj search: {note}");
+    }
+    let prefix = resolved.prefix;
+    let pattern = resolved.pattern;
     if url.is_empty() {
         url = "http://localhost:9200".to_string();
     }
@@ -689,7 +764,6 @@ pub fn run_search_cli() -> i32 {
     // are strict, so the clause is HTTP 400 rather than a silent miss
     // (#1601). Read the mapping and drop a leg no resolved index maps; an
     // unreadable mapping keeps the code-shaped query.
-    let pattern = format!("{prefix}-*");
     let raw_mapping = es.get_json(&format!("/{pattern}/_mapping")).ok();
     let mapped = raw_mapping.as_ref().and_then(mapped_property_names);
     // Types are only trusted when the name union was readable. An error body
@@ -783,6 +857,50 @@ pub fn run_search_cli() -> i32 {
 mod tests {
     use super::*;
     use xerj_common::code_query::normalize_code_search_query;
+
+    /// `My_Proj` is stored as `my-proj-*`. Searching the typed characters
+    /// misses the corpus. A trailing `-*` is the pattern, not part of the
+    /// prefix. A prefix that cannot name an index is refused before HTTP.
+    #[test]
+    fn resolve_prefix_matches_what_autoindex_stores() {
+        let project = resolve_prefix("project").unwrap();
+        assert_eq!(project.prefix, "project");
+        assert_eq!(project.pattern, "project-*");
+        assert!(prefix_rewrite_note("project", &project).is_none());
+        assert!(prefix_rewrite_note("  project  ", &project).is_none());
+
+        let rewritten = resolve_prefix("  My_Proj  ").unwrap();
+        assert_eq!(rewritten.prefix, "my-proj");
+        assert_eq!(rewritten.pattern, "my-proj-*");
+        assert_eq!(
+            crate::dataset::sanitize_prefix("My_Proj"),
+            rewritten.prefix,
+            "resolution must be sanitize_prefix, not a second copy of the rules"
+        );
+        let note = prefix_rewrite_note("My_Proj", &rewritten).unwrap();
+        assert!(note.contains("my-proj-*"), "{note}");
+
+        assert_eq!(
+            resolve_prefix("owner--repo").unwrap().pattern,
+            "owner--repo-*"
+        );
+        assert_eq!(resolve_prefix("project-*").unwrap().pattern, "project-*");
+        assert_eq!(
+            resolve_prefix(DEFAULT_SEARCH_PREFIX).unwrap().pattern,
+            "ax-*"
+        );
+
+        let empty = resolve_prefix("___").unwrap_err();
+        assert!(empty.contains("[a-z0-9]"), "{empty}");
+        assert!(resolve_prefix("   ").is_err());
+        let digit = resolve_prefix("2042").unwrap_err();
+        assert!(digit.contains("2042"), "{digit}");
+        assert!(
+            !digit.contains("walked"),
+            "search must not talk about a walk it does not do: {digit}"
+        );
+        assert!(digit.contains("lowercase letter"), "{digit}");
+    }
 
     #[test]
     fn help_says_the_default_ranking_is_lexical() {

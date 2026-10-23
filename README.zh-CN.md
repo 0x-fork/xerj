@@ -350,7 +350,7 @@ DeepSeek Harness 在它的 Cordis 补丁文件里把 MCP 作为插件加载：
 | `xerj_brain_overview` / `xerj_brain_ego` / `xerj_brain_link` / `xerj_brain_unlink` | 操作“第二大脑”链接索引：查看概况、展开某个节点有证据支持的邻域、建立和撤销链接 |
 | `xerj_plan` | 输入自然语言筛选条件，返回经过校验的查询 DSL（`POST /_ask`；确定性的规则处理，不使用 LLM） |
 
-调用 `xerj_search` 时传入 `{"prefix":"project","query":"retry policy"}` 可搜索 `project-*`，等同于 `xerj search --prefix project`。要指定具体索引名或模式，改用 `index`；`index` 和 `prefix` 不能同时非空。`prefix` 会被去掉首尾空白，且不能为空。两个参数都不传时，工具搜索 `ax-*`。
+调用 `xerj_search` 时传入 `{"prefix":"project","query":"retry policy"}` 可搜索 `project-*`，等同于 `xerj search --prefix project`。`prefix` 与 CLI 走同一个解析函数，也就是 `xerj autoindex --prefix` 实际写入的前缀，因此 `My_Proj` 搜索 `my-proj-*`。要指定具体索引名或模式，改用 `index`；`index` 和 `prefix` 不能同时非空。空前缀、不含 `[a-z0-9]` 的前缀，以及无法作为索引名的前缀都会报错。两个参数都不传时，工具搜索 `ax-*`。
 
 `xerj_def` 查找本地定义，复用 `xerj def --json` 的查询、排序和位置去重逻辑。例如，`{"symbol":"Cache","prefix":"project","kind":"struct","lang":"rust","k":5}` 搜索 `project-*`；也可以用 `index` 替代 `prefix`，作用域规则与 `xerj_search` 相同。`symbol` 也接受描述能力的短语。`k` 必须为 1–50，默认 5；可选的 `max_tokens` 限制响应大小。
 

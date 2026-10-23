@@ -478,7 +478,7 @@ pub fn run_def_cli() -> i32 {
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
     let mut api_key = std::env::var("XERJ_API_KEY").ok().filter(|s| !s.is_empty());
-    let mut prefix = "ax".to_string();
+    let mut prefix = crate::search::DEFAULT_SEARCH_PREFIX.to_string();
     let mut k: usize = 5;
     let mut kind: Option<String> = None;
     let mut lang: Option<String> = None;
@@ -528,6 +528,18 @@ pub fn run_def_cli() -> i32 {
             return 2;
         }
     };
+    let resolved = match crate::search::resolve_prefix(&prefix) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("xerj def: {e}\n\n{USAGE}");
+            return 2;
+        }
+    };
+    if let Some(note) = crate::search::prefix_rewrite_note(&prefix, &resolved) {
+        eprintln!("xerj def: {note}");
+    }
+    let prefix = resolved.prefix;
+    let pattern = resolved.pattern;
     if url.is_empty() {
         url = "http://localhost:9200".to_string();
     }
@@ -563,7 +575,6 @@ pub fn run_def_cli() -> i32 {
         return 2;
     }
 
-    let pattern = format!("{prefix}-*");
     let raw_mapping = es.get_json(&format!("/{pattern}/_mapping")).ok();
     let mapped = raw_mapping.as_ref().and_then(mapped_property_names);
     if let Some(set) = mapped.as_ref().filter(|s| !s.is_empty()) {

@@ -20,7 +20,7 @@ async fn prefix_search_returns_only_its_corpus_for_plain_and_dsl_queries() {
             .unwrap();
     });
     let client = reqwest::Client::new();
-    for index in ["project-docs", "ax-other"] {
+    for index in ["project-docs", "ax-other", "my-proj-docs"] {
         let response = client
             .put(format!("{url}/{index}"))
             .json(
@@ -50,6 +50,8 @@ async fn prefix_search_returns_only_its_corpus_for_plain_and_dsl_queries() {
     for query in [json!("retry policy"), json!({"match": {"text": "retry"}})] {
         for (scope, expected_index) in [
             (json!({"prefix": "project"}), "project-docs"),
+            (json!({"prefix": "My_Proj"}), "my-proj-docs"),
+            (json!({"prefix": "project-*"}), "project-docs"),
             (json!({}), "ax-other"),
             (json!({"index": "project-docs"}), "project-docs"),
         ] {

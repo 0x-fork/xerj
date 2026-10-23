@@ -754,7 +754,9 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
             "name": "xerj_search",
             "description":
                 "Full-text / keyword / structured search over a XERJ index. Proxies \
-                 POST /{index}/_search. Pass `query` as a PLAIN STRING for the \
+                 POST /{index}/_search. Pass `prefix` (a `xerj search --prefix` value, \
+                 resolved by that command) or `index` (a name or pattern) — not both; \
+                 with neither, searches `ax-*`. Pass `query` as a PLAIN STRING for the \
                  definition-first code search (ranks the file that defines a symbol \
                  above files that merely mention it — the right default for code), \
                  or as an ES query-DSL object (e.g. {\"term\":{\"status\":\"open\"}}, \
@@ -782,11 +784,15 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                     },
                     "prefix": {
                         "type": "string",
-                        "description": "Autoindex prefix, like `xerj search --prefix`: \
-                         `project` searches `project-*`. Pass the prefix without the \
-                         `-*` suffix. Leading/trailing whitespace is trimmed; an empty \
-                         prefix is an error. Cannot be combined with a non-empty `index`. \
-                         With neither argument, searches `ax-*`."
+                        "description": "Autoindex prefix, resolved by the same function as \
+                         `xerj search --prefix` and `xerj autoindex --prefix`: lower-case \
+                         [a-z0-9] runs joined by '-', so `project` searches `project-*` and \
+                         `My_Proj` searches `my-proj-*`. A trailing `-*` is dropped. \
+                         Whitespace is trimmed. An empty prefix, a prefix with no [a-z0-9] \
+                         character, or a prefix that cannot name an index is an error before \
+                         any request. Cannot be combined with a non-empty `index`. With \
+                         neither argument, searches `ax-*` (the CLI default when `--prefix` \
+                         is omitted)."
                     },
                     "query": {
                         "type": ["object", "string"],
@@ -2267,9 +2273,14 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
     build_search_with_mapping(args, None)
 }
 
-/// One scope for both mapping discovery and search. `prefix` follows the
-/// CLI's `{prefix}-*` expansion (`xerj-autoindex/src/search.rs`); `index`
-/// retains its existing blank-as-absent behavior (#962).
+/// One scope for both mapping discovery and search.
+///
+/// `prefix` is [`xerj_autoindex::search::resolve_prefix`], the function
+/// `xerj search --prefix` uses. `index` keeps its blank-as-absent behavior
+/// (#962). Neither argument uses the CLI default prefix (`ax`), which is
+/// what `xerj search` does when `--prefix` is omitted — an error there would
+/// break every caller that searches the default corpus. Both is an error:
+/// the two scopes name different things and neither is a safe default.
 fn search_index(args: &Value) -> Result<String, String> {
     let index = args
         .get("index")
@@ -2287,8 +2298,14 @@ fn search_index(args: &Value) -> Result<String, String> {
                 .into(),
         ),
         (Some(index), None) => Ok(index.to_owned()),
-        (None, Some(prefix)) => Ok(format!("{prefix}-*")),
-        (None, None) => Ok("ax-*".into()),
+        (None, Some(prefix)) => xerj_autoindex::search::resolve_prefix(prefix)
+            .map(|resolved| resolved.pattern)
+            .map_err(|e| format!("`prefix` {e}")),
+        (None, None) => {
+            xerj_autoindex::search::resolve_prefix(xerj_autoindex::search::DEFAULT_SEARCH_PREFIX)
+                .map(|resolved| resolved.pattern)
+                .map_err(|e| format!("`prefix` {e}"))
+        }
     }
 }
 
@@ -3350,7 +3367,12 @@ mod tests {
         // call — nothing said the corpus lives under `ax-*`. The default
         // now matches what autoindex writes (and what `xerj search` uses).
         let (_, path, _) = built(build_search(&json!({})));
-        assert_eq!(path, "/ax-*/_search");
+        let default_pattern =
+            xerj_autoindex::search::resolve_prefix(xerj_autoindex::search::DEFAULT_SEARCH_PREFIX)
+                .unwrap()
+                .pattern;
+        assert_eq!(path, format!("/{default_pattern}/_search"));
+        assert_eq!(default_pattern, "ax-*");
         // Whitespace-only is treated as absent; explicit index still wins.
         let (_, path, _) = built(build_search(&json!({ "index": "  " })));
         assert_eq!(path, "/ax-*/_search");
@@ -3371,6 +3393,16 @@ mod tests {
             "index": "  ", "prefix": "project"
         })));
         assert_eq!(path, "/project-*/_search");
+        // The pattern is the CLI resolver's, including autoindex's rewrite
+        // (`My_Proj` is stored as `my-proj-*`) and a trailing `-*` the caller
+        // copied off an index name.
+        for prefix in ["My_Proj", "  my-proj  ", "my-proj-*"] {
+            let (_, path, body) = built(build_search(&json!({"prefix": prefix})));
+            let resolved = xerj_autoindex::search::resolve_prefix(prefix).unwrap();
+            assert_eq!(path, format!("/{}/_search", resolved.pattern), "{prefix}");
+            assert_eq!(resolved.pattern, "my-proj-*");
+            assert!(body.get("prefix").is_none());
+        }
     }
 
     #[test]
@@ -3383,6 +3415,8 @@ mod tests {
         for prefix in [
             json!(""),
             json!("  "),
+            json!("___"),
+            json!("2042"),
             json!(42),
             json!(false),
             json!([]),
@@ -3391,6 +3425,9 @@ mod tests {
             let error = build_search(&json!({"prefix": prefix})).unwrap_err();
             assert!(error.contains("`prefix`"), "{error}");
         }
+        let digit = build_search(&json!({"prefix": "2042"})).unwrap_err();
+        assert!(digit.contains("lowercase letter"), "{digit}");
+        assert!(!digit.contains("walked"), "{digit}");
         let (_, path, _) = built(build_search(&json!({"prefix": null})));
         assert_eq!(path, "/ax-*/_search");
     }
@@ -4647,6 +4684,8 @@ mod tests {
             json!({"index": "docs", "prefix": "project", "query": "retry"}),
             json!({"prefix": false, "query": "retry"}),
             json!({"prefix": "  ", "query": {"match_all": {}}}),
+            json!({"prefix": "___", "query": "retry"}),
+            json!({"prefix": "2042", "query": "retry"}),
         ] {
             let result = block_on(call_tool(
                 &ctx,
