@@ -17044,6 +17044,11 @@ async fn search_impl(
                         } else {
                             raw
                         };
+                        // #1940 stores the embedding as one `xerj:f32:` string.
+                        // `fields` reports the vector the caller named, which
+                        // is the number array — including `"_source": false`,
+                        // where the engine keeps the packed source on purpose.
+                        let raw = raw.map(expand_packed_embedding_value);
                         let arr_raw: Vec<Value> = match raw {
                             Some(Value::Array(a)) => a,
                             Some(Value::Null) | None => continue,
@@ -17515,6 +17520,7 @@ async fn search_impl(
                             other => {
                                 if is_stored(other) {
                                     if let Some(raw) = get_source_value_by_path(&h.source, other) {
+                                        let raw = expand_packed_embedding_value(raw);
                                         let arr = match raw {
                                             Value::Array(a) => a,
                                             Value::Null => continue,
@@ -17561,6 +17567,7 @@ async fn search_impl(
                             .or_else(|| target_via_alias.and_then(|t| get_source_value_by_path(&h.source, t)))
                             .or_else(|| get_source_value_by_path(&h.source, &response_key));
                         if let Some(raw) = raw {
+                            let raw = expand_packed_embedding_value(raw);
                             let arr = match raw {
                                 Value::Array(a) => a,
                                 Value::Null => vec![],
@@ -42517,6 +42524,9 @@ pub(crate) fn build_docvalue_fields(
             let base = field_name.strip_suffix(".keyword")?;
             get_source_value_by_path(source, base)
         });
+        // Same packed-embedding expansion as `fields` (#1940). Doc values
+        // skip the string, so this path is the one that still sees it.
+        let raw = raw.map(expand_packed_embedding_value);
         let arr: Vec<Value> = match raw {
             Some(Value::Array(a)) => a,
             Some(Value::Null) | None => vec![],
@@ -42674,6 +42684,14 @@ pub(crate) fn get_field_value_via_walk(source: &Value, segs: &[&str]) -> Option<
         }
     }
     walk(source, segs)
+}
+
+/// Expand a packed embedding (`xerj:f32:` hex) into the number array
+/// `fields` and `docvalue_fields` have always returned. Leaves every other
+/// value unchanged, including a vector that is already a number array.
+fn expand_packed_embedding_value(mut value: Value) -> Value {
+    xerj_common::packed_f32::expand_packed_f32_values(&mut value);
+    value
 }
 
 pub(crate) fn get_source_value_by_path(source: &Value, path: &str) -> Option<Value> {

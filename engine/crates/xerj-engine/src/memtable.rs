@@ -5158,15 +5158,25 @@ pub(crate) fn looks_like_multi_vector(val: &serde_json::Value) -> bool {
         return false;
     }
     for row in rows {
-        let Some(components) = row.as_array() else {
-            return false;
+        let width = if let Some(text) = row.as_str() {
+            // Packed chunk vectors (#1940) are one string per passage, not
+            // a number array. Same rectangular rule as the array form.
+            match xerj_common::packed_f32::unpack_f32_vector(text) {
+                Some(values) => values.len(),
+                None => return false,
+            }
+        } else {
+            let Some(components) = row.as_array() else {
+                return false;
+            };
+            if components.is_empty() || !components.iter().all(serde_json::Value::is_number) {
+                return false;
+            }
+            components.len()
         };
-        if components.is_empty() || !components.iter().all(serde_json::Value::is_number) {
-            return false;
-        }
         match dims {
-            None => dims = Some(components.len()),
-            Some(d) if d == components.len() => {}
+            None => dims = Some(width),
+            Some(d) if d == width => {}
             Some(_) => return false,
         }
     }

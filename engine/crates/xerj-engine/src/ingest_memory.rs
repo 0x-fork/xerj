@@ -730,12 +730,27 @@ pub fn vector_value_capacity(
             _ => 0,
         }
     }
+    fn retained_vector_bytes(value: &serde_json::Value) -> usize {
+        match value {
+            // Packed embeddings retain one string, not one Value per
+            // component (#1940). Count it or the ledger reports the vector
+            // as free. Number arrays still go through `arrays`.
+            serde_json::Value::String(text) if xerj_common::packed_f32::is_packed_f32(text) => {
+                text.capacity()
+            }
+            serde_json::Value::Array(values) => {
+                values.capacity() * std::mem::size_of::<serde_json::Value>()
+                    + values.iter().map(retained_vector_bytes).sum::<usize>()
+            }
+            other => arrays(other),
+        }
+    }
     match value {
         serde_json::Value::Object(values) => values
             .iter()
             .map(|(key, value)| {
                 if fields.contains(key) {
-                    arrays(value)
+                    retained_vector_bytes(value)
                 } else {
                     vector_value_capacity(value, fields)
                 }

@@ -1510,18 +1510,6 @@ fn decode_projected_column<'a>(
     Ok(decoded[index].as_ref().unwrap())
 }
 
-fn finite_f32_vector(values: Vec<f64>) -> Option<Vec<f32>> {
-    let mut out = Vec::with_capacity(values.len());
-    for value in values {
-        let value = value as f32;
-        if !value.is_finite() {
-            return None;
-        }
-        out.push(value);
-    }
-    Some(out)
-}
-
 struct TypedVectorRowsVisitor<'a> {
     expected_rows: usize,
     column_index: usize,
@@ -1548,32 +1536,19 @@ impl<'de> serde::de::Visitor<'de> for TypedVectorRowsVisitor<'_> {
             let Some(value) = seq.next_element::<serde_json::Value>()? else {
                 return Err(serde::de::Error::custom("vector column ended early"));
             };
-            let typed = match value {
-                serde_json::Value::Null => None,
-                serde_json::Value::Array(values) => {
-                    let values = values
-                        .into_iter()
-                        .map(|value| value.as_f64())
-                        .collect::<Option<Vec<_>>>()
-                        .and_then(finite_f32_vector);
-                    let Some(values) = values else {
+            // Null is a supported absence. A packed `xerj:f32:` string is the
+            // retained embedding form (#1940); a number array is the form
+            // segments wrote before that. Anything else cannot be scored as
+            // a vector and drops the whole column to the stored-document scan.
+            let typed = if value.is_null() {
+                None
+            } else {
+                match xerj_common::packed_f32::json_to_f32_vector(&value) {
+                    Some(values) => Some(values),
+                    None => {
                         supported = false;
-                        out.push(None);
-                        if checkpoint_decoded_row(
-                            row,
-                            self.column_index,
-                            self.checkpoint,
-                            self.cancelled,
-                        ) {
-                            return Err(serde::de::Error::custom("stored decode cancelled"));
-                        }
-                        continue;
-                    };
-                    Some(values)
-                }
-                _ => {
-                    supported = false;
-                    None
+                        None
+                    }
                 }
             };
             out.push(typed);
@@ -1649,18 +1624,10 @@ fn decode_typed_vector_rows_controlled(
             .map_err(|error| StorageError::Other(anyhow::anyhow!("constant decode: {error}")))?
         {
             serde_json::Value::Null => None,
-            serde_json::Value::Array(values) => {
-                let Some(values) = values
-                    .into_iter()
-                    .map(|value| value.as_f64())
-                    .collect::<Option<Vec<_>>>()
-                    .and_then(finite_f32_vector)
-                else {
-                    return Ok(Ok(None));
-                };
-                Some(values)
-            }
-            _ => return Ok(Ok(None)),
+            other => match xerj_common::packed_f32::json_to_f32_vector(&other) {
+                Some(values) => Some(values),
+                None => return Ok(Ok(None)),
+            },
         };
         return repeat_constant_rows_controlled(row, num_docs, column_index, checkpoint)
             .map(|result| result.map(Some));
@@ -1733,15 +1700,7 @@ fn decode_typed_vector_chunk_rows_controlled(
                     ))
                 })?;
                 for chunk in chunks {
-                    let serde_json::Value::Array(values) = chunk else {
-                        return Ok(Ok(None));
-                    };
-                    let Some(vector) = values
-                        .into_iter()
-                        .map(|value| value.as_f64())
-                        .collect::<Option<Vec<_>>>()
-                        .and_then(finite_f32_vector)
-                    else {
+                    let Some(vector) = xerj_common::packed_f32::json_to_f32_vector(&chunk) else {
                         return Ok(Ok(None));
                     };
                     typed.push(vector);
@@ -1805,16 +1764,8 @@ fn parse_typed_chunk_reader<R: std::io::Read>(
                     serde_json::Value::Array(chunks) => {
                         let mut result = Vec::with_capacity(chunks.len());
                         for chunk in chunks {
-                            let serde_json::Value::Array(values) = chunk else {
-                                supported = false;
-                                continue;
-                            };
-                            let vector = values
-                                .into_iter()
-                                .map(|value| value.as_f64())
-                                .collect::<Option<Vec<_>>>()
-                                .and_then(finite_f32_vector);
-                            let Some(vector) = vector else {
+                            let Some(vector) = xerj_common::packed_f32::json_to_f32_vector(&chunk)
+                            else {
                                 supported = false;
                                 continue;
                             };

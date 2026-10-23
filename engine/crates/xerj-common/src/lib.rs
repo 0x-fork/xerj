@@ -58,6 +58,7 @@ pub mod hub;
 pub mod localauth;
 pub mod metrics;
 pub mod net;
+pub mod packed_f32;
 pub mod resource;
 pub mod schema;
 pub mod thread_spawn;
