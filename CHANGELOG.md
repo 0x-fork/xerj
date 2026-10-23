@@ -209,15 +209,6 @@ mgtf and mariomarcolongo.
   [#204](https://github.com/xerj-org/xerj/issues/204), PR
   [#2263](https://github.com/xerj-org/xerj/pull/2263), Tong-bit-art).
 
-- On Windows, the process memory cap is limited by commit space (the commit
-  limit and what this process can still commit), not only by physical RAM. A
-  default `xerj autoindex` on a machine with no pagefile and little free
-  commit rejects writes with HTTP 429 naming that limit and how to enlarge
-  the pagefile, instead of aborting with `memory allocation of N bytes
-  failed` (#1122). The AUTO tier is still chosen from physical RAM, then
-  lowered when commit is the tighter ceiling. Linux and macOS budgets are
-  unchanged.
-
 - A `semantic` query on a `semantic_text` field returns `highlight` fragments
   when the request asks for them
   ([#1947](https://github.com/xerj-org/xerj/issues/1947), PR
