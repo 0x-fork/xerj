@@ -26140,6 +26140,28 @@ impl Index {
         self.store.version_map.live_count() as u64
     }
 
+    /// Documents physically present but not live: superseded versions left by
+    /// updates and documents killed by deletes, until a merge folds them away.
+    /// This is the pre-merge meaning ES gives `docs.deleted`, derived from
+    /// segment metadata + the memtable + the version map, so a listing does not
+    /// decode every segment's tombstone section.
+    ///
+    /// It is NOT the same number as `Σ segment_rows().deleted_doc_count`:
+    /// xerj writes tombstones only for explicit deletes, while an update
+    /// supersedes the old version through the version map without tombstoning
+    /// it. Both kinds are absent from search, so both belong here.
+    #[inline]
+    pub fn deleted_doc_count(&self) -> u64 {
+        let snap = self.store.snapshot();
+        let physical: u64 = snap
+            .segments
+            .iter()
+            .map(|segment| segment.doc_count)
+            .sum::<u64>()
+            + self.memtable.doc_count() as u64;
+        physical.saturating_sub(self.live_doc_count())
+    }
+
     /// Real per-segment rows for `_cat/segments` (#1202): one entry per LIVE
     /// segment in the durable snapshot — its id, its docs, its deleted docs,
     /// its on-disk bytes. The predecessor endpoint fabricated a single `_0`
