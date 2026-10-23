@@ -3884,6 +3884,53 @@ mod phase_a_grouping_tests {
         );
     }
 
+    /// #1504: desk-phone syslog (`<PRI>Mon dd hh:mm:ss host tag[pid]: msg`)
+    /// used to plan as `txt-prose`, so timestamp, host and severity were not
+    /// fields and the stemmer kept the stop word `is`. It plans as `logs`
+    /// with the english analyzer.
+    #[test]
+    fn phone_syslog_plans_as_logs_with_the_english_analyzer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("phones.log"),
+            "<131>Oct 16 09:06:58 192.168.1.20 SIP [990]: registration failed\n\
+             <134>Oct 16 09:07:01 192.168.1.20 SIP [990]: call cleared\n\
+             <131>Oct 16 09:07:02 192.168.1.21 SIP[991]: SIP engine not registered\n\
+             <134>Oct 16 09:07:03 192.168.1.21 SIP[991]: watchdog reconnect\n\
+             Oct 16 09:07:04 pbx pbx-phone[990]: configuration loaded\n\
+             Oct 16 09:07:05 pbx pbx-phone[991]: device is online\n",
+        )
+        .unwrap();
+        let plan = plan_for(root);
+        let logs: Vec<_> = plan
+            .datasets
+            .iter()
+            .filter(|d| d.family == "logs")
+            .collect();
+        assert_eq!(
+            logs.len(),
+            1,
+            "expected one logs dataset, got {:?}",
+            plan.datasets
+                .iter()
+                .map(|d| (
+                    d.slug.as_str(),
+                    d.family.as_str(),
+                    d.text_analyzer.as_deref()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            logs[0].text_analyzer.as_deref(),
+            Some(infer::LOG_TEXT_ANALYZER)
+        );
+        let names: Vec<&str> = logs[0].specs.iter().map(|s| s.name.as_str()).collect();
+        for field in ["ts", "host", "program", "message"] {
+            assert!(names.contains(&field), "missing {field} in {names:?}");
+        }
+    }
+
     const CODE: &str = "// The event loop dispatches every ready connection to a worker.\n\
         // Each worker drains its queue before polling for more sockets.\n\
         static void dispatch_ready_connections(struct event_loop *loop) {\n\
@@ -4463,9 +4510,18 @@ fn build_phase_a(
             .members
             .iter()
             .any(|&m| matches!(file_meta[m], Some((Family::Code, _))));
-        let text_analyzer =
-            infer::elect_dataset_analyzer(&specs, &c.fields, has_code, cfg.code_analyzer)
-                .map(str::to_string);
+        // A pure log cluster (not a docs cluster a log file was demoted
+        // into). `c.family` is the cluster's own family; docs clusters are
+        // labelled `Family::Code` by `dataset::cluster`.
+        let log_dataset = c.family == Family::Logs && !c.is_docs;
+        let text_analyzer = infer::elect_dataset_analyzer(
+            &specs,
+            &c.fields,
+            has_code,
+            cfg.code_analyzer,
+            log_dataset,
+        )
+        .map(str::to_string);
         datasets.push(PlanDataset {
             slug: c.slug.clone(),
             index: format!("{}-{}", cfg.prefix, c.slug),

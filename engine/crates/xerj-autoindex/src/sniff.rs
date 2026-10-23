@@ -4486,6 +4486,20 @@ mod text_family_tests {
                    Oct 16 09:07:01 pbx sshd[1235]: Accepted publickey for admin\n\
                    Oct 16 09:07:02 pbx pbx-phone[990]: SIP engine not registered\n";
         assert_eq!(classify_full(rfc), Family::Logs);
+
+        // Desk-phone syslog carries a `<PRI>` and often a space before the
+        // pid bracket. RFC 5424 puts a version digit between `<PRI>` and an
+        // ISO timestamp. Both used to miss every template and land in
+        // `TxtProse`, so timestamp, host and severity were not fields.
+        let phone = "<131>Oct 16 09:06:58 192.168.1.20 SIP [990]: registration failed\n\
+                     <134>Oct 16 09:07:01 192.168.1.20 SIP [990]: call cleared\n\
+                     <131>Oct 16 09:07:02 192.168.1.21 SIP[991]: SIP engine not registered\n";
+        assert_eq!(classify_full(phone), Family::Logs);
+
+        let rfc5424 = "<134>1 2026-10-16T09:06:58.123Z 10.0.0.50 sipd 4321 - - SIP engine not registered\n\
+                       <131>1 2026-10-16T09:07:01.000Z 10.0.0.50 sipd 4321 - - registration failed\n\
+                       <165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\"] An application event log entry\n";
+        assert_eq!(classify_full(rfc5424), Family::Logs);
     }
 
     /// #1504 review: the ISO-syslog template must not steal files from Csv or
@@ -4536,6 +4550,17 @@ mod text_family_tests {
             classify_full(notes),
             Family::Logs,
             "timestamped notes are prose, not Logs"
+        );
+
+        // A `<PRI>` prefix is not enough. Without the timestamp shape these
+        // stay prose — the new phone/RFC5424 templates must not claim them.
+        let pri_prose = "<134> this is not a timestamp host prog: msg\n\
+                         <131> notes from the retro about the release\n\
+                         <999> hello the configuration is invalid\n";
+        assert_ne!(
+            classify_full(pri_prose),
+            Family::Logs,
+            "a priority-looking prefix without a timestamp is prose"
         );
     }
 

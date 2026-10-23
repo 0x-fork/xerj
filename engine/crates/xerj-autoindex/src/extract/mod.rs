@@ -181,6 +181,12 @@ pub fn extract_as_document_with_name(
     gzip: bool,
     sink: Sink,
 ) -> Result<ExtractStats> {
+    // A demoted catalog or bundle is re-sampled through this renderer. The
+    // same skip as `extract` — otherwise the phrase text the code path
+    // refused comes back in as `body`.
+    if skip_phrase_index(logical_path, content_path, gzip) {
+        return emit_phrase_skip(logical_path, sink);
+    }
     let mut stats = ExtractStats::default();
     let Some(bytes) = read_whole(content_path, gzip, MAX_WHOLE_FILE)? else {
         stats.junk += 1;
@@ -207,6 +213,93 @@ pub fn extract_as_document_with_name(
     Ok(stats)
 }
 
+/// Bytes of a JS/CSS prefix read to decide "this is a bundle, not source".
+const MINIFIED_PREFIX: u64 = 8192;
+/// Below this, a one-line file is a small module, not the huge bundle the
+/// #1504 report lost queries to (`quill.js`, `jssip.min.js`).
+const MINIFIED_MIN_BYTES: usize = 1500;
+
+/// Translation catalogs and minified bundles repeat every UI phrase and win
+/// natural-language code queries (#1504). Named catalogs (`lang/*.php`,
+/// `values*/strings.xml`, `*.lproj/*.strings`, `*.po`, `*.min.js`) are
+/// decided from the logical path. A bundle that is not named `*.min.js`
+/// (`quill.js`) is one enormous line; the prefix test catches that without
+/// reading the rest of the file.
+///
+/// The phrase text is not indexed. The file still gets one title record, so
+/// it stays in the corpus, and a query whose only hit would have been the
+/// catalog no longer has the catalog outranking the implementing source —
+/// the catalog is not a candidate. `.pyi` stubs are not skipped: `xerj def`
+/// still has to resolve a name that exists only as a stub.
+fn skip_phrase_index(logical: &Path, content: &Path, gzip: bool) -> bool {
+    let rel = logical.to_string_lossy().replace('\\', "/");
+    if xerj_common::xccode::is_translation_or_bundle(&rel) {
+        return true;
+    }
+    js_or_css(logical) && prefix_is_minified_bundle(content, gzip)
+}
+
+fn js_or_css(logical: &Path) -> bool {
+    let name = logical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".gz").unwrap_or(&name);
+    matches!(
+        name.rsplit('.').next().unwrap_or(""),
+        "js" | "jsx" | "mjs" | "cjs" | "css"
+    )
+}
+
+fn prefix_is_minified_bundle(path: &Path, gzip: bool) -> bool {
+    let Ok(mut reader) = open_reader(path, gzip, Some(MINIFIED_PREFIX)) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if reader.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    if buf.len() < MINIFIED_MIN_BYTES {
+        return false;
+    }
+    let newlines = buf.iter().filter(|b| **b == b'\n').count();
+    if newlines <= 2 {
+        return true;
+    }
+    // A short banner in front of one giant line: that line is most of the
+    // prefix. A source file with one long string among real lines is not.
+    let max_line = buf
+        .split(|b| *b == b'\n')
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(0);
+    max_line >= 4000 && max_line * 4 >= buf.len() * 3
+}
+
+/// One title record and no phrase text. `title` is the file name, which a
+/// natural-language query does not contain, so the record cannot outrank
+/// the implementing source. No `body`: the semantic election embeds `body`,
+/// and a stub sentence here would put the catalog back into the vector leg.
+fn emit_phrase_skip(logical: &Path, sink: Sink) -> Result<ExtractStats> {
+    let mut stats = ExtractStats::default();
+    let title = logical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let mut fields = Map::new();
+    fields.insert("title".into(), Value::String(title));
+    stats.records += 1;
+    sink(RawRecord {
+        fields,
+        locator: "code".into(),
+        group: None,
+        origin: FieldOrigin::Extractor,
+    });
+    Ok(stats)
+}
+
 /// Dispatch to the family extractor. `limit_bytes` bounds SAMPLING reads;
 /// `None` = full stream.
 pub fn extract(
@@ -215,6 +308,13 @@ pub fn extract(
     limit_bytes: Option<u64>,
     sink: Sink,
 ) -> Result<ExtractStats> {
+    // Logical name, never the content path: durable preparation reads a
+    // content-addressed blob (`blobs/00000000`) whose name is not the source
+    // (#294). The bytes still come from `path`.
+    let logical = sn.logical_name.as_deref().unwrap_or(path);
+    if skip_phrase_index(logical, path, sn.gzip) {
+        return emit_phrase_skip(logical, sink);
+    }
     match sn.family {
         Family::Jsonl => jsonl::extract(path, sn.gzip, limit_bytes, sink),
         Family::Json => json::extract(path, sn.gzip, sink),
@@ -1596,6 +1696,148 @@ mod slot_tests {
                 && lines[0].contains("in_use=1")
                 && lines[0].contains("limit=1"),
             "{lines:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phrase_skip_tests {
+    use super::*;
+    use crate::sniff::{Family, Sniffed};
+
+    const PHRASE: &str = "push notification wait for mobile device to register before dial";
+
+    fn sniffed(family: Family, logical: &str) -> Sniffed {
+        Sniffed {
+            family,
+            gzip: false,
+            binary_kind: None,
+            csv: None,
+            encoding: "utf-8",
+            logical_name: Some(std::path::PathBuf::from(logical)),
+        }
+    }
+
+    fn indexed_text(logical: &str, family: Family, bytes: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, bytes).unwrap();
+        let sn = sniffed(family, logical);
+        let mut recs = Vec::new();
+        extract(&path, &sn, None, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        recs.iter()
+            .flat_map(|r| r.fields.values())
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #1504: a multilingual repo's catalogs contain every UI phrase once per
+    /// language and fill the fetch window, so reordering the hits that came
+    /// back cannot surface the implementing file. The phrase must not be
+    /// indexed from the catalog. The service file that implements it keeps it.
+    #[test]
+    fn translation_catalogs_do_not_index_the_phrase_the_source_keeps() {
+        let catalog = format!("<?php\nreturn [\n  'dial.wait' => '{PHRASE}',\n];\n");
+        let from_catalog = indexed_text("web/lang/en.php", Family::Code, &catalog);
+        assert!(
+            !from_catalog.contains(PHRASE),
+            "lang/*.php indexed the UI phrase: {from_catalog}"
+        );
+        assert!(
+            from_catalog.contains("en.php"),
+            "the catalog file stays in the corpus by name"
+        );
+
+        let strings = format!(
+            "<?xml version=\"1.0\"?>\n<resources>\n  <string name=\"dial_wait\">{PHRASE}</string>\n</resources>\n"
+        );
+        let from_xml = indexed_text("res/values-da/strings.xml", Family::Xml, &strings);
+        assert!(
+            !from_xml.contains(PHRASE),
+            "strings.xml indexed the phrase: {from_xml}"
+        );
+
+        let po = format!("msgid \"{PHRASE}\"\nmsgstr \"{PHRASE}\"\n");
+        let from_po = indexed_text("locale/da.po", Family::TxtProse, &po);
+        assert!(
+            !from_po.contains(PHRASE),
+            ".po indexed the phrase: {from_po}"
+        );
+
+        let apple = format!("\"dial.wait\" = \"{PHRASE}\";\n");
+        let from_strings =
+            indexed_text("ios/da.lproj/Localizable.strings", Family::TxtLines, &apple);
+        assert!(
+            !from_strings.contains(PHRASE),
+            ".strings indexed the phrase: {from_strings}"
+        );
+
+        let source = format!(
+            "<?php\nfunction waitForMobile() {{\n  // {PHRASE}\n  return $this->dial();\n}}\n"
+        );
+        let from_source = indexed_text(
+            "web/src/services/phones/NecTemplate.php",
+            Family::Code,
+            &source,
+        );
+        assert!(
+            from_source.contains(PHRASE),
+            "the implementing file must stay searchable: {from_source}"
+        );
+    }
+
+    /// #1504: `quill.js` is one line and is not named `*.min.js`, so the path
+    /// rule does not see it. A normal source file with the same phrase, wrapped
+    /// like source, stays indexed. A named `*.min.js` is skipped even when short.
+    #[test]
+    fn one_line_js_bundles_are_skipped_and_source_js_is_not() {
+        let pad = "x".repeat(1800);
+        let bundle = format!("!function(){{var s=\"{PHRASE}\";{pad}}}();");
+        assert!(
+            bundle.len() > MINIFIED_MIN_BYTES,
+            "fixture must clear the size floor, got {}",
+            bundle.len()
+        );
+        assert!(!bundle.contains('\n'));
+        let from_bundle = indexed_text("assets/quill.js", Family::Code, &bundle);
+        assert!(
+            !from_bundle.contains(PHRASE),
+            "one-line quill.js indexed the phrase: {from_bundle}"
+        );
+
+        let named = format!("/* {PHRASE} */\n");
+        let from_min = indexed_text("assets/jssip.min.js", Family::Code, &named);
+        assert!(
+            !from_min.contains(PHRASE),
+            "named min.js indexed the phrase: {from_min}"
+        );
+
+        let mut source = format!("function waitForMobile() {{\n  // {PHRASE}\n");
+        for i in 0..40 {
+            source.push_str(&format!("  var line{i} = {i};\n"));
+        }
+        source.push_str("}\n");
+        let from_source = indexed_text("web/src/dial.js", Family::Code, &source);
+        assert!(
+            from_source.contains(PHRASE),
+            "ordinary javascript must stay searchable: {from_source}"
+        );
+    }
+
+    /// A type stub stays indexed. Query-time demotion ranks it behind the
+    /// implementation; stripping it would hide a name that exists only here.
+    #[test]
+    fn pyi_stubs_keep_their_text() {
+        let stub = "def wait_for_register() -> None:\n    \"\"\"push notification wait\"\"\"\n";
+        let text = indexed_text("candle/quantized.pyi", Family::Code, stub);
+        assert!(
+            text.contains("wait_for_register"),
+            "a stub must stay indexed for xerj def: {text}"
         );
     }
 }

@@ -721,14 +721,16 @@ pub fn demote_catalog_noise(hits: Vec<Value>) -> Vec<Value> {
 /// ones a multilingual repo uses for key→string tables, not a general
 /// "prose file" filter: `lang/*.php`, `values*/strings.xml`, `*.lproj/*.strings`,
 /// `*.po` / `*.pot`, and `*.min.js` / `*.min.mjs` / `*.min.css`.
-pub fn is_catalog_noise(path: &str) -> bool {
-    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    // Type stubs repeat the public signature and outrank the implementation
-    // on a natural-language query (candle field report 2026-10-17: `.pyi`
-    // files were the top hits). They stay searchable, behind source.
-    if name.ends_with(".pyi") {
-        return true;
-    }
+///
+/// This is the index-time predicate. Autoindex does not put the phrase text
+/// of these files into `body` — a post-fetch reorder cannot help when the
+/// catalogs fill the whole fetch window, and a one-line bundle that is not
+/// named `*.min.js` is caught separately by content. `.pyi` stubs are NOT
+/// in this set: they stay indexed so `xerj def` can still resolve a name
+/// that exists only as a stub, and [`is_catalog_noise`] ranks them behind
+/// the implementation at query time.
+pub fn is_translation_or_bundle(path: &str) -> bool {
+    let name = file_name(path);
     if name.ends_with(".min.js") || name.ends_with(".min.mjs") || name.ends_with(".min.css") {
         return true;
     }
@@ -745,6 +747,18 @@ pub fn is_catalog_noise(path: &str) -> bool {
         return true;
     }
     parent.ends_with(".lproj") && name.ends_with(".strings")
+}
+
+/// Translation catalogs, minified bundles, and type stubs (#1504, #1651).
+pub fn is_catalog_noise(path: &str) -> bool {
+    // Type stubs repeat the public signature and outrank the implementation
+    // on a natural-language query (candle field report 2026-10-17: `.pyi`
+    // files were the top hits). They stay searchable, behind source.
+    file_name(path).ends_with(".pyi") || is_translation_or_bundle(path)
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 fn parent_segment(path: &str) -> Option<&str> {
@@ -1727,6 +1741,19 @@ mod tests {
         assert!(is_catalog_noise("web/lang/en.php"));
         assert!(is_catalog_noise("res/values/strings.xml"));
         assert!(is_catalog_noise("assets/app.min.css"));
+        // `.pyi` is query-time noise only. Stripping it at index time would
+        // hide a name that exists only as a stub from `xerj def`.
+        assert!(!is_translation_or_bundle("candle/quantized.pyi"));
+        assert!(is_translation_or_bundle("web/lang/en.php"));
+        assert!(is_translation_or_bundle("assets/jssip.min.js"));
+        // A huge one-line bundle that is not named `*.min.js` (the report's
+        // `quill.js`) is not a path match. Index-time content detection
+        // catches it; this predicate must not pretend the name is enough.
+        assert!(!is_translation_or_bundle("assets/quill.js"));
+        assert!(!is_catalog_noise("assets/quill.js"));
+        assert!(!is_translation_or_bundle(
+            "web/src/services/phones/NecTemplate.php"
+        ));
     }
 
     /// #1146: with a mixed mapping the fused request may only go to the

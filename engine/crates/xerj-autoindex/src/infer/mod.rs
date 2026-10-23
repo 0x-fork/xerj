@@ -883,15 +883,33 @@ impl CodeAnalyzer {
 /// `code` wins over the stemmer (the maintainer's call on #1198): the flag is
 /// an explicit operator choice, sub-words already reach most of what stemming
 /// would in prose inside code, and layering both is unmeasured. A dataset
-/// without code members keeps [`elected_default_analyzer`]'s answer either way.
+/// without code members keeps [`elected_default_analyzer`]'s answer either way,
+/// except a log dataset (below).
+///
+/// The analyzer a log-only dataset gets (#1504). `"english"` is `standard`
+/// plus the Lucene English stop list plus the Snowball stemmer. Log messages
+/// look like natural language, so the ordinary election picks `"stemmer"`,
+/// which keeps stop words. A `match` for a phrase that never occurs then
+/// hits every record containing `is`. Stop words are dropped on both sides
+/// of the query, and only for this family — the global default stays
+/// `"stemmer"` / `"standard"` because dropping stop words changes every
+/// document's BM25 length norm (#1059).
+pub const LOG_TEXT_ANALYZER: &str = "english";
+
+/// Dataset text analyzer. `log_dataset` elects [`LOG_TEXT_ANALYZER`];
+/// `--code-analyzer code` still wins when the dataset holds code.
 pub fn elect_dataset_analyzer(
     specs: &[FieldSpec],
     fields: &HashMap<String, FieldAcc>,
     has_code: bool,
     code_analyzer: CodeAnalyzer,
+    log_dataset: bool,
 ) -> Option<&'static str> {
     if has_code && code_analyzer == CodeAnalyzer::Code {
         return Some(CODE_TEXT_ANALYZER);
+    }
+    if log_dataset {
+        return Some(LOG_TEXT_ANALYZER);
     }
     elected_default_analyzer(specs, fields)
 }
@@ -1297,7 +1315,7 @@ mod tests {
     fn code_analyzer_flag_elects_code_for_a_code_dataset_and_the_stemmer_defers() {
         let (specs, fields) = stemmer_electing_sample();
         assert_eq!(
-            elect_dataset_analyzer(&specs, &fields, true, CodeAnalyzer::Code),
+            elect_dataset_analyzer(&specs, &fields, true, CodeAnalyzer::Code, false),
             Some(CODE_TEXT_ANALYZER)
         );
     }
@@ -1308,12 +1326,38 @@ mod tests {
     fn code_analyzer_flag_leaves_a_dataset_without_code_on_todays_election() {
         let (specs, fields) = stemmer_electing_sample();
         assert_eq!(
-            elect_dataset_analyzer(&specs, &fields, false, CodeAnalyzer::Code),
+            elect_dataset_analyzer(&specs, &fields, false, CodeAnalyzer::Code, false),
             Some(STEMMING_TEXT_ANALYZER)
         );
         assert_eq!(
-            elect_dataset_analyzer(&[], &HashMap::new(), false, CodeAnalyzer::Code),
+            elect_dataset_analyzer(&[], &HashMap::new(), false, CodeAnalyzer::Code, false),
             None
+        );
+    }
+
+    /// #1504: log messages look like prose, so the ordinary election is
+    /// `"stemmer"`, which keeps stop words. A `match` of `"configuration is
+    /// invalid"` then hits every record that contains `is`. A log dataset
+    /// elects `"english"` (stemmer + the Lucene stop list) instead. A prose
+    /// dataset does not — that length-norm change stays off the global default.
+    #[test]
+    fn log_dataset_elects_english_so_stopwords_are_not_terms() {
+        let (specs, fields) = stemmer_electing_sample();
+        assert_eq!(
+            elected_default_analyzer(&specs, &fields),
+            Some(STEMMING_TEXT_ANALYZER),
+            "the same sample is the stemmer without the log flag — that is the bug"
+        );
+        assert_eq!(
+            elect_dataset_analyzer(&specs, &fields, false, CodeAnalyzer::Standard, true),
+            Some(LOG_TEXT_ANALYZER)
+        );
+        assert_eq!(LOG_TEXT_ANALYZER, "english");
+        // An explicit `--code-analyzer code` on a dataset that also holds
+        // code still wins: the operator asked for it.
+        assert_eq!(
+            elect_dataset_analyzer(&specs, &fields, true, CodeAnalyzer::Code, true),
+            Some(CODE_TEXT_ANALYZER)
         );
     }
 
@@ -1324,7 +1368,7 @@ mod tests {
         assert_eq!(CodeAnalyzer::default(), CodeAnalyzer::Standard);
         for has_code in [true, false] {
             assert_eq!(
-                elect_dataset_analyzer(&specs, &fields, has_code, CodeAnalyzer::Standard),
+                elect_dataset_analyzer(&specs, &fields, has_code, CodeAnalyzer::Standard, false),
                 elected_default_analyzer(&specs, &fields)
             );
         }
