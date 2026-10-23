@@ -4,7 +4,7 @@
 //! (The engine's dynamic mapping has NO date detection — verified — so
 //! autoindex is the date layer.)
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc, Weekday};
 
 /// Epoch windows: 1990-01-01 .. 2100-01-01
 pub const EPOCH_MS_MIN: i64 = 631_152_000_000;
@@ -22,6 +22,11 @@ pub enum DateEnc {
     Rfc2822,      // Tue, 01 Jul 2025 10:00:00 +0000
     EpochMillis,  // numeric
     EpochSeconds, // numeric
+    /// vsftpd/wu-ftpd `xferlog` current-time: `Fri Oct 16 09:06:58 2026`
+    /// (ctime: weekday, month, day, time, year). No zone, so UTC is assumed,
+    /// the same assumption as the other naive encodings. Declared ahead of
+    /// [`DateEnc::BsdSyslog`] because it carries a year.
+    Asctime,
     /// RFC 3164 timestamp: `Oct 17 22:26:01` / `Oct  5 09:06:58`. No year and
     /// no zone. Appended last so a tie still prefers every encoding above,
     /// which all carry a year.
@@ -39,6 +44,7 @@ impl DateEnc {
             DateEnc::Rfc2822 => "rfc2822",
             DateEnc::EpochMillis => "epoch-millis",
             DateEnc::EpochSeconds => "epoch-seconds",
+            DateEnc::Asctime => "asctime (Www Mmm dd hh:mm:ss yyyy, assumed UTC)",
             // The year is not in the stamp. It is the year of `now` unless
             // that reading is more than 24h in the future, in which case it
             // is the previous year (a December line read in January).
@@ -105,6 +111,9 @@ pub fn parse_date_str_at(s: &str, now: DateTime<Utc>) -> Option<(DateTime<Utc>, 
         if let Ok(dt) = DateTime::parse_from_rfc2822(t) {
             return Some((dt.with_timezone(&Utc), DateEnc::Rfc2822));
         }
+        if let Some(dt) = parse_asctime(t) {
+            return Some((dt, DateEnc::Asctime));
+        }
         if let Some(dt) = parse_bsd_syslog(t, now) {
             return Some((dt, DateEnc::BsdSyslog));
         }
@@ -132,6 +141,52 @@ fn english_month(name: &str) -> Option<u32> {
     })
 }
 
+/// `Www Mmm dd hh:mm:ss yyyy`, the whole string and nothing else. The weekday
+/// has to be the weekday of that civil date: a mismatched name is not a
+/// transfer-log stamp. No zone is present, so the instant is UTC.
+fn parse_asctime(t: &str) -> Option<DateTime<Utc>> {
+    let mut parts = t.split_whitespace();
+    let weekday = english_weekday(parts.next()?)?;
+    let month = english_month(parts.next()?)?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let year: i32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=31).contains(&day) || time.len() != 8 {
+        return None;
+    }
+    let (hour, minute, second) = hms(time)?;
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    if date.weekday() != weekday {
+        return None;
+    }
+    date.and_hms_opt(hour, minute, second)
+        .map(|ndt| Utc.from_utc_datetime(&ndt))
+}
+
+fn english_weekday(name: &str) -> Option<Weekday> {
+    Some(match name {
+        "Mon" => Weekday::Mon,
+        "Tue" => Weekday::Tue,
+        "Wed" => Weekday::Wed,
+        "Thu" => Weekday::Thu,
+        "Fri" => Weekday::Fri,
+        "Sat" => Weekday::Sat,
+        "Sun" => Weekday::Sun,
+        _ => return None,
+    })
+}
+
+fn hms(time: &str) -> Option<(u32, u32, u32)> {
+    let mut hm = time.split(':');
+    let hour: u32 = hm.next()?.parse().ok()?;
+    let minute: u32 = hm.next()?.parse().ok()?;
+    let second: u32 = hm.next()?.parse().ok()?;
+    if hm.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
 /// `Mmm dd hh:mm:ss` (day space-padded), the whole string and nothing else.
 /// Year: `now`'s UTC year, unless that instant is more than 24 hours ahead
 /// of `now`, in which case the previous year. A Feb 29 that is not a real
@@ -145,13 +200,7 @@ fn parse_bsd_syslog(t: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if parts.next().is_some() || !(1..=31).contains(&day) || time.len() != 8 {
         return None;
     }
-    let mut hm = time.split(':');
-    let hour: u32 = hm.next()?.parse().ok()?;
-    let minute: u32 = hm.next()?.parse().ok()?;
-    let second: u32 = hm.next()?.parse().ok()?;
-    if hm.next().is_some() {
-        return None;
-    }
+    let (hour, minute, second) = hms(time)?;
     let at = |year: i32| {
         NaiveDate::from_ymd_opt(year, month, day)?
             .and_hms_opt(hour, minute, second)
@@ -292,5 +341,28 @@ mod tests {
                 .1
                 != DateEnc::BsdSyslog
         );
+    }
+
+    /// #1504: vsftpd `xferlog` stamps the transfer as ctime (`Www Mmm dd
+    /// hh:mm:ss yyyy`). That string missed every encoding, so the column
+    /// mapped `keyword` and a time-range filter matched nothing. The weekday
+    /// has to be the real weekday of the date; a year-less RFC 3164 stamp
+    /// stays on the BSD path.
+    #[test]
+    fn xferlog_asctime_stamps_are_dates_and_a_wrong_weekday_is_not() {
+        let (dt, enc) = parse_date_str("Fri Oct 16 09:06:58 2026").unwrap();
+        assert_eq!(enc, DateEnc::Asctime);
+        assert_eq!(to_rfc3339_millis(&dt), "2026-10-16T09:06:58.000Z");
+
+        let (padded, enc) = parse_date_str("Mon Oct  5 09:06:58 2026").unwrap();
+        assert_eq!(enc, DateEnc::Asctime);
+        assert_eq!(to_rfc3339_millis(&padded), "2026-10-05T09:06:58.000Z");
+
+        // Oct 16 2026 is a Friday. Saturday is a different day.
+        assert!(parse_date_str("Sat Oct 16 09:06:58 2026").is_none());
+        // RFC 3164 has no weekday and no year. It must not become asctime.
+        let now = at(2026, 10, 17, 23, 0, 0);
+        let (_, enc) = parse_date_str_at("Oct 16 09:06:58", now).unwrap();
+        assert_eq!(enc, DateEnc::BsdSyslog);
     }
 }

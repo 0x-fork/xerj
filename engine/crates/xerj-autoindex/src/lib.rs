@@ -544,6 +544,17 @@ fn dataset_mapping_body(dataset: &PlanDataset, extra: &[infer::FieldSpec]) -> Va
     } else {
         create_body["settings"] = json!({"index.query.strict_unknown_fields": true});
     }
+    // #1504: log messages are searched as phrases. The english analyzer
+    // already drops `is`; an omitted `match` is still OR for the content
+    // words, so `SIP 403 Forbidden` hits every line that contains `SIP`.
+    // The engine reads this key in `Index::search` and fills an omitted
+    // operator with AND. An explicit `"operator": "or"` is left alone, and
+    // a non-log index never gets the key, so the ES default stays OR.
+    // The key lives here, beside `strict_unknown_fields`, and not in
+    // `build_mapping`: that value is hashed into the generation contract.
+    if dataset.family == "logs" {
+        create_body["settings"]["index.query.default_match_operator"] = json!("and");
+    }
     create_body
 }
 
@@ -3926,8 +3937,90 @@ mod phase_a_grouping_tests {
             Some(infer::LOG_TEXT_ANALYZER)
         );
         let names: Vec<&str> = logs[0].specs.iter().map(|s| s.name.as_str()).collect();
-        for field in ["ts", "host", "program", "message"] {
+        for field in ["ts", "host", "program", "message", "severity"] {
             assert!(names.contains(&field), "missing {field} in {names:?}");
+        }
+        let spec = |name: &str| {
+            logs[0]
+                .specs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        assert_eq!(spec("ts").es_type, "date", "a time window filters on ts");
+        assert_eq!(logs[0].time_field.as_deref(), Some("ts"));
+        assert_eq!(spec("host").es_type, "keyword", "a device filter is exact");
+        assert_eq!(spec("severity").es_type, "keyword");
+        let body = dataset_create_body(logs[0]);
+        assert_eq!(
+            body["settings"]["index.query.default_match_operator"],
+            json!("and"),
+            "an omitted match on a log index requires every token"
+        );
+    }
+
+    /// #1504: vsftpd `xferlog` was already one record per line, but its ctime
+    /// stamp (`Fri Oct 16 09:06:58 2026`) was not a date, so a time-range
+    /// filter on the transfer log matched nothing. A prose file does not
+    /// pick up the log match-operator default.
+    #[test]
+    fn xferlog_timestamp_maps_as_date_and_prose_does_not_default_match_to_and() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("xferlog"),
+            "Fri Oct 16 09:06:58 2026 1 10.0.0.7 4242 /uploads/fw.bin b _ o r admin ftp 0 * c\n\
+             Fri Oct 16 09:07:10 2026 2 10.0.0.8 10 /uploads/invalid.bin b _ o r admin ftp 0 * i\n\
+             Sat Oct 17 11:00:00 2026 0 10.0.0.9 0 /pub/README a C i a guest ftp 1 guest c\n\
+             Sun Oct 18 08:30:00 2026 4 10.0.0.7 100 /var/log/a.log b _ o r admin ftp 0 * c\n\
+             Mon Oct 19 09:06:58 2026 1 10.0.0.7 50 /uploads/cfg.xml b _ i r admin ftp 0 * c\n\
+             Tue Oct 20 09:06:58 2026 1 10.0.0.4 50 /uploads/cfg.xml b _ i r admin ftp 0 * c\n",
+        )
+        .unwrap();
+        let plan = plan_for(root);
+        let logs: Vec<_> = plan
+            .datasets
+            .iter()
+            .filter(|d| d.family == "logs")
+            .collect();
+        assert_eq!(
+            logs.len(),
+            1,
+            "{:?}",
+            plan.datasets.iter().map(|d| &d.family).collect::<Vec<_>>()
+        );
+        let ts = logs[0]
+            .specs
+            .iter()
+            .find(|s| s.name == "ts")
+            .expect("xferlog ts");
+        assert_eq!(ts.es_type, "date", "{ts:?}");
+        assert!(
+            ts.date_enc
+                .as_deref()
+                .is_some_and(|e| e.contains("asctime")),
+            "{ts:?}"
+        );
+        assert_eq!(logs[0].time_field.as_deref(), Some("ts"));
+        let host = logs[0].specs.iter().find(|s| s.name == "host").unwrap();
+        assert_eq!(host.es_type, "keyword");
+        assert_eq!(
+            dataset_create_body(logs[0])["settings"]["index.query.default_match_operator"],
+            json!("and")
+        );
+
+        let prose = tempfile::tempdir().unwrap();
+        std::fs::write(prose.path().join("README.md"), PROSE).unwrap();
+        let prose_plan = plan_for(prose.path());
+        assert!(!prose_plan.datasets.is_empty());
+        assert!(prose_plan.datasets.iter().all(|d| d.family != "logs"));
+        for dataset in &prose_plan.datasets {
+            assert!(
+                dataset_create_body(dataset)["settings"]
+                    .get("index.query.default_match_operator")
+                    .is_none(),
+                "a non-log index keeps match's OR default"
+            );
         }
     }
 

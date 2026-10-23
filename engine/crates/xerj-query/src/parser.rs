@@ -523,7 +523,9 @@ fn parse_match(params: &Value) -> Result<QueryNode> {
         return Ok(QueryNode::Match {
             field,
             query,
-            operator: BoolOperator::Or,
+            // No `operator` key exists in the shorthand. Log indices resolve
+            // this to AND (#1504); every other index treats it as OR.
+            operator: BoolOperator::Omitted,
             analyzer: None,
             boost: None,
             minimum_should_match: None,
@@ -544,7 +546,12 @@ fn parse_match(params: &Value) -> Result<QueryNode> {
         .get("query")
         .and_then(scalar_to_string)
         .ok_or_else(|| qerr("`match.query` must be a non-empty scalar"))?;
-    let operator = parse_bool_operator(vobj.get("operator"))?;
+    // Absent key → Omitted, not OR. An explicit "or" stays OR, including on
+    // a log index whose default is AND (#1504).
+    let operator = match vobj.get("operator") {
+        None => BoolOperator::Omitted,
+        some => parse_bool_operator(some)?,
+    };
     let analyzer = vobj
         .get("analyzer")
         .and_then(|v| v.as_str())
@@ -5239,7 +5246,7 @@ mod tests {
     fn test_match_shorthand() {
         let node = q(json!({"match": {"title": "hello world"}}));
         assert!(
-            matches!(node, QueryNode::Match { ref field, ref query, operator: BoolOperator::Or, .. }
+            matches!(node, QueryNode::Match { ref field, ref query, operator: BoolOperator::Omitted, .. }
             if field == "title" && query == "hello world")
         );
     }
@@ -5269,6 +5276,25 @@ mod tests {
             assert_eq!(analyzer, Some("english".to_string()));
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    /// #1504: a long-form `match` that leaves `operator` out is not the same
+    /// node as one that says `"operator": "or"`. The log-index default can
+    /// fill the gap; it must not override an explicit OR.
+    #[test]
+    fn match_without_an_operator_is_omitted_and_explicit_or_is_or() {
+        let omitted = q(json!({"match": {"message": {"query": "SIP 403 Forbidden"}}}));
+        match omitted {
+            QueryNode::Match { operator, .. } => assert_eq!(operator, BoolOperator::Omitted),
+            other => panic!("expected match, got {other:?}"),
+        }
+        let explicit = q(json!({
+            "match": {"message": {"query": "SIP 403 Forbidden", "operator": "or"}}
+        }));
+        match explicit {
+            QueryNode::Match { operator, .. } => assert_eq!(operator, BoolOperator::Or),
+            other => panic!("expected match, got {other:?}"),
         }
     }
 

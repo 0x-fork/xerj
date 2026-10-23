@@ -74,7 +74,7 @@ pub use error::{ParseError, QueryError, Result};
 pub use parser::{parse_query, parse_request};
 
 // Rewriter
-pub use rewriter::rewrite;
+pub use rewriter::{apply_default_match_operator, rewrite};
 
 // Planner
 pub use planner::{plan_query, ExecutionPlan};

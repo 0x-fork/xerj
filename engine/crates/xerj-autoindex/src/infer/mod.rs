@@ -894,6 +894,10 @@ impl CodeAnalyzer {
 /// of the query, and only for this family — the global default stays
 /// `"stemmer"` / `"standard"` because dropping stop words changes every
 /// document's BM25 length norm (#1059).
+///
+/// This does not change `match`'s operator. Content words are still OR
+/// unless the index also sets `index.query.default_match_operator` to
+/// `and`, which a logs dataset's create body does.
 pub const LOG_TEXT_ANALYZER: &str = "english";
 
 /// Dataset text analyzer. `log_dataset` elects [`LOG_TEXT_ANALYZER`];

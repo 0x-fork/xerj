@@ -20391,6 +20391,29 @@ impl Index {
     }
 
     /// Execute a search request against this index.
+    /// #1504. Autoindex writes `index.query.default_match_operator: and` on a
+    /// logs dataset so an omitted `match` requires every token. The key is
+    /// stored the way the create body sent it (a flat dotted key, or nested
+    /// under `index.query`). Any other value, including absence, keeps ES's
+    /// OR default.
+    fn match_operator_defaults_to_and(settings: &Value) -> bool {
+        let is_and = |v: &Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("and"));
+        if settings
+            .pointer("/index/query/default_match_operator")
+            .is_some_and(is_and)
+        {
+            return true;
+        }
+        [Some(settings), settings.get("index")]
+            .into_iter()
+            .flatten()
+            .any(|container| {
+                container
+                    .get("index.query.default_match_operator")
+                    .is_some_and(is_and)
+            })
+    }
+
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         use crate::collection_publication::ReadAdmission;
 
@@ -20500,6 +20523,22 @@ impl Index {
                 savings: None,
             }
         };
+        // #1504: a logs index resolves an omitted match operator to AND
+        // before the cache key is hashed, so a cached page cannot be the OR
+        // hit list. Indices without the setting keep the request as parsed
+        // (Omitted executes as OR). Explicit `"operator": "or"` is untouched.
+        let default_match_and = {
+            let settings = self.settings.read().await;
+            Self::match_operator_defaults_to_and(&settings)
+        };
+        let rewritten = if default_match_and {
+            let mut owned = request.clone();
+            xerj_query::apply_default_match_operator(&mut owned, xerj_query::BoolOperator::And);
+            Some(owned)
+        } else {
+            None
+        };
+        let request = rewritten.as_ref().unwrap_or(request);
         // M3 framework: response cache.  Hash the request shape and the
         // current dataset version; on a hit return the cloned `Arc<SearchResult>`
         // immediately, skipping the semaphore, search_inner, locks, and
@@ -47884,15 +47923,18 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
                 }
                 let need = match operator {
                     xerj_query::ast::BoolOperator::And => q_tokens.len(),
-                    xerj_query::ast::BoolOperator::Or => match minimum_should_match {
-                        None => 1,
-                        Some(MinShouldMatch::Fixed(n)) => *n as usize,
-                        Some(MinShouldMatch::Percentage(pct)) => {
-                            ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
-                                .max(1)
+                    // Omitted is OR until a log index rewrites it (#1504).
+                    xerj_query::ast::BoolOperator::Or | xerj_query::ast::BoolOperator::Omitted => {
+                        match minimum_should_match {
+                            None => 1,
+                            Some(MinShouldMatch::Fixed(n)) => *n as usize,
+                            Some(MinShouldMatch::Percentage(pct)) => {
+                                ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
+                                    .max(1)
+                            }
+                            Some(other) => other.required(q_tokens.len()).unwrap_or(1),
                         }
-                        Some(other) => other.required(q_tokens.len()).unwrap_or(1),
-                    },
+                    }
                 };
                 let raw_values: Vec<String> = match get_field_value(source, field) {
                     Some(Value::String(value)) => vec![value],
@@ -48006,17 +48048,21 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
             // so the threshold applies across the union.
             let need: usize = match operator {
                 xerj_query::ast::BoolOperator::And => q_tokens.len(),
-                xerj_query::ast::BoolOperator::Or => match minimum_should_match {
-                    None => 1,
-                    Some(MinShouldMatch::Fixed(n)) => *n as usize,
-                    Some(MinShouldMatch::Percentage(pct)) => {
-                        ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize).max(1)
+                // Omitted is OR until a log index rewrites it (#1504).
+                xerj_query::ast::BoolOperator::Or | xerj_query::ast::BoolOperator::Omitted => {
+                    match minimum_should_match {
+                        None => 1,
+                        Some(MinShouldMatch::Fixed(n)) => *n as usize,
+                        Some(MinShouldMatch::Percentage(pct)) => {
+                            ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
+                                .max(1)
+                        }
+                        // #846: negative / negative-% / combination resolve against
+                        // the token count; terms_set field/script counts aren't
+                        // valid on a plain match, so degrade those to OR (need 1).
+                        Some(other) => other.required(q_tokens.len()).unwrap_or(1),
                     }
-                    // #846: negative / negative-% / combination resolve against
-                    // the token count; terms_set field/script counts aren't
-                    // valid on a plain match, so degrade those to OR (need 1).
-                    Some(other) => other.required(q_tokens.len()).unwrap_or(1),
-                },
+                }
             };
             let count_matched = |field_tokens: &[String]| -> usize {
                 q_tokens
@@ -62280,6 +62326,137 @@ mod exact_scan_hydration_tests {
         assert!(
             drained.load(std::sync::atomic::Ordering::SeqCst),
             "on_drained must fire on the empty-shard fast path"
+        );
+    }
+}
+
+/// #1504: a logs index's omitted `match` requires every token. The same
+/// query on an index without the setting stays ES's OR, and an explicit
+/// `"operator": "or"` on the logs index stays OR too.
+#[cfg(test)]
+mod log_match_operator_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("message", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn english() -> Value {
+        json!({"analysis": {"analyzer": {"default": {"type": "english"}}}})
+    }
+
+    async fn index_lines(idx: &Index, lines: &[(&str, &str)]) {
+        idx.abort_background_tasks();
+        for (id, message) in lines {
+            idx.index_document(Some((*id).to_string()), json!({"message": message}))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn hit_ids(result: &SearchResult) -> Vec<String> {
+        let mut ids: Vec<String> = result.hits.iter().map(|hit| hit.id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    const LINES: &[(&str, &str)] = &[
+        ("sip-only", "SIP engine not registered"),
+        ("forbidden", "SIP/2.0 403 Forbidden"),
+        ("is-only", "device is online"),
+        ("both-words", "invalid configuration detected"),
+    ];
+
+    #[test]
+    fn the_setting_is_read_from_a_flat_key_or_a_nested_object() {
+        assert!(Index::match_operator_defaults_to_and(&json!({
+            "index.query.default_match_operator": "and"
+        })));
+        assert!(Index::match_operator_defaults_to_and(&json!({
+            "index": {"query": {"default_match_operator": "AND"}}
+        })));
+        assert!(!Index::match_operator_defaults_to_and(&json!({
+            "analysis": {"analyzer": {"default": {"type": "english"}}}
+        })));
+        assert!(!Index::match_operator_defaults_to_and(&json!({
+            "index.query.default_match_operator": "or"
+        })));
+    }
+
+    #[tokio::test]
+    async fn a_log_index_match_requires_every_token_and_a_plain_index_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+
+        let mut logs_settings = english();
+        logs_settings["index.query.default_match_operator"] = json!("and");
+        engine
+            .create_index_with_settings("logs", message_schema(), logs_settings)
+            .unwrap();
+        engine
+            .create_index_with_settings("plain", message_schema(), english())
+            .unwrap();
+        let logs = engine.get_index("logs").unwrap();
+        let plain = engine.get_index("plain").unwrap();
+        index_lines(&logs, LINES).await;
+        index_lines(&plain, LINES).await;
+
+        let sip = xerj_query::parse_request(&json!({
+            "query": {"match": {"message": "SIP 403 Forbidden"}},
+            "size": 10
+        }))
+        .unwrap();
+        let sip_or = xerj_query::parse_request(&json!({
+            "query": {"match": {"message": {"query": "SIP 403 Forbidden", "operator": "or"}}},
+            "size": 10
+        }))
+        .unwrap();
+
+        // Memtable path (operator AND is a stored scan) and the flushed FTS
+        // path must agree: a line that only says SIP is not the phrase.
+        for idx in [&logs, &plain] {
+            let before = hit_ids(&idx.search(&sip).await.unwrap());
+            idx.flush().await.unwrap();
+            let after = hit_ids(&idx.search(&sip).await.unwrap());
+            assert_eq!(before, after, "flush must not change the hit set");
+        }
+        assert_eq!(
+            hit_ids(&logs.search(&sip).await.unwrap()),
+            vec!["forbidden".to_string()],
+            "SIP 403 Forbidden must not hit a line that only contains SIP"
+        );
+        assert_eq!(
+            hit_ids(&logs.search(&sip_or).await.unwrap()),
+            vec!["forbidden".to_string(), "sip-only".to_string()],
+            "an explicit operator or still matches any token"
+        );
+        let plain_hits = hit_ids(&plain.search(&sip).await.unwrap());
+        assert!(
+            plain_hits.contains(&"sip-only".to_string())
+                && plain_hits.contains(&"forbidden".to_string()),
+            "without the setting, match stays OR: {plain_hits:?}"
+        );
+
+        let phrase = xerj_query::parse_request(&json!({
+            "query": {"match": {"message": "configuration is invalid"}},
+            "size": 10
+        }))
+        .unwrap();
+        assert_eq!(
+            hit_ids(&logs.search(&phrase).await.unwrap()),
+            vec!["both-words".to_string()],
+            "is is not a term, and the other two words must both be present"
+        );
+        assert!(
+            !hit_ids(&plain.search(&phrase).await.unwrap()).contains(&"is-only".to_string()),
+            "the english analyzer already drops is, on a non-log index too"
         );
     }
 }

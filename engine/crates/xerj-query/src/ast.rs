@@ -33,6 +33,16 @@ pub enum BoolOperator {
     Or,
     /// All tokens must match.
     And,
+    /// The request did not name an operator. Execution treats this as [`Or`]
+    /// unless the index sets `index.query.default_match_operator` to `and`
+    /// (#1504, log datasets). Not a wire value: the parser produces it only
+    /// when the `operator` key is absent, and [`crate::apply_default_match_operator`]
+    /// resolves it before a log index runs the query. An explicit `"or"` stays
+    /// [`Or`], so a caller can still ask for the ES default on a log index.
+    ///
+    /// Serde's missing-field default stays [`Or`]. A deserialized AST that
+    /// never went through the parser must not grow this variant.
+    Omitted,
 }
 
 /// Determines how scores are combined for `MultiMatch` queries.
