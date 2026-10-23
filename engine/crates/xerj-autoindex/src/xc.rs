@@ -241,6 +241,9 @@ const CORPUS_USAGE: &str =
 
 a flag may precede the verb (xerj corpus --url URL index <name>);
 clone the repos, detect licences, write corpora/<name>/corpus.json;
+a repo entry may set 'paths' to relative directories (for example data/osv)
+and the checkout harvests only those; omit it to harvest the whole pin, and
+the list is written back into corpus.json;
 a local checkout's root .xerjignore is copied into the clone when it differs
 from the committed file (git clone drops an untracked or uncommitted one);
 a pinned --from rebuild stays exact and does not copy it, and says so;
@@ -317,23 +320,72 @@ pub(crate) fn git_fetch_failure(sha: &str, output: &str) -> String {
 
 /// Move a clone to `sha` (shallow). Never a shell string: the sha comes from
 /// an untrusted manifest, and `Command` passes it as ONE argv element.
+/// An empty `paths` list checks out the whole pin — every caller that is not
+/// a subpath harvest.
 pub(crate) fn checkout_at_sha(target: &Path, url: &str, sha: &str) -> Result<()> {
-    if !target.join(".git").exists() {
-        std::fs::create_dir_all(target)?;
-        git(Some(target), &["init", "--quiet"])?;
-        git(Some(target), &["remote", "add", "origin", url]).ok();
-        git(Some(target), &["config", "remote.origin.promisor", "true"]).ok();
-        git(
-            Some(target),
-            &["config", "remote.origin.partialclonefilter", "blob:none"],
-        )
-        .ok();
+    checkout_at_sha_paths(target, url, sha, &[])
+}
+
+/// [`checkout_at_sha`] that harvests only `paths` when the list is non-empty
+/// (#1842). `paths` is validated again here: this is the function that turns
+/// the strings into a git argv.
+pub(crate) fn checkout_at_sha_paths(
+    target: &Path,
+    url: &str,
+    sha: &str,
+    paths: &[String],
+) -> Result<()> {
+    ensure_pin_origin(target, url)?;
+    fetch_pin(target, sha)?;
+    // Refuse a path the pin does not contain BEFORE the sparse rules change
+    // the worktree. A typo must not delete the previous checkout.
+    confirm_paths_are_trees(target, sha, paths)?;
+    apply_sparse_limit(target, paths)?;
+    checkout_pin(target, sha)?;
+    git(Some(target), &["clean", "-qfd"]).ok();
+    confirm_paths_materialized(target, paths)?;
+    Ok(())
+}
+
+/// The worktree is already at `sha`. Apply or clear the subpath limit without
+/// fetching again. A re-run of a manifest that gained `paths` narrows a
+/// previous whole-repo checkout; a re-run that dropped `paths` restores it.
+pub(crate) fn limit_checked_out_pin(target: &Path, sha: &str, paths: &[String]) -> Result<()> {
+    confirm_paths_are_trees(target, sha, paths)?;
+    let was_sparse = sparse_checkout_enabled(target);
+    apply_sparse_limit(target, paths)?;
+    if !paths.is_empty() || was_sparse {
+        git(Some(target), &["clean", "-qfd"]).ok();
     }
+    confirm_paths_materialized(target, paths)?;
+    Ok(())
+}
+
+fn ensure_pin_origin(target: &Path, url: &str) -> Result<()> {
+    if target.join(".git").exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    git(Some(target), &["init", "--quiet"])?;
+    git(Some(target), &["remote", "add", "origin", url]).ok();
+    git(Some(target), &["config", "remote.origin.promisor", "true"]).ok();
+    git(
+        Some(target),
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    )
+    .ok();
+    Ok(())
+}
+
+fn fetch_pin(target: &Path, sha: &str) -> Result<()> {
     match git(Some(target), &["fetch", "--depth", "1", "origin", sha]) {
-        Ok((0, _)) => {}
+        Ok((0, _)) => Ok(()),
         Ok((_, output)) => anyhow::bail!("{}", git_fetch_failure(sha, &output)),
         Err(e) => anyhow::bail!("{}", git_fetch_failure(sha, &e.to_string())),
     }
+}
+
+fn checkout_pin(target: &Path, sha: &str) -> Result<()> {
     let co = git(
         Some(target),
         &["checkout", "--quiet", "--force", "--detach", sha],
@@ -341,8 +393,123 @@ pub(crate) fn checkout_at_sha(target: &Path, url: &str, sha: &str) -> Result<()>
     if !co.map(|(rc, _)| rc == 0).unwrap_or(false) {
         anyhow::bail!("git checkout {sha} failed");
     }
-    git(Some(target), &["clean", "-qfd"]).ok();
     Ok(())
+}
+
+/// `git()` glues stderr onto stdout. Object types and config values are one
+/// word on stdout; a fetch warning on stderr must not change the word.
+/// Stderr is returned separately so a failed command can still quote git.
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<(i32, String, String)> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.first().unwrap_or(&"")))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+fn sparse_checkout_enabled(target: &Path) -> bool {
+    match git_stdout(
+        target,
+        &[
+            "config",
+            "--get",
+            "--default",
+            "false",
+            "core.sparseCheckout",
+        ],
+    ) {
+        Ok((0, out, _)) => out.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Limit the worktree to `paths`, or clear a previous limit.
+///
+/// Cone mode is the wrong shape here. `git sparse-checkout set --cone
+/// data/osv` also materializes every file in ancestor directories (the
+/// licence, the module file, the root tests). `corpus index` walks whatever
+/// is on disk, and those extra files are how a "subpath" harvest still
+/// becomes another dataset. Non-cone pattern `/{path}/` is the directory and
+/// everything under it, and not a sibling whose name merely starts with the
+/// same prefix (`data/osv-extra`). Git 2.43 accepts `--no-cone`. If a future
+/// git removes it, this fails closed instead of cloning the whole pin.
+fn apply_sparse_limit(target: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        if !sparse_checkout_enabled(target) {
+            return Ok(());
+        }
+        let (rc, out) = git(Some(target), &["sparse-checkout", "disable"])?;
+        if rc != 0 {
+            anyhow::bail!("git sparse-checkout disable failed: {out}");
+        }
+        return Ok(());
+    }
+    for path in paths {
+        xccode::pathgate::valid_sparse_path(path).map_err(anyhow::Error::msg)?;
+    }
+    let patterns: Vec<String> = paths.iter().map(|path| format!("/{path}/")).collect();
+    let mut args: Vec<&str> = vec!["sparse-checkout", "set", "--no-cone", "--"];
+    for pattern in &patterns {
+        args.push(pattern);
+    }
+    let (rc, out) = git(Some(target), &args)?;
+    if rc != 0 {
+        anyhow::bail!(
+            "git sparse-checkout set failed for {}: {out}",
+            paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn confirm_paths_are_trees(target: &Path, sha: &str, paths: &[String]) -> Result<()> {
+    for path in paths {
+        let spec = format!("{sha}:{path}");
+        match git_stdout(target, &["cat-file", "-t", &spec]) {
+            Ok((0, out, _)) => {
+                let kind = out.split_whitespace().next().unwrap_or("");
+                if kind != "tree" {
+                    anyhow::bail!(
+                        "paths entry '{path}' is a {kind} at {sha}, not a directory. \
+                         Name the directory to harvest (for example \"data/osv\")"
+                    );
+                }
+            }
+            Ok((_, _, err)) => anyhow::bail!(
+                "paths entry '{path}' is not a directory at {sha}. The pin has no \
+                 such tree, so nothing was checked out. git: {err}"
+            ),
+            Err(e) => anyhow::bail!("could not inspect '{path}' at {sha}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn confirm_paths_materialized(target: &Path, paths: &[String]) -> Result<()> {
+    for path in paths {
+        if !target.join(path).is_dir() {
+            anyhow::bail!(
+                "sparse checkout did not materialize '{path}'. The pin lists that \
+                 directory, but the worktree does not contain it"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn paths_note(paths: &[String]) -> String {
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!(" (only {})", paths.join(", "))
+    }
 }
 
 fn dir_stats(target: &Path) -> (String, u64, u64) {
@@ -524,6 +691,15 @@ fn resolve_corpus_name(
         })
 }
 
+/// One repo `corpus add` will materialize. `paths` empty means the whole pin.
+struct CorpusSource {
+    repo: String,
+    url: String,
+    sha: String,
+    declared: String,
+    paths: Vec<String>,
+}
+
 fn run_corpus_add(args: &[String]) -> i32 {
     let mut name: Option<String> = None;
     let mut as_name: Option<String> = None;
@@ -656,15 +832,15 @@ fn run_corpus_add(args: &[String]) -> i32 {
     // no explicit <name>/--as, the manifest's own 'corpus' field supplies
     // it. Everything downstream (dest, carry, entries) needs the resolved
     // name, so resolution lives here and nowhere else. The pin's query
-    // hints (#1254) ride beside the tuple rather than inside it — a
+    // hints (#1254) ride beside the rows rather than inside them — a
     // three-slot tuple tripped clippy's type_complexity on the pinned
-    // CI toolchain.
+    // CI toolchain. `paths` (#1842) stays on the row: it is per repo.
     let mut pin_query: Option<manifest::QueryHints> = None;
     // repo -> (sha, review) from the hub pin: a human's licence review of the
     // repo at that sha, recorded when the checkout lands there (#1893).
     let mut pin_reviews: std::collections::HashMap<String, (String, Value)> =
         std::collections::HashMap::new();
-    let (name, rows): (String, Vec<(String, String, String, String)>) = if let Some(path) = &from {
+    let (name, rows): (String, Vec<CorpusSource>) = if let Some(path) = &from {
         let hub = match manifest::read_hub_manifest(Path::new(path)) {
             Ok(h) => h,
             Err(e) => {
@@ -690,7 +866,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
             resolved,
             hub.rows
                 .into_iter()
-                .map(|r| (r.repo, r.url, r.sha, r.declared_licence))
+                .map(|r| CorpusSource {
+                    repo: r.repo,
+                    url: r.url,
+                    sha: r.sha,
+                    declared: r.declared_licence,
+                    paths: r.paths,
+                })
                 .collect(),
         )
     } else {
@@ -709,7 +891,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
                         .unwrap_or("")
                         .trim_end_matches(".git")
                         .to_string();
-                    (repo, u.clone(), String::new(), String::new())
+                    CorpusSource {
+                        repo,
+                        url: u.clone(),
+                        sha: String::new(),
+                        declared: String::new(),
+                        paths: Vec::new(),
+                    }
                 })
                 .collect(),
         )
@@ -765,7 +953,14 @@ fn run_corpus_add(args: &[String]) -> i32 {
     let mut entries: Vec<manifest::ManifestRepo> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
-    for (repo_name, url, sha, declared) in rows {
+    for source in rows {
+        let CorpusSource {
+            repo: repo_name,
+            url,
+            sha,
+            declared,
+            paths,
+        } = source;
         // The one destructive step (checkout --force + clean -fd) runs inside
         // this path: gate the name HERE, again, even though read_hub_manifest
         // already did — the plain-URL arm has no other gate.
@@ -775,6 +970,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
             continue;
         }
         let target = dest.join(&repo_name);
+        let note = paths_note(&paths);
         // After the checkout exists and before the manifest counts files.
         // A pin warns instead of copying; an unpinned local path copies.
         let carry_ignore = |checkout: &Path| {
@@ -795,28 +991,61 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 .filter(|(rc, _)| *rc == 0)
                 .map(|(_, out)| out);
             if at.as_deref() == Some(sha.as_str()) {
+                // HEAD matching the pin is not the harvest. A previous run
+                // may have checked out the whole repo; `paths` still has to
+                // narrow it, and a manifest that dropped `paths` has to
+                // widen it back.
+                if let Err(e) = limit_checked_out_pin(&target, &sha, &paths) {
+                    eprintln!("  [FAIL] {repo_name}: {e:#}; continuing");
+                    skipped.push(repo_name);
+                    continue;
+                }
                 println!(
-                    "  [ok] {repo_name} already at {}",
+                    "  [ok] {repo_name} already at {}{note}",
                     &sha[..12.min(sha.len())]
                 );
                 carry_ignore(&target);
-                record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+                record(
+                    &mut entries,
+                    &repo_name,
+                    &url,
+                    &target,
+                    &declared,
+                    &paths,
+                    &carry,
+                );
                 continue;
             }
-            println!("  [pin] {repo_name} -> {}", &sha[..12.min(sha.len())]);
-            if let Err(e) = checkout_at_sha(&target, &url, &sha) {
+            println!("  [pin] {repo_name} -> {}{note}", &sha[..12.min(sha.len())]);
+            if let Err(e) = checkout_at_sha_paths(&target, &url, &sha, &paths) {
                 eprintln!("  [FAIL] {repo_name}: {e:#}; continuing");
                 skipped.push(repo_name);
                 continue;
             }
             carry_ignore(&target);
-            record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+            record(
+                &mut entries,
+                &repo_name,
+                &url,
+                &target,
+                &declared,
+                &paths,
+                &carry,
+            );
             continue;
         }
         if target.join(".git").exists() {
             println!("  [skip] {repo_name} already cloned");
             carry_ignore(&target);
-            record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+            record(
+                &mut entries,
+                &repo_name,
+                &url,
+                &target,
+                &declared,
+                &paths,
+                &carry,
+            );
             continue;
         }
         println!("  [clone] {repo_name}");
@@ -839,15 +1068,23 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 }
             }
         } else {
-            println!("  [pin] {repo_name} -> {}", &sha[..12.min(sha.len())]);
-            if let Err(e) = checkout_at_sha(&target, &url, &sha) {
+            println!("  [pin] {repo_name} -> {}{note}", &sha[..12.min(sha.len())]);
+            if let Err(e) = checkout_at_sha_paths(&target, &url, &sha, &paths) {
                 eprintln!("  [FAIL] {repo_name}: {e:#}; continuing");
                 skipped.push(repo_name);
                 continue;
             }
         }
         carry_ignore(&target);
-        record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+        record(
+            &mut entries,
+            &repo_name,
+            &url,
+            &target,
+            &declared,
+            &paths,
+            &carry,
+        );
     }
 
     if entries.is_empty() {
@@ -856,10 +1093,10 @@ fn run_corpus_add(args: &[String]) -> i32 {
     }
 
     // Regenerated FROM DISK, never copied through from the input — except
-    // the pin's query hints (#1254), which are author DECLARATION, not
-    // derived state: they travel from the hub pin into the corpus.json the
-    // clone writes, so a re-clone cannot silently drop the corpus's
-    // retrieval posture.
+    // the pin's query hints (#1254) and per-repo `paths` (#1842), which are
+    // author DECLARATION, not derived state: they travel from the hub pin
+    // into the corpus.json the clone writes, so a re-clone cannot silently
+    // drop the corpus's retrieval posture or widen a subpath harvest.
     let cloned_at = chrono_now_stamp();
     let manifest_path = dest.join("corpus.json");
     manifest::write_corpus_manifest_kind(
@@ -1184,6 +1421,7 @@ fn add_pack_materialize(
             files: Some(*counts.get(&s.slug).unwrap_or(&0)),
             bytes: Some(bytes),
             review: None,
+            paths: Vec::new(),
         });
     }
     manifest::write_corpus_manifest_kind(
@@ -1203,6 +1441,7 @@ fn record(
     url: &str,
     target: &Path,
     declared: &str,
+    paths: &[String],
     carry: &dyn Fn(&str, &str) -> Option<Value>,
 ) {
     let lic = xccode::licence::detect_licence(target);
@@ -1246,6 +1485,7 @@ fn record(
         files: Some(files),
         bytes: Some(bytes),
         review,
+        paths: paths.to_vec(),
     });
 }
 
@@ -3746,6 +3986,7 @@ precedence = ["a", "b"]
                 files: None,
                 bytes: None,
                 review: None,
+                paths: Vec::new(),
             }],
             None,
         );
@@ -4022,6 +4263,211 @@ precedence = ["a", "b"]
         assert!(
             !pinned.join(".xerjignore").exists(),
             "a pinned rebuild stays at the recorded sha and does not copy the working tree's .xerjignore"
+        );
+    }
+
+    fn worktree_files(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn write_pin(path: &Path, url: &str, sha: &str, paths: Option<&[&str]>) {
+        let mut repo = json!({
+            "repo": "vulndb",
+            "url": url,
+            "licence": "BSD-3-Clause",
+            "sha": sha,
+        });
+        if let Some(paths) = paths {
+            repo["paths"] = json!(paths);
+        }
+        std::fs::write(
+            path,
+            json!({ "corpus": "sparse-demo", "repos": [repo] }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// #1842: `paths` harvests only those directories. A whole-repo pin of
+    /// golang/vulndb indexed ~1.2M docs; the documented corpus is the
+    /// `data/osv` advisory tree. Cone mode would also leave ancestor files
+    /// (LICENSE, go tests) for `corpus index` to ingest, so the checkout is
+    /// the directory itself. Re-adding the same pin narrows a previous full
+    /// checkout, and dropping `paths` restores it.
+    #[test]
+    fn corpus_add_from_paths_harvests_only_those_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let origin = home.path().join("origin");
+        init_committed_repo(
+            &origin,
+            &[
+                ("LICENSE", "bsd\n"),
+                ("data/osv/GO-1.json", "{}\n"),
+                ("data/osv/sub/n.json", "{}\n"),
+                ("data/osv-extra/nope.json", "{}\n"),
+                ("data/reports/R.yaml", "id: 1\n"),
+                ("cmd/main.go", "package main\n"),
+            ],
+        );
+        let sha = head_sha(&origin);
+        let url = origin.display().to_string();
+        let manifest = home.path().join("pin.json");
+        let checkout = home.path().join("corpora/sparse-demo/vulndb");
+
+        write_pin(&manifest, &url, &sha, None);
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0,
+            "a pin with no paths still harvests the whole repo"
+        );
+        assert_eq!(
+            worktree_files(&checkout),
+            vec![
+                "LICENSE".to_string(),
+                "cmd/main.go".to_string(),
+                "data/osv-extra/nope.json".to_string(),
+                "data/osv/GO-1.json".to_string(),
+                "data/osv/sub/n.json".to_string(),
+                "data/reports/R.yaml".to_string(),
+            ]
+        );
+
+        write_pin(&manifest, &url, &sha, Some(&["data/osv"]));
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0,
+            "re-adding the same sha with paths must narrow the existing checkout"
+        );
+        assert_eq!(
+            worktree_files(&checkout),
+            vec![
+                "data/osv/GO-1.json".to_string(),
+                "data/osv/sub/n.json".to_string(),
+            ]
+        );
+        let recorded =
+            manifest::read_corpus_manifest(&home.path().join("corpora/sparse-demo/corpus.json"))
+                .unwrap();
+        assert_eq!(recorded.repos[0].paths, vec!["data/osv".to_string()]);
+        assert_eq!(
+            recorded.repos[0].files,
+            Some(2),
+            "the manifest counts the harvested files, not the rest of the pin"
+        );
+        let shared =
+            manifest::read_hub_manifest(&home.path().join("corpora/sparse-demo/corpus.json"))
+                .unwrap();
+        assert_eq!(shared.rows[0].paths, vec!["data/osv".to_string()]);
+
+        // Idempotent: a second limited add does not bring the siblings back.
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0
+        );
+        assert_eq!(worktree_files(&checkout).len(), 2);
+
+        write_pin(&manifest, &url, &sha, Some(&["data/osv", "cmd"]));
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0
+        );
+        assert_eq!(
+            worktree_files(&checkout),
+            vec![
+                "cmd/main.go".to_string(),
+                "data/osv/GO-1.json".to_string(),
+                "data/osv/sub/n.json".to_string(),
+            ]
+        );
+
+        write_pin(&manifest, &url, &sha, None);
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0,
+            "dropping paths restores the whole pin"
+        );
+        assert!(checkout.join("data/reports/R.yaml").is_file());
+        assert!(checkout.join("LICENSE").is_file());
+        assert!(manifest::read_corpus_manifest(
+            &home.path().join("corpora/sparse-demo/corpus.json")
+        )
+        .unwrap()
+        .repos[0]
+            .paths
+            .is_empty());
+    }
+
+    /// A path the pin does not contain, and a path that escapes the repo,
+    /// must not materialize the rest of the tree.
+    #[test]
+    fn corpus_add_from_paths_refuses_a_missing_or_escaping_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let origin = home.path().join("origin");
+        init_committed_repo(
+            &origin,
+            &[("LICENSE", "bsd\n"), ("data/reports/R.yaml", "id: 1\n")],
+        );
+        let sha = head_sha(&origin);
+        let url = origin.display().to_string();
+        let manifest = home.path().join("pin.json");
+        write_pin(&manifest, &url, &sha, Some(&["data/nope"]));
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            1
+        );
+        let checkout = home.path().join("corpora/sparse-demo/vulndb");
+        assert!(
+            !home.path().join("corpora/sparse-demo/corpus.json").exists(),
+            "a failed harvest must not record a corpus"
+        );
+        assert!(
+            !checkout.join("LICENSE").exists(),
+            "a missing paths entry must not fall back to a full checkout"
+        );
+        assert!(!checkout.join("data/reports/R.yaml").exists());
+
+        std::fs::write(
+            &manifest,
+            json!({
+                "corpus": "escape-demo",
+                "repos": [{
+                    "repo": "vulndb",
+                    "url": url,
+                    "sha": sha,
+                    "paths": ["../secret"]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            2
+        );
+        assert!(
+            !home.path().join("corpora/escape-demo").exists(),
+            "an escaping paths entry is refused before any directory is created"
         );
     }
 }

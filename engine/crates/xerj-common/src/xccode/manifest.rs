@@ -34,6 +34,12 @@ pub struct ManifestRepo {
     /// match — a human's licence review must survive a re-index.
     #[serde(default)]
     pub review: Option<Value>,
+    /// Directories this checkout harvested (`data/osv`). Empty means the
+    /// whole pin. Author declaration, like [`CorpusManifest::query`]: it is
+    /// written back so a shared `corpus.json` rebuilds the same limited
+    /// tree. Absent on every historical manifest.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,8 +132,10 @@ pub fn licence_map(root: &Path, corpus: &str) -> HashMap<String, String> {
 }
 
 /// One repo entry as the writer emits it. Compact, key order pinned
-/// (`repo,url,licence,sha,files,bytes[,review]`) — byte-identical to the
-/// script's hand-built line so existing manifests diff clean against new ones.
+/// (`repo,url,licence,sha,files,bytes[,paths][,review]`) — byte-identical to
+/// the script's hand-built line so existing manifests diff clean against new
+/// ones. `paths` is omitted when empty, which is every manifest written
+/// before a subpath harvest existed.
 fn entry_json(repo: &ManifestRepo) -> String {
     let mut m = Map::new();
     m.insert("repo".into(), Value::String(repo.repo.clone()));
@@ -139,6 +147,9 @@ fn entry_json(repo: &ManifestRepo) -> String {
     }
     if let Some(b) = repo.bytes {
         m.insert("bytes".into(), Value::from(b));
+    }
+    if !repo.paths.is_empty() {
+        m.insert("paths".into(), Value::from(repo.paths.clone()));
     }
     if let Some(r) = &repo.review {
         m.insert("review".into(), r.clone());
@@ -217,6 +228,9 @@ pub struct HubRow {
     /// repo at `sha`). `xerj corpus add` records it in the cloned corpus.json
     /// when the checkout lands at that same sha (#1893).
     pub review: Option<Value>,
+    /// Repo-relative directories to harvest. Empty harvests the whole pin
+    /// (#1842). Already validated by [`read_hub_manifest`].
+    pub paths: Vec<String>,
 }
 
 /// A whole validated hub manifest: the corpus name plus its rows. The
@@ -229,6 +243,47 @@ pub struct HubManifest {
     pub rows: Vec<HubRow>,
     /// The pin's `query` block (#1254), carried into the cloned corpus.json.
     pub query: Option<QueryHints>,
+}
+
+/// `paths` on one repo entry. Absent harvests the whole pin. Present must be
+/// a non-empty array of relative directories — a string or an empty array is
+/// a mistake, not a request for the whole repo, and is refused so a typo
+/// cannot silently clone everything (#1842).
+fn read_sparse_paths(repo: &str, row: &Value) -> Result<Vec<String>, String> {
+    let Some(raw) = row.get("paths") else {
+        return Ok(Vec::new());
+    };
+    let Some(arr) = raw.as_array() else {
+        return Err(format!(
+            "repo '{repo}': 'paths' must be a non-empty array of relative directories \
+             such as [\"data/osv\"]; omit the field to harvest the whole pin"
+        ));
+    };
+    if arr.is_empty() {
+        return Err(format!(
+            "repo '{repo}': 'paths' is empty; omit the field to harvest the whole pin, \
+             or name at least one directory"
+        ));
+    }
+    if arr.len() > pathgate::MAX_SPARSE_PATHS {
+        return Err(format!(
+            "repo '{repo}': 'paths' has {} entries; at most {} directories can be \
+             sparse-checked out. Name a parent directory instead.",
+            arr.len(),
+            pathgate::MAX_SPARSE_PATHS
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(text) = entry.as_str() else {
+            return Err(format!("repo '{repo}': 'paths' entries must be strings"));
+        };
+        let path = pathgate::valid_sparse_path(text).map_err(|e| format!("repo '{repo}': {e}"))?;
+        if !out.iter().any(|seen: &String| seen == &path) {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 /// Parse and VALIDATE a hub manifest (`--from`). Untrusted input rules from
@@ -278,6 +333,7 @@ pub fn read_hub_manifest(path: &Path) -> Result<HubManifest, String> {
         pathgate::valid_repo_name(repo).map_err(|e| format!("{}: {e}", path.display()))?;
         let sha = r.get("sha").and_then(Value::as_str).unwrap_or("");
         pathgate::valid_sha(repo, sha).map_err(|e| format!("{}: {e}", path.display()))?;
+        let paths = read_sparse_paths(repo, r).map_err(|e| format!("{}: {e}", path.display()))?;
         out.push(HubRow {
             repo: repo.to_string(),
             url: url.to_string(),
@@ -288,6 +344,7 @@ pub fn read_hub_manifest(path: &Path) -> Result<HubManifest, String> {
                 .unwrap_or("")
                 .to_string(),
             review: r.get("review").filter(|v| v.is_object()).cloned(),
+            paths,
         });
     }
     Ok(HubManifest {
@@ -319,6 +376,7 @@ mod tests {
             files: Some(912),
             bytes: Some(1_234_567),
             review: Some(review.clone()),
+            paths: Vec::new(),
         }];
         write_corpus_manifest(&path, "kv", "2026-08-06T12:00:00Z", &repos);
         let text = std::fs::read_to_string(&path).unwrap();
@@ -347,6 +405,7 @@ mod tests {
             files: Some(2),
             bytes: Some(512),
             review: None,
+            paths: Vec::new(),
         }];
         write_corpus_manifest_kind(&path, "rust-vulns", Some("harvested"), "t", &repos, None);
         let text = std::fs::read_to_string(&path).unwrap();
@@ -386,6 +445,7 @@ mod tests {
                     files: None,
                     bytes: None,
                     review: None,
+                    paths: Vec::new(),
                 },
                 ManifestRepo {
                     repo: "sonic".into(),
@@ -395,6 +455,7 @@ mod tests {
                     files: None,
                     bytes: None,
                     review: None,
+                    paths: Vec::new(),
                 },
             ],
         );
@@ -431,6 +492,7 @@ mod tests {
                 files: None,
                 bytes: None,
                 review: hub.rows[0].review.clone(),
+                paths: Vec::new(),
             }],
             None,
         );
@@ -512,6 +574,7 @@ mod tests {
             files: None,
             bytes: None,
             review: None,
+            paths: Vec::new(),
         }];
         // No hints: byte-for-byte the historical pinned format (the
         // round-trip test above pins the exact bytes; here the absence).
@@ -625,6 +688,103 @@ mod tests {
         .unwrap();
         let err = read_hub_manifest(&pin).unwrap_err();
         assert!(err.contains("query"), "{err}");
+    }
+
+    /// #1842: a repo-pin can name the directories to harvest. The field is
+    /// per repo, normalized, and written back so a shared corpus.json rebuilds
+    /// the same limited tree. A bad value is refused here, before git runs.
+    #[test]
+    fn hub_paths_are_normalized_written_back_and_refused_when_unsafe() {
+        let dir = tmp();
+        let pin = dir.join("go-vulndb.json");
+        let sha = "5cd8418cf9c867d344fda07a73ea844b0f34bca2";
+        std::fs::write(
+            &pin,
+            json!({
+                "corpus": "go-vulndb",
+                "repos": [{
+                    "repo": "corpus-go-vulndb-osv",
+                    "url": "https://github.com/golang/vulndb",
+                    "sha": sha,
+                    "paths": ["data/osv/", "data/osv", "cmd"]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let hub = read_hub_manifest(&pin).unwrap();
+        assert_eq!(
+            hub.rows[0].paths,
+            vec!["data/osv".to_string(), "cmd".to_string()]
+        );
+
+        let repos = vec![ManifestRepo {
+            repo: "corpus-go-vulndb-osv".into(),
+            url: "https://github.com/golang/vulndb".into(),
+            licence: "BSD-3-Clause".into(),
+            sha: sha.into(),
+            files: Some(2),
+            bytes: Some(40),
+            review: None,
+            paths: hub.rows[0].paths.clone(),
+        }];
+        let written = dir.join("corpus.json");
+        write_corpus_manifest(&written, "go-vulndb", "t", &repos);
+        let text = std::fs::read_to_string(&written).unwrap();
+        assert!(text.contains("\"paths\":[\"data/osv\",\"cmd\"]"), "{text}");
+        assert!(text.find("\"paths\"").unwrap() < text.find("}").unwrap());
+        let back = read_hub_manifest(&written).unwrap();
+        assert_eq!(back.rows[0].paths, hub.rows[0].paths);
+        // A manifest with no paths field is the historical whole-pin harvest.
+        std::fs::write(
+            &pin,
+            json!({
+                "corpus": "go-vulndb",
+                "repos": [{ "repo": "corpus-go-vulndb-osv", "url": "u", "sha": sha }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(read_hub_manifest(&pin).unwrap().rows[0].paths.is_empty());
+
+        for (body, needle) in [
+            (
+                json!({ "corpus": "go-vulndb", "repos": [{ "repo": "r", "url": "u", "sha": sha, "paths": "data/osv" }] }),
+                "must be a non-empty array",
+            ),
+            (
+                json!({ "corpus": "go-vulndb", "repos": [{ "repo": "r", "url": "u", "sha": sha, "paths": [] }] }),
+                "paths' is empty",
+            ),
+            (
+                json!({ "corpus": "go-vulndb", "repos": [{ "repo": "r", "url": "u", "sha": sha, "paths": ["../secret"] }] }),
+                "escapes the repository",
+            ),
+            (
+                json!({ "corpus": "go-vulndb", "repos": [{ "repo": "r", "url": "u", "sha": sha, "paths": ["/etc"] }] }),
+                "is absolute",
+            ),
+            (
+                json!({ "corpus": "go-vulndb", "repos": [{ "repo": "r", "url": "u", "sha": sha, "paths": ["data/osv/*"] }] }),
+                "glob",
+            ),
+        ] {
+            std::fs::write(&pin, body.to_string()).unwrap();
+            let err = read_hub_manifest(&pin).unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?} in {err}");
+        }
+        let too_many: Vec<String> = (0..33).map(|i| format!("d{i}")).collect();
+        std::fs::write(
+            &pin,
+            json!({
+                "corpus": "go-vulndb",
+                "repos": [{ "repo": "r", "url": "u", "sha": sha, "paths": too_many }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = read_hub_manifest(&pin).unwrap_err();
+        assert!(err.contains("at most 32"), "{err}");
     }
 
     fn find_repo_root() -> std::path::PathBuf {

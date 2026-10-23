@@ -119,6 +119,79 @@ pub fn valid_repo_name(repo: &str) -> Result<(), String> {
     ))
 }
 
+/// How many directories one repo entry may name. A harvest is a few
+/// subtrees (`data/osv`), not a file list; past this, name a parent.
+pub const MAX_SPARSE_PATHS: usize = 32;
+
+/// Validate one `paths` entry from an untrusted hub manifest and return the
+/// normalized directory (`data/osv`, no leading or trailing slash).
+///
+/// The entry becomes a non-cone sparse-checkout pattern `/{path}/`. That
+/// pattern is gitignore syntax, so a glob, a negation, or `..` is not a
+/// directory name — it is an instruction. Reject those before git sees them.
+/// An absolute path is rejected rather than stripped: stripping `/etc` into
+/// `etc` would harvest a different directory than the one the manifest named.
+pub fn valid_sparse_path(raw: &str) -> Result<String, String> {
+    let reject = |why: &str| {
+        Err(format!(
+            "'paths' entry {raw:?} {why}. Name a relative directory such as \
+             \"data/osv\"; omit 'paths' to harvest the whole pin"
+        ))
+    };
+    if raw.chars().any(|c| c.is_control()) {
+        return reject("contains a control character");
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return reject("is empty");
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return reject("is absolute");
+    }
+    let mut chars = trimmed.chars();
+    if matches!(
+        (chars.next(), chars.next()),
+        (Some(c), Some(':')) if c.is_ascii_alphabetic()
+    ) {
+        return reject("is absolute");
+    }
+    if trimmed.contains('\\') {
+        return reject("contains a backslash");
+    }
+    let body = trimmed.trim_end_matches('/');
+    if body.is_empty() {
+        return reject("is empty");
+    }
+    if body.len() > 240 {
+        return reject("is longer than 240 bytes");
+    }
+    let mut parts = Vec::new();
+    for component in body.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return reject("escapes the repository");
+        }
+        if component.starts_with('-') {
+            return reject("must not start a path component with '-'");
+        }
+        if component.contains(':') {
+            // `git cat-file <sha>:<path>` treats the first colon as the
+            // separator, so a colon in the directory name is not a path.
+            return reject("contains ':'");
+        }
+        if component
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '[' | ']' | '!' | '#'))
+        {
+            return reject("contains a glob or gitignore pattern character");
+        }
+        if component.chars().any(|c| c.is_whitespace()) {
+            return reject("contains whitespace");
+        }
+        parts.push(component);
+    }
+    Ok(parts.join("/"))
+}
+
 /// Validate a pinned sha: full 40 lowercase hex.
 ///
 /// A short sha is not fetchable from a remote (`git fetch --depth 1 origin
@@ -230,5 +303,39 @@ mod tests {
         assert!(valid_sha("ClickHouse", &ok.to_uppercase()).is_ok());
         assert!(valid_sha("x", &format!("{ok}1")).is_err(), "41 chars");
         assert!(valid_sha("x", "zzz").is_err());
+    }
+
+    #[test]
+    fn sparse_paths_are_relative_directories_and_nothing_else() {
+        assert_eq!(valid_sparse_path("data/osv").unwrap(), "data/osv");
+        assert_eq!(valid_sparse_path("  data/osv/ ").unwrap(), "data/osv");
+        assert_eq!(valid_sparse_path("docs").unwrap(), "docs");
+        for bad in [
+            "",
+            " ",
+            "/",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "C:/Windows",
+            "..",
+            "../secret",
+            "data/../../etc",
+            "data//osv",
+            "data/./osv",
+            "data/osv/*",
+            "data/osv/**",
+            "data:osv",
+            "!",
+            "#only",
+            "-rf",
+            "data/osv extra",
+            "data/osv\ncmd",
+        ] {
+            let err = valid_sparse_path(bad).unwrap_err();
+            assert!(
+                err.contains("relative directory"),
+                "{bad:?} should be rejected with the reason: {err}"
+            );
+        }
     }
 }
