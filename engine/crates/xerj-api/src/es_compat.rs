@@ -23019,6 +23019,41 @@ fn apply_one_update_stmt(source: &mut Value, stmt: &str, params: &Value) -> Resu
 // POST /{index}/_refresh
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One `_shards.failures` entry for `_refresh`, in selector order. The first
+/// failure's HTTP status becomes the response status (ES
+/// `BaseBroadcastResponse::getStatus`).
+fn record_refresh_failure(
+    failures: &mut Vec<Value>,
+    response_status: &mut StatusCode,
+    name: &str,
+    rendered: Value,
+) {
+    let status = rendered
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|code| StatusCode::from_u16(code as u16).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if failures.is_empty() {
+        *response_status = status;
+    }
+    let reason = rendered
+        .pointer("/error/root_cause/0")
+        .or_else(|| rendered.pointer("/error"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
+    let status_name = status
+        .canonical_reason()
+        .unwrap_or("Internal Server Error")
+        .to_ascii_uppercase()
+        .replace([' ', '-'], "_");
+    failures.push(json!({
+        "shard": 0,
+        "index": name,
+        "status": status_name,
+        "reason": reason,
+    }));
+}
+
 pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -23031,39 +23066,42 @@ pub async fn refresh_index(
     let mut successful = 0u64;
     let mut failures = Vec::new();
     let mut response_status = StatusCode::OK;
-    // #1635: `Index::flush` bounds both flush admission and the caller-visible
-    // wait. One stuck index returns an error naming that index; this loop
-    // records it under `_shards.failures` and continues, so the refresh of
-    // the other indices in the pattern is not parked behind it.
-    for (name, idx) in &handles {
-        match idx.flush().await {
+    // #2234: `_refresh` makes writes searchable. It is not `_flush`.
+    // `Index::flush` also runs verified WAL maintenance (snapshot fsync and
+    // prune). That work shares the disk with a background segment merge, and
+    // this handler used to await it one index at a time — a wildcard refresh
+    // sat behind the first busy index for the whole flush budget, which is
+    // what stalled autoindex finalize. `Index::refresh` publishes an
+    // unflushed memtable and returns immediately when that memtable is
+    // already empty (#1635 still bounds a memtable that does have to be
+    // published). The indices run together, so a healthy index is searchable
+    // while a busy one is still inside its own budget. Results are collected
+    // in selector order: the first failure still sets the HTTP status.
+    let mut tasks = Vec::with_capacity(handles.len());
+    for (name, idx) in handles {
+        let task_name = name.clone();
+        tasks.push((
+            name,
+            tokio::spawn(async move { (task_name, idx.refresh().await) }),
+        ));
+    }
+    for (name, task) in tasks {
+        let (name, result) = match task.await {
+            Ok(pair) => pair,
+            Err(error) => {
+                let rendered = ApiError::new(xerj_common::XerjError::internal(format!(
+                    "index [{name}] refresh task failed: {error}"
+                )))
+                .into_value();
+                record_refresh_failure(&mut failures, &mut response_status, &name, rendered);
+                continue;
+            }
+        };
+        match result {
             Ok(()) => successful += 1,
             Err(error) => {
                 let rendered = ApiError::new(xerj_common::XerjError::from(error)).into_value();
-                let status = rendered
-                    .get("status")
-                    .and_then(Value::as_u64)
-                    .and_then(|code| StatusCode::from_u16(code as u16).ok())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                if failures.is_empty() {
-                    response_status = status;
-                }
-                let reason = rendered
-                    .pointer("/error/root_cause/0")
-                    .or_else(|| rendered.pointer("/error"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
-                let status_name = status
-                    .canonical_reason()
-                    .unwrap_or("Internal Server Error")
-                    .to_ascii_uppercase()
-                    .replace([' ', '-'], "_");
-                failures.push(json!({
-                    "shard": 0,
-                    "index": name,
-                    "status": status_name,
-                    "reason": reason,
-                }));
+                record_refresh_failure(&mut failures, &mut response_status, &name, rendered);
             }
         }
     }

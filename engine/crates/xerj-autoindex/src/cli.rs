@@ -622,7 +622,8 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20PHASES, in order. Every long step is a phase of its own, so a line\n\
          \x20\x20\x20\x20that still says `scan` at 100% means scan — not indexing:\n\
          \x20\x20\x20\x20\x20\x20default (graph) path: walk, hash, scan, prepare, graph, index,\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20graph-corpus, finalize-refresh, finalize-count,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20graph-corpus, finalize-refresh (one refresh per dataset,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20the in-flight index named), finalize-count,\n\
          \x20\x20\x20\x20\x20\x20\x20\x20finalize-correlate, finalize-histogram, finalize-catalog\n\
          \x20\x20\x20\x20\x20\x20--no-graph path:      walk, hash, scan, prepare (install mappings),\n\
          \x20\x20\x20\x20\x20\x20\x20\x20snapshot (seal + extract, bytes), index (sealed bulk bytes, the\n\

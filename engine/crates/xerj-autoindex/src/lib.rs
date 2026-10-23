@@ -10293,30 +10293,43 @@ fn run_index_report_inner(
     // countable before each loop starts, so it is reported like any other
     // phase — split into named sub-phases because the mix of one-shot refreshes
     // and per-dataset round trips has no single honest denominator.
-    pr.phase("finalize-refresh", 1 + graph.is_some() as u64, 0);
-    // #1635: a refresh that never returns used to sit here at items=0 with
-    // no error (`rate=unknown`). The server now fails the stuck index by
-    // name. Swallowing that (`.ok()`) turned the failure back into a green
-    // run whose documents were not all refreshed.
-    let pattern = format!("{}-*", cfg.prefix);
-    es.refresh(&pattern).map_err(|error| {
-        anyhow::anyhow!(
-            "finalize-refresh of {pattern} failed: {error:#}. The server names the index that \
-             did not refresh; documents already written stay indexed and rerunning the same \
-             command resumes"
-        )
-    })?;
-    pr.item_done(0);
+    // #2234: one wildcard `POST /{prefix}-*/_refresh` made this phase a single
+    // request with denominator 1. The server refreshed the matches one index
+    // at a time, so a large index with a segment merge in progress held the
+    // whole call (and this phase printed nothing until it returned). Refresh
+    // each index this run wrote, name it on the bar while the request is in
+    // flight, and do not retry a timeout five more times. The server refreshes
+    // a multi-index target concurrently; one index here is one request so the
+    // wait, if there is one, is that index's own budget.
+    pr.phase(
+        "finalize-refresh",
+        plan.datasets.len() as u64 + graph.is_some() as u64,
+        0,
+    );
+    let mut refresh_failures: Vec<String> = Vec::new();
+    for dataset in &plan.datasets {
+        let _waiting = pr.file(&dataset.index, 0);
+        if let Err(error) = es.refresh_once(&dataset.index) {
+            refresh_failures.push(format!("{}: {error:#}", dataset.index));
+        }
+    }
     // The dot-prefixed edges index is outside the {prefix}-* pattern.
     if let Some(gr) = &graph {
-        es.refresh(&gr.edges_index).map_err(|error| {
-            anyhow::anyhow!(
-                "finalize-refresh of {} failed: {error:#}. Documents already written stay \
-                 indexed and rerunning the same command resumes",
-                gr.edges_index
-            )
-        })?;
-        pr.item_done(0);
+        let _waiting = pr.file(&gr.edges_index, 0);
+        if let Err(error) = es.refresh_once(&gr.edges_index) {
+            refresh_failures.push(format!("{}: {error:#}", gr.edges_index));
+        }
+    }
+    if !refresh_failures.is_empty() {
+        // #1635: swallowing a refresh failure (`.ok()`) turned it back into a
+        // green run whose documents were not all refreshed. Name every index
+        // that did not refresh. Documents already written stay indexed.
+        anyhow::bail!(
+            "finalize-refresh failed for {} index(es): {}. Documents already written stay \
+             indexed and rerunning the same command resumes",
+            refresh_failures.len(),
+            refresh_failures.join(" | ")
+        );
     }
 
     // live per-dataset counts + time ranges (every claim traces to a run)
