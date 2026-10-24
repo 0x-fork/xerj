@@ -1593,9 +1593,11 @@ apply; if it does not, YOU are the gate — estimate, ask, and only then run.
     see it on an older binary, check `_count` before you conclude the run is hung.
   * `pct` AND `eta_s` ARE HONEST OR ABSENT. Both can be the literal string `unknown` (JSON
     `null`) — before a denominator exists, before the estimate has settled, or when nothing
-    has completed recently (`eta_quality=stalled`, meaning one big file is still
-    streaming). Never invent a number to fill the gap; report `waiting_on` instead, which
-    names the file it is actually on.
+    has completed recently (`eta_quality=stalled`). That includes a phase sitting at
+    0/N — under 2% used to stay `eta_quality=unknown` for the whole hang — and a phase
+    with no denominator that has been silent for 10 minutes. A short walk at
+    `pct=unknown` is not a stall. Never invent a number to fill the gap; report
+    `waiting_on` instead, which names the file it is actually on.
   * PERCENT IS BYTES-BASED, NOT FILE-BASED. `items=250/251` with `pct=1.9` is normal and
     correct: in that measured corpus one 34.6 MB file held 98% of the bytes. A file-count
     percent would have claimed 99.6% and then sat there.

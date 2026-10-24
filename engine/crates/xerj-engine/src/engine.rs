@@ -30,7 +30,11 @@ use crate::{EngineError, Result};
 // tier, dozens of indices under their own flush line but over the 2 GiB
 // summed-memtable budget, indexed count stuck at 0). The sampler requests
 // a DRAIN on either latch: flush every index, release rebuildable caches,
-// purge allocator pages.
+// purge allocator pages. The latches do not share a timer. RSS uses
+// [`crate::governor::MemoryDrainSchedule`], which doubles its spacing up to
+// 15 minutes when a drain does not lower RSS (#1981). The summed-memtable
+// latch keeps the fixed 2 s window (#2238): that flush is what lets corpus
+// index move, and a stable RSS must not stretch it.
 
 /// Minimum spacing between automatic drains while the breaker stays engaged.
 /// The engage edge always fires immediately; repeats are rate-limited so a
@@ -38,15 +42,20 @@ use crate::{EngineError, Result};
 /// reads) without the drain worker competing with ingest for every tick.
 const MEMORY_DRAIN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Whether this sampler tick should ask the drain worker to run (#948, #2238).
+/// Whether this sampler tick should ask the drain worker to run on the fixed
+/// window (#948, #2238).
 ///
-/// `needs_drain` is [`crate::governor::ResourceGovernor::ingest_pressure_needs_drain`]:
-/// the RSS latch or the summed-memtable latch. A memtable-only trip used to
-/// return false here, so a multi-index ingest that had filled the auto tier's
-/// 2 GiB memtable budget kept receiving HTTP 429 with nothing flushed and the
+/// The sampler passes the summed-memtable latch. A memtable-only trip used to
+/// be ignored, so a multi-index ingest that had filled the auto tier's 2 GiB
+/// memtable budget kept receiving HTTP 429 with nothing flushed and the
 /// indexed count stayed at 0. The engage edge fires immediately; while the
 /// latch stays up, repeats wait `min_interval`. Releasing the latch clears
 /// the timer so the next engage drains at once.
+///
+/// The RSS latch does not use this function. A drain that cannot shrink RSS
+/// backs off ([`crate::governor::MemoryDrainSchedule`], #1981). Applying that
+/// backoff to the memtable latch would stall corpus index while RSS sits
+/// still, which is the normal shape of a memtable-only trip.
 fn pressure_drain_due(
     needs_drain: bool,
     last_drain_at: &mut Option<std::time::Instant>,
@@ -65,6 +74,32 @@ fn pressure_drain_due(
         *last_drain_at = Some(now);
     }
     due
+}
+
+/// Whether this sample should request one drain for either parent latch.
+///
+/// RSS and the summed-memtable budget each keep their own clock. A flat RSS
+/// backs off ([`crate::governor::MemoryDrainSchedule`]); memtable pressure
+/// stays on [`MEMORY_DRAIN_MIN_INTERVAL`], including when the RSS clock is
+/// already stretched. One `true` is one request — the channel coalesces a
+/// second — so a staggered engage can ask slightly sooner than one window,
+/// and neither latch waits out the other's gap.
+fn sample_drain_due(
+    now: std::time::Instant,
+    rss: u64,
+    rss_engaged: bool,
+    memtable_engaged: bool,
+    rss_drains: &mut crate::governor::MemoryDrainSchedule,
+    last_memtable_drain_at: &mut Option<std::time::Instant>,
+) -> bool {
+    let rss_due = rss_drains.observe(now, rss, rss_engaged);
+    let memtable_due = pressure_drain_due(
+        memtable_engaged,
+        last_memtable_drain_at,
+        now,
+        MEMORY_DRAIN_MIN_INTERVAL,
+    );
+    rss_due || memtable_due
 }
 
 /// Bounded request channel from the sampler thread to the drain worker.
@@ -4381,10 +4416,16 @@ impl Engine {
                 period_ms = crate::governor::SAMPLE_INTERVAL_MS,
                 "memory/disk sampler thread started (parent circuit breaker)"
             );
-            // #948 drain bookkeeping: None while the breaker is
-            // disengaged (so the next engage edge fires immediately),
-            // Some(last-drain) while engaged (rate-limited repeats).
-            let mut last_drain_at: Option<std::time::Instant> = None;
+            // Two clocks (#948). RSS backs off when a drain does not lower
+            // it (#1981). The summed-memtable latch stays on the 2 s window
+            // (#2238), including while that RSS clock is already stretched:
+            // a stable RSS is the normal shape of a memtable-only trip, and
+            // backing off there leaves corpus index at 429 with nothing
+            // flushed. try_send never blocks, so Thread A's no-lock contract
+            // still holds.
+            let mut rss_drains =
+                crate::governor::MemoryDrainSchedule::new(MEMORY_DRAIN_MIN_INTERVAL);
+            let mut last_memtable_drain_at: Option<std::time::Instant> = None;
             loop {
                 std::thread::sleep(period);
                 if weak_a.strong_count() == 0 {
@@ -4402,19 +4443,17 @@ impl Engine {
                 let (disk_pct, disk_avail) = crate::governor::disk_used_pct_and_avail(&data_dir);
                 governor.refresh_memory_observing(observed, disk_pct, disk_avail, available_commit);
 
-                // Issue #948 / #2238 — a breaker that only rejects never lets
-                // a memory-pinned workload finish: caches hold gigabytes of
-                // re-hydratable state and the memtable holds raw write
-                // payloads, and 429s free none of it. Request a drain on the
-                // engage edge of EITHER parent latch (RSS or summed memtable)
-                // and at most once per window while it stays engaged.
-                // try_send never blocks, so Thread A's no-lock/no-block
-                // contract above still holds.
-                if pressure_drain_due(
-                    governor.ingest_pressure_needs_drain(),
-                    &mut last_drain_at,
+                if sample_drain_due(
                     std::time::Instant::now(),
-                    MEMORY_DRAIN_MIN_INTERVAL,
+                    // Same figure the breaker just compared: working set, or
+                    // on Windows the max of working set and commit charge.
+                    // Backing off on the working set alone would stretch
+                    // drains while commit charge is the value still climbing.
+                    observed,
+                    governor.memory_breaker_engaged(),
+                    governor.memtable_breaker_engaged(),
+                    &mut rss_drains,
+                    &mut last_memtable_drain_at,
                 ) {
                     if let Some(tx) = MEMORY_DRAIN_TX.get() {
                         let _ = tx.try_send(());
@@ -6109,12 +6148,14 @@ mod index_template_merge_tests {
 
 #[cfg(test)]
 mod pressure_drain_tests {
-    use super::pressure_drain_due;
+    use super::{pressure_drain_due, sample_drain_due, MEMORY_DRAIN_MIN_INTERVAL};
+    use crate::governor::MemoryDrainSchedule;
     use std::time::{Duration, Instant};
 
     /// #2238: the engage edge drains immediately, a still-engaged latch does
     /// not drain again inside the window, and releasing the latch arms the
-    /// next engage. `needs_drain` is the governor's memtable-or-RSS predicate.
+    /// next engage. The sampler passes the memtable latch; the RSS latch
+    /// has its own schedule.
     #[test]
     fn pressure_drain_fires_on_the_engage_edge_and_respects_the_window() {
         let mut last = None;
@@ -6141,6 +6182,106 @@ mod pressure_drain_tests {
         assert!(
             pressure_drain_due(true, &mut last, t0 + Duration::from_secs(3), window),
             "the next engage drains immediately"
+        );
+    }
+
+    /// #1981 x #2238: a flat RSS backs off, and that backoff must not hide a
+    /// memtable trip. Corpus index hits the summed budget while RSS is
+    /// stable; the flush that frees it stays on the 2 s window. A memtable
+    /// engage that arrives during an RSS gap drains on that sample, not at
+    /// the end of the gap.
+    #[test]
+    fn memtable_pressure_is_not_stretched_by_the_rss_backoff() {
+        let min = MEMORY_DRAIN_MIN_INTERVAL;
+        let t0 = Instant::now();
+        let stuck = 64 * 1024 * 1024;
+        let mut rss_drains = MemoryDrainSchedule::new(min);
+        let mut last_memtable = None;
+
+        let mut rss_fires = 0u32;
+        let mut t = Duration::ZERO;
+        let warmup = Duration::from_secs(60);
+        while t < warmup {
+            if sample_drain_due(
+                t0 + t,
+                stuck,
+                true,
+                false,
+                &mut rss_drains,
+                &mut last_memtable,
+            ) {
+                rss_fires += 1;
+            }
+            t += min;
+        }
+        assert!(
+            rss_fires < 20,
+            "a flat RSS must back off across 60s, fired {rss_fires}"
+        );
+        assert!(
+            !sample_drain_due(
+                t0 + warmup,
+                stuck,
+                true,
+                false,
+                &mut rss_drains,
+                &mut last_memtable,
+            ),
+            "the RSS clock is still inside its backed-off gap"
+        );
+        assert!(
+            sample_drain_due(
+                t0 + warmup,
+                stuck,
+                true,
+                true,
+                &mut rss_drains,
+                &mut last_memtable,
+            ),
+            "a memtable engage drains immediately during that gap"
+        );
+        assert!(!sample_drain_due(
+            t0 + warmup + Duration::from_millis(500),
+            stuck,
+            true,
+            true,
+            &mut rss_drains,
+            &mut last_memtable,
+        ));
+        assert!(sample_drain_due(
+            t0 + warmup + min,
+            stuck,
+            true,
+            true,
+            &mut rss_drains,
+            &mut last_memtable,
+        ));
+
+        // Memtable only, RSS stable and disengaged: every 2 s step fires.
+        // Folding this latch into the RSS backoff would drop fires well
+        // below the step count.
+        let mut rss_drains = MemoryDrainSchedule::new(min);
+        let mut last_memtable = None;
+        let horizon = Duration::from_secs(120);
+        let mut mem_fires = 0u32;
+        let mut t = Duration::ZERO;
+        while t < horizon {
+            if sample_drain_due(
+                t0 + t,
+                stuck,
+                false,
+                true,
+                &mut rss_drains,
+                &mut last_memtable,
+            ) {
+                mem_fires += 1;
+            }
+            t += min;
+        }
+        let steps = (horizon.as_secs() / min.as_secs()) as u32;
+        assert_eq!(
+            mem_fires, steps,
+            "memtable pressure keeps the fixed window while RSS does not fall"
         );
     }
 }
