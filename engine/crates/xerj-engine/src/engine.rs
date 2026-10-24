@@ -1128,6 +1128,10 @@ impl Engine {
                                 Engine::apply_date_mapping_flags(&idx, m.value());
                             }
                             engine.load_or_backfill_index_created_at(&name_str);
+                            // Before the index is visible: a write that lands
+                            // in the same instant must already see the
+                            // persisted default pipeline (#2294).
+                            engine.rehydrate_index_settings_from_disk(&name_str);
                             engine.indices.insert(name_str, idx);
                         }
                         Err(e) => {
@@ -1720,6 +1724,54 @@ impl Engine {
                 file: path.display().to_string(),
                 reason: format!("{e} ({} bytes on disk)", bytes.len()),
             }),
+        }
+    }
+
+    /// Copy `<data_dir>/<name>/settings.json` into `index_settings`.
+    ///
+    /// Create and `PUT /_settings` fill that map, and [`Self::default_pipeline_for`]
+    /// reads only the map. `GET /_settings` falls back to the file when the
+    /// entry is missing, so after a restart the binding was still reported
+    /// and ordinary writes no longer ran it (#2294). Boot, failed-index
+    /// retry, and snapshot restore all open an existing index through
+    /// `Index::open` and must rebuild the map from the same file `open` loaded.
+    ///
+    /// A missing file, or a JSON `null`, drops any stale entry: restoring a
+    /// snapshot that was created without settings must not keep the pipeline
+    /// the previous index had in memory. An unreadable or unparseable file is
+    /// logged and left as-is. `Index::open` already refuses an unparseable
+    /// `settings.json` before this runs, so a parse error here is a change
+    /// between those two reads, not a second copy of that refusal.
+    fn rehydrate_index_settings_from_disk(&self, name: &str) {
+        let path = self.data_dir.join(name).join("settings.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(settings) if !settings.is_null() => {
+                    self.index_settings.insert(name.to_string(), settings);
+                }
+                Ok(_) => {
+                    self.index_settings.remove(name);
+                }
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "settings.json did not parse while rebuilding index settings; \
+                         leaving the in-memory binding unchanged"
+                    );
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.index_settings.remove(name);
+            }
+            Err(e) => {
+                warn!(
+                    name,
+                    error = %e,
+                    "settings.json unreadable while rebuilding index settings; \
+                     leaving the in-memory binding unchanged"
+                );
+            }
         }
     }
 
@@ -3426,6 +3478,7 @@ impl Engine {
                 if let Some(m) = self.index_mappings.get(name) {
                     Engine::apply_date_mapping_flags(&idx, m.value());
                 }
+                self.rehydrate_index_settings_from_disk(name);
                 self.indices.insert(name.to_string(), idx);
                 self.failed_indices.remove(name);
                 info!(name, "failed index reopened");
@@ -4455,9 +4508,11 @@ impl Engine {
             return Some(p);
         }
         // A write that auto-creates the index resolves the pipeline before
-        // that create (#2281). The template's default applies only then: an
-        // index that already exists keeps whatever it was created with, even
-        // when this in-memory map was not rehydrated after a restart.
+        // that create (#2281). The template's default applies only then.
+        // An index that already exists keeps the pipeline persisted in its
+        // `settings.json`, which boot, retry, and snapshot restore copy back
+        // into this map (#2294). Falling through to the template would attach
+        // a pipeline the index was not created with.
         if self.indices.contains_key(index) || self.failed_indices.contains_key(index) {
             return None;
         }
@@ -4963,6 +5018,9 @@ impl Engine {
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
+                    // Replace whatever the live map held. A snapshot created
+                    // without settings must not keep the previous binding.
+                    self.rehydrate_index_settings_from_disk(idx_name);
                     self.indices.insert(idx_name.clone(), idx);
                     // Restoring from a snapshot is *the* repair for an index
                     // that failed to open, so clear the recorded failure —

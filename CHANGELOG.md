@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An existing index's persisted `index.default_pipeline` runs again after a
+  clean restart. `GET /_settings` still reported the binding, and the
+  pipeline definition was still there, but an ordinary document write no
+  longer copied the field: the in-memory binding was filled on create and
+  on settings update, and opening the index from disk did not rebuild it.
+  Boot, a failed-index retry, and snapshot restore now copy `settings.json`
+  back into that map. Explicit `?pipeline=` was already unaffected
+  ([#2294](https://github.com/xerj-org/xerj/issues/2294)).
+
 - `xerj autoindex` no longer aborts the node on one large JSON file (#1122).
   A bulk whose analysis would cross the memory watermark is rejected with
   HTTP 429 before the documents are parsed, so several in-flight bulks cannot

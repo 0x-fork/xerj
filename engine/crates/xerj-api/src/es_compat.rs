@@ -2975,10 +2975,11 @@ async fn get_index_inner(
 ///
 /// Two fixes over replaying the display map alone (#1092):
 ///
-/// * The display map (`engine.index_settings`) lives in memory only, so after a
-///   restart it is empty and every create-time setting vanished from the
-///   response. A live index with no display entry falls back to its persisted
-///   `settings.json` copy — what the index was created with.
+/// * The display map (`engine.index_settings`) is rebuilt from each index's
+///   `settings.json` when that index is opened (#2294). A live index whose
+///   display entry is still missing falls back to the same file — what the
+///   index was created with — so `GET /_settings` and `default_pipeline_for`
+///   agree.
 /// * `analysis` is reported from the engine, not echoed: whatever spelling the
 ///   caller used (`settings.analysis` beside an `index` block was dropped
 ///   outright), the response carries `index.analysis` = the block the index's
