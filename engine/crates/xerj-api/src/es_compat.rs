@@ -25110,6 +25110,98 @@ pub struct AliasAction {
 pub struct AliasActionParams {
     pub index: String,
     pub alias: String,
+    /// `POST /_aliases` carries the same per-alias metadata `PUT
+    /// /{index}/_alias/{name}` does. These used to be missing from this struct,
+    /// so serde silently discarded them and a filtered alias created through
+    /// the standard action API exposed every document.
+    #[serde(default)]
+    pub filter: Option<Value>,
+    #[serde(default)]
+    pub routing: Option<Value>,
+    #[serde(default)]
+    pub index_routing: Option<Value>,
+    #[serde(default)]
+    pub search_routing: Option<Value>,
+    #[serde(default)]
+    pub is_write_index: Option<bool>,
+    #[serde(default)]
+    pub is_hidden: Option<bool>,
+}
+
+/// The metadata object `PUT /{index}/_alias/{name}` and `POST /_aliases` both
+/// persist for an alias. Empty means "no metadata" (and clears any stale
+/// entry on a re-add).
+fn alias_action_meta(add: &AliasActionParams) -> Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = &add.filter {
+        obj.insert("filter".to_string(), v.clone());
+    }
+    if let Some(v) = &add.routing {
+        obj.insert("routing".to_string(), v.clone());
+    }
+    if let Some(v) = &add.index_routing {
+        obj.insert("index_routing".to_string(), v.clone());
+    }
+    if let Some(v) = &add.search_routing {
+        obj.insert("search_routing".to_string(), v.clone());
+    }
+    if let Some(v) = add.is_write_index {
+        obj.insert("is_write_index".to_string(), Value::Bool(v));
+    }
+    if let Some(v) = add.is_hidden {
+        obj.insert("is_hidden".to_string(), Value::Bool(v));
+    }
+    Value::Object(obj)
+}
+
+/// Replace (or clear, for empty metadata) one alias's metadata on one index
+/// and persist it. Clearing matters: re-adding an alias without a filter must
+/// not leave the previous filter enforced.
+fn store_alias_meta(state: &AppState, index: &str, alias: &str, meta: &Value) {
+    let mut existing = state
+        .engine
+        .index_alias_metadata
+        .get(index)
+        .map(|v| v.clone())
+        .unwrap_or_else(|| json!({}));
+    if !existing.is_object() {
+        existing = json!({});
+    }
+    if let Some(obj) = existing.as_object_mut() {
+        if meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            obj.remove(alias);
+        } else {
+            obj.insert(alias.to_string(), meta.clone());
+        }
+    }
+    state
+        .engine
+        .index_alias_metadata
+        .insert(index.to_string(), existing);
+    state.engine.flush_alias_metadata();
+}
+
+/// Drop one alias's stored metadata after the alias itself was removed.
+fn clear_alias_meta(state: &AppState, index: &str, alias: &str) {
+    let Some(mut existing) = state
+        .engine
+        .index_alias_metadata
+        .get(index)
+        .map(|v| v.clone())
+    else {
+        return;
+    };
+    let Some(obj) = existing.as_object_mut() else {
+        return;
+    };
+    if obj.remove(alias).is_none() {
+        return;
+    }
+    state
+        .engine
+        .index_alias_metadata
+        .insert(index.to_string(), existing);
+    state.engine.flush_alias_metadata();
 }
 
 #[derive(Debug, Deserialize)]
@@ -25178,10 +25270,15 @@ pub async fn post_aliases(
     for step in &plan {
         match step {
             Resolved::Add(add, targets) => {
+                let meta = alias_action_meta(add);
+                if let Some(reason) = alias_value_type_error(&add.alias, &meta) {
+                    return es_bad_request("illegal_argument_exception", &reason, None);
+                }
                 for target in targets {
                     if let Err(error) = state.engine.add_alias(&add.alias, target) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
+                    store_alias_meta(&state, target, &add.alias, &meta);
                 }
             }
             Resolved::Remove(remove, targets) => {
@@ -25189,6 +25286,7 @@ pub async fn post_aliases(
                     if let Err(error) = state.engine.remove_alias(&remove.alias, target) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
+                    clear_alias_meta(&state, target, &remove.alias);
                 }
             }
         }
@@ -25478,24 +25576,9 @@ pub async fn put_alias(
 
     let attach = |idx_name: &str| -> xerj_engine::Result<()> {
         state.engine.add_alias(&alias, idx_name)?;
-        if !alias_meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-            let mut existing = state
-                .engine
-                .index_alias_metadata
-                .get(idx_name)
-                .map(|v| v.clone())
-                .unwrap_or(json!({}));
-            if let Some(obj) = existing.as_object_mut() {
-                obj.insert(alias.clone(), alias_meta.clone());
-            } else {
-                existing = json!({ alias.clone(): alias_meta.clone() });
-            }
-            state
-                .engine
-                .index_alias_metadata
-                .insert(idx_name.to_string(), existing);
-            state.engine.flush_alias_metadata();
-        }
+        // Re-putting an alias replaces its definition: an empty body clears a
+        // previous filter instead of leaving it enforced.
+        store_alias_meta(&state, idx_name, &alias, &alias_meta);
         Ok(())
     };
 
@@ -25528,11 +25611,13 @@ pub async fn delete_alias(
         if let Err(error) = state.engine.remove_alias(&alias, &index) {
             return ApiError::new(xerj_common::XerjError::from(error)).into_response();
         }
+        clear_alias_meta(&state, &index, &alias);
     } else {
         for idx in &targets {
             if let Err(error) = state.engine.remove_alias(&alias, idx) {
                 return ApiError::new(xerj_common::XerjError::from(error)).into_response();
             }
+            clear_alias_meta(&state, idx, &alias);
         }
     }
     Json(json!({ "acknowledged": true })).into_response()
@@ -32417,17 +32502,44 @@ pub async fn cat_aliases(
         }
     }
 
+    // `_cat/aliases` used to print a literal `-` for every metadata column, so
+    // a filtered alias created by `POST /_aliases` (or PUT …/_alias/…) looked
+    // unfiltered here even after the read paths honoured the filter. `*` is
+    // ES's text/JSON rendering for "this alias has a filter".
+    let cat_cell = |meta: &Value, key: &str| -> String {
+        match meta.get(key) {
+            None | Some(Value::Null) => "-".to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        }
+    };
+    let render = |alias: &str, index: &str| -> (String, String, String, String) {
+        let meta = alias_meta_for(&state, index, alias);
+        let filter = if meta.get("filter").is_some() {
+            "*".to_string()
+        } else {
+            "-".to_string()
+        };
+        (
+            filter,
+            cat_cell(&meta, "index_routing"),
+            cat_cell(&meta, "search_routing"),
+            cat_cell(&meta, "is_write_index"),
+        )
+    };
+
     if params.format.as_deref() == Some("json") {
         let arr: Vec<Value> = rows
             .iter()
             .map(|(alias, index)| {
+                let (filter, ri, rs, iw) = render(alias, index);
                 json!({
                     "alias": alias,
                     "index": index,
-                    "filter": "-",
-                    "routing.index": "-",
-                    "routing.search": "-",
-                    "is_write_index": "-",
+                    "filter": filter,
+                    "routing.index": ri,
+                    "routing.search": rs,
+                    "is_write_index": iw,
                 })
             })
             .collect();
@@ -32436,7 +32548,10 @@ pub async fn cat_aliases(
 
     let lines: Vec<String> = rows
         .iter()
-        .map(|(alias, index)| format!("{alias} {index} - - - -"))
+        .map(|(alias, index)| {
+            let (filter, ri, rs, iw) = render(alias, index);
+            format!("{alias} {index} {filter} {ri} {rs} {iw}")
+        })
         .collect();
     let body = if lines.is_empty() {
         String::new()

@@ -142,6 +142,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snippets at the same citation. Rendered text is deduped only when both its
   locator and displayed passage match an already-shown block; display labels,
   separators and match citations no longer stand in for source ranges.
+- `POST /_aliases` stores the alias metadata it is given: `filter`, routing,
+  `is_write_index` and `is_hidden`. Those fields were dropped by the action
+  parser, so a filtered alias created through the standard API exposed every
+  document while the same alias created with `PUT /{index}/_alias/{name}`
+  worked; `_cat/aliases` also printed `-` for the filter. Removing an alias (or
+  re-adding it without a filter) now clears the stored metadata, so a stale
+  filter cannot outlive its definition.
 
 - x86_64 release binaries no longer require AVX2. The build baseline is
   `x86-64-v2` (SSE4.2). The HNSW eight-accumulator dot product — the kernel
