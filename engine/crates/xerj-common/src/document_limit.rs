@@ -21,6 +21,39 @@ use serde_json::Value;
 /// skipped. A single value over this limit is not indexed.
 pub const MAX_INDEXED_DOCUMENT_BYTES: usize = 8 << 20;
 
+/// Extra bytes an `_update` envelope may use beyond two documents at the ceiling.
+///
+/// The body can carry a partial `doc` and an `upsert`, each a full indexed
+/// document, plus a script. The engine caps a script source at 64 KiB;
+/// JSON escaping can double that, and the object keys sit beside the two
+/// bodies. 256 KiB covers that wrapping. A larger raw body is refused
+/// before `serde_json` builds a DOM (#1122).
+pub const UPDATE_ENVELOPE_SLACK_BYTES: usize = 256 * 1024;
+
+/// Largest raw `POST /{index}/_update/{id}` body that is parsed.
+///
+/// Bytes past this limit are refused before `serde_json`. A body at or
+/// under the limit is still subject to [`MAX_INDEXED_DOCUMENT_BYTES`] on
+/// the document the update would write.
+pub const MAX_UPDATE_BODY_BYTES: usize =
+    2 * MAX_INDEXED_DOCUMENT_BYTES + UPDATE_ENVELOPE_SLACK_BYTES;
+
+/// `true` when an `_update` body is past [`MAX_UPDATE_BODY_BYTES`].
+pub fn update_body_too_large(len: usize) -> bool {
+    len > MAX_UPDATE_BODY_BYTES
+}
+
+/// Refusal text for an `_update` body of `len` bytes.
+///
+/// The text does not say the body was invalid JSON: the size check runs
+/// before parse, including when the bytes are not JSON.
+pub fn update_body_refusal(len: usize) -> String {
+    format!(
+        "update body is {len} bytes, over the {MAX_UPDATE_BODY_BYTES} byte limit; \
+         it was not parsed and the existing document was not changed"
+    )
+}
+
 /// `true` when `len` is past [`MAX_INDEXED_DOCUMENT_BYTES`].
 pub fn indexed_document_too_large(len: usize) -> bool {
     len > MAX_INDEXED_DOCUMENT_BYTES
@@ -101,6 +134,28 @@ mod tests {
         assert_eq!(MAX_INDEXED_DOCUMENT_BYTES, 8 * 1024 * 1024);
         assert!(!indexed_document_too_large(MAX_INDEXED_DOCUMENT_BYTES));
         assert!(indexed_document_too_large(MAX_INDEXED_DOCUMENT_BYTES + 1));
+    }
+
+    #[test]
+    fn an_update_envelope_fits_two_documents_and_refuses_one_byte_over() {
+        assert_eq!(
+            MAX_UPDATE_BODY_BYTES,
+            2 * MAX_INDEXED_DOCUMENT_BYTES + 256 * 1024
+        );
+        assert!(!update_body_too_large(MAX_UPDATE_BODY_BYTES));
+        assert!(update_body_too_large(MAX_UPDATE_BODY_BYTES + 1));
+        let text = update_body_refusal(MAX_UPDATE_BODY_BYTES + 1);
+        assert!(
+            text.contains(&(MAX_UPDATE_BODY_BYTES + 1).to_string()),
+            "{text}"
+        );
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size refusal is not a parse error: {text}"
+        );
     }
 
     #[test]

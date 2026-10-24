@@ -10201,19 +10201,17 @@ fn run_index_report_inner(
             files_done.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // #1122: `Scope::spawn` panics when a thread cannot be created (thread
-    // limit, memory exhaustion), and release builds are panic=abort, so one
-    // failed spawn used to abort the whole run. Spawn through the fallible
-    // builder instead: workers that did start share the queue between them,
-    // the pipe stops counting the ones that never did, and if none started
-    // this thread works the queue itself. Slower, never wrong.
-    std::thread::scope(|scope| {
+    // #1122: `Builder::spawn_scoped` returns `Ok`, then the child panics
+    // if it cannot map an alternate signal stack. Release builds are
+    // panic=abort, so that panic takes the process down. `thread_spawn::scope`
+    // uses `pthread_create` and does not install that stack. A refusal is
+    // an error: workers that did start share the queue, the pipe stops
+    // counting the ones that never did, and if none started this thread
+    // works the queue itself. The failed closure is dropped unrun.
+    xerj_common::thread_spawn::scope(|scope| {
         let mut started = 0usize;
         for _ in 0..worker_count {
-            match std::thread::Builder::new()
-                .name("autoindex-worker".into())
-                .spawn_scoped(scope, worker)
-            {
+            match scope.spawn("autoindex-worker", worker) {
                 Ok(_) => started += 1,
                 Err(error) => {
                     pr.note(&format!(

@@ -4501,6 +4501,126 @@ mod oversized_single_doc {
     }
 }
 
+#[cfg(test)]
+mod oversized_update {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::config::{Config, WalSync};
+    use xerj_common::document_limit::MAX_UPDATE_BODY_BYTES;
+    use xerj_common::metrics::Metrics;
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn an_oversized_update_body_is_refused_before_it_is_parsed() {
+        let body = vec![b'x'; MAX_UPDATE_BODY_BYTES + 1];
+        let err = parse_update_body(&body).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size check must run before parse: {text}"
+        );
+        let small = parse_update_body(br#"{"doc":{"name":"ada"}}"#).unwrap();
+        assert_eq!(small.doc.unwrap()["name"], "ada");
+    }
+
+    #[tokio::test]
+    async fn post_update_refuses_an_oversized_body_and_a_small_update_applies() {
+        let app = crate::router::build_es_compat_router(test_state());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::put("/upd/_doc/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"ada","n":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        // Valid JSON, over the envelope. A parse-first path would accept
+        // the syntax and answer with the document ceiling (or index it).
+        // The size refusal names the update limit and does not say the
+        // body was invalid JSON.
+        let mut big = Vec::new();
+        big.extend_from_slice(br#"{"doc":{"blob":""#);
+        big.extend(std::iter::repeat_n(b'a', MAX_UPDATE_BODY_BYTES));
+        big.extend_from_slice(br#""}}"#);
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::post("/upd/_update/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "parsed before the size check: {text}"
+        );
+
+        let fetched = app
+            .clone()
+            .oneshot(Request::get("/upd/_doc/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["_source"]["name"], json!("ada"));
+        assert_eq!(doc["_source"]["n"], json!(1));
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::post("/upd/_update/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"doc":{"name":"ada2"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let fetched = app
+            .oneshot(Request::get("/upd/_doc/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["_source"]["name"], json!("ada2"));
+        assert_eq!(
+            doc["_source"]["n"],
+            json!(1),
+            "fields the update did not name stay"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /{index}/_doc/{id}?_source_includes=f1,f2&_source_excludes=f3
 // ─────────────────────────────────────────────────────────────────────────────
@@ -22984,12 +23104,43 @@ async fn build_update_get_field(
     }
 }
 
+/// Parse an `_update` body from raw bytes.
+///
+/// The size check runs before `serde_json`. The route used to take
+/// `Json<EsUpdateBody>`, so axum built the DOM before the handler. A body
+/// between this envelope and `limits.max_body_bytes` (100 MiB) was parsed
+/// even when it could not be applied, and that parse is an infallible
+/// allocation (`panic = "abort"`, #1122). Bytes that are not JSON and are
+/// also over the limit report the size refusal, not a parse error.
+pub(crate) fn parse_update_body(body: &[u8]) -> Result<EsUpdateBody, xerj_common::XerjError> {
+    if xerj_common::document_limit::update_body_too_large(body.len()) {
+        let len = body.len();
+        tracing::warn!(
+            bytes = len,
+            limit = xerj_common::document_limit::MAX_UPDATE_BODY_BYTES,
+            "update body refused before parse; the existing document was not changed (#1122)"
+        );
+        return Err(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::update_body_refusal(len),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        xerj_common::XerjError::invalid_document_json(format!("invalid JSON body: {e}"))
+    })
+}
+
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(query_params): Query<UpdateDocParams>,
-    Json(body): Json<EsUpdateBody>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    // Before `get_or_create_index`, so a refused body does not create an
+    // index and does not read or write the document.
+    let body = match parse_update_body(&body) {
+        Ok(body) => body,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     let idx = match state.engine.get_or_create_index(&index) {
         Ok(i) => i,
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
@@ -32383,13 +32534,10 @@ mod scripted_update_publication_tests {
                     State(state),
                     Path(("script-counter".to_string(), "counter".to_string())),
                     Query(UpdateDocParams::default()),
-                    Json(EsUpdateBody {
-                        doc: None,
-                        doc_as_upsert: false,
-                        upsert: None,
-                        script: Some(json!("ctx._source.n += 1")),
-                        detect_noop: None,
-                    }),
+                    bytes::Bytes::from(
+                        serde_json::to_vec(&json!({"script": "ctx._source.n += 1"}))
+                            .expect("script update body"),
+                    ),
                 )
                 .await
                 .into_response()
