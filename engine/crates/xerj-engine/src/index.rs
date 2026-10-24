@@ -17958,6 +17958,11 @@ impl Index {
             xerj_ai::local::local_embed(text, dims)
         } else {
             // #530: name the offending field, symmetric with the knn 400 (#498).
+            // A concrete index keeps this 400. A wildcard, `_all`, or alias
+            // expansion is isolated by the search coordinator (#2305): those
+            // indices contribute no hits instead of failing the request.
+            // Do not soften this error here — the explicit-index contract is
+            // the 400, and the coordinator matches this reason text.
             return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
                 format!(
                     "semantic query on field [{field}]: it is not a `semantic_text` field, so \

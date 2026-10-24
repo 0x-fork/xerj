@@ -12589,6 +12589,135 @@ impl SkippedIndices {
     }
 }
 
+/// #2305: indices a wildcard, `_all`/`*`, or alias expansion included that
+/// have no `semantic_text` field for the queried name. They cannot answer
+/// and must not 400 the indices that can. An explicitly named index is not
+/// recorded here (#530 still fails that request).
+#[derive(Default)]
+struct ExpandedSemanticSkips {
+    attempted: u32,
+    skipped: u32,
+    first_reason: Option<String>,
+    failures: Vec<Value>,
+}
+
+impl ExpandedSemanticSkips {
+    fn note_attempt(&mut self) {
+        self.attempted += 1;
+    }
+
+    /// `Ok(())` — `index_name` was expanded and lacks the field; the miss is
+    /// recorded and the caller continues. `Err(err)` — the caller must fail
+    /// the request with `err` (explicit index, or a different error).
+    fn take_skippable(
+        &mut self,
+        selector: &str,
+        index_name: &str,
+        node: &str,
+        err: xerj_common::XerjError,
+    ) -> Result<(), xerj_common::XerjError> {
+        let Some(reason) = absent_semantic_field_reason(&err) else {
+            return Err(err);
+        };
+        if selector_names_index_explicitly(selector, index_name) {
+            return Err(err);
+        }
+        let reason = reason.to_string();
+        tracing::warn!(
+            index = %index_name,
+            error = %reason.chars().take(300).collect::<String>(),
+            "semantic search: expanded index has no semantic_text field; skipping it"
+        );
+        self.failures
+            .push(semantic_field_shard_failure(index_name, node, &reason));
+        self.skipped += 1;
+        if self.first_reason.is_none() {
+            self.first_reason = Some(reason);
+        }
+        Ok(())
+    }
+
+    /// When every index that was searched lacked the field, there is nothing
+    /// to answer from. A wrong field name on a wildcard must stay a 400
+    /// rather than an empty 200.
+    fn failure_if_every_index_skipped(&self) -> Option<xerj_common::XerjError> {
+        if self.attempted > 0 && self.skipped == self.attempted {
+            self.first_reason
+                .clone()
+                .map(xerj_common::XerjError::invalid_query)
+        } else {
+            None
+        }
+    }
+}
+
+/// The engine's refusal for a `semantic` query against a field that is not
+/// `semantic_text` (lexical embedder, no comparable stored vector). The
+/// clause is the contract the coordinator matches; the rest of the sentence
+/// is the operator hint and may be reworded.
+fn absent_semantic_field_reason(err: &xerj_common::XerjError) -> Option<&str> {
+    match err {
+        xerj_common::XerjError::InvalidQuery { reason }
+            if reason.contains("it is not a `semantic_text` field") =>
+        {
+            Some(reason.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// True when `index_name` is a concrete token of `selector` (comma-separated,
+/// date math already resolved the way the search path resolves it). A
+/// wildcard, `_all`/`*`, or an alias token is not the concrete index name, so
+/// members reached only through that expansion are not explicitly named.
+fn selector_names_index_explicitly(selector: &str, index_name: &str) -> bool {
+    selector.split(',').any(|token| {
+        let token = resolve_date_math_index(token.trim());
+        token == index_name
+    })
+}
+
+fn semantic_field_shard_failure(index: &str, node: &str, reason: &str) -> Value {
+    json!({
+        "shard": 0,
+        "index": index,
+        "node": node,
+        "reason": {
+            "type": "illegal_argument_exception",
+            "reason": reason
+        }
+    })
+}
+
+#[cfg(test)]
+mod expanded_semantic_selector_tests {
+    use super::selector_names_index_explicitly;
+
+    #[test]
+    fn a_concrete_token_is_explicit_and_a_pattern_is_not() {
+        assert!(selector_names_index_explicitly("proj-notes", "proj-notes"));
+        assert!(selector_names_index_explicitly(
+            "proj-notes,proj-tags",
+            "proj-tags"
+        ));
+        assert!(!selector_names_index_explicitly("proj-*", "proj-notes"));
+        assert!(!selector_names_index_explicitly("proj-*", "proj-tags"));
+        assert!(!selector_names_index_explicitly("_all", "proj-notes"));
+        assert!(!selector_names_index_explicitly("*", "proj-notes"));
+        // An alias token is not the concrete member name.
+        assert!(!selector_names_index_explicitly("proj", "proj-notes"));
+        // A concrete name beside a pattern is still explicit.
+        assert!(selector_names_index_explicitly(
+            "proj-*,proj-tags",
+            "proj-tags"
+        ));
+        assert!(!selector_names_index_explicitly(
+            "proj-*,proj-tags",
+            "proj-notes"
+        ));
+    }
+}
+
 async fn search_dispatch(
     state: AppState,
     index: String,
@@ -14993,6 +15122,9 @@ async fn search_impl(
     let mut spawned_searches = Vec::with_capacity(index_names.len());
     // Only used when an in-process caller asked to have failing indices skipped.
     let mut skipped = SkippedIndices::default();
+    // #2305: wildcard / `_all` / alias members with no `semantic_text` field.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
             Ok(i) => i,
@@ -15115,6 +15247,7 @@ async fn search_impl(
     // handles, aborting their still-running searches.
     for (idx_name, mut search_task) in spawned_searches {
         let search_result = (&mut search_task.0).await;
+        semantic_skips.note_attempt();
 
         match search_result {
             Err(join_err) => {
@@ -15139,7 +15272,17 @@ async fn search_impl(
                     shards_failed_count += 1;
                     continue;
                 }
-                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+                // #2305: a wildcard, `_all`, or alias member with no
+                // `semantic_text` field for this query contributes no hits.
+                // A concrete name in the selector still fails the request.
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, idx_name, search_node.as_str(), err) {
+                    Ok(()) => {
+                        shards_failed_count += 1;
+                        continue;
+                    }
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
             }
             Ok(Ok(result)) => {
                 // A Painless resource limit tripped somewhere in scoring or
@@ -15230,6 +15373,13 @@ async fn search_impl(
     // failure is the answer.
     if let Some(failure) = skipped.all_failed() {
         return failure;
+    }
+    // #2305: a pattern that matched only indices without the semantic field
+    // is the same 400 an explicit index would return — an empty 200 would
+    // hide a wrong field name. A mix (some indices have the field) falls
+    // through and answers from those.
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
 
     // ── Post-merge `auto_date_histogram` re-coordination ────────────────────
@@ -18399,11 +18549,16 @@ async fn search_impl(
         }
     }
 
-    // Surface the synthesized `_shards.failures` array for an HDR-percentiles
-    // negative-value shard failure (the `failed`/`successful` counts were
-    // already adjusted via `shards_failed_count` above).
+    // Surface shard failures: an expanded index with no `semantic_text` field
+    // (#2305), and an HDR-percentiles negative-value shard (the
+    // `failed`/`successful` counts were already adjusted via
+    // `shards_failed_count` above).
     if let Some(failure) = hdr_shard_failure.take() {
-        response_body["_shards"]["failures"] = json!([failure]);
+        semantic_skips.failures.push(failure);
+    }
+    if !semantic_skips.failures.is_empty() {
+        response_body["_shards"]["failures"] =
+            Value::Array(std::mem::take(&mut semantic_skips.failures));
     }
 
     // (script_fields are evaluated per hit against the hit's source in the
@@ -25702,6 +25857,10 @@ pub async fn search_with_scroll(
     // Execute search across all indices and collect ALL hits.
     let mut all_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total_count: u64 = 0;
+    // #2305: alias expansion on this route (wildcards are not expanded here)
+    // must not 400 every member because one lacks the semantic field.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
 
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
@@ -25714,6 +25873,7 @@ pub async fn search_with_scroll(
         full_req.size = SCROLL_SNAPSHOT_MAX_HITS;
         full_req.from = 0;
 
+        semantic_skips.note_attempt();
         match idx.search(&full_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
@@ -25724,8 +25884,17 @@ pub async fn search_with_scroll(
                     all_hits.push((idx_name.clone(), hit));
                 }
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Err(e) => {
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, idx_name, search_node.as_str(), err) {
+                    Ok(()) => continue,
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
         }
+    }
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
 
     let took_ms = started.elapsed().as_millis() as u64;
@@ -28773,6 +28942,11 @@ async fn msearch_impl(
         let mut merged_aggs: Option<Value> = None;
         let mut search_error: Option<xerj_common::XerjError> = None;
         let mut script_failure: Option<String> = None;
+        // #2305: same wildcard/alias isolation as `_search`. `_msearch` fans
+        // out on its own, so a `proj-*` item used to 400 when one match lacked
+        // the semantic field.
+        let mut semantic_skips = ExpandedSemanticSkips::default();
+        let search_node = state.engine.node_id.clone();
 
         for idx_name in &index_names {
             let idx = match state.engine.get_index(idx_name) {
@@ -28782,6 +28956,7 @@ async fn msearch_impl(
                     break;
                 }
             };
+            semantic_skips.note_attempt();
             match idx.search(&search_req).await {
                 Ok(result) => {
                     // A Painless resource limit tripped during scoring/aggs:
@@ -28806,8 +28981,19 @@ async fn msearch_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(xerj_common::XerjError::from(e));
-                    break;
+                    let err = xerj_common::XerjError::from(e);
+                    match semantic_skips.take_skippable(
+                        &index_name,
+                        idx_name,
+                        search_node.as_str(),
+                        err,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            search_error = Some(err);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -28815,6 +29001,9 @@ async fn msearch_impl(
         if let Some(reason) = script_failure {
             responses.push(script_limit_error_value(&reason));
             continue;
+        }
+        if search_error.is_none() {
+            search_error = semantic_skips.failure_if_every_index_skipped();
         }
 
         // The sub-response carries the SAME body the single-request `_search`
@@ -28882,6 +29071,16 @@ async fn msearch_impl(
         });
         if let Some(aggs) = merged_aggs {
             resp["aggregations"] = aggs;
+        }
+        if semantic_skips.skipped > 0 {
+            let total = index_names.len().max(1) as u32;
+            resp["_shards"] = json!({
+                "total": total,
+                "successful": total.saturating_sub(semantic_skips.skipped),
+                "skipped": 0,
+                "failed": semantic_skips.skipped,
+                "failures": semantic_skips.failures,
+            });
         }
         // PIT sub-searches echo the pit_id first, exactly like `_search`
         // (ES 8.x msearch items carry it too — same search_after loop
@@ -39018,7 +39217,12 @@ pub async fn search_template(
     // question this sweep didn't ask.
     let mut merged_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total: u64 = 0;
+    // #2305: this minimal merge still fans a semantic query across every
+    // match of a wildcard. An expanded index without the field is skipped.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
     for (name, idx) in &handles {
+        semantic_skips.note_attempt();
         match idx.search(&search_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
@@ -39027,8 +39231,17 @@ pub async fn search_template(
                 total += result.total.value;
                 merged_hits.extend(result.hits.into_iter().map(|h| (name.clone(), h)));
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Err(e) => {
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, name, search_node.as_str(), err) {
+                    Ok(()) => continue,
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
         }
+    }
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
     merged_hits.sort_by(|(_, a), (_, b)| {
         b.score
@@ -39058,7 +39271,7 @@ pub async fn search_template(
             })
         })
         .collect();
-    Json(json!({
+    let mut resp = json!({
         "took": took_ms,
         "timed_out": false,
         "_shards": crate::responses::EsShards::search_success(),
@@ -39067,8 +39280,18 @@ pub async fn search_template(
             "max_score": max_score,
             "hits": hits,
         },
-    }))
-    .into_response()
+    });
+    if semantic_skips.skipped > 0 {
+        let shard_total = handles.len().max(1) as u32;
+        resp["_shards"] = json!({
+            "total": shard_total,
+            "successful": shard_total.saturating_sub(semantic_skips.skipped),
+            "skipped": 0,
+            "failed": semantic_skips.skipped,
+            "failures": semantic_skips.failures,
+        });
+    }
+    Json(resp).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39289,6 +39512,9 @@ async fn msearch_template_impl(
         let mut total_count: u64 = 0;
         let mut script_failure: Option<String> = None;
         let mut search_error: Option<xerj_common::XerjError> = None;
+        // #2305: `*` / `_all` and alias expansion on this route.
+        let mut semantic_skips = ExpandedSemanticSkips::default();
+        let search_node = state.engine.node_id.clone();
 
         // Both arms below used to be `if let Ok(..)` with no else, so a
         // missing index or a query the engine refused produced
@@ -39307,6 +39533,7 @@ async fn msearch_template_impl(
                     break;
                 }
             };
+            semantic_skips.note_attempt();
             match idx.search(&search_req).await {
                 Ok(result) => {
                     if let Some(reason) = result.script_failure {
@@ -39329,8 +39556,19 @@ async fn msearch_template_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(xerj_common::XerjError::from(e));
-                    break;
+                    let err = xerj_common::XerjError::from(e);
+                    match semantic_skips.take_skippable(
+                        &index_name,
+                        idx_name,
+                        search_node.as_str(),
+                        err,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            search_error = Some(err);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -39341,6 +39579,9 @@ async fn msearch_template_impl(
             responses.push(script_limit_error_value(&reason));
             continue;
         }
+        if search_error.is_none() {
+            search_error = semantic_skips.failure_if_every_index_skipped();
+        }
 
         if let Some(err) = search_error {
             responses.push(ApiError::new(err).into_value());
@@ -39348,7 +39589,7 @@ async fn msearch_template_impl(
         }
 
         let took_ms = started.elapsed().as_millis() as u64;
-        responses.push(json!({
+        let mut item = json!({
             "took": took_ms,
             "timed_out": false,
             "_shards": crate::responses::EsShards::search_success(),
@@ -39356,7 +39597,18 @@ async fn msearch_template_impl(
                 "total": { "value": total_count, "relation": "eq" },
                 "hits": merged_hits,
             },
-        }));
+        });
+        if semantic_skips.skipped > 0 {
+            let total = index_names.len().max(1) as u32;
+            item["_shards"] = json!({
+                "total": total,
+                "successful": total.saturating_sub(semantic_skips.skipped),
+                "skipped": 0,
+                "failed": semantic_skips.skipped,
+                "failures": semantic_skips.failures,
+            });
+        }
+        responses.push(item);
     }
 
     Json(json!({
