@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- With `[cluster] enabled = true`, `POST /_bulk`, `POST /{index}/_bulk`, and
+  `POST /{index}/_update/{id}` run on the shard primary, whichever member
+  accepted the request. A bulk body is split by primary. An action whose
+  primary is another member is forwarded there and is not indexed on the
+  receiver. The primary then copies the stored document (or the delete)
+  onto the in-sync replicas and acknowledges it with the same quorum as
+  `PUT /{index}/_doc/{id}`. `_bulk` covers index, create, update, and
+  delete. `_update` covers a partial document and a script; the script
+  runs on the primary, where the current source is. A missing `_id` on
+  index or create is chosen before the owner is selected, so the stored
+  id is the id that was routed. An update that does not change the source
+  is not copied again. A copy that misses quorum is
+  `503 replica_not_acknowledged` for that item: the primary has the write.
+  `_update_by_query` and native `/v1` ingest still write on the receiving
+  node. A write still needs the primary. `[cluster] enabled = false` does
+  not take this path (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170)).
+
 - `xerj corpus add --own` and `xerj corpus own <name>` (`--off` clears it)
   mark a corpus as your own first-party code (`"own": true` in its
   `corpus.json`). `xerj code` and MCP `xerj_code_search` still name an

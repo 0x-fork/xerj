@@ -20449,9 +20449,19 @@ async fn process_bulk_body(
         )
     });
 
-    let result =
-        xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, text_ref, opts)
-            .await;
+    // Cluster mode routes each action to its shard primary and copies the
+    // stored document. No cluster handle: the local bulk pipeline, unchanged.
+    // `wire` is the primary's `_version` / `_seq_no`. The accepting node does
+    // not have the document, so the lookup below would report a fresh id.
+    let (result, wire) = if state.engine.has_cluster() {
+        crate::cluster_shard::bulk_on_primaries(state, default_index, text_ref, opts).await
+    } else {
+        (
+            xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, text_ref, opts)
+                .await,
+            Vec::new(),
+        )
+    };
     let took_ms = result.took_ms;
     let errors = result.errors;
 
@@ -20476,7 +20486,7 @@ async fn process_bulk_body(
     let mut audited_index_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     let mut items: Vec<EsBulkItem> = Vec::with_capacity(result.items.len());
-    for item in result.items {
+    for (ordinal, item) in result.items.into_iter().enumerate() {
         let failed = item.error.is_some() || !(200..300).contains(&item.status);
         if failed {
             failed_items += 1;
@@ -20498,6 +20508,13 @@ async fn process_bulk_body(
         // `status: 400` reads as "this write landed".
         let (version, seq_no, primary_term, shards) = if failed {
             (None, None, None, None)
+        } else if let Some((version, seq_no)) = wire.get(ordinal).copied().flatten() {
+            (
+                Some(version),
+                Some(seq_no),
+                Some(1),
+                Some(crate::responses::EsShards::single_success()),
+            )
         } else {
             let (version, seq_no) = state
                 .engine
@@ -23056,7 +23073,7 @@ fn format_date(dt: chrono::DateTime<chrono::Utc>, fmt: &str) -> String {
 // POST /{index}/_update/{id}
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EsUpdateBody {
     /// Partial document fields to merge into existing source.
     pub doc: Option<Value>,
@@ -23076,7 +23093,7 @@ pub struct EsUpdateBody {
 }
 
 /// Query parameters for the `_update` endpoint.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateDocParams {
     /// `refresh=true|wait_for` — accepted without error; memtable is always visible.
     pub refresh: Option<String>,
@@ -23162,6 +23179,13 @@ pub(crate) fn parse_update_body(body: &[u8]) -> Result<EsUpdateBody, xerj_common
     })
 }
 
+pub(crate) struct LocalUpdate {
+    pub response: axum::response::Response,
+    /// The primary stored a new source. A cluster caller copies it. A noop,
+    /// a miss, and every error leave this false.
+    pub replicate: bool,
+}
+
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
@@ -23174,9 +23198,36 @@ pub async fn update_doc(
         Ok(body) => body,
         Err(e) => return ApiError::new(e).into_response(),
     };
-    let idx = match state.engine.get_or_create_index(&index) {
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_update(&state, &index, &id, &body, &query_params).await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+    apply_local_update(&state, &index, &id, body, &query_params)
+        .await
+        .response
+}
+
+pub(crate) async fn apply_local_update(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    body: EsUpdateBody,
+    query_params: &UpdateDocParams,
+) -> LocalUpdate {
+    fn settled(response: impl IntoResponse, replicate: bool) -> LocalUpdate {
+        LocalUpdate {
+            response: response.into_response(),
+            replicate,
+        }
+    }
+    let idx = match state.engine.get_or_create_index(index) {
         Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        Err(e) => {
+            return settled(ApiError::new(xerj_common::XerjError::from(e)), false);
+        }
     };
 
     // ── Scripted update path ────────────────────────────────────────────────
@@ -23186,7 +23237,10 @@ pub async fn update_doc(
     if let Some(script_val) = body.script.as_ref() {
         let (src, params) = extract_update_script(script_val);
         if src.is_empty() {
-            return update_script_bad_request("script source is required".to_string());
+            return settled(
+                update_script_bad_request("script source is required".to_string()),
+                false,
+            );
         }
         let upsert_body = body.upsert.clone().or_else(|| {
             if body.doc_as_upsert {
@@ -23202,7 +23256,7 @@ pub async fn update_doc(
         let (transformed, fault) = xerj_engine::painless::with_script_fault_capture(
             xerj_engine::painless::with_script_deadline(
                 deadline,
-                idx.transform_document_serialized(&id, upsert_body, move |mut current| {
+                idx.transform_document_serialized(id, upsert_body, move |mut current| {
                     apply_painless_update(&mut current, &src, &params)?;
                     Ok::<_, String>(current)
                 }),
@@ -23210,65 +23264,66 @@ pub async fn update_doc(
         )
         .await;
         if let Some(reason) = fault {
-            return script_limit_response(&reason);
+            return settled(script_limit_response(&reason), false);
         }
         match transformed {
             Ok(Ok(Some(outcome))) => {
-                state.metrics.record_doc_indexed(&index);
+                state.metrics.record_doc_indexed(index);
                 let resp = outcome.response;
                 let mut er = if outcome.created {
                     crate::responses::EsDocResponse::created(
-                        &index,
+                        index,
                         &resp.id,
                         resp.version,
                         resp.seq_no.saturating_sub(1),
                     )
                 } else {
                     crate::responses::EsDocResponse::updated(
-                        &index,
+                        index,
                         &resp.id,
                         resp.version,
                         resp.seq_no.saturating_sub(1),
                     )
                 };
-                if update_wants_get(&query_params) {
-                    er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+                if update_wants_get(query_params) {
+                    er.get = Some(build_update_get_field(&idx, &resp.id, query_params).await);
                 }
-                return Json(er).into_response();
+                return settled(Json(er), true);
             }
             Ok(Ok(None)) => {
-                let e = xerj_common::XerjError::document_not_found(&id, &index);
-                return ApiError::new(e).into_response();
+                let e = xerj_common::XerjError::document_not_found(id, index);
+                return settled(ApiError::new(e), false);
             }
-            Ok(Err(error)) => return update_script_bad_request(error),
+            Ok(Err(error)) => return settled(update_script_bad_request(error), false),
             Err(error) => {
-                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                return settled(ApiError::new(xerj_common::XerjError::from(error)), false);
             }
         }
     }
 
     match idx
-        .update_document_with_upsert(&id, body.doc, body.upsert, body.doc_as_upsert)
+        .update_document_with_upsert(id, body.doc, body.upsert, body.doc_as_upsert)
         .await
     {
         Ok(Some(resp)) => {
-            state.metrics.record_doc_indexed(&index);
+            let replicate = resp.result != "noop";
+            state.metrics.record_doc_indexed(index);
             let mut er = crate::responses::EsDocResponse::updated(
-                &index,
+                index,
                 &resp.id,
                 resp.version,
                 resp.seq_no.saturating_sub(1),
             );
-            if update_wants_get(&query_params) {
-                er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+            if update_wants_get(query_params) {
+                er.get = Some(build_update_get_field(&idx, &resp.id, query_params).await);
             }
-            Json(er).into_response()
+            settled(Json(er), replicate)
         }
         Ok(None) => {
-            let e = xerj_common::XerjError::document_not_found(&id, &index);
-            ApiError::new(e).into_response()
+            let e = xerj_common::XerjError::document_not_found(id, index);
+            settled(ApiError::new(e), false)
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        Err(e) => settled(ApiError::new(xerj_common::XerjError::from(e)), false),
     }
 }
 

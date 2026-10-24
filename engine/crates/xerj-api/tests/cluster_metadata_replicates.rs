@@ -115,6 +115,17 @@ async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value)
     .await
 }
 
+async fn post_ndjson(app: &Router, path: &str, body: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        Request::post(path)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(body.to_string()))
+            .expect("request"),
+    )
+    .await
+}
+
 async fn get(app: &Router, path: &str) -> (StatusCode, Value) {
     send(
         app,
@@ -354,6 +365,44 @@ async fn cluster_disabled_create_stays_on_the_node_that_received_it() {
         body.pointer("/hits/total/value").and_then(|v| v.as_u64()),
         Some(1),
         "single-node search stays one document: {body}"
+    );
+
+    let (status, body) = post_ndjson(
+        &a,
+        "/local/_bulk",
+        "{\"index\":{\"_id\":\"b1\"}}\n{\"title\":\"bulk\"}\n",
+    )
+    .await;
+    assert!(status.is_success(), "single-node bulk: {status} {body}");
+    assert_eq!(
+        body.pointer("/errors").and_then(|v| v.as_bool()),
+        Some(false),
+        "{body}"
+    );
+    let (status, got) = get(&a, "/local/_doc/b1").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let (status, _) = get(&b, "/local/_doc/b1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = post_json(
+        &a,
+        "/local/_update/b1",
+        json!({ "doc": { "title": "patched" } }),
+    )
+    .await;
+    assert!(status.is_success(), "single-node update: {status} {body}");
+    let (status, got) = get(&a, "/local/_doc/b1").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got.pointer("/_source/title").and_then(|v| v.as_str()),
+        Some("patched")
+    );
+    let (status, _) = get(&b, "/local/_doc/b1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get(&a, "/.xerj_replica_local_0/_doc/b1").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "single-node bulk and update do not open a replica store"
     );
 }
 
@@ -1884,4 +1933,366 @@ async fn a_restarted_replica_is_refilled_to_the_primary_live_set_before_it_rejoi
     let _leader = wait_leader(&members, &[false, false, false]).await;
     create_replicated_orders(&members).await;
     refill_after_missed_writes(members, Some(&bus)).await;
+}
+
+fn bulk_item(body: &Value, at: usize) -> &Value {
+    let item = body
+        .pointer(&format!("/items/{at}"))
+        .unwrap_or_else(|| panic!("bulk response has no item {at}: {body}"));
+    item.as_object()
+        .and_then(|obj| obj.values().next())
+        .unwrap_or_else(|| panic!("bulk item {at} has no action: {item}"))
+}
+
+async fn user_source(member: &Member, id: &str) -> Option<Value> {
+    member
+        .engine
+        .get_index("orders")
+        .expect("orders is open")
+        .get_document(id)
+        .await
+        .expect("get")
+}
+
+async fn replica_source(member: &Member, shard: u32, id: &str) -> Option<Value> {
+    let store = xerj_cluster::replica_index_name("orders", shard).expect("store name");
+    member
+        .engine
+        .get_index(&store)
+        .unwrap_or_else(|_| panic!("replica store {store} is not open"))
+        .get_document(id)
+        .await
+        .expect("replica get")
+}
+
+/// `_bulk` and `_update` accepted by a node that does not own the id are
+/// applied on the primary and copied onto the in-sync replica. The receiving
+/// node's user index does not keep them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_and_update_from_a_non_owner_write_the_primary_and_the_replica() {
+    let members = ring(true).await;
+    let _leader = wait_leader(&members, &[false, false, false]).await;
+
+    let (status, body) = put_json(
+        &members[0].app,
+        "/orders",
+        json!({
+            "settings": { "index": { "number_of_replicas": 1 } },
+            "mappings": { "properties": { "title": { "type": "text" } } }
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "create: {status} {body}");
+    for member in &members {
+        wait_status(&member.app, "/orders", StatusCode::OK).await;
+    }
+
+    let mut placed: Vec<(String, usize, usize, u32)> = Vec::new();
+    for n in 0..128 {
+        let id = format!("b{n}");
+        let Some(primary) = members
+            .iter()
+            .position(|member| member.engine.owns_shard("orders", &id))
+        else {
+            continue;
+        };
+        let (shard, _) = members[primary]
+            .engine
+            .primary_of("orders", &id)
+            .expect("placement");
+        let replicas = members[primary].engine.replica_nodes("orders", shard);
+        if replicas.len() != 1 {
+            continue;
+        }
+        let Some(replica) = members
+            .iter()
+            .position(|member| member.handle.node_id() == replicas[0])
+        else {
+            continue;
+        };
+        if placed.iter().any(|(_, owner, _, _)| *owner == primary) {
+            continue;
+        }
+        placed.push((id, primary, replica, shard));
+        if placed.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(placed.len(), 2, "two primaries: {placed:?}");
+    let (id_a, primary_a, replica_a, shard_a) = placed[0].clone();
+    let (id_b, primary_b, replica_b, shard_b) = placed[1].clone();
+    assert_ne!(primary_a, primary_b);
+    let writer = (0..3)
+        .find(|n| *n != primary_a && *n != primary_b)
+        .expect("a node that owns neither id");
+
+    let bulk = format!(
+        "{{\"index\":{{\"_index\":\"orders\",\"_id\":\"{id_a}\"}}}}\n\
+         {{\"title\":\"bulk\",\"n\":1}}\n\
+         {{\"create\":{{\"_index\":\"orders\",\"_id\":\"{id_b}\"}}}}\n\
+         {{\"title\":\"other\"}}\n\
+         {{\"update\":{{\"_index\":\"orders\",\"_id\":\"{id_a}\"}}}}\n\
+         {{\"doc\":{{\"via\":\"bulk-update\"}}}}\n\
+         {{\"index\":{{\"_index\":\"orders\"}}}}\n\
+         {{\"title\":\"auto\"}}\n"
+    );
+    let (status, body) = post_ndjson(&members[writer].app, "/_bulk", &bulk).await;
+    assert!(status.is_success(), "bulk from non-owner: {status} {body}");
+    assert_eq!(
+        body.pointer("/errors").and_then(|v| v.as_bool()),
+        Some(false),
+        "{body}"
+    );
+    assert_eq!(
+        bulk_item(&body, 0).get("result").and_then(|v| v.as_str()),
+        Some("created"),
+        "{body}"
+    );
+    assert_eq!(
+        bulk_item(&body, 1).get("result").and_then(|v| v.as_str()),
+        Some("created"),
+        "{body}"
+    );
+    assert_eq!(
+        bulk_item(&body, 2).get("result").and_then(|v| v.as_str()),
+        Some("updated"),
+        "bulk update merged on the primary: {body}"
+    );
+    let auto_id = bulk_item(&body, 3)
+        .get("_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("auto id: {body}"))
+        .to_string();
+    assert!(!auto_id.is_empty());
+
+    let on_primary = user_source(&members[primary_a], &id_a).await;
+    assert_eq!(
+        on_primary
+            .as_ref()
+            .and_then(|doc| doc.get("via"))
+            .and_then(|v| v.as_str()),
+        Some("bulk-update"),
+        "primary has the bulk update: {on_primary:?}"
+    );
+    let on_replica = replica_source(&members[replica_a], shard_a, &id_a).await;
+    assert_eq!(
+        on_replica
+            .as_ref()
+            .and_then(|doc| doc.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("bulk"),
+        "replica copied the bulk update: {on_replica:?}"
+    );
+    assert_eq!(
+        on_replica
+            .as_ref()
+            .and_then(|doc| doc.get("via"))
+            .and_then(|v| v.as_str()),
+        Some("bulk-update")
+    );
+    for (at, member) in members.iter().enumerate() {
+        if at == primary_a {
+            continue;
+        }
+        assert!(
+            user_source(member, &id_a).await.is_none(),
+            "node {at} user index stored {id_a}"
+        );
+    }
+    let on_b = replica_source(&members[replica_b], shard_b, &id_b).await;
+    assert_eq!(
+        on_b.as_ref()
+            .and_then(|doc| doc.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("other"),
+        "create in the same bulk reached the other primary's replica: {on_b:?}"
+    );
+    assert!(
+        user_source(&members[writer], &id_b).await.is_none(),
+        "the receiver stored {id_b}"
+    );
+
+    let mut holders = Vec::new();
+    for (at, member) in members.iter().enumerate() {
+        if user_source(member, &auto_id).await.is_some() {
+            holders.push(at);
+        }
+    }
+    assert_eq!(
+        holders,
+        vec![members
+            .iter()
+            .position(|member| member.engine.owns_shard("orders", &auto_id))
+            .expect("auto-id has a primary")],
+        "an id assigned before routing has one user-index copy"
+    );
+    let auto_primary = holders[0];
+    let (auto_shard, _) = members[auto_primary]
+        .engine
+        .primary_of("orders", &auto_id)
+        .expect("auto placement");
+    let auto_replicas = members[auto_primary]
+        .engine
+        .replica_nodes("orders", auto_shard);
+    assert_eq!(auto_replicas.len(), 1);
+    let auto_replica = members
+        .iter()
+        .position(|member| member.handle.node_id() == auto_replicas[0])
+        .expect("auto replica");
+    let auto_copy = replica_source(&members[auto_replica], auto_shard, &auto_id).await;
+    assert_eq!(
+        auto_copy
+            .as_ref()
+            .and_then(|doc| doc.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("auto"),
+        "{auto_copy:?}"
+    );
+
+    let overwrite = format!(
+        "{{\"index\":{{\"_index\":\"orders\",\"_id\":\"{id_a}\"}}}}\n\
+         {{\"title\":\"from-primary\",\"n\":1}}\n"
+    );
+    let (status, body) = post_ndjson(&members[primary_a].app, "/orders/_bulk", &overwrite).await;
+    assert!(status.is_success(), "bulk on the primary: {status} {body}");
+    assert_eq!(
+        body.pointer("/errors").and_then(|v| v.as_bool()),
+        Some(false),
+        "{body}"
+    );
+    let on_replica = replica_source(&members[replica_a], shard_a, &id_a).await;
+    assert_eq!(
+        on_replica
+            .as_ref()
+            .and_then(|doc| doc.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("from-primary"),
+        "a bulk the primary itself accepts is still copied: {on_replica:?}"
+    );
+
+    let (status, body) = post_json(
+        &members[writer].app,
+        &format!("/orders/_update/{id_a}"),
+        json!({ "doc": { "extra": "yes", "n": 2 } }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "update from non-owner: {status} {body}"
+    );
+    assert_eq!(
+        body.get("result").and_then(|v| v.as_str()),
+        Some("updated"),
+        "{body}"
+    );
+    let on_primary = user_source(&members[primary_a], &id_a)
+        .await
+        .expect("primary");
+    assert_eq!(
+        on_primary.get("extra").and_then(|v| v.as_str()),
+        Some("yes"),
+        "{on_primary}"
+    );
+    assert_eq!(on_primary.get("n").and_then(|v| v.as_u64()), Some(2));
+    let on_replica = replica_source(&members[replica_a], shard_a, &id_a)
+        .await
+        .expect("replica");
+    assert_eq!(
+        on_replica.get("extra").and_then(|v| v.as_str()),
+        Some("yes")
+    );
+    assert_eq!(
+        on_replica.get("title").and_then(|v| v.as_str()),
+        Some("from-primary")
+    );
+    assert!(user_source(&members[writer], &id_a).await.is_none());
+
+    let (status, body) = post_json(
+        &members[writer].app,
+        &format!("/orders/_update/{id_a}"),
+        json!({ "script": { "source": "ctx._source.title = 'scripted'" } }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "scripted update from non-owner: {status} {body}"
+    );
+    let on_primary = user_source(&members[primary_a], &id_a)
+        .await
+        .expect("primary");
+    assert_eq!(
+        on_primary.get("title").and_then(|v| v.as_str()),
+        Some("scripted"),
+        "the script ran where the document is: {on_primary}"
+    );
+    assert_eq!(
+        on_primary.get("extra").and_then(|v| v.as_str()),
+        Some("yes")
+    );
+    let on_replica = replica_source(&members[replica_a], shard_a, &id_a)
+        .await
+        .expect("replica");
+    assert_eq!(
+        on_replica.get("title").and_then(|v| v.as_str()),
+        Some("scripted"),
+        "{on_replica}"
+    );
+
+    let deletion = format!("{{\"delete\":{{\"_index\":\"orders\",\"_id\":\"{id_b}\"}}}}\n");
+    let (status, body) = post_ndjson(&members[writer].app, "/_bulk", &deletion).await;
+    assert!(status.is_success(), "bulk delete: {status} {body}");
+    assert_eq!(
+        body.pointer("/errors").and_then(|v| v.as_bool()),
+        Some(false),
+        "{body}"
+    );
+    assert!(user_source(&members[primary_b], &id_b).await.is_none());
+    assert!(
+        replica_source(&members[replica_b], shard_b, &id_b)
+            .await
+            .is_none(),
+        "the replica still has the deleted document"
+    );
+    let (status, body) = get(&members[writer].app, &format!("/orders/_doc/{id_b}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    members[primary_a].handle.clear_shard_handler();
+    let (status, body) = get(&members[writer].app, &format!("/orders/_doc/{id_a}")).await;
+    assert!(
+        status.is_success(),
+        "GET after the primary stops reads the copy: {status} {body}"
+    );
+    assert_eq!(
+        body.pointer("/_source/title").and_then(|v| v.as_str()),
+        Some("scripted"),
+        "{body}"
+    );
+    let again = format!(
+        "{{\"index\":{{\"_index\":\"orders\",\"_id\":\"{id_a}\"}}}}\n\
+         {{\"title\":\"no-primary\"}}\n"
+    );
+    let (status, body) = post_ndjson(&members[writer].app, "/_bulk", &again).await;
+    assert!(status.is_success(), "bulk HTTP status: {status} {body}");
+    assert_eq!(
+        body.pointer("/errors").and_then(|v| v.as_bool()),
+        Some(true),
+        "{body}"
+    );
+    assert_eq!(
+        bulk_item(&body, 0).get("status").and_then(|v| v.as_u64()),
+        Some(503),
+        "a bulk write still needs the primary: {body}"
+    );
+    let on_replica = replica_source(&members[replica_a], shard_a, &id_a)
+        .await
+        .expect("replica");
+    assert_eq!(
+        on_replica.get("title").and_then(|v| v.as_str()),
+        Some("scripted"),
+        "the refused bulk did not change the copy: {on_replica}"
+    );
+
+    for member in &members {
+        let _ = member.shutdown.send(true);
+    }
 }

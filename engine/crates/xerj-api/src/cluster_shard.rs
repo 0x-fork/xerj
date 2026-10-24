@@ -2,9 +2,11 @@
 //!
 //! With a cluster handle attached, a replicated index carries a primary plan
 //! in the same Raft entry as the create. [`dispatch_index`] forwards a
-//! document to the owner [`Engine::route_write`] names. The primary then
-//! copies an index or delete onto the in-sync replicas and acknowledges the
-//! caller when a quorum of the copies has confirmed. A replica that does not
+//! document to the owner [`Engine::route_write`] names. [`dispatch_update`]
+//! and [`bulk_on_primaries`] send `_update` and `_bulk` to that same owner.
+//! The primary copies an index, delete, or the document an update stored
+//! onto the in-sync replicas and acknowledges the caller when a quorum of
+//! the copies has confirmed. A replica that does not
 //! confirm is dropped from the in-sync set when the rest already make a
 //! quorum. That replica copies the primary's live documents when it can
 //! answer again, and the primary then publishes it back into the in-sync
@@ -17,7 +19,7 @@
 //! a primary search does not count them twice. The owner's handler does not
 //! route a `replica` apply again.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,8 +30,8 @@ use serde_json::{json, Value};
 use xerj_cluster::{ApplyEffect, ClusterCommand, ShardOp, ShardResult};
 
 use crate::es_compat::{
-    apply_get_doc_source_filter, search_shard_local, EsSearchBody, EsSearchJson,
-    EsSearchQueryParams, GetDocParams,
+    apply_get_doc_source_filter, apply_local_update, search_shard_local, EsSearchBody,
+    EsSearchJson, EsSearchQueryParams, EsUpdateBody, GetDocParams, UpdateDocParams,
 };
 use crate::responses::{EsDeleteDocResponse, EsDocResponse, EsGetResponse};
 use crate::state::AppState;
@@ -247,6 +249,60 @@ pub(crate) async fn dispatch_delete(
         if_primary_term,
         replica: false,
         shard: 0,
+    };
+    Dispatch::Done(forward_retrying(state, &owner, op).await)
+}
+
+/// Route one `_update` to the shard primary. The primary applies the partial
+/// document or the script and copies the stored source onto the in-sync replicas.
+///
+/// [`Dispatch::Local`] is only an index with no shard plan. Single-node mode
+/// does not call this.
+pub(crate) async fn dispatch_update(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    body: &EsUpdateBody,
+    params: &UpdateDocParams,
+) -> Dispatch {
+    if !state.engine.has_cluster() {
+        return Dispatch::Local;
+    }
+    let concrete = match ensure_concrete_index(state, index).await {
+        Ok(name) => name,
+        Err(err) => return Dispatch::Done(ensure_fail_response(index, err)),
+    };
+    let body_json = match serde_json::to_string(body) {
+        Ok(json) => json,
+        Err(err) => {
+            return Dispatch::Done(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "type": "parsing_exception",
+                            "reason": format!("update body could not be forwarded: {err}")
+                        },
+                        "status": 400
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    let params_json = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+    if state.engine.owns_shard(&concrete, id) {
+        let result = local_update(state, index, id, &body_json, &params_json).await;
+        return Dispatch::Done(http_result(result));
+    }
+    let Some(owner) = state.engine.route_write(&concrete, id) else {
+        return Dispatch::Local;
+    };
+    let op = ShardOp::UpdateDoc {
+        index: index.to_string(),
+        id: id.to_string(),
+        body_json,
+        params_json,
     };
     Dispatch::Done(forward_retrying(state, &owner, op).await)
 }
@@ -576,6 +632,40 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                     if_primary_term,
                     replica,
                     shard,
+                )
+                .await
+            }
+            ShardOp::UpdateDoc {
+                index,
+                id,
+                body_json,
+                params_json,
+            } => {
+                let concrete = concrete_index_name(&self.state.engine, &index);
+                if self.state.engine.get_index(&concrete).is_err() {
+                    return ShardResult::http(503, shard_not_ready_body(&index));
+                }
+                if !self.state.engine.owns_shard(&concrete, &id) {
+                    if let Some(owner) = self.state.engine.route_write(&concrete, &id) {
+                        return not_this_primary(&index, &owner);
+                    }
+                }
+                local_update(&self.state, &index, &id, &body_json, &params_json).await
+            }
+            ShardOp::Bulk {
+                body,
+                default_index,
+                require_alias,
+                default_pipeline,
+                default_source_req_json,
+            } => {
+                handle_bulk(
+                    &self.state,
+                    &body,
+                    default_index.as_deref(),
+                    require_alias,
+                    default_pipeline,
+                    default_source_req_json,
                 )
                 .await
             }
@@ -1464,4 +1554,1010 @@ async fn local_search(
         .await
     };
     response_to_result(response).await
+}
+
+// ── `_update` and `_bulk` on the primary ────────────────────────────────────
+
+/// Backing index when `name` is an alias, otherwise `name`.
+///
+/// `Engine::get_index` writes an alias through its first backing index. Routing
+/// has to use that same name, or the shard plan (which lives on the concrete
+/// index) is invisible and the write stays on the node that received it.
+fn concrete_index_name(engine: &xerj_engine::Engine, name: &str) -> String {
+    engine
+        .aliases
+        .get(name)
+        .and_then(|names| names.first().cloned())
+        .filter(|backing| !backing.is_empty())
+        .unwrap_or_else(|| name.to_string())
+}
+
+enum EnsureFail {
+    Engine(xerj_engine::EngineError),
+    Unavailable(String),
+}
+
+fn ensure_fail_response(index: &str, err: EnsureFail) -> Response {
+    match err {
+        EnsureFail::Engine(err) => engine_error_response(err),
+        EnsureFail::Unavailable(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {
+                    "type": "shard_not_ready",
+                    "reason": format!("index [{index}] is not on this shard yet: {reason}")
+                },
+                "status": 503
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn ensure_fail_status(err: EnsureFail) -> (u16, String) {
+    match err {
+        EnsureFail::Engine(err) => {
+            let common = xerj_common::XerjError::from(err);
+            let status = common.http_status();
+            (status, common.to_string())
+        }
+        EnsureFail::Unavailable(reason) => (503, reason),
+    }
+}
+
+async fn wait_index_open(state: &AppState, name: &str) -> bool {
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        if state.engine.get_index(name).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Open `name`, creating it through the Raft log when it is not an alias and
+/// this node does not have it yet. Does not write a document.
+async fn ensure_concrete_index(state: &AppState, name: &str) -> Result<String, EnsureFail> {
+    let concrete = concrete_index_name(&state.engine, name);
+    if concrete != name {
+        if state.engine.get_index(&concrete).is_err() {
+            return Err(EnsureFail::Unavailable(format!(
+                "alias [{name}] does not point at an open index"
+            )));
+        }
+        return Ok(concrete);
+    }
+    if state.engine.get_index(&concrete).is_err() {
+        state
+            .engine
+            .ensure_replicated_index(&concrete)
+            .await
+            .map_err(EnsureFail::Engine)?;
+    }
+    if !wait_index_open(state, &concrete).await {
+        return Err(EnsureFail::Unavailable(format!(
+            "index [{concrete}] was not open after the create committed"
+        )));
+    }
+    Ok(concrete)
+}
+
+fn not_this_primary(index: &str, owner: &str) -> ShardResult {
+    ShardResult::http(
+        409,
+        json!({
+            "error": {
+                "type": "shard_not_primary",
+                "reason": format!("[{index}] is owned by [{owner}], not this node")
+            },
+            "status": 409
+        })
+        .to_string(),
+    )
+}
+
+async fn local_update(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    body_json: &str,
+    params_json: &str,
+) -> ShardResult {
+    let concrete = concrete_index_name(&state.engine, index);
+    if state.engine.get_index(&concrete).is_err() {
+        return ShardResult::http(503, shard_not_ready_body(index));
+    }
+    let body: EsUpdateBody = match serde_json::from_str(body_json) {
+        Ok(body) => body,
+        Err(err) => {
+            return ShardResult::http(
+                400,
+                json!({
+                    "error": {
+                        "type": "parsing_exception",
+                        "reason": format!("forwarded update body is not JSON: {err}")
+                    },
+                    "status": 400
+                })
+                .to_string(),
+            );
+        }
+    };
+    let params: UpdateDocParams = serde_json::from_str(params_json).unwrap_or_default();
+    let applied = apply_local_update(state, index, id, body, &params).await;
+    if !applied.replicate {
+        return response_to_result(applied.response).await;
+    }
+    let copy = match state.engine.get_index(&concrete) {
+        Ok(idx) => match idx.get_document(id).await {
+            Ok(Some(doc)) => match serde_json::to_string(&doc) {
+                Ok(source_json) => ShardOp::IndexDoc {
+                    index: concrete.clone(),
+                    id: id.to_string(),
+                    source_json,
+                    op: "index".to_string(),
+                    if_seq_no: None,
+                    if_primary_term: None,
+                    version: None,
+                    version_type: None,
+                    replica: false,
+                    shard: 0,
+                },
+                Err(err) => {
+                    return ShardResult::http(
+                        503,
+                        json!({
+                            "error": {
+                                "type": "replica_not_acknowledged",
+                                "reason": format!(
+                                    "primary applied the update on [{index}] but document [{id}] could not be copied: {err}"
+                                )
+                            },
+                            "status": 503
+                        })
+                        .to_string(),
+                    );
+                }
+            },
+            Ok(None) => ShardOp::DeleteDoc {
+                index: concrete.clone(),
+                id: id.to_string(),
+                if_seq_no: None,
+                if_primary_term: None,
+                replica: false,
+                shard: 0,
+            },
+            Err(err) => {
+                return ShardResult::http(
+                    503,
+                    json!({
+                        "error": {
+                            "type": "replica_not_acknowledged",
+                            "reason": format!(
+                                "primary applied the update on [{index}] but document [{id}] could not be read for the replica copy: {err}"
+                            )
+                        },
+                        "status": 503
+                    })
+                    .to_string(),
+                );
+            }
+        },
+        Err(err) => {
+            return ShardResult::http(
+                503,
+                json!({
+                    "error": {
+                        "type": "replica_not_acknowledged",
+                        "reason": format!(
+                            "primary applied the update on [{index}] but [{concrete}] is not open for the replica copy: {err}"
+                        )
+                    },
+                    "status": 503
+                })
+                .to_string(),
+            );
+        }
+    };
+    if let Err(nack) = replicate_write(state, &concrete, id, copy).await {
+        return nack;
+    }
+    response_to_result(applied.response).await
+}
+
+/// One parsed bulk action, in request order.
+struct BulkPiece {
+    action: String,
+    /// Name the caller used. The bulk pipeline reports this on the item.
+    index: String,
+    id: String,
+    action_line: String,
+    source_line: Option<String>,
+    /// Set when this action is already an error and must not be written.
+    preset: Option<xerj_engine::bulk::BulkItemResult>,
+    concrete: String,
+}
+
+fn bulk_item_error(
+    action: &str,
+    index: &str,
+    id: &str,
+    status: u16,
+    error: impl Into<String>,
+) -> xerj_engine::bulk::BulkItemResult {
+    xerj_engine::bulk::BulkItemResult {
+        action: action.to_string(),
+        index: index.to_string(),
+        id: id.to_string(),
+        status,
+        result: None,
+        error: Some(error.into()),
+        get_source: None,
+    }
+}
+
+/// Same pairing rule as the bulk engine: a delete action has no source line.
+/// The two parsers have to agree, or a delete swallows the next action.
+fn bulk_action_line_is_delete(line: &str) -> bool {
+    let b = line.as_bytes();
+    let mut p = 0usize;
+    while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
+        p += 1;
+    }
+    if p >= b.len() || b[p] != b'{' {
+        return false;
+    }
+    p += 1;
+    while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
+        p += 1;
+    }
+    if p >= b.len() || b[p] != b'"' {
+        return false;
+    }
+    p += 1;
+    let start = p;
+    while p < b.len() && b[p] != b'"' {
+        p += 1;
+    }
+    p < b.len() && &b[start..p] == b"delete"
+}
+
+fn json_meta_id(meta: &Value) -> Option<String> {
+    match meta.get("_id")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn split_bulk_pieces(body: &str, default_index: Option<&str>) -> Vec<BulkPiece> {
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut pieces = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let raw_action = lines[i];
+        let is_delete = bulk_action_line_is_delete(raw_action);
+        let source_line = if !is_delete && i + 1 < lines.len() {
+            let source = lines[i + 1];
+            i += 2;
+            Some(source.to_string())
+        } else {
+            i += 1;
+            None
+        };
+        let action_val: Value = match serde_json::from_str(raw_action) {
+            Ok(value) => value,
+            Err(err) => {
+                pieces.push(BulkPiece {
+                    action: "unknown".to_string(),
+                    index: default_index.unwrap_or("_unknown").to_string(),
+                    id: String::new(),
+                    action_line: String::new(),
+                    source_line: None,
+                    preset: Some(bulk_item_error(
+                        "unknown",
+                        default_index.unwrap_or("_unknown"),
+                        "",
+                        400,
+                        format!("failed to parse action line: {err}"),
+                    )),
+                    concrete: String::new(),
+                });
+                continue;
+            }
+        };
+        let (action, meta) = if let Some(meta) = action_val.get("index") {
+            ("index", meta)
+        } else if let Some(meta) = action_val.get("create") {
+            ("create", meta)
+        } else if let Some(meta) = action_val.get("update") {
+            ("update", meta)
+        } else if let Some(meta) = action_val.get("delete") {
+            ("delete", meta)
+        } else {
+            pieces.push(BulkPiece {
+                action: "unknown".to_string(),
+                index: default_index.unwrap_or("_unknown").to_string(),
+                id: String::new(),
+                action_line: String::new(),
+                source_line: None,
+                preset: Some(bulk_item_error(
+                    "unknown",
+                    default_index.unwrap_or("_unknown"),
+                    "",
+                    400,
+                    "unknown action type",
+                )),
+                concrete: String::new(),
+            });
+            continue;
+        };
+        let mut meta = if meta.is_object() {
+            meta.clone()
+        } else {
+            json!({})
+        };
+        let index = meta
+            .get("_index")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| default_index.map(str::to_string))
+            .unwrap_or_else(|| "_unknown".to_string());
+        if meta.get("_index").and_then(Value::as_str).is_none() {
+            meta["_index"] = json!(index);
+        }
+        if let Some(id) = json_meta_id(&meta) {
+            if id.is_empty() {
+                pieces.push(BulkPiece {
+                    action: action.to_string(),
+                    index: index.clone(),
+                    id: String::new(),
+                    action_line: String::new(),
+                    source_line: None,
+                    preset: Some(bulk_item_error(
+                        action,
+                        &index,
+                        "",
+                        400,
+                        "if _id is specified it must not be empty",
+                    )),
+                    concrete: String::new(),
+                });
+                continue;
+            }
+        }
+        let id = match json_meta_id(&meta) {
+            Some(id) => id,
+            None if action == "index" || action == "create" => {
+                let id = uuid::Uuid::new_v4().to_string();
+                meta["_id"] = json!(id);
+                id
+            }
+            None => {
+                let reason = if action == "update" {
+                    "update action requires _id"
+                } else {
+                    "delete action requires _id"
+                };
+                pieces.push(BulkPiece {
+                    action: action.to_string(),
+                    index: index.clone(),
+                    id: String::new(),
+                    action_line: String::new(),
+                    source_line: None,
+                    preset: Some(bulk_item_error(action, &index, "", 400, reason)),
+                    concrete: String::new(),
+                });
+                continue;
+            }
+        };
+        if action != "delete" && source_line.is_none() {
+            pieces.push(BulkPiece {
+                action: action.to_string(),
+                index: index.clone(),
+                id: id.clone(),
+                action_line: String::new(),
+                source_line: None,
+                preset: Some(bulk_item_error(
+                    action,
+                    &index,
+                    &id,
+                    400,
+                    "missing document body",
+                )),
+                concrete: String::new(),
+            });
+            continue;
+        }
+        let mut action_obj = serde_json::Map::new();
+        action_obj.insert(action.to_string(), meta);
+        let action_line = serde_json::to_string(&Value::Object(action_obj))
+            .unwrap_or_else(|_| raw_action.to_string());
+        pieces.push(BulkPiece {
+            action: action.to_string(),
+            index,
+            id,
+            action_line,
+            source_line: if action == "delete" {
+                None
+            } else {
+                source_line
+            },
+            preset: None,
+            concrete: String::new(),
+        });
+    }
+    pieces
+}
+
+fn group_ndjson(pieces: &[BulkPiece], which: &[usize]) -> String {
+    let mut body = String::new();
+    for &at in which {
+        body.push_str(&pieces[at].action_line);
+        body.push('\n');
+        if let Some(source) = &pieces[at].source_line {
+            body.push_str(source);
+            body.push('\n');
+        }
+    }
+    body
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BulkWire {
+    version: u64,
+    seq_no: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PrimaryBulkReply {
+    took_ms: u64,
+    errors: bool,
+    items: Vec<xerj_engine::bulk::BulkItemResult>,
+    wire: Vec<Option<BulkWire>>,
+}
+
+fn nack_reason(result: &ShardResult) -> String {
+    serde_json::from_str::<Value>(&result.body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/reason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| result.body.clone())
+}
+
+fn mark_bulk_nack(item: &mut xerj_engine::bulk::BulkItemResult, nack: &ShardResult) {
+    item.status = nack.status;
+    item.result = None;
+    item.get_source = None;
+    item.error = Some(nack_reason(nack));
+}
+
+fn wire_of(engine: &xerj_engine::Engine, index: &str, id: &str) -> Option<(u64, u64)> {
+    let idx = engine.get_index(index).ok()?;
+    Some((
+        idx.lookup_version(id).unwrap_or(1),
+        idx.lookup_seq_no(id).unwrap_or(0),
+    ))
+}
+
+/// Run the local bulk pipeline, then copy each success onto the in-sync replicas.
+///
+/// A noop update is not copied: the source did not change. A failed item is
+/// not copied. A copy that misses quorum replaces that item's success with
+/// the same `replica_not_acknowledged` a single-document write returns. The
+/// primary already has the write.
+async fn replicate_bulk_result(
+    state: &AppState,
+    mut result: xerj_engine::bulk::BulkResult,
+) -> (xerj_engine::bulk::BulkResult, Vec<Option<(u64, u64)>>) {
+    let mut wire = Vec::with_capacity(result.items.len());
+    // `item` borrows `result.items`, so the flag is applied after the loop.
+    let mut copy_failed = false;
+    for item in &mut result.items {
+        let failed = item.error.is_some() || !(200..300).contains(&item.status);
+        if failed || item.id.is_empty() {
+            if !failed && item.id.is_empty() {
+                item.status = 503;
+                item.result = None;
+                item.error = Some(
+                    "bulk item was acknowledged without an id, so it was not copied".to_string(),
+                );
+                copy_failed = true;
+            }
+            wire.push(None);
+            continue;
+        }
+        let concrete = concrete_index_name(&state.engine, &item.index);
+        if item.action == "delete" {
+            let index = concrete.clone();
+            let id = item.id.clone();
+            let op = ShardOp::DeleteDoc {
+                index: index.clone(),
+                id: id.clone(),
+                if_seq_no: None,
+                if_primary_term: None,
+                replica: false,
+                shard: 0,
+            };
+            if let Err(nack) = replicate_write(state, &index, &id, op).await {
+                mark_bulk_nack(item, &nack);
+                copy_failed = true;
+            }
+            wire.push(None);
+            continue;
+        }
+        if item.result.as_deref() == Some("noop") {
+            wire.push(wire_of(&state.engine, &concrete, &item.id));
+            continue;
+        }
+        let op = match state.engine.get_index(&concrete) {
+            Ok(idx) => match idx.get_document(&item.id).await {
+                Ok(Some(doc)) => match serde_json::to_string(&doc) {
+                    Ok(source_json) => ShardOp::IndexDoc {
+                        index: concrete.clone(),
+                        id: item.id.clone(),
+                        source_json,
+                        op: "index".to_string(),
+                        if_seq_no: None,
+                        if_primary_term: None,
+                        version: None,
+                        version_type: None,
+                        replica: false,
+                        shard: 0,
+                    },
+                    Err(err) => {
+                        mark_bulk_nack(
+                            item,
+                            &ShardResult::http(
+                                503,
+                                json!({
+                                    "error": {
+                                        "type": "replica_not_acknowledged",
+                                        "reason": format!(
+                                            "primary applied the bulk item on [{concrete}] but document [{}] is not JSON: {err}",
+                                            item.id
+                                        )
+                                    },
+                                    "status": 503
+                                })
+                                .to_string(),
+                            ),
+                        );
+                        copy_failed = true;
+                        wire.push(None);
+                        continue;
+                    }
+                },
+                Ok(None) => ShardOp::DeleteDoc {
+                    index: concrete.clone(),
+                    id: item.id.clone(),
+                    if_seq_no: None,
+                    if_primary_term: None,
+                    replica: false,
+                    shard: 0,
+                },
+                Err(err) => {
+                    mark_bulk_nack(
+                        item,
+                        &ShardResult::http(
+                            503,
+                            json!({
+                                "error": {
+                                    "type": "replica_not_acknowledged",
+                                    "reason": format!(
+                                        "primary applied the bulk item on [{concrete}] but document [{}] could not be read: {err}",
+                                        item.id
+                                    )
+                                },
+                                "status": 503
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    copy_failed = true;
+                    wire.push(None);
+                    continue;
+                }
+            },
+            Err(err) => {
+                mark_bulk_nack(
+                    item,
+                    &ShardResult::http(
+                        503,
+                        json!({
+                            "error": {
+                                "type": "replica_not_acknowledged",
+                                "reason": format!(
+                                    "primary applied the bulk item but [{concrete}] is not open: {err}"
+                                )
+                            },
+                            "status": 503
+                        })
+                        .to_string(),
+                    ),
+                );
+                copy_failed = true;
+                wire.push(None);
+                continue;
+            }
+        };
+        let index = op_index(&op).to_string();
+        if let Err(nack) = replicate_write(state, &index, &item.id, op).await {
+            mark_bulk_nack(item, &nack);
+            copy_failed = true;
+            wire.push(None);
+            continue;
+        }
+        wire.push(wire_of(&state.engine, &concrete, &item.id));
+    }
+    if copy_failed {
+        result.errors = true;
+    }
+    (result, wire)
+}
+
+fn op_index(op: &ShardOp) -> &str {
+    match op {
+        ShardOp::IndexDoc { index, .. }
+        | ShardOp::DeleteDoc { index, .. }
+        | ShardOp::UpdateDoc { index, .. } => index,
+        _ => "",
+    }
+}
+
+fn bulk_opts_from_parts(
+    require_alias: Option<bool>,
+    default_pipeline: Option<String>,
+    default_source_req_json: Option<String>,
+) -> xerj_engine::bulk::BulkOpts {
+    xerj_engine::bulk::BulkOpts {
+        require_alias,
+        default_pipeline,
+        default_source_req: default_source_req_json
+            .and_then(|json| serde_json::from_str(&json).ok()),
+    }
+}
+
+async fn run_primary_bulk(
+    state: &AppState,
+    body: &str,
+    default_index: Option<&str>,
+    opts: xerj_engine::bulk::BulkOpts,
+) -> (xerj_engine::bulk::BulkResult, Vec<Option<(u64, u64)>>) {
+    let result =
+        xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, body, opts).await;
+    replicate_bulk_result(state, result).await
+}
+
+/// Refuse a forwarded bulk that names a shard this node does not own, and
+/// wait until every named index is open. Either check happens before any
+/// document is written.
+fn bulk_refused_here(state: &AppState, pieces: &[BulkPiece]) -> Option<ShardResult> {
+    let me = state.engine.routing_node_id();
+    for piece in pieces {
+        if piece.preset.is_some() {
+            continue;
+        }
+        let concrete = concrete_index_name(&state.engine, &piece.index);
+        if state.engine.get_index(&concrete).is_err() {
+            return Some(ShardResult::http(503, shard_not_ready_body(&piece.index)));
+        }
+        if state.engine.owns_shard(&concrete, &piece.id) {
+            continue;
+        }
+        if let Some(owner) = state.engine.route_write(&concrete, &piece.id) {
+            if owner != me {
+                return Some(not_this_primary(&piece.index, &owner));
+            }
+        }
+    }
+    None
+}
+
+async fn handle_bulk(
+    state: &AppState,
+    body: &str,
+    default_index: Option<&str>,
+    require_alias: Option<bool>,
+    default_pipeline: Option<String>,
+    default_source_req_json: Option<String>,
+) -> ShardResult {
+    let pieces = split_bulk_pieces(body, default_index);
+    if let Some(refused) = bulk_refused_here(state, &pieces) {
+        return refused;
+    }
+    let opts = bulk_opts_from_parts(require_alias, default_pipeline, default_source_req_json);
+    let (result, wire) = run_primary_bulk(state, body, default_index, opts).await;
+    let reply = PrimaryBulkReply {
+        took_ms: result.took_ms,
+        errors: result.errors,
+        items: result.items,
+        wire: wire
+            .into_iter()
+            .map(|item| item.map(|(version, seq_no)| BulkWire { version, seq_no }))
+            .collect(),
+    };
+    let body = serde_json::to_string(&reply).unwrap_or_else(|_| {
+        json!({
+            "took_ms": 0,
+            "errors": true,
+            "items": [],
+            "wire": []
+        })
+        .to_string()
+    });
+    ShardResult::http(200, body)
+}
+
+struct OwnerGroup {
+    remote: bool,
+    owner: String,
+    pieces: Vec<usize>,
+}
+
+fn spread_group_failure(
+    pieces: &[BulkPiece],
+    which: &[usize],
+    status: u16,
+    error: String,
+) -> (
+    Vec<xerj_engine::bulk::BulkItemResult>,
+    Vec<Option<(u64, u64)>>,
+) {
+    let items = which
+        .iter()
+        .map(|&at| {
+            bulk_item_error(
+                &pieces[at].action,
+                &pieces[at].index,
+                &pieces[at].id,
+                status,
+                error.clone(),
+            )
+        })
+        .collect();
+    (items, vec![None; which.len()])
+}
+
+async fn execute_owner_group(
+    state: &AppState,
+    pieces: &[BulkPiece],
+    group: &OwnerGroup,
+    opts: &xerj_engine::bulk::BulkOpts,
+    default_index: Option<&str>,
+) -> (
+    Vec<xerj_engine::bulk::BulkItemResult>,
+    Vec<Option<(u64, u64)>>,
+) {
+    let body = group_ndjson(pieces, &group.pieces);
+    if !group.remote {
+        let (result, wire) = run_primary_bulk(state, &body, default_index, opts.clone()).await;
+        return align_group(pieces, &group.pieces, result, wire);
+    }
+    let op = ShardOp::Bulk {
+        body,
+        default_index: default_index.map(str::to_string),
+        require_alias: opts.require_alias,
+        default_pipeline: opts.default_pipeline.clone(),
+        default_source_req_json: opts
+            .default_source_req
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok()),
+    };
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        match state.engine.forward_shard(&group.owner, op.clone()).await {
+            Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(result) if (200..300).contains(&result.status) => {
+                match serde_json::from_str::<PrimaryBulkReply>(&result.body) {
+                    Ok(reply) => {
+                        let wire = reply
+                            .wire
+                            .into_iter()
+                            .map(|item| item.map(|wire| (wire.version, wire.seq_no)))
+                            .collect();
+                        let result = xerj_engine::bulk::BulkResult {
+                            took_ms: reply.took_ms,
+                            errors: reply.errors,
+                            items: reply.items,
+                        };
+                        return align_group(pieces, &group.pieces, result, wire);
+                    }
+                    Err(err) => {
+                        return spread_group_failure(
+                            pieces,
+                            &group.pieces,
+                            503,
+                            format!("primary bulk response was not usable: {err}"),
+                        );
+                    }
+                }
+            }
+            Ok(result) => {
+                return spread_group_failure(
+                    pieces,
+                    &group.pieces,
+                    result.status,
+                    nack_reason(&result),
+                );
+            }
+            Err(err) => {
+                return spread_group_failure(pieces, &group.pieces, 503, err.to_string());
+            }
+        }
+    }
+}
+
+fn align_group(
+    pieces: &[BulkPiece],
+    which: &[usize],
+    mut result: xerj_engine::bulk::BulkResult,
+    mut wire: Vec<Option<(u64, u64)>>,
+) -> (
+    Vec<xerj_engine::bulk::BulkItemResult>,
+    Vec<Option<(u64, u64)>>,
+) {
+    if result.items.len() == which.len() {
+        if wire.len() < which.len() {
+            wire.resize(which.len(), None);
+        }
+        wire.truncate(which.len());
+        return (result.items, wire);
+    }
+    if result.items.len() == 1 && result.errors {
+        let err = result.items.pop().expect("length checked");
+        let reason = err
+            .error
+            .unwrap_or_else(|| "bulk request failed".to_string());
+        return spread_group_failure(pieces, which, err.status, reason);
+    }
+    spread_group_failure(
+        pieces,
+        which,
+        500,
+        format!(
+            "primary returned {} bulk items for {} actions",
+            result.items.len(),
+            which.len()
+        ),
+    )
+}
+
+/// Route a bulk body to each action's primary and copy the successes.
+///
+/// [`crate::es_compat`] calls this only when a cluster handle is attached.
+/// The returned wire versions are the primary's. The accepting node does not
+/// have the document, so a local lookup would report a fresh id.
+pub(crate) async fn bulk_on_primaries(
+    state: &AppState,
+    default_index: Option<&str>,
+    body: &str,
+    opts: xerj_engine::bulk::BulkOpts,
+) -> (xerj_engine::bulk::BulkResult, Vec<Option<(u64, u64)>>) {
+    let started = Instant::now();
+    let line_count = body.lines().filter(|line| !line.trim().is_empty()).count();
+    let max_actions = state.engine.config().limits.max_actions_per_bulk;
+    if line_count == 0 || (max_actions > 0 && line_count > max_actions.saturating_mul(2)) {
+        let result =
+            xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, body, opts)
+                .await;
+        let wire = vec![None; result.items.len()];
+        return (result, wire);
+    }
+
+    let mut pieces = split_bulk_pieces(body, default_index);
+    let mut ensured: HashMap<String, Result<String, (u16, String)>> = HashMap::new();
+    for piece in &mut pieces {
+        if piece.preset.is_some() {
+            continue;
+        }
+        let outcome = if let Some(cached) = ensured.get(&piece.index) {
+            cached.clone()
+        } else {
+            let outcome = match ensure_concrete_index(state, &piece.index).await {
+                Ok(name) => Ok(name),
+                Err(err) => Err(ensure_fail_status(err)),
+            };
+            ensured.insert(piece.index.clone(), outcome.clone());
+            outcome
+        };
+        match outcome {
+            Ok(name) => piece.concrete = name,
+            Err((status, reason)) => {
+                piece.preset = Some(bulk_item_error(
+                    &piece.action,
+                    &piece.index,
+                    &piece.id,
+                    status,
+                    reason,
+                ));
+            }
+        }
+    }
+
+    let mut groups: Vec<OwnerGroup> = Vec::new();
+    for (at, piece) in pieces.iter().enumerate() {
+        if piece.preset.is_some() {
+            continue;
+        }
+        let remote = if state.engine.owns_shard(&piece.concrete, &piece.id) {
+            None
+        } else {
+            state.engine.route_write(&piece.concrete, &piece.id)
+        };
+        let owner = remote.clone().unwrap_or_default();
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.remote == remote.is_some() && group.owner == owner)
+        {
+            group.pieces.push(at);
+        } else {
+            groups.push(OwnerGroup {
+                remote: remote.is_some(),
+                owner,
+                pieces: vec![at],
+            });
+        }
+    }
+
+    let mut items: Vec<Option<xerj_engine::bulk::BulkItemResult>> =
+        pieces.iter().map(|piece| piece.preset.clone()).collect();
+    let mut wire = vec![None; pieces.len()];
+    for group in &groups {
+        let (group_items, group_wire) =
+            execute_owner_group(state, &pieces, group, &opts, default_index).await;
+        for (slot, (item, item_wire)) in group
+            .pieces
+            .iter()
+            .zip(group_items.into_iter().zip(group_wire))
+        {
+            items[*slot] = Some(item);
+            wire[*slot] = item_wire;
+        }
+    }
+    let items: Vec<_> = items
+        .into_iter()
+        .enumerate()
+        .map(|(at, item)| {
+            item.unwrap_or_else(|| {
+                bulk_item_error(
+                    pieces
+                        .get(at)
+                        .map(|piece| piece.action.as_str())
+                        .unwrap_or("index"),
+                    pieces
+                        .get(at)
+                        .map(|piece| piece.index.as_str())
+                        .unwrap_or(""),
+                    pieces.get(at).map(|piece| piece.id.as_str()).unwrap_or(""),
+                    500,
+                    "bulk item was not executed",
+                )
+            })
+        })
+        .collect();
+    let errors = items
+        .iter()
+        .any(|item| item.error.is_some() || !(200..300).contains(&item.status));
+    (
+        xerj_engine::bulk::BulkResult {
+            took_ms: started.elapsed().as_millis() as u64,
+            errors,
+            items,
+        },
+        wire,
+    )
 }
