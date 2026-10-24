@@ -576,6 +576,11 @@ pub struct FileAssignment {
     pub as_document: bool,
 }
 
+/// Substring of a PDF junk reason that means the isolated parser process
+/// never started. Kept here so the run summary and the spawn error cannot
+/// drift: a family-wide failure is this reason on every PDF, with none indexed.
+pub(crate) const PDF_WORKER_START_FAILURE: &str = "could not start the isolated PDF parser";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JunkFile {
     pub file_key: String,
@@ -584,6 +589,10 @@ pub struct JunkFile {
     pub status: String, // junk | skipped | stale-plan
     pub reason: String,
     pub bytes: u64,
+}
+
+fn is_pdf_format(format: &str) -> bool {
+    format.strip_suffix("(gzip)").unwrap_or(format) == "pdf"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -663,6 +672,35 @@ pub struct RefusedDataset {
 }
 
 impl Plan {
+    /// `Some(n)` when every PDF in this plan failed because the isolated
+    /// parser could not start, and none was indexed (#2336).
+    ///
+    /// One corrupt PDF stays ordinary junk. A platform that cannot spawn the
+    /// worker fails the whole family the same way, and exit 3 would report
+    /// that as success. `n` is the number of PDF files.
+    pub(crate) fn pdf_worker_unavailable_count(&self) -> Option<u64> {
+        let indexed = self
+            .files
+            .values()
+            .filter(|file| file.family == "pdf")
+            .count();
+        if indexed > 0 {
+            return None;
+        }
+        let mut pdfs = 0u64;
+        let mut start_failures = 0u64;
+        for junk in &self.junk_files {
+            if !is_pdf_format(&junk.format) {
+                continue;
+            }
+            pdfs += 1;
+            if junk.reason.contains(PDF_WORKER_START_FAILURE) {
+                start_failures += 1;
+            }
+        }
+        (pdfs > 0 && start_failures == pdfs).then_some(pdfs)
+    }
+
     /// The run-document fields that say a corpus lacks a dataset (#929); empty
     /// when nothing was refused, so a run document with nothing to report stays
     /// byte-identical to the one earlier releases published — the generated
@@ -2936,5 +2974,61 @@ mod compatibility_tests {
         assert!(error.to_string().contains("already in use"));
         assert!(dir.path().join(".autoindex-stage-live").exists());
         drop(journal);
+    }
+}
+
+#[cfg(test)]
+mod pdf_worker_unavailable_tests {
+    use super::{FileAssignment, JunkFile, Plan, PDF_WORKER_START_FAILURE};
+
+    fn junk(format: &str, reason: &str) -> JunkFile {
+        JunkFile {
+            file_key: format!("key-{format}"),
+            rel: format!("f.{format}"),
+            format: format.to_string(),
+            status: "junk".into(),
+            reason: reason.into(),
+            bytes: 1,
+        }
+    }
+
+    fn indexed_pdf() -> FileAssignment {
+        FileAssignment {
+            rel: "a.pdf".into(),
+            path_id: "a.pdf".into(),
+            is_symlink: Some(false),
+            family: "pdf".into(),
+            gzip: false,
+            content_digest: None,
+            assignments: Vec::new(),
+            as_document: false,
+        }
+    }
+
+    #[test]
+    fn every_pdf_start_failure_counts_gzip_members_and_ignores_other_formats() {
+        let mut plan = Plan::default();
+        let reason = format!("extract failed: {PDF_WORKER_START_FAILURE} for quarterly.pdf");
+        plan.junk_files.push(junk("pdf", &reason));
+        plan.junk_files.push(junk("pdf(gzip)", &reason));
+        plan.junk_files.push(junk("txt", "unreadable"));
+        assert_eq!(plan.pdf_worker_unavailable_count(), Some(2));
+    }
+
+    #[test]
+    fn a_parsed_pdf_or_a_different_failure_stays_ordinary_junk() {
+        let mut mixed = Plan::default();
+        mixed.junk_files.push(junk("pdf", PDF_WORKER_START_FAILURE));
+        mixed.junk_files.push(junk("pdf", "damaged"));
+        assert_eq!(mixed.pdf_worker_unavailable_count(), None);
+
+        let mut indexed = Plan::default();
+        indexed.files.insert("k".into(), indexed_pdf());
+        indexed
+            .junk_files
+            .push(junk("pdf", PDF_WORKER_START_FAILURE));
+        assert_eq!(indexed.pdf_worker_unavailable_count(), None);
+
+        assert_eq!(Plan::default().pdf_worker_unavailable_count(), None);
     }
 }

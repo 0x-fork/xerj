@@ -19,6 +19,8 @@ pub mod mbox;
 pub(crate) mod opc;
 pub mod pdf;
 pub mod pptx;
+#[cfg(unix)]
+pub(crate) mod rlimit;
 pub mod sqldump;
 pub mod sqlite_x;
 pub mod sqlsrc;

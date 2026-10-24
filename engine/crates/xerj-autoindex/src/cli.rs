@@ -557,8 +557,10 @@ pub fn help_text_with(feedback: bool) -> String {
          \n\
          PDF EXTRACTION:\n\
          \x20\x20\x20\x20Each PDF uses a fresh process. Limits: 512 MiB input, 32 MiB worker output,\n\
-         \x20\x20\x20\x20100,000 pages, and 1.5 GiB address space on Unix. This is crash/resource\n\
-         \x20\x20\x20\x20isolation, not a security sandbox; non-Unix platforms have no OS memory cap.\n\
+         \x20\x20\x20\x20100,000 pages, and a 1.5 GiB address-space cap on Unix where the OS accepts\n\
+         \x20\x20\x20\x20RLIMIT_AS. If the OS refuses that cap (EINVAL or EPERM, as on macOS 27), the\n\
+         \x20\x20\x20\x20refusal is logged once and the worker still starts. The cap is crash isolation,\n\
+         \x20\x20\x20\x20not a security sandbox; non-Unix platforms have no OS memory cap.\n\
          \x20\x20\x20\x20Image-only pages need OCR. Page parse failures reject the whole PDF instead\n\
          \x20\x20\x20\x20of silently creating a partial index. XERJ_PDF_WORKER_BIN is a trusted,\n\
          \x20\x20\x20\x20developer-only executable override.\n\
@@ -798,8 +800,11 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20that does not fit is not started, including with --yes.\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Already-indexed files are not deleted unless --drop-indexed\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20is also set;\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x202 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20refused unsafe state transition\n",
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x202 usage; 1 endpoint/journal failure, a refused corpus removal, a\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20refused unsafe state transition, or pdf-worker-unavailable — every PDF\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20failed because the isolated parser could not start. Other files may\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20already be indexed. Read `reason` on the xerj-done line; the summary\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20on stdout opens with `not ok:`\n",
         feedback_block = xerj_common::feedback::block(feedback),
         default_poll = crate::objwatch::cost::DEFAULT_POLL_INTERVAL_SECS,
         default_budget = crate::objwatch::cost::DEFAULT_MAX_MONTHLY_CLASS_A,

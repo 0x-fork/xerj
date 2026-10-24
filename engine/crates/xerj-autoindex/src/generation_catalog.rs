@@ -371,6 +371,12 @@ pub fn project_generation(
             .iter()
             .any(|dataset| dataset.semantic_field.is_some()),
     });
+    // #2336: absent unless every PDF failed to start the isolated parser, so
+    // a generation with no such failure serializes the run document it always
+    // did. The terminal line reads this field back and exits 1.
+    if let Some(n) = desired.plan.pdf_worker_unavailable_count() {
+        run_doc["pdf_worker_unavailable"] = json!(n);
+    }
     // #929: a generation that lacks a dataset says so in the one document every
     // reader of the corpus starts from (`Plan::refused_run_fields`).
     for (key, value) in desired.plan.refused_run_fields() {

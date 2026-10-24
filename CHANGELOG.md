@@ -126,6 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` no longer junks every PDF on an OS that rejects
+  `setrlimit(RLIMIT_AS)` (macOS 27 returns `EINVAL`; a hard limit below
+  1536 MiB returns `EPERM`). The address-space cap is crash isolation: the
+  refusal is logged once and the worker still starts. Linux still applies
+  the 1536 MiB cap. The same refusal is ignored for the isolated `.xls`
+  reader. If every PDF fails because the worker could not start, the run
+  finishes `ok=false exit=1 reason=pdf-worker-unavailable` instead of
+  looking like completed-with-junk
+  ([#2336](https://github.com/xerj-org/xerj/issues/2336)).
+
 - `xerj autoindex` indexes `.sql` schema, migration, and routine files as
   code. `CREATE TABLE` / `VIEW` / `FUNCTION` / `PROCEDURE` / `INDEX` /
   `TRIGGER` / `TYPE` / `SCHEMA` / `SEQUENCE` become symbols, and the source

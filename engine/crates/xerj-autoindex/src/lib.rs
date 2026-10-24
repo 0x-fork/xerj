@@ -1102,6 +1102,7 @@ fn project_reconcile_plan(
             })
             .collect()
     });
+    note_worker_address_space_cap(pr);
     let rebuild = incremental_schema_rebuild_command(cfg, state_dir);
     reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample, &rebuild)
 }
@@ -1538,6 +1539,11 @@ fn alias_sweep_notes(paths: &[&str], error: &str) -> Vec<String> {
 /// that still contains junk reports 3 again instead of flapping to 0.
 fn generated_exit_code(summary: &Value) -> i32 {
     let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    // #2336: every PDF failed because the worker process could not start.
+    // Exit 3 would call that success. The field is absent on every other run.
+    if count("pdf_worker_unavailable") > 0 {
+        return 1;
+    }
     if count("junk_records_total") > 0 || count("files_junk") > 0 {
         3
     } else {
@@ -1551,17 +1557,26 @@ fn generated_exit_code(summary: &Value) -> i32 {
 /// unless something it reads first says otherwise. The `xerj-done` line on
 /// stderr already carries `ok=true`, yet it is the LAST line of a long progress
 /// stream and the summary on stdout opened with a timing line that never
-/// mentioned the exit code at all. So every finished run now leads with one
-/// line that starts `ok:` and names the exit code in words; exit 3 also says
-/// what was recorded and where to look, so junk stays visible.
+/// mentioned the exit code at all. A finished run leads with one line that
+/// starts `ok:` and names the exit code in words; exit 3 also says what was
+/// recorded and where to look, so junk stays visible. A family-wide PDF
+/// worker startup failure (#2336) leads with `not ok:` and exit 1.
 pub(crate) fn outcome_headline(
     code: i32,
     junk_files: u64,
     junk_records: u64,
     alias_sweep_failed: bool,
     stale_plan_files: u64,
+    pdf_worker_unavailable: Option<u64>,
     files_removed: u64,
 ) -> String {
+    if let Some(n) = pdf_worker_unavailable.filter(|n| *n > 0) {
+        return format!(
+            "not ok: the isolated PDF parser could not start for {}, so no PDF text was indexed. \
+             Other files in this run were still indexed. Exit 1 ({PDF_WORKER_UNAVAILABLE_REASON})",
+            estimate::count_phrase(n, "PDF file", "PDF files")
+        );
+    }
     if code != 3 {
         return format!("ok: indexed and searchable (exit {code}, completed)");
     }
@@ -1693,6 +1708,14 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_
         extra.push(("skipped_dataless", skipped_dataless));
     }
     extra.extend(coverage.fields());
+    note_worker_address_space_cap(pr);
+    let pdf_down = count("pdf_worker_unavailable");
+    if pdf_down > 0 {
+        pr.note(&pdf_worker_unavailable_note(pdf_down));
+        extra.push(("pdf_worker_unavailable", pdf_down));
+        pr.finish(false, 1, PDF_WORKER_UNAVAILABLE_REASON, &extra);
+        return;
+    }
     pr.finish(
         true,
         code,
@@ -1704,6 +1727,31 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_
         &extra,
     );
 }
+
+/// `xerj-done` reason when every PDF failed because the isolated parser
+/// process could not start (#2336). Exit 1, `ok=false`. Other files in the
+/// same run may already be indexed; a corrupt PDF that the worker did parse
+/// stays exit 3.
+const PDF_WORKER_UNAVAILABLE_REASON: &str = "pdf-worker-unavailable";
+
+fn pdf_worker_unavailable_note(count: u64) -> String {
+    format!(
+        "warning: the isolated PDF parser could not start for {}, so no PDF text was indexed. \
+         Other files in this run were still indexed. This is a worker startup failure (process \
+         or resource limits). Exit 1 ({PDF_WORKER_UNAVAILABLE_REASON}).",
+        estimate::count_phrase(count, "PDF file", "PDF files")
+    )
+}
+
+#[cfg(unix)]
+fn note_worker_address_space_cap(progress: &Progress) {
+    if let Some(warning) = extract::rlimit::take_address_space_cap_warning() {
+        progress.note(warning);
+    }
+}
+
+#[cfg(not(unix))]
+fn note_worker_address_space_cap(_progress: &Progress) {}
 
 fn inventory_size_map(inventory: &content::Inventory) -> HashMap<&str, u64> {
     inventory
@@ -4944,6 +4992,7 @@ fn build_phase_a(
     });
 
     report_pdf_spool_fallbacks(files, &scans, ctx);
+    note_worker_address_space_cap(pr);
 
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
@@ -6539,6 +6588,12 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
     if let Some(skipped) = skip_doc {
         summary["skipped"] = skipped;
     }
+    // Recomputed from the committed plan, not only copied from the catalog
+    // document: a no-op re-run reads the previous run document, which may
+    // predate this field, and a family-wide worker failure must still exit 1.
+    if let Some(n) = committed.plan.pdf_worker_unavailable_count() {
+        summary["pdf_worker_unavailable"] = json!(n);
+    }
     journal.finish(&summary)?;
     if cfg.json {
         println!("{summary}");
@@ -6552,6 +6607,12 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
                 count("junk_records_total"),
                 false,
                 0,
+                summary
+                    .get("pdf_worker_unavailable")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 0),
+                // File removal is reported on the graph path. This printer
+                // is the generated route, which does not sweep membership.
                 0,
             )
         );
@@ -11663,6 +11724,12 @@ fn run_index_report_inner(
     if let Some(skipped) = skipped_json(&all_junk) {
         run_doc["skipped"] = skipped;
     }
+    // #2336: present only when every PDF failed to start the isolated parser.
+    // A single corrupt PDF stays ordinary junk and does not set the field.
+    let pdf_worker_unavailable = plan.pdf_worker_unavailable_count();
+    if let Some(n) = pdf_worker_unavailable {
+        run_doc["pdf_worker_unavailable"] = json!(n);
+    }
     // Owned lines: the resume-plan update below mutates `plan.junk_files`,
     // which `all_junk` borrows. The summary prints these after that update.
     let skip_lines = skipped_lines(&all_junk);
@@ -11755,8 +11822,11 @@ fn run_index_report_inner(
     // than on a code of their own: inventing another success code would break
     // every caller that already branches on 0/3. The `reason` is what tells
     // them apart. A removal is not exit 0: that is what the run printed when
-    // the documents stayed live (#2314).
-    let code = if junk_total_records > 0
+    // the documents stayed live (#2314). A PDF worker that could not start is
+    // exit 1: exit 3 would call a missing PDF family success (#2336).
+    let code = if pdf_worker_unavailable.is_some() {
+        1
+    } else if junk_total_records > 0
         || junk_file_count > 0
         || alias_sweep_error.is_some()
         || skipped_appeared > 0
@@ -11777,6 +11847,7 @@ fn run_index_report_inner(
                 junk_total_records,
                 alias_sweep_error.is_some(),
                 skipped_appeared as u64,
+                pdf_worker_unavailable,
                 files_removed,
             )
         );
@@ -11929,14 +12000,22 @@ fn run_index_report_inner(
     if dataless_skipped > 0 {
         done_fields.push(("skipped_dataless", dataless_skipped));
     }
+    if let Some(n) = pdf_worker_unavailable {
+        done_fields.push(("pdf_worker_unavailable", n));
+        pr.note(&pdf_worker_unavailable_note(n));
+    }
+    note_worker_address_space_cap(&pr);
     pr.finish(
-        true,
+        pdf_worker_unavailable.is_none(),
         code,
-        // A stale plan wins the `reason` when files on disk were not indexed:
-        // junk is the everyday state, and `completed-with-junk` is what hid
-        // those files (#2076). The alias-sweep failure is next: it needs an
-        // operator, and junk does not.
-        if skipped_appeared > 0 {
+        // A worker that cannot start wins the `reason`: exit 3 would call a
+        // missing PDF family success (#2336). A stale plan is next, because
+        // junk is the everyday state and `completed-with-junk` is what hid
+        // those files (#2076). The alias-sweep failure needs an operator,
+        // and ordinary junk does not.
+        if pdf_worker_unavailable.is_some() {
+            PDF_WORKER_UNAVAILABLE_REASON
+        } else if skipped_appeared > 0 {
             STALE_RESUME_PLAN_REASON
         } else if alias_sweep_error.is_some() {
             ALIAS_SWEEP_FAILED_REASON
@@ -13956,11 +14035,11 @@ mod generation_contract_identity_tests {
     /// what was recorded instead of hiding it.
     #[test]
     fn a_finished_run_leads_with_an_ok_line_that_spells_out_exit_3() {
-        let clean = outcome_headline(0, 0, 0, false, 0, 0);
+        let clean = outcome_headline(0, 0, 0, false, 0, None, 0);
         assert!(clean.starts_with("ok: indexed and searchable"), "{clean}");
         assert!(clean.contains("exit 0"), "{clean}");
 
-        let junk = outcome_headline(3, 1, 0, false, 0, 0);
+        let junk = outcome_headline(3, 1, 0, false, 0, None, 0);
         assert!(junk.starts_with("ok: indexed and searchable"), "{junk}");
         assert!(
             junk.contains("exit 3 (completed-with-junk) is SUCCESS, not an error"),
@@ -13970,10 +14049,10 @@ mod generation_contract_identity_tests {
         assert!(junk.contains("xerj autoindex"), "{junk}");
         assert!(!junk.contains('\n'), "one line: {junk}");
 
-        let both = outcome_headline(3, 2, 5, false, 0, 0);
+        let both = outcome_headline(3, 2, 5, false, 0, None, 0);
         assert!(both.contains("2 files and 5 records"), "{both}");
 
-        let removed = outcome_headline(3, 0, 0, false, 0, 1);
+        let removed = outcome_headline(3, 0, 0, false, 0, None, 1);
         assert!(
             removed.contains("exit 3 (files-removed) is SUCCESS, not an error"),
             "{removed}"
@@ -13987,13 +14066,13 @@ mod generation_contract_identity_tests {
             "a removal is not junk: {removed}"
         );
         assert!(!removed.contains('\n'), "one line: {removed}");
-        let removed_and_junk = outcome_headline(3, 1, 0, false, 0, 2);
+        let removed_and_junk = outcome_headline(3, 1, 0, false, 0, None, 2);
         assert!(
             removed_and_junk.contains("Also recorded as junk: 1 file"),
             "{removed_and_junk}"
         );
 
-        let stale = outcome_headline(3, 0, 0, false, 2, 0);
+        let stale = outcome_headline(3, 0, 0, false, 2, None, 0);
         assert!(stale.contains("exit 3 (stale-resume-plan)"), "{stale}");
         assert!(
             stale.contains("2 files skipped because the resumed plan is stale"),
@@ -14005,13 +14084,18 @@ mod generation_contract_identity_tests {
             "a stale plan is not junk: {stale}"
         );
         assert!(!stale.contains('\n'), "one line: {stale}");
-        let stale_and_junk = outcome_headline(3, 1, 0, false, 2, 0);
+        let stale_and_junk = outcome_headline(3, 1, 0, false, 2, None, 0);
         assert!(
             stale_and_junk.contains("Also recorded as junk: 1 file"),
             "{stale_and_junk}"
         );
 
-        let sweep = outcome_headline(3, 4, 0, true, 0, 0);
+        let sweep = outcome_headline(3, 4, 0, true, 0, None, 0);
+        let pdfs = outcome_headline(1, 4, 0, false, 0, Some(4), 0);
+        assert!(pdfs.starts_with("not ok:"), "{pdfs}");
+        assert!(pdfs.contains("4 PDF files"), "{pdfs}");
+        assert!(pdfs.contains(PDF_WORKER_UNAVAILABLE_REASON), "{pdfs}");
+        assert!(!pdfs.contains("is SUCCESS"), "{pdfs}");
         assert!(sweep.starts_with("ok: indexed and searchable"), "{sweep}");
         assert!(sweep.contains(ALIAS_SWEEP_FAILED_REASON), "{sweep}");
         assert!(sweep.contains("rerun the same command"), "{sweep}");
@@ -14367,6 +14451,50 @@ mod code_coverage_tests {
             "a run that skipped nothing keeps the terminal line it had: {text}"
         );
         assert!(!text.contains("warning:"), "{text}");
+    }
+
+    #[test]
+    fn every_pdf_failing_to_start_ends_the_run_as_a_worker_outage() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            3,
+            &json!({
+                "files_indexed": 2,
+                "records_total": 4,
+                "generation": 1,
+                "code_files": 0,
+                "code_files_indexed": 0,
+                "code_files_junked": 0,
+                "pdf_worker_unavailable": 2,
+            }),
+            0,
+        );
+        let text = captured(&buffer);
+        let done = text
+            .lines()
+            .find(|line| line.starts_with("xerj-done "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(done.contains("ok=false"), "{done}");
+        assert!(done.contains("exit=1"), "{done}");
+        assert!(done.contains("reason=pdf-worker-unavailable"), "{done}");
+        assert!(done.contains("pdf_worker_unavailable=2"), "{done}");
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("warning:") && line.contains("isolated PDF parser")),
+            "{text}"
+        );
+        assert!(
+            text.trim_end()
+                .lines()
+                .next_back()
+                .unwrap()
+                .starts_with("xerj-done "),
+            "the warning precedes the terminal line: {text}"
+        );
     }
 
     #[test]
