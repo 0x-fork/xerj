@@ -108,6 +108,44 @@ fn sample_drain_due(
 static MEMORY_DRAIN_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> =
     std::sync::OnceLock::new();
 
+/// Ask the drain worker to flush, at most once per [`MEMORY_DRAIN_MIN_INTERVAL`].
+///
+/// The sampler requests a drain on its own clock (`pressure_drain_due`). A
+/// write the breaker has just rejected also requests one (#2321): the 429
+/// itself does not free the memtable, and waiting for the next sample is how
+/// a client that retries immediately spends its patience against a budget
+/// nothing is flushing. This clock is separate, so the first rejection is
+/// immediate even when the sampler just fired. Later rejections from this
+/// path are spaced by the same interval, so a stream of 429s does not queue a
+/// drain per bulk. No worker (a library `Engine` that never called
+/// [`Engine::spawn_resource_sampler`]) is a no-op; callers that must flush
+/// inline use [`Engine::publish_memtables_if_budget_engaged`].
+pub(crate) fn request_memory_pressure_drain() {
+    if !drain_request_due() {
+        return;
+    }
+    if let Some(tx) = MEMORY_DRAIN_TX.get() {
+        let _ = tx.try_send(());
+    }
+}
+
+fn drain_request_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // `u64::MAX` is "never requested". Elapsed millis from process start do
+    // not reach it.
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    let now_ms = u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    let window_ms = u64::try_from(MEMORY_DRAIN_MIN_INTERVAL.as_millis()).unwrap_or(2_000);
+    if prev != u64::MAX && now_ms.saturating_sub(prev) < window_ms {
+        return false;
+    }
+    LAST_MS.store(now_ms, Ordering::Relaxed);
+    true
+}
+
 /// Spawn attempts (and the first back-off) for the governor's sampler and
 /// drain threads. They are started once, at boot; losing one disables the
 /// parent memory breaker for the life of the process, so a transient
@@ -4313,13 +4351,65 @@ impl Engine {
     /// new way to wedge. Returns the number of indexes drained; closed
     /// indexes are skipped (their caches were already released at close).
     pub async fn drain_rebuildable_memory(&self) -> usize {
-        let loaded: Vec<Arc<Index>> = self
+        let loaded = self.open_indices_largest_memtable_first();
+        self.release_rebuildable_memory(&loaded).await
+    }
+
+    /// Open indices, largest live memtable first (#2321).
+    ///
+    /// The summed budget stays engaged until enough bytes are retired. DashMap
+    /// iteration order can flush a tiny index first and leave the breaker up
+    /// for the rest of the walk; the index holding the bytes goes first so
+    /// the next sample can admit writes while the smaller ones are still
+    /// publishing.
+    fn open_indices_largest_memtable_first(&self) -> Vec<Arc<Index>> {
+        let mut loaded: Vec<Arc<Index>> = self
             .indices
             .iter()
             .filter(|e| !self.closed_indices.contains_key(e.key().as_str()))
             .map(|e| Arc::clone(e.value()))
             .collect();
-        self.release_rebuildable_memory(&loaded).await
+        loaded.sort_by_key(|idx| std::cmp::Reverse(idx.memtable_bytes()));
+        loaded
+    }
+
+    /// Publish memtables that are holding the process budget, before a search
+    /// walks them (#2321).
+    ///
+    /// A `{prefix}-*` search scans every index's memtable, frozen generations
+    /// included. On the 8 GiB auto tier that sum sits at 2 GiB while each
+    /// index is still under its own flush line — the same shape that answers
+    /// writes with HTTP 429. Scanning it is the multi-minute query a restart
+    /// (flush to segments) brought down to seconds. Flush, largest first, and
+    /// wait until the charged bytes drop or 30 s pass. Cache release is
+    /// intentionally not done here: the search that follows has to read the
+    /// segments just published.
+    ///
+    /// A no-op when the memtable breaker is off, so an ordinary search does
+    /// not flush. No governor (an `Index` built directly) is also a no-op.
+    pub async fn publish_memtables_if_budget_engaged(&self) -> usize {
+        let Some(governor) = crate::governor::global() else {
+            return 0;
+        };
+        if !governor.memtable_breaker_engaged() {
+            return 0;
+        }
+        let loaded = self.open_indices_largest_memtable_first();
+        let mut published = 0usize;
+        for idx in &loaded {
+            if idx.memtable_bytes() > 0 && idx.flush().await.is_ok() {
+                published += 1;
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            governor.refresh_memtable(self.total_memtable_bytes());
+            if !governor.memtable_breaker_engaged() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        published
     }
 
     /// Flush then release the rebuildable caches of exactly `indices`, then

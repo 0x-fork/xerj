@@ -13088,6 +13088,35 @@ pub(crate) async fn search_shard_local(
     .await
 }
 
+/// Heap-allocate the publish future before it is polled.
+///
+/// `publish_memtables_if_budget_engaged` awaits `Index::flush`. That future
+/// is large enough that building it inside `search_impl` overflows the worker
+/// stack (#2321). A sync function creates it here, on the task that is about
+/// to poll it, and only the box escapes.
+#[inline(never)]
+fn boxed_memtable_publish(
+    engine: std::sync::Arc<xerj_engine::Engine>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send>> {
+    Box::pin(async move { engine.publish_memtables_if_budget_engaged().await })
+}
+
+/// Publish memtables that are holding the process budget, on a fresh task.
+///
+/// A no-op — and no spawn — when the memtable breaker is off, so an ordinary
+/// search does not flush. The spawn keeps `Index::flush`'s frame off
+/// `search_impl`'s stack.
+async fn publish_engaged_memtables(engine: std::sync::Arc<xerj_engine::Engine>) {
+    if !xerj_engine::governor::global().is_some_and(|governor| governor.memtable_breaker_engaged())
+    {
+        return;
+    }
+    let _ = tokio::spawn(async move {
+        let _published = boxed_memtable_publish(engine).await;
+    })
+    .await;
+}
+
 async fn search_impl(
     state: AppState,
     index: String,
@@ -13099,6 +13128,10 @@ async fn search_impl(
     // Read once, before the first `.await`: what the in-process hub caller asked
     // of this search. A request off the wire gets the default and is unaffected.
     let in_process = in_process_search();
+    // #2321: a memtable sitting on the process budget is what a `{prefix}-*`
+    // search scans. Publish it before this request walks it. No-op unless
+    // that breaker is engaged. Read `in_process` first — it is task-local.
+    publish_engaged_memtables(std::sync::Arc::clone(&state.engine)).await;
     // Closed-index handling is deferred to after index resolution below so
     // `ignore_unavailable` / `expand_wildcards` are honored per ES semantics.
 

@@ -27204,7 +27204,13 @@ impl Index {
         if let Some(g) = crate::governor::global() {
             g.check_disk_block(self.name.as_str())
                 .map_err(EngineError::Common)?;
-            g.check_ingest_admission().map_err(EngineError::Common)?;
+            if let Err(error) = g.check_ingest_admission() {
+                // The rejection does not free the memtable or the RSS that
+                // tripped it. Request the drain on this 429, not only on the
+                // sampler's next tick (#2321, #948).
+                crate::engine::request_memory_pressure_drain();
+                return Err(EngineError::Common(error));
+            }
         }
         Ok(())
     }

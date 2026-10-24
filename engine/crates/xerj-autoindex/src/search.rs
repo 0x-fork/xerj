@@ -386,9 +386,12 @@ pub(crate) struct CorpusSnapshot {
 /// `xerj def` has no hits.
 ///
 /// A prefix that matches no index exits `1` and names the prefixes already
-/// on the node. The `xerj autoindex <folder>` hint is only for a node whose
-/// catalog and index list are both empty — a miss against a real corpus is
-/// not a reason to tell the operator to index again.
+/// on the node, in that same line. The line says it is not a search result:
+/// it returns before any query runs, and a one-line reading of "no indices
+/// named …" was taken for an instant empty search (#2321). The
+/// `xerj autoindex <folder>` hint is only for a node whose catalog and index
+/// list are both empty — a miss against a real corpus is not a reason to
+/// tell the operator to index again.
 pub(crate) fn empty_lookup_report(
     command: &str,
     prefix: &str,
@@ -400,7 +403,7 @@ pub(crate) fn empty_lookup_report(
     let prefix_absent = matches!(snap.under_prefix, Some(ref names) if names.is_empty());
     let mut lines = Vec::new();
     if prefix_absent {
-        lines.push(format!("no indices named {pattern}"));
+        lines.push(missing_prefix_line(&pattern, snap));
     } else if command == "def" {
         lines.push(format!("no definition in {pattern} for: {query}"));
         lines.push(format!(
@@ -427,15 +430,21 @@ pub(crate) fn empty_lookup_report(
     if catalog_empty {
         lines.push("(index a relevant repo first: xerj autoindex <folder>)".to_string());
     } else if let Some(prefixes) = snap.catalog_prefixes.as_ref().filter(|p| !p.is_empty()) {
-        lines.push(format!("prefixes on this node: {}", prefixes.join(", ")));
+        // The missing-prefix headline already lists these. A real miss (the
+        // prefix exists, the query did not match) still needs the line.
+        if !prefix_absent {
+            lines.push(format!("prefixes on this node: {}", prefixes.join(", ")));
+        }
         if let Some(other) = prefixes.iter().find(|p| p.as_str() != prefix) {
             lines.push(format!("try: xerj {command} --prefix {other} \"{query}\""));
         }
     } else if let Some(indices) = snap.all_indices.as_ref().filter(|n| !n.is_empty()) {
-        lines.push(format!(
-            "indices on this node: {}",
-            join_capped(indices, 20)
-        ));
+        if !prefix_absent {
+            lines.push(format!(
+                "indices on this node: {}",
+                join_capped(indices, 20)
+            ));
+        }
         lines.push(
             "the catalog lists no prefixes; --prefix is the index name before the dataset slug"
                 .to_string(),
@@ -443,6 +452,24 @@ pub(crate) fn empty_lookup_report(
     }
     let exit = if prefix_absent { 1 } else { 0 };
     (lines, exit)
+}
+
+/// The refusal line for a prefix that matches nothing.
+///
+/// Prefixes from the catalog win. Index names are the fallback when the
+/// catalog has none (an autoindex that aborted before writing a run or
+/// dataset document still left `{prefix}-{slug}` indices).
+fn missing_prefix_line(pattern: &str, snap: &CorpusSnapshot) -> String {
+    let mut line = format!("no indices named {pattern} — this is not a search result");
+    if let Some(prefixes) = snap.catalog_prefixes.as_ref().filter(|p| !p.is_empty()) {
+        line.push_str(&format!("; prefixes on this node: {}", prefixes.join(", ")));
+    } else if let Some(indices) = snap.all_indices.as_ref().filter(|n| !n.is_empty()) {
+        line.push_str(&format!(
+            "; indices on this node: {}",
+            join_capped(indices, 20)
+        ));
+    }
+    line
 }
 
 fn join_capped(items: &[String], cap: usize) -> String {
@@ -476,19 +503,41 @@ pub(crate) fn corpus_snapshot(es: &Es, prefix: &str) -> CorpusSnapshot {
     }
 }
 
-/// Distinct `prefix` values on catalog run documents, sorted. `None` when
-/// the catalog cannot be read — that is not the same as an empty catalog.
+/// Distinct `prefix` values on catalog run and dataset documents, sorted.
+///
+/// Run documents are the historical source. Dataset documents carry the same
+/// field and are written as indexing proceeds, so a run that aborted before
+/// its run document (#2321) still names the prefix. `None` when the catalog
+/// cannot be read — that is not the same as an empty catalog. A dataset
+/// query that fails leaves the run prefixes in place.
 fn catalog_run_prefixes(es: &Es) -> Option<Vec<String>> {
+    let runs = catalog_kind_body(es, "run")?;
+    let mut prefixes = prefixes_from_catalog_body(&runs);
+    if let Some(datasets) = catalog_kind_body(es, "dataset") {
+        for prefix in prefixes_from_catalog_body(&datasets) {
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+        prefixes.sort();
+    }
+    Some(prefixes)
+}
+
+fn catalog_kind_body(es: &Es, doc_kind: &str) -> Option<Value> {
     let body = json!({
         "size": 200,
-        "query": { "term": { "doc_kind": "run" } },
+        "query": { "term": { "doc_kind": doc_kind } },
         "_source": ["prefix"]
     });
-    let v = es
-        .search(xerj_common::AUTOINDEX_CATALOG_INDEX, &body)
-        .ok()?;
+    es.search(xerj_common::AUTOINDEX_CATALOG_INDEX, &body).ok()
+}
+
+fn prefixes_from_catalog_body(v: &Value) -> Vec<String> {
     let mut prefixes = BTreeSet::new();
-    let hits = v.pointer("/hits/hits").and_then(Value::as_array)?;
+    let Some(hits) = v.pointer("/hits/hits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
     for hit in hits {
         if let Some(prefix) = hit.pointer("/_source/prefix").and_then(Value::as_str) {
             if !prefix.is_empty() {
@@ -496,7 +545,7 @@ fn catalog_run_prefixes(es: &Es) -> Option<Vec<String>> {
             }
         }
     }
-    Some(prefixes.into_iter().collect())
+    prefixes.into_iter().collect()
 }
 
 /// What `xerj search` / `xerj def` print when the query request itself fails.
@@ -1704,6 +1753,15 @@ mod tests {
         );
         assert_eq!(exit, 1);
         let text = lines.join("\n");
+        let headline = lines.first().expect("headline");
+        assert!(
+            headline.starts_with("no indices named typo-* — this is not a search result"),
+            "{headline}"
+        );
+        assert!(
+            headline.contains("prefixes on this node: eng, sled"),
+            "the refusal line itself must name the prefixes: {headline}"
+        );
         assert!(text.contains("no indices named typo-*"), "{text}");
         assert!(text.contains("prefixes on this node: eng, sled"), "{text}");
         assert!(
@@ -1825,12 +1883,34 @@ mod tests {
         );
         assert_eq!(exit, 1);
         let text = lines.join("\n");
+        let headline = lines.first().expect("headline");
+        assert!(
+            headline.contains("indices on this node: sled-docs, eng-logs"),
+            "index names stand in for prefixes on the refusal line: {headline}"
+        );
         assert!(
             text.contains("indices on this node: sled-docs, eng-logs"),
             "{text}"
         );
         assert!(text.contains("catalog lists no prefixes"), "{text}");
         assert!(!text.contains("xerj autoindex"), "{text}");
+    }
+
+    #[test]
+    fn catalog_prefix_values_keep_dataset_documents_and_drop_an_empty_prefix() {
+        let body = json!({
+            "hits": {"hits": [
+                {"_source": {"doc_kind": "dataset", "prefix": "repo"}},
+                {"_source": {"doc_kind": "run", "prefix": "repo"}},
+                {"_source": {"doc_kind": "dataset", "prefix": "other"}},
+                {"_source": {"prefix": ""}}
+            ]}
+        });
+        assert_eq!(
+            prefixes_from_catalog_body(&body),
+            vec!["other".to_string(), "repo".to_string()]
+        );
+        assert!(prefixes_from_catalog_body(&json!({"hits": {}})).is_empty());
     }
 
     /// #1284: one index mapping `code` as `long` fails a wildcard `multi_match`
