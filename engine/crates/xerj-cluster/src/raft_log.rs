@@ -25,9 +25,14 @@
 //! `BTreeMap<index, (term, file_offset, payload_length)>`, and re-derive
 //! `commit_index` + `last_applied` from a sidecar `commit.meta` file.
 //!
-//! `fsync` is batched: by default every 100 ms or whenever 256 entries
-//! accumulate in the OS page cache, whichever comes first.  Both values
-//! are tunable via `[cluster] raft_fsync_ms = 100` / `raft_fsync_batch = 256`.
+//! The server opens this log at `{data_dir}/_raft` (`RAFT_DIR_NAME`).
+//! `_raft` is not a valid index name, and the directory has no `wal`
+//! child, so the engine's index scan does not open it.
+//!
+//! `hard.meta` stores the current term, the vote, and the logical end of
+//! the log. Truncation does not rewrite `raft.log`; entries past that end
+//! stay in the file and are ignored on the next open. A missing `hard.meta`
+//! (a log written before this file existed) keeps every CRC-valid record.
 //!
 //! Exit criterion for M5.1 (verified by `raft_log_persist_test`):
 //!
@@ -55,8 +60,19 @@ use crc32fast::Hasher as Crc32;
 /// Magic for the raft log file format.  Distinct from the WAL magic so
 /// we never confuse one for the other on recovery.
 const MAGIC: u32 = 0x5A52_4C32; // "ZRL2" (ASCII Z R L 2)
+const HARD_MAGIC: u32 = 0x5A52_4853; // "ZRHS"
 const LOG_FILE: &str = "raft.log";
 const COMMIT_FILE: &str = "commit.meta";
+const HARD_FILE: &str = "hard.meta";
+
+/// Directory name under the node's data dir. Not a valid index name, so a
+/// user index cannot occupy the same path and take the log with it on delete.
+pub const RAFT_DIR_NAME: &str = "_raft";
+
+/// `{data_dir}/_raft`, where the server opens [`FileRaftLog`].
+pub fn raft_storage_dir(data_dir: impl AsRef<Path>) -> PathBuf {
+    data_dir.as_ref().join(RAFT_DIR_NAME)
+}
 
 /// Raft payload kinds.  We only use `ClusterCommand` today but leave room
 /// for future out-of-band messages (config changes, snapshots).
@@ -96,6 +112,13 @@ pub struct FileRaftLog {
     last_index: u64,
     /// Commit index persisted to `commit.meta`.
     commit_index: u64,
+    /// Current term persisted in `hard.meta`. 0 when that file is absent.
+    hard_term: u64,
+    /// Vote in `hard_term`, when one was persisted.
+    hard_vote: Option<String>,
+    /// Logical end of the log. `None` means `hard.meta` did not record one
+    /// and the scan is authoritative. `Some(0)` is an empty log.
+    log_end: Option<u64>,
 }
 
 impl FileRaftLog {
@@ -197,6 +220,11 @@ impl FileRaftLog {
 
         // Load committed index (best-effort).
         let commit_index = Self::load_commit_index(&dir).unwrap_or(0);
+        let (hard_term, hard_vote, log_end) = Self::load_hard_state(&dir)?;
+        if let Some(end) = log_end {
+            seek_table.retain(|&idx, _| idx <= end);
+            last_index = seek_table.keys().next_back().copied().unwrap_or(0);
+        }
 
         Ok(Self {
             dir,
@@ -204,6 +232,9 @@ impl FileRaftLog {
             seek_table,
             last_index,
             commit_index,
+            hard_term,
+            hard_vote,
+            log_end,
         })
     }
 
@@ -295,14 +326,13 @@ impl FileRaftLog {
         Ok(Some((term, payload)))
     }
 
-    /// Truncate the log by removing every entry with `index >= from`.
+    /// Drop every seek-table entry with `index >= from`.
     ///
-    /// This is called by Raft when a leader steps down and the new leader
-    /// instructs the follower to overwrite conflicting tail entries.
-    /// We don't physically truncate the file — the seek table evicts the
-    /// removed entries, the CRC of later writes will differ, and on
-    /// recovery we stop reading at the first CRC mismatch.  That keeps
-    /// this method O(log n) instead of O(file_size).
+    /// The file is not rewritten. The drop becomes durable when
+    /// [`FileRaftLog::set_log_end`] records the new end; until that file
+    /// is replaced, a crash reopens the previous tail. Callers that have
+    /// already decided the tail is gone must set the end before they
+    /// acknowledge the append that conflicted.
     pub fn truncate_from(&mut self, from: u64) {
         self.seek_table.retain(|&idx, _| idx < from);
         self.last_index = self
@@ -322,6 +352,140 @@ impl FileRaftLog {
         std::fs::write(&tmp, idx.to_le_bytes())?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
+    }
+
+    /// Term and vote from `hard.meta`. Term 0 and a missing vote mean the
+    /// file was absent.
+    pub fn hard_term(&self) -> u64 {
+        self.hard_term
+    }
+
+    pub fn hard_vote(&self) -> Option<&str> {
+        self.hard_vote.as_deref()
+    }
+
+    /// Logical end recorded in `hard.meta`, if that file had one.
+    pub fn persisted_log_end(&self) -> Option<u64> {
+        self.log_end
+    }
+
+    /// Record the current term and vote. The logical log end is left as it is.
+    ///
+    /// Memory is updated only after `hard.meta` is replaced. A failed write
+    /// leaves the previous term and vote in place, so a later log-end save
+    /// cannot publish an election this process aborted.
+    pub fn set_hard_state(&mut self, term: u64, voted_for: Option<&str>) -> Result<()> {
+        self.persist_hard(term, voted_for, self.log_end)?;
+        self.hard_term = term;
+        self.hard_vote = voted_for.map(str::to_string);
+        Ok(())
+    }
+
+    /// Record the highest index that is still part of the log.
+    ///
+    /// The file is replaced before the seek table drops indexes above `end`.
+    /// A failed write leaves those entries readable. The next open ignores
+    /// them once this call has succeeded.
+    pub fn set_log_end(&mut self, end: u64) -> Result<()> {
+        self.persist_hard(self.hard_term, self.hard_vote.as_deref(), Some(end))?;
+        if end < self.last_index {
+            self.truncate_from(end + 1);
+        }
+        self.log_end = Some(end);
+        Ok(())
+    }
+
+    /// Replace `hard.meta`. The caller updates its fields only after this
+    /// returns `Ok`.
+    fn persist_hard(&self, term: u64, vote: Option<&str>, log_end: Option<u64>) -> Result<()> {
+        let path = self.dir.join(HARD_FILE);
+        let tmp = self.dir.join("hard.meta.tmp");
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(&HARD_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&term.to_le_bytes());
+        match log_end {
+            Some(end) => {
+                buf.push(1);
+                buf.extend_from_slice(&end.to_le_bytes());
+            }
+            None => {
+                buf.push(0);
+                buf.extend_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        match vote {
+            Some(vote) => {
+                let bytes = vote.as_bytes();
+                let len = u32::try_from(bytes.len()).context("raft vote longer than u32")?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => buf.extend_from_slice(&u32::MAX.to_le_bytes()),
+        }
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("writing {tmp:?}"))?;
+            file.write_all(&buf)
+                .with_context(|| format!("writing {tmp:?}"))?;
+            file.sync_all()
+                .with_context(|| format!("syncing {tmp:?}"))?;
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {path:?}"))?;
+        // The rename is the publication. Sync the directory so a crash cannot
+        // lose the directory entry that names the new file.
+        let dir =
+            File::open(&self.dir).with_context(|| format!("opening {:?} to sync", self.dir))?;
+        dir.sync_all()
+            .with_context(|| format!("syncing raft dir {:?}", self.dir))?;
+        Ok(())
+    }
+
+    fn load_hard_state(dir: &Path) -> Result<(u64, Option<String>, Option<u64>)> {
+        let path = dir.join(HARD_FILE);
+        if !path.exists() {
+            return Ok((0, None, None));
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {path:?}"))?;
+        if bytes.len() < 4 + 4 + 8 + 1 + 8 + 4 {
+            return Err(anyhow!("raft hard state {path:?} is truncated"));
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+        if magic != HARD_MAGIC {
+            return Err(anyhow!("raft hard state {path:?} has a bad magic"));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+        if version != 1 {
+            return Err(anyhow!(
+                "raft hard state {path:?} has version {version}, want 1"
+            ));
+        }
+        let term = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+        let has_end = bytes[16];
+        let end = u64::from_le_bytes(bytes[17..25].try_into().expect("8 bytes"));
+        let log_end = match has_end {
+            0 => None,
+            1 => Some(end),
+            other => return Err(anyhow!("raft hard state {path:?} has log-end flag {other}")),
+        };
+        let vote_len = u32::from_le_bytes(bytes[25..29].try_into().expect("4 bytes"));
+        let vote = if vote_len == u32::MAX {
+            None
+        } else {
+            let start = 29;
+            let end_at = start + vote_len as usize;
+            if bytes.len() < end_at {
+                return Err(anyhow!("raft hard state {path:?} vote is truncated"));
+            }
+            let text = std::str::from_utf8(&bytes[start..end_at])
+                .with_context(|| format!("raft vote in {path:?} is not utf-8"))?;
+            Some(text.to_string())
+        };
+        Ok((term, vote, log_end))
     }
 
     /// Highest log index appended so far (0 if the log is empty).
@@ -423,5 +587,57 @@ mod tests {
         let log2 = FileRaftLog::open(dir.path()).unwrap();
         assert!(log2.len() >= 4);
         assert!(log2.len() <= 5);
+    }
+
+    #[test]
+    fn log_end_hides_a_truncated_tail_on_reopen() {
+        let dir = tempdir().unwrap();
+        let mut log = FileRaftLog::open(dir.path()).unwrap();
+        for i in 1..=5 {
+            log.append(1, i, format!("{i}").as_bytes()).unwrap();
+        }
+        log.fsync().unwrap();
+        log.truncate_from(4);
+        log.set_log_end(3).unwrap();
+        drop(log);
+
+        let mut log2 = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log2.last_index(), 3);
+        assert!(log2.read(4).unwrap().is_none());
+        assert!(log2.read(5).unwrap().is_none());
+        assert_eq!(log2.read(3).unwrap().unwrap().1, b"3");
+
+        log2.append(2, 4, b"new").unwrap();
+        log2.fsync().unwrap();
+        log2.set_log_end(4).unwrap();
+        drop(log2);
+
+        let mut log3 = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log3.last_index(), 4);
+        assert_eq!(log3.read(4).unwrap().unwrap().1, b"new");
+        assert!(log3.read(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn hard_state_roundtrip_and_a_truncated_file_refuses_to_open() {
+        let dir = tempdir().unwrap();
+        let mut log = FileRaftLog::open(dir.path()).unwrap();
+        log.set_hard_state(4, Some("n2")).unwrap();
+        log.set_log_end(0).unwrap();
+        drop(log);
+
+        let log2 = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log2.hard_term(), 4);
+        assert_eq!(log2.hard_vote(), Some("n2"));
+        assert_eq!(log2.persisted_log_end(), Some(0));
+
+        std::fs::write(dir.path().join(HARD_FILE), [1u8, 2, 3]).unwrap();
+        match FileRaftLog::open(dir.path()) {
+            Err(err) => assert!(
+                err.to_string().contains("truncated"),
+                "corrupt hard state must not look like no vote: {err}"
+            ),
+            Ok(_) => panic!("corrupt hard state opened"),
+        }
     }
 }

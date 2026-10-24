@@ -21,10 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirm. Fewer confirmations than the quorum is still HTTP 503
   `replica_not_acknowledged` — the primary has the write, and retrying the
   index copies it to the replicas still in sync. There is still no
-  `wait_for_active_shards`, no replica promotion, and no snapshot catch-up
-  for a node that missed the log (part of
+  `wait_for_active_shards` and no replica promotion. A restarted member
+  reloads metadata from the on-disk Raft log; document backfill is still
+  open (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170)). Single-node mode
   does not take this path.
+
+- With `[cluster] enabled = true`, the server opens an on-disk Raft log
+  at `{data_dir}/_raft` and replays its committed prefix before it
+  serves. A restart restores the shard plan and the in-sync set, so a
+  later document write is routed to the primary again. A member that
+  starts with an empty log copies the leader's log and applies it, which
+  installs index metadata (and an empty replica store when this node is
+  a replica). It does not copy documents written before it joined. A
+  replica removed from the in-sync set is not filled in. The log is not
+  compacted; there is no InstallSnapshot. Term and vote are stored with
+  the log, so a restarted node does not grant a second vote in the same
+  term. `[cluster] enabled = false` does not open the log (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170)).
 
 - A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0)
   inserts the README's `mcp-xerj` stdio row via
