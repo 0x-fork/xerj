@@ -725,7 +725,7 @@
     },
     {
       "name": "xerj_code_search",
-      "description": "Reference-coding retrieval over a corpus of peer projects: how did real codebases solve this problem? Returns the matching definition (not a byte window), the file:line to cite, and per-hit licence warnings — AGPL/SSPL/Elastic/BUSL/GPL/LGPL/MPL sources are approach-only. Refuses indices older than 30 days (override with stale_ok). A no-match is NOT an error: it says the corpus is wrong for the task. A line `weak match: the corpus may not cover this` means the passages are nearest neighbours, not coverage — fall back to grep or another corpus. Pass `max_tokens` to cap the response at a token budget (never exceeded; see that argument for the tokenizer and the locator-only rule). Corpora: `xerj corpus list`.",
+      "description": "Reference-coding retrieval over a corpus of peer projects: how did real codebases solve this problem? Returns the matching definition (not a byte window), the file:line to cite, and per-hit licence warnings — AGPL/SSPL/Elastic/BUSL/GPL/LGPL/MPL sources are approach-only. A corpus marked own (`xerj corpus add --own`, or `xerj corpus own <name>`) is the caller's own first-party code: an unidentified licence (UNKNOWN or NONE-FOUND) stays in the hit header and the do-not-copy banner is omitted for that unidentified licence only. A detected copyleft or source-available licence still warns. Hub pack licence classes are unchanged. Refuses indices older than 30 days (override with stale_ok). A no-match is NOT an error: it says the corpus is wrong for the task. A line `weak match: the corpus may not cover this` means the passages are nearest neighbours, not coverage — fall back to grep or another corpus. Pass `max_tokens` to cap the response at a token budget (never exceeded; see that argument for the tokenizer and the locator-only rule). Corpora: `xerj corpus list`.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -772,7 +772,7 @@
               "warn",
               "strict"
             ],
-            "description": "strict strips passage text from restricted-licence hits, keeping locator + warning (default warn)."
+            "description": "strict strips passage text from restricted-licence hits, keeping locator + warning (default warn). An own corpus's unidentified licence is not stripped."
           },
           "max_tokens": {
             "type": "integer",

@@ -1265,6 +1265,11 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                 "real codebases solve this problem? Returns the matching definition ",
                 "(not a byte window), the file:line to cite, and per-hit licence ",
                 "warnings — AGPL/SSPL/Elastic/BUSL/GPL/LGPL/MPL sources are approach-only. ",
+                "A corpus marked own (`xerj corpus add --own`, or `xerj corpus own <name>`) ",
+                "is the caller's own first-party code: an unidentified licence (UNKNOWN or ",
+                "NONE-FOUND) stays in the hit header and the do-not-copy banner is omitted ",
+                "for that unidentified licence only. A detected copyleft or source-available ",
+                "licence still warns. Hub pack licence classes are unchanged. ",
                 "Refuses indices older than 30 days (override with stale_ok). ",
                 "A no-match is NOT an error: it says the corpus is wrong for the task. ",
                 "A line `weak match: the corpus may not cover this` means the passages are nearest neighbours, not coverage — fall back to grep or another corpus. ",
@@ -1282,7 +1287,7 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                     "full": { "type": "integer", "description": "Max chars per passage (default 800; 0 = file head only)." },
                     "no_symbol": { "type": "boolean", "description": "Window selection instead of the matching definition." },
                     "stale_ok": { "type": "boolean", "description": "Override the 30-day staleness refusal." },
-                    "licence_policy": { "type": "string", "enum": ["warn", "strict"], "description": "strict strips passage text from restricted-licence hits, keeping locator + warning (default warn)." },
+                    "licence_policy": { "type": "string", "enum": ["warn", "strict"], "description": "strict strips passage text from restricted-licence hits, keeping locator + warning (default warn). An own corpus's unidentified licence is not stripped." },
                     "max_tokens": max_tokens_arg_schema()
                 },
                 "required": ["corpus", "query"]
@@ -5750,5 +5755,156 @@ mod tests {
             Some("ApiKey real-key"),
             "an empty candidate must be skipped over, not stop the search"
         );
+    }
+
+    /// #2339: MCP `xerj_code_search` is the same renderer as `xerj code`.
+    /// An own corpus keeps UNKNOWN in the header and drops the do-not-copy
+    /// banner. The same passage from a corpus that is not marked own still
+    /// carries the banner.
+    #[test]
+    fn code_search_own_corpus_omits_the_unidentified_copy_banner() {
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var("XERJ_CODE_HOME").ok();
+        std::env::set_var("XERJ_CODE_HOME", home.path());
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("XERJ_CODE_HOME", value),
+                    None => std::env::remove_var("XERJ_CODE_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let write_corpus = |name: &str, own: bool| {
+            let dir = home.path().join("corpora").join(name);
+            std::fs::create_dir_all(dir.join("myrepo")).unwrap();
+            let own_json = if own { ",\"own\":true" } else { "" };
+            std::fs::write(
+                dir.join("corpus.json"),
+                format!(
+                    "{{\"corpus\":\"{name}\"{own_json},\"repos\":[{{\"repo\":\"myrepo\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}}]}}"
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join("state")).unwrap();
+            // An unparsable stamp disables the age refusal; this test is
+            // about the banner, not the clock.
+            std::fs::write(
+                home.path().join("state").join(format!("{name}.json")),
+                format!(
+                    "{{\"corpus\":\"{name}\",\"indexed_at\":\"fresh\",\"prefix\":\"xc-{name}\",\"url\":\"u\",\"autoindex_exit\":0,\"salvaged\":false,\"build\":\"b1\",\"index_prefix\":\"xc-{name}-b1\",\"state_dir\":\"/tmp/s\"}}"
+                ),
+            )
+            .unwrap();
+        };
+        write_corpus("owned", true);
+        write_corpus("other", false);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mapping = r#"{"idx":{"mappings":{"properties":{"body":{"type":"text"}}}}}"#;
+            let hit = r#"{"hits":{"hits":[{"_score":4.0,"_source":{"ax_path":"myrepo/src/lib.rs","line":1,"body":"fn mine() {}\n"}}]}}"#;
+            let cat = r#"[{"index":"xc-owned-b1-000"}]"#;
+            let started = std::time::Instant::now();
+            let mut served = 0;
+            while served < 6 && started.elapsed() < std::time::Duration::from_secs(20) {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                sock.set_nonblocking(false).unwrap();
+                served += 1;
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut sock, &mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let length = headers.lines().find_map(|line| {
+                                    let rest = line
+                                        .split_once(':')
+                                        .filter(|(name, _)| {
+                                            name.eq_ignore_ascii_case("content-length")
+                                        })?
+                                        .1;
+                                    rest.trim().parse::<usize>().ok()
+                                });
+                                let body_at = header_end + 4;
+                                if let Some(length) = length {
+                                    while buf.len() < body_at + length {
+                                        match std::io::Read::read(&mut sock, &mut tmp) {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let body = if head.contains("_cat/indices") {
+                    cat
+                } else if head.contains("_mapping") {
+                    mapping
+                } else {
+                    hit
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut sock, response.as_bytes());
+            }
+        });
+
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            auth: None,
+        };
+        let owned = block_on(call_tool(
+            &ctx,
+            &json!({"params": {"name": "xerj_code_search", "arguments": {
+                "corpus": "owned", "query": "fn mine"
+            }}}),
+        ));
+        let other = block_on(call_tool(
+            &ctx,
+            &json!({"params": {"name": "xerj_code_search", "arguments": {
+                "corpus": "other", "query": "fn mine"
+            }}}),
+        ));
+        server.join().unwrap();
+
+        let owned_text = tool_body(&owned);
+        let other_text = tool_body(&other);
+        assert_eq!(owned["isError"], false, "{owned_text}");
+        assert_eq!(other["isError"], false, "{other_text}");
+        assert!(owned_text.contains(", UNKNOWN)"), "{owned_text}");
+        assert!(owned_text.contains("fn mine()"), "{owned_text}");
+        assert!(!owned_text.contains("!!"), "{owned_text}");
+        assert!(!owned_text.contains("do not copy"), "{owned_text}");
+        assert!(
+            other_text.contains("!! UNKNOWN: adapt the APPROACH, do not copy the code"),
+            "{other_text}"
+        );
+        assert!(other_text.contains(", UNKNOWN)"), "{other_text}");
     }
 }

@@ -10,6 +10,12 @@
 //! * CLONE time — the same tuple gates the one-line warning `xerj corpus add`
 //!   prints per repo.
 //!
+//! A corpus the operator marked own ([`copy_warning_applies`]) is their own
+//! first-party code. An unidentified licence stays recorded and is still
+//! named in the hit header, but the do-not-copy banner is omitted for that
+//! unidentified licence only. A licence the detector actually named is
+//! unchanged, and a hub pack's licence class is not this tuple.
+//!
 //! The original scripts let these drift (the clone-time check was missing the
 //! MPL arm, so `sonic` warned only at query time despite a comment saying the
 //! two "MUST stay in step"). The port unifies on the FULLER tuple: strictly
@@ -96,6 +102,19 @@ pub fn reviewed_spdx(review: Option<&serde_json::Value>) -> Option<String> {
 /// naming a restricted one).
 pub fn is_unidentified(lic: &str) -> bool {
     matches!(lic.trim(), "" | "UNKNOWN" | "NONE-FOUND")
+}
+
+/// Whether a passage or a clone line should carry the do-not-copy banner.
+///
+/// `own` is the corpus-level first-party marker (`xerj corpus add --own` /
+/// `xerj corpus own`). It suppresses the banner only when the recorded
+/// licence is unidentified — the owner's own tree often has no LICENSE file,
+/// and "do not copy" is the wrong instruction for that code. The licence
+/// string itself is not rewritten. A named restricted licence (GPL, AGPL,
+/// MPL, …) still warns: marking a corpus own does not relicense a checkout
+/// the detector could read.
+pub fn copy_warning_applies(lic: &str, own: bool) -> bool {
+    !lic.is_empty() && is_restricted(lic) && !(own && is_unidentified(lic))
 }
 
 /// The licence to label a repo's passages with: the recorded detector string,
@@ -342,6 +361,30 @@ mod tests {
             assert!(clone_warning_line(lic).is_some(), "{lic} must warn");
         }
         assert!(clone_warning_line("Apache-2.0/MIT").is_none());
+    }
+
+    /// #2339: own code keeps an unidentified licence on the record, and does
+    /// not get the do-not-copy banner for that unidentified licence. A named
+    /// restricted licence still warns.
+    #[test]
+    fn own_suppresses_only_an_unidentified_copy_warning() {
+        assert!(!copy_warning_applies("UNKNOWN", true));
+        assert!(!copy_warning_applies("NONE-FOUND", true));
+        assert!(!copy_warning_applies("", true));
+        assert!(copy_warning_applies("UNKNOWN", false));
+        assert!(copy_warning_applies("NONE-FOUND", false));
+        assert!(
+            copy_warning_applies("AGPL", true),
+            "own does not relicense AGPL"
+        );
+        assert!(copy_warning_applies("GPL-3.0", true));
+        assert!(copy_warning_applies("MPL-2.0", true));
+        assert!(!copy_warning_applies("Apache-2.0", true));
+        assert!(!copy_warning_applies("Apache-2.0", false));
+        assert!(
+            copy_warning_applies("UNKNOWN/MIT", true),
+            "a mixed string that names a constituent is not unidentified"
+        );
     }
 
     // ── a completed human review names an unidentified licence (#1893) ──

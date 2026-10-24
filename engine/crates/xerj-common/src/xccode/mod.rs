@@ -610,6 +610,9 @@ pub fn run_code_query(
     //    re-derived at query time, never from prose.
     let licences = manifest::licence_map(root, &corpus);
     let checkout = root.join("corpora").join(&corpus);
+    // #2339: first-party marker lives on corpus.json, beside the licence
+    // record. It does not change the licence string the header prints.
+    let own = manifest::corpus_is_own(root, &corpus);
 
     let text = render::render(
         &hits,
@@ -626,6 +629,7 @@ pub fn run_code_query(
             lexical_lines: params.mode == Mode::Bm25
                 || note.as_deref().is_some_and(|n| n.starts_with("BM25 only")),
             checkout: Some(&checkout),
+            own,
         },
         note.as_deref(),
     );
@@ -1473,6 +1477,77 @@ mod tests {
         assert!(out
             .text
             .contains("!! AGPL: adapt the APPROACH, do not copy the code"));
+    }
+
+    /// #2339: the CLI pipeline (`xerj code` calls this) and the MCP tool share
+    /// this function. An own corpus keeps the unidentified licence in the
+    /// header and drops the banner. The same corpus without the marker, and
+    /// a named restricted licence, still warn.
+    #[test]
+    fn own_corpus_query_omits_the_unidentified_banner_and_keeps_the_licence() {
+        let root = root_with_state();
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"own\":true,\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(out.text.contains(", UNKNOWN)"), "{text}", text = out.text);
+        assert!(out.text.contains("void addReplyNull"), "{}", out.text);
+        assert!(!out.text.contains("!!"), "{}", out.text);
+        assert!(!out.text.contains("do not copy"), "{}", out.text);
+
+        let mut strict = CodeParams::new("kv", "q");
+        strict.strict_licence = true;
+        let out = run_code_query(&root, &FakeHttp::new(), "u", &strict, "`--stale-ok`");
+        assert!(out.text.contains("void addReplyNull"), "{}", out.text);
+        assert!(!out.text.contains("!!"), "{}", out.text);
+
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert!(
+            out.text
+                .contains("!! UNKNOWN: adapt the APPROACH, do not copy the code"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains(", UNKNOWN)"), "{}", out.text);
+
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"own\":true,\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"AGPL\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert!(
+            out.text
+                .contains("!! AGPL: adapt the APPROACH, do not copy the code"),
+            "own does not silence a detected AGPL: {}",
+            out.text
+        );
     }
 
     #[test]

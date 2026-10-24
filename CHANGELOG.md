@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `xerj corpus add --own` and `xerj corpus own <name>` (`--off` clears it)
+  mark a corpus as your own first-party code (`"own": true` in its
+  `corpus.json`). `xerj code` and MCP `xerj_code_search` still name an
+  unidentified licence (`UNKNOWN` or `NONE-FOUND`) on each hit and omit
+  the do-not-copy banner for that unidentified licence. A licence the
+  detector actually named still warns. A local path is not marked own
+  unless the flag is passed, and a `--from` manifest cannot set the
+  marker. `xerj corpus index` prints a per-file-class indexed vs
+  ignored-data summary at the end
+  ([#2339](https://github.com/xerj-org/xerj/issues/2339)).
+
 - With `[cluster] enabled = true`, a replica that does not have the
   primary's live documents copies them and then rejoins the in-sync set.
   That covers a member that starts after the writes (the create entry

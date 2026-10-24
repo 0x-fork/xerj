@@ -2085,6 +2085,99 @@ fn without_corpus_data_files(files: Vec<walk::FileEntry>) -> (Vec<walk::FileEntr
     (kept, dropped, skipped_bytes)
 }
 
+/// Per-extension accounting printed at the end of `xerj corpus index`
+/// (#2339, the summary half of #1985).
+///
+/// `indexed` is what the walk admits after ignore rules, minus the corpus
+/// manifest and — unless `include_data` — the data-file families.
+/// `ignored data` is those families. A pruned directory is not expanded
+/// into extensions; the ignore-rules line names the prune instead. A walk
+/// that cannot run yields no lines, and the index verdict still prints.
+pub(crate) fn corpus_file_class_summary(root: &Path, include_data: bool) -> Vec<String> {
+    let Ok((files, ignore)) =
+        walk::walk_reporting(root, false, ignore_rules::IgnoreOptions::default())
+    else {
+        return Vec::new();
+    };
+    let files: Vec<walk::FileEntry> = files
+        .into_iter()
+        .filter(|file| file.rel != CORPUS_MANIFEST_REL)
+        .collect();
+    let (kept, skipped): (Vec<walk::FileEntry>, Vec<walk::FileEntry>) = if include_data {
+        (files, Vec::new())
+    } else {
+        let mut kept = Vec::new();
+        let mut skipped = Vec::new();
+        for file in files {
+            if is_corpus_data_file(&file) {
+                skipped.push(file);
+            } else {
+                kept.push(file);
+            }
+        }
+        (kept, skipped)
+    };
+    let mut lines = vec![format!(
+        "file classes: indexed {} ({} file{})",
+        format_class_counts(&class_counts(&kept)),
+        kept.len(),
+        if kept.len() == 1 { "" } else { "s" },
+    )];
+    if !skipped.is_empty() {
+        lines.push(format!(
+            "file classes: ignored data {} ({} file{}) — pass --include-data to index them",
+            format_class_counts(&class_counts(&skipped)),
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" },
+        ));
+    }
+    if ignore.files_skipped > 0 || ignore.dirs_pruned > 0 {
+        lines.push(format!(
+            "file classes: ignore rules skipped {} file{} and pruned {} director{}",
+            ignore.files_skipped,
+            if ignore.files_skipped == 1 { "" } else { "s" },
+            ignore.dirs_pruned,
+            if ignore.dirs_pruned == 1 { "y" } else { "ies" },
+        ));
+    }
+    lines
+}
+
+fn class_of(file: &walk::FileEntry) -> String {
+    file.path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "noext".to_string())
+}
+
+fn class_counts(files: &[walk::FileEntry]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for file in files {
+        *counts.entry(class_of(file)).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn format_class_counts(counts: &BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    let mut ranked: Vec<(&String, &u64)> = counts.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    const SHOW: usize = 12;
+    let mut parts: Vec<String> = ranked
+        .iter()
+        .take(SHOW)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect();
+    if ranked.len() > SHOW {
+        parts.push(format!("+{}", ranked.len() - SHOW));
+    }
+    parts.join(" ")
+}
+
 #[cfg(test)]
 mod generation_preflight_tests {
     use super::*;
@@ -2271,6 +2364,52 @@ mod corpus_data_skip_tests {
     fn a_file_without_an_extension_is_kept() {
         let (kept, count, bytes) = without_corpus_data_files(vec![entry("Makefile", 1)]);
         assert_eq!((kept.len(), count, bytes), (1, 0, 0));
+    }
+
+    /// #2339: the corpus-index tail names indexed extensions and the data
+    /// families the gate left out. `corpus.json` is bookkeeping. A pruned
+    /// `node_modules` is the ignore-rules line, not an indexed class.
+    #[test]
+    fn corpus_index_summary_splits_indexed_extensions_from_ignored_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "docs\n").unwrap();
+        std::fs::write(root.join("Makefile"), "all:\n").unwrap();
+        std::fs::write(root.join("data/rows.csv"), "a,b\n").unwrap();
+        std::fs::write(root.join("data/ROWS.CSV"), "c,d\n").unwrap();
+        std::fs::write(root.join("sim.h5"), "not-really\n").unwrap();
+        std::fs::write(root.join("corpus.json"), "{}\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+
+        let lines = corpus_file_class_summary(root, false);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("file classes: indexed md=1 noext=1 rs=1 (3 files)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "file classes: ignored data csv=2 h5=1 (3 files) — pass --include-data to index them"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("pruned"), "{text}");
+        assert!(!text.contains("corpus.json"), "{text}");
+        assert!(!text.contains("js="), "{text}");
+
+        let included = corpus_file_class_summary(root, true).join("\n");
+        assert!(
+            included.contains("csv=2") && included.contains("h5=1") && included.contains("rs=1"),
+            "{included}"
+        );
+        assert!(
+            !included.contains("ignored data"),
+            "include-data indexes the data families: {included}"
+        );
     }
 }
 
