@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0-rc.99] - 2026-10-24
 
-Window since v1.0.0-rc.98: 115 merged pull requests. x86_64 release binaries
+Window since v1.0.0-rc.98: 116 merged pull requests. x86_64 release binaries
 run on CPUs without AVX2. Cluster mode replicates index metadata, routes a
 document write to the primary named at create, copies an acknowledged write
 onto replicas placed at create, acknowledges that write once a quorum of
@@ -810,7 +810,11 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   Content-Signal, `llms.txt`, an IndexNow key, and MCP listing manifests
   (`server.json`, the mcpb manifest, and a Docker MCP Dockerfile). The
   registry manifest names the tagged release v1.0.0-rc.98 (PR
-  [#2323](https://github.com/xerj-org/xerj/pull/2323)).
+  [#2323](https://github.com/xerj-org/xerj/pull/2323)). The mcpb package
+  identifier points at the prerelease asset
+  `releases/download/mcpb-v1.0.0-rc.98/xerj-mcp-1.0.0-rc.98.mcpb`, not
+  `releases/download/v1.0.0-rc.98/` (PR
+  [#2364](https://github.com/xerj-org/xerj/pull/2364)).
 - A ready-to-paste DeepSeek Harness MCP config, with `env` and `cwd`
   ([#2286](https://github.com/xerj-org/xerj/issues/2286), PR
   [#2288](https://github.com/xerj-org/xerj/pull/2288)). Both Windows install

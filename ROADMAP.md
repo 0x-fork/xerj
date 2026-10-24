@@ -48,7 +48,7 @@ onto a replica that is behind (PR
 [#2347](https://github.com/xerj-org/xerj/pull/2347)). Replica promotion,
 `wait_for_active_shards`, native `/v1` ingest, `_delete_by_query`, and
 moving copies when membership changes stay open on #1170. The window
-since rc.98 is 115 merged pull requests; the CHANGELOG lists every one. x86_64 binaries run without AVX2 (PR
+since rc.98 is 116 merged pull requests; the CHANGELOG lists every one. x86_64 binaries run without AVX2 (PR
 [#2253](https://github.com/xerj-org/xerj/pull/2253), which supersedes the
 installer refusal in PR
 [#2178](https://github.com/xerj-org/xerj/pull/2178)), and `ctutils` 0.4.5
