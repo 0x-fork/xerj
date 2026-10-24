@@ -318,6 +318,29 @@ impl MemoryShardDir {
     }
 }
 
+/// Stack reserved for one in-process shard call. Smaller than this overflows
+/// `search_impl`'s future; `std::thread` at this size is the sigaltstack
+/// abort #1122 hit.
+const SHARD_CALL_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Map a spawn that did not happen into the error the HTTP caller sees.
+///
+/// The job is dropped. Running it on the caller's stack is the overflow
+/// this thread exists to avoid, and dropping it does not write the document.
+pub(crate) fn map_shard_spawn_failure<F>(
+    to: &str,
+    failure: xerj_common::thread_spawn::SpawnFailure<F>,
+) -> ShardError {
+    let error = failure.error;
+    drop(failure.job);
+    ShardError::Unavailable {
+        to: to.to_string(),
+        reason: format!(
+            "could not start the shard call: {error}; the node stayed up and this call was not run"
+        ),
+    }
+}
+
 /// In-process [`ShardRpc`]. A call runs the target's handler on a fresh
 /// stack and waits for it.
 ///
@@ -328,6 +351,12 @@ impl MemoryShardDir {
 /// index-visibility guard is intentionally not carried across: a TCP handler
 /// has none, and an absent guard is how cluster-internal replica stores stay
 /// reachable.
+///
+/// The thread is 8 MiB and is started with [`xerj_common::thread_spawn`], not
+/// `std::thread::Builder`. Builder returns `Ok` and then panics in the child
+/// when the alternate signal stack cannot be mapped; with `panic = "abort"`
+/// that kills the node (#1122). A failed spawn answers the caller and does
+/// not run the handler on this stack.
 pub struct MemoryShardRpc {
     node_id: String,
     dir: Arc<MemoryShardDir>,
@@ -355,21 +384,25 @@ impl ShardRpc for MemoryShardRpc {
         let runtime = tokio::runtime::Handle::current();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let target = to.to_string();
-        std::thread::Builder::new()
-            .name("xerj-shard".into())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
+        let handle = match xerj_common::thread_spawn::try_spawn_stack(
+            "xerj-shard",
+            SHARD_CALL_STACK_BYTES,
+            move || {
                 let result = runtime.block_on(handler.handle(op));
                 let _ = tx.send(result);
-            })
-            .map_err(|err| ShardError::Unavailable {
-                to: target.clone(),
-                reason: format!("could not start the shard call: {err}"),
-            })?;
-        rx.await.map_err(|_| ShardError::Unavailable {
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(failure) => return Err(map_shard_spawn_failure(&target, failure)),
+        };
+        let received = rx.await.map_err(|_| ShardError::Unavailable {
             to: target,
             reason: "shard call stopped before answering".to_string(),
-        })
+        });
+        // Reap the helper. It has already sent (or dropped the sender);
+        // join does not run the handler again.
+        drop(handle);
+        received
     }
 
     fn set_handler(&self, handler: Arc<dyn ShardHandler>) {
@@ -458,5 +491,82 @@ mod tests {
                 replicas: Vec::new(),
             }]
         );
+    }
+
+    /// #1122: `std::thread::Builder::spawn` panics in the child when the
+    /// alternate signal stack cannot be mapped (os error 12), after the
+    /// parent has been told the thread exists. The shard call must surface
+    /// that as [`ShardError`] and must not run the handler.
+    #[test]
+    fn a_shard_call_that_cannot_spawn_is_an_error_and_does_not_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use xerj_common::thread_spawn::{try_spawn_with, Spawn, SpawnedThread};
+
+        struct Refuse;
+
+        impl Spawn for Refuse {
+            fn spawn(
+                &self,
+                _name: &str,
+                job: xerj_common::thread_spawn::BoxedJob,
+            ) -> std::io::Result<SpawnedThread> {
+                drop(job);
+                Err(std::io::Error::from_raw_os_error(12))
+            }
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let job_ran = Arc::clone(&ran);
+        let failure = try_spawn_with(&Refuse, true, "xerj-shard", move || {
+            job_ran.store(true, Ordering::SeqCst);
+        })
+        .expect_err("spawn refused");
+        let err = super::map_shard_spawn_failure("n2", failure);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "handler ran after a failed spawn"
+        );
+        let text = err.to_string();
+        assert!(text.contains("n2"), "{text}");
+        assert!(text.contains("could not start the shard call"), "{text}");
+        assert!(text.contains("stayed up"), "{text}");
+        assert!(
+            text.contains("12") || text.contains("Cannot allocate memory"),
+            "{text}"
+        );
+    }
+
+    struct EchoHandler;
+
+    #[async_trait::async_trait]
+    impl ShardHandler for EchoHandler {
+        async fn handle(&self, op: ShardOp) -> ShardResult {
+            ShardResult::http(200, format!("{op:?}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_process_shard_call_runs_the_handler_on_the_helper_stack() {
+        let dir = MemoryShardDir::new();
+        let rpc = MemoryShardRpc::new("n1", Arc::clone(&dir));
+        rpc.set_handler(Arc::new(EchoHandler));
+        let result = rpc
+            .call(
+                "n1",
+                ShardOp::GetDoc {
+                    index: "orders".into(),
+                    id: "1".into(),
+                    source: None,
+                    source_includes: None,
+                    source_excludes: None,
+                    replica: false,
+                    shard: 0,
+                },
+            )
+            .await
+            .expect("spawn and call");
+        assert_eq!(result.status, 200);
+        assert!(result.body.contains("orders"), "{}", result.body);
     }
 }

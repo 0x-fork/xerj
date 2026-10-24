@@ -2354,12 +2354,24 @@ impl Es {
         let es = self.clone();
         let index_owned = index.to_owned();
         let body = body.clone();
-        std::thread::Builder::new()
-            .name("xerj-verify-search".to_owned())
-            .spawn(move || {
+        // #1122: `Builder::spawn` panics in the child on a failed signal-stack
+        // mmap after returning `Ok`. A failed `try_spawn` runs the search on
+        // this thread instead: the parallel HEAD probe is the optimization,
+        // and the process stays up.
+        if let Err(failure) =
+            xerj_common::thread_spawn::try_spawn("xerj-verify-search", move || {
                 let _ = tx.send(es.search(&index_owned, &body));
             })
-            .context("spawn finalize-verify search")?;
+        {
+            if let Some(job) = failure.job {
+                job();
+            } else {
+                anyhow::bail!(
+                    "could not start finalize-verify search for {index}: {}; the process stayed up",
+                    failure.error
+                );
+            }
+        }
         loop {
             match rx.recv_timeout(Self::VERIFY_INDEX_POLL) {
                 Ok(Ok(value)) => return Ok(value),

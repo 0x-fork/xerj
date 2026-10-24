@@ -967,41 +967,41 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     // so one failed spawn here used to abort the whole run. A failed spawn
     // now stops the worker and fails this one file, like any other worker
     // start-up failure.
-    let out_reader = match std::thread::Builder::new()
-        .name("xerj-pdf-stdout".into())
-        .spawn(move || {
+    let out_reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-pdf-stdout", move || {
             let _closed = out_closed;
             read_capped(stdout, MAX_WORKER_OUTPUT)
         }) {
-        Ok(reader) => reader,
-        Err(error) => {
-            terminate_worker_tree(&mut child);
-            return Err(error).with_context(|| {
-                format!(
-                    "could not start the PDF parser's output reader for {}",
-                    path.display()
-                )
-            });
-        }
-    };
-    let err_reader = match std::thread::Builder::new()
-        .name("xerj-pdf-stderr".into())
-        .spawn(move || {
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                terminate_worker_tree(&mut child);
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the PDF parser's output reader for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+    let err_reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-pdf-stderr", move || {
             let _closed = err_closed;
             read_capped(stderr, MAX_WORKER_STDERR as usize)
         }) {
-        Ok(reader) => reader,
-        Err(error) => {
-            terminate_worker_tree(&mut child);
-            let _ = out_reader.join();
-            return Err(error).with_context(|| {
-                format!(
-                    "could not start the PDF parser's error reader for {}",
-                    path.display()
-                )
-            });
-        }
-    };
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                terminate_worker_tree(&mut child);
+                let _ = out_reader.join();
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the PDF parser's error reader for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
 
     let started = Instant::now();
     let timeout = Duration::from_secs(WORKER_TIMEOUT_SECS.load(Ordering::Relaxed));

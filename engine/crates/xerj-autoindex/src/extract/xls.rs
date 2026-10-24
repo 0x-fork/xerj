@@ -362,22 +362,23 @@ fn run_worker(
     // #1122: `std::thread::spawn` panics when a thread cannot be created and
     // release builds are panic=abort; a failed spawn stops the worker and
     // fails this one file instead of aborting the run.
-    let reader = match std::thread::Builder::new()
-        .name("xerj-xls-stdout".into())
-        .spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            kill_group(pid);
-            let _ = child.wait();
-            return Err(error).with_context(|| {
-                format!(
-                    "could not start the .xls reader's output thread for {}",
-                    path.display()
-                )
-            });
-        }
-    };
+    let reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-xls-stdout", move || {
+            read_capped(stdout, MAX_WORKER_OUTPUT)
+        }) {
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                kill_group(pid);
+                let _ = child.wait();
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the .xls reader's output thread for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
 
     let started = std::time::Instant::now();
     let status = loop {

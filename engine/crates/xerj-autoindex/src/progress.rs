@@ -948,42 +948,44 @@ impl Progress {
         }
         let progress = Arc::clone(self);
         let interval = self.interval;
-        let handle = std::thread::Builder::new()
-            .name("autoindex-progress".into())
-            .spawn(move || {
-                // Hold the guard across the loop and test the flag BEFORE
-                // waiting. A condvar notification reaches only threads already
-                // parked in `wait`, so a `stop()` that lands while this thread
-                // is anywhere else — above all before its very first wait — is
-                // delivered to nobody and is gone. Re-checking the predicate
-                // under the lock is what makes it impossible to miss: the flag
-                // is set under the same mutex, so either we see it here or we
-                // are already parked and the notify wakes us.
-                //
-                // Getting this wrong is not a latency detail. `Ticker::drop`
-                // joins this thread, so a lost stop turns every early exit —
-                // `es.ping()` refused, `no-files`, a small `--dry-run` — into a
-                // full `--progress-interval` of silence AFTER the terminal line
-                // has printed, and `--progress-interval 3600` makes that an
-                // hour.
-                let mut stopped = progress.stopped.lock().unwrap();
-                while !*stopped {
-                    let (guard, _timeout) = progress
-                        .wake
-                        .wait_timeout(stopped, interval)
-                        .expect("progress ticker mutex poisoned");
-                    stopped = guard;
-                    if *stopped {
-                        break;
-                    }
-                    // Never emit while holding `stopped`: `stop()` would block
-                    // behind a write to a slow pipe.
-                    drop(stopped);
-                    progress.emit();
-                    stopped = progress.stopped.lock().unwrap();
+        // #1122: `Builder::spawn` returns `Ok` and then panics in the child
+        // when the alternate signal stack cannot be mapped. `.ok()` only
+        // sees the `Err` from `pthread_create`. `try_spawn` does not install
+        // that stack, so a refusal is a missing ticker, not a dead process.
+        let handle = xerj_common::thread_spawn::try_spawn("autoindex-progress", move || {
+            // Hold the guard across the loop and test the flag BEFORE
+            // waiting. A condvar notification reaches only threads already
+            // parked in `wait`, so a `stop()` that lands while this thread
+            // is anywhere else — above all before its very first wait — is
+            // delivered to nobody and is gone. Re-checking the predicate
+            // under the lock is what makes it impossible to miss: the flag
+            // is set under the same mutex, so either we see it here or we
+            // are already parked and the notify wakes us.
+            //
+            // Getting this wrong is not a latency detail. `Ticker::drop`
+            // joins this thread, so a lost stop turns every early exit —
+            // `es.ping()` refused, `no-files`, a small `--dry-run` — into a
+            // full `--progress-interval` of silence AFTER the terminal line
+            // has printed, and `--progress-interval 3600` makes that an
+            // hour.
+            let mut stopped = progress.stopped.lock().unwrap();
+            while !*stopped {
+                let (guard, _timeout) = progress
+                    .wake
+                    .wait_timeout(stopped, interval)
+                    .expect("progress ticker mutex poisoned");
+                stopped = guard;
+                if *stopped {
+                    break;
                 }
-            })
-            .ok();
+                // Never emit while holding `stopped`: `stop()` would block
+                // behind a write to a slow pipe.
+                drop(stopped);
+                progress.emit();
+                stopped = progress.stopped.lock().unwrap();
+            }
+        })
+        .ok();
         Ticker {
             progress: Arc::clone(self),
             handle,
@@ -1063,7 +1065,7 @@ impl Drop for WatchGuard<'_> {
 /// called `finish` — closes the stream with an honest `ok=false` line.
 pub struct Ticker {
     progress: Arc<Progress>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<xerj_common::thread_spawn::SpawnedThread>,
 }
 
 impl Drop for Ticker {

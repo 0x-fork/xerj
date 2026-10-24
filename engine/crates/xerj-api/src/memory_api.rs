@@ -462,7 +462,7 @@ pub async fn store(
         State(state.clone()),
         Path((index.clone(), id.clone())),
         axum::extract::Query(IndexDocParams::default()),
-        Json(doc),
+        es_compat::document_body(&doc),
     )
     .await
     .into_response();

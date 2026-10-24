@@ -3941,6 +3941,34 @@ fn resolve_effective_pipeline(
     }
 }
 
+/// Parse one indexed document from raw bytes.
+///
+/// The size check runs before `serde_json`. `PUT /{index}/_doc/{id}` used
+/// to take `Json<Value>`, which builds the DOM inside axum before the
+/// handler runs. A body between the 8 MiB document ceiling and
+/// `limits.max_body_bytes` (100 MiB) was parsed, then refused, and the
+/// parse itself is what aborted the node under a memory cap (#1122).
+/// Bytes that are not valid JSON and are also over the ceiling report the
+/// size refusal, not a parse error — that is how a test can see the check
+/// ran first.
+pub(crate) fn parse_indexed_document_body(body: &[u8]) -> Result<Value, xerj_common::XerjError> {
+    if xerj_common::document_limit::indexed_document_too_large(body.len()) {
+        return Err(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::indexed_document_refusal(body.len()),
+        ));
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| xerj_common::XerjError::invalid_query(format!("invalid JSON body: {e}")))
+}
+
+/// Serialize a document the in-process callers already hold as a [`Value`]
+/// into the raw body [`index_doc`] parses. Those callers (brain edges,
+/// agent memory) are small; the HTTP routes pass the request bytes through
+/// unchanged.
+pub(crate) fn document_body(doc: &Value) -> bytes::Bytes {
+    bytes::Bytes::from(serde_json::to_vec(doc).unwrap_or_else(|_| Vec::from(&b"{}"[..])))
+}
+
 /// Fast path for `POST /{index}/_doc`: receives raw bytes to skip the axum
 /// JSON extractor's extra validation pass and parse directly with simd_json /
 /// serde_json.  No schema validation is performed here; the engine layer handles
@@ -3951,22 +3979,9 @@ pub async fn index_doc_auto(
     Query(params): Query<IndexDocAutoParams>,
     body: bytes::Bytes,
 ) -> impl IntoResponse {
-    if xerj_common::document_limit::indexed_document_too_large(body.len()) {
-        return ApiError::new(xerj_common::XerjError::invalid_document_json(
-            xerj_common::document_limit::indexed_document_refusal(body.len()),
-        ))
-        .into_response();
-    }
-    // Parse the raw body directly — avoids the axum Json extractor's extra
-    // content-type enforcement and serde_json::from_str double-pass.
-    let doc: Value = match serde_json::from_slice(&body) {
+    let doc = match parse_indexed_document_body(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return ApiError::new(xerj_common::XerjError::invalid_query(format!(
-                "invalid JSON body: {e}"
-            )))
-            .into_response();
-        }
+        Err(e) => return ApiError::new(e).into_response(),
     };
 
     let doc = apply_ignore_malformed(&state, &index, doc);
@@ -4115,8 +4130,13 @@ pub async fn index_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<IndexDocParams>,
-    Json(doc): Json<Value>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    // Size check before the DOM exists. See [`parse_indexed_document_body`].
+    let doc = match parse_indexed_document_body(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     // Apply ignore_malformed validation — remove malformed values and add
     // field names to _ignored[] per the index mapping. No-op when the index
     // has no mapping yet.
@@ -4321,8 +4341,12 @@ pub async fn create_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<CreateDocParams>,
-    Json(doc): Json<Value>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    let doc = match parse_indexed_document_body(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     // Execute ingest pipeline if one is specified (explicit `?pipeline=`) or
     // resolved from the index's `index.default_pipeline` setting.
     let effective_pipeline = resolve_effective_pipeline(&state, &index, params.pipeline.as_deref());
@@ -4393,6 +4417,87 @@ pub async fn create_doc(
             (StatusCode::CREATED, Json(er)).into_response()
         }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod oversized_single_doc {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::config::{Config, WalSync};
+    use xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES;
+    use xerj_common::metrics::Metrics;
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn an_oversized_body_is_refused_before_it_is_parsed() {
+        let body = vec![b'x'; MAX_INDEXED_DOCUMENT_BYTES + 1];
+        let err = parse_indexed_document_body(&body).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("not indexed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size check must run before parse: {text}"
+        );
+        let small = parse_indexed_document_body(br#"{"name":"ada"}"#).unwrap();
+        assert_eq!(small["name"], "ada");
+    }
+
+    #[tokio::test]
+    async fn put_and_create_refuse_an_oversized_body_and_a_small_put_indexes() {
+        let app = crate::router::build_es_compat_router(test_state());
+        let body = vec![b'x'; MAX_INDEXED_DOCUMENT_BYTES + 1];
+        for path in ["/oversize/_doc/1", "/oversize/_create/1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+                "{path}: {text}"
+            );
+            assert!(text.contains("not indexed"), "{path}: {text}");
+            assert!(
+                !text.contains("invalid JSON"),
+                "{path} parsed before the size check: {text}"
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::put("/oversize/_doc/ok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"ada"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 }
 

@@ -30,6 +30,7 @@ pub mod index_guard;
 pub mod ingest_memory;
 pub mod lifecycle;
 pub mod memtable;
+mod merge_reserve;
 mod node_lock;
 pub mod painless;
 pub mod pools;

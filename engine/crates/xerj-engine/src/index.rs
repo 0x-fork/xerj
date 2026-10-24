@@ -11125,9 +11125,10 @@ impl Index {
         // Process-wide admission: disk flood-stage block (item 3) + parent
         // memory circuit breaker (item 1). Fires before any per-index work.
         self.governor_write_gate()?;
-        // Already-parsed bodies (PUT `/_doc/{id}` builds a `Value` in the
-        // extractor) still have to be refused before semantic embedding and
-        // `analyze_doc`. Bulk NDJSON is refused on the raw bytes earlier.
+        // Bodies that arrived already parsed (in-process callers, a pipeline
+        // rewrite) still have to be refused before semantic embedding and
+        // `analyze_doc`. HTTP `PUT`/`POST /_doc` and bulk NDJSON are refused
+        // on the raw bytes earlier.
         if let Some(seen) =
             xerj_common::document_limit::json_value_exceeds_indexed_document_limit(&source)
         {
@@ -13678,8 +13679,27 @@ impl Index {
                     let mut min_seq = u64::MAX;
                     let mut max_seq = 0u64;
 
-                    let mut merged_json_buf: Vec<u8> = Vec::with_capacity(60 * 1024 * 1024);
-                    merged_json_buf.push(b'[');
+                    // #1122: `Vec::with_capacity(60 MiB)` aborts the process
+                    // when the allocator refuses (`memory allocation of N
+                    // bytes failed`, no panic line). `try_reserve` of the
+                    // same 60 MiB keeps the success path and turns a refusal
+                    // into an aborted batch. Inputs stay on disk.
+                    let mut merged_json_buf: Vec<u8> = Vec::new();
+                    if let Err(error) = crate::merge_reserve::reserve_merge_output_buffer(
+                        &mut merged_json_buf,
+                        crate::merge_reserve::MERGE_OUTPUT_RESERVE_BYTES,
+                    ) {
+                        tracing::error!("{error}");
+                        failed_for_task.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    if let Err(error) =
+                        crate::merge_reserve::extend_merge_output(&mut merged_json_buf, b"[")
+                    {
+                        tracing::error!("{error}");
+                        failed_for_task.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
                     let mut first_doc = true;
                     let mut live_doc_count: u64 = 0;
 
@@ -13903,8 +13923,21 @@ impl Index {
 
                         // The FTS/doc-values ordinal space of a segment is the
                         // order of its stored documents, so the map is exactly as
-                        // long as this vector.
-                        doc_maps[source_index] = vec![None; raw_docs.len()];
+                        // long as this vector. `vec![None; n]` aborts if that
+                        // allocation is refused (#1122); `try_reserve` does not.
+                        let mut ordinals = Vec::new();
+                        if ordinals.try_reserve(raw_docs.len()).is_err() {
+                            tracing::error!(
+                                ?seg_path,
+                                docs = raw_docs.len(),
+                                "merge aborted: not enough memory to reserve the document map; \
+                                 input segments were preserved and the node stayed up"
+                            );
+                            failed_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
+                        ordinals.resize(raw_docs.len(), None);
+                        doc_maps[source_index] = ordinals;
                         for (source_ordinal, raw) in raw_docs.iter().enumerate() {
                             let raw_str = raw.get();
                             let id_seq: IdSeq = match serde_json::from_str(raw_str) {
@@ -13934,14 +13967,23 @@ impl Index {
                             }
 
                             // Survives — hold (seq, id, raw) for the global
-                            // _seq_no-ordered build below.
-                            survivors.push((
-                                id_seq.seq_no,
-                                id_seq.id.to_string(),
-                                raw_str.to_string(),
-                                source_index as u32,
-                                source_ordinal as u32,
-                            ));
+                            // _seq_no-ordered build below. Growth is fallible:
+                            // `push` aborts the process when the allocator
+                            // refuses (#1122).
+                            if let Err(error) = crate::merge_reserve::try_push_merge(
+                                &mut survivors,
+                                (
+                                    id_seq.seq_no,
+                                    id_seq.id.to_string(),
+                                    raw_str.to_string(),
+                                    source_index as u32,
+                                    source_ordinal as u32,
+                                ),
+                            ) {
+                                tracing::error!("{error}");
+                                failed_for_task.fetch_add(1, Ordering::Relaxed);
+                                return None;
+                            }
                             survivor_bytes = survivor_bytes.saturating_add(
                                 raw_str.len()
                                     + id_seq.id.len()
@@ -13971,14 +14013,35 @@ impl Index {
                     let mut fts_input_bytes: usize = 0;
                     for (seq_no, id_str, raw_str, source_index, source_ordinal) in survivors {
                         if !first_doc {
-                            merged_json_buf.push(b',');
+                            if let Err(error) = crate::merge_reserve::extend_merge_output(
+                                &mut merged_json_buf,
+                                b",",
+                            ) {
+                                tracing::error!("{error}");
+                                failed_for_task.fetch_add(1, Ordering::Relaxed);
+                                return None;
+                            }
                         }
                         first_doc = false;
-                        merged_json_buf.extend_from_slice(raw_str.as_bytes());
+                        if let Err(error) = crate::merge_reserve::extend_merge_output(
+                            &mut merged_json_buf,
+                            raw_str.as_bytes(),
+                        ) {
+                            tracing::error!("{error}");
+                            failed_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
                         live_doc_count += 1;
                         // The .ids side-car must cover every stored doc
                         // (alignment invariant, see above).
-                        ids_pairs.push((seq_no, id_str.clone()));
+                        if let Err(error) = crate::merge_reserve::try_push_merge(
+                            &mut ids_pairs,
+                            (seq_no, id_str.clone()),
+                        ) {
+                            tracing::error!("{error}");
+                            failed_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
 
                         // Per-doc Value parse for FTS / DV builders.
                         //
@@ -14024,7 +14087,13 @@ impl Index {
                                     doc_value.get("_source").unwrap_or(&Value::Null),
                                 ));
                         }
-                        fts_input.push((id_str, fields, source));
+                        if let Err(error) =
+                            crate::merge_reserve::try_push_merge(&mut fts_input, (id_str, fields, source))
+                        {
+                            tracing::error!("{error}");
+                            failed_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
                         // Sampled checkpoints every 8192 drained docs: the
                         // survivor set shrinks as `merged_json_buf` and
                         // `fts_input` grow, so the crossover IS the batch's
@@ -14050,7 +14119,13 @@ impl Index {
                     if live_doc_count == 0 {
                         return None;
                     }
-                    merged_json_buf.push(b']');
+                    if let Err(error) =
+                        crate::merge_reserve::extend_merge_output(&mut merged_json_buf, b"]")
+                    {
+                        tracing::error!("{error}");
+                        failed_for_task.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
                     crate::ingest_memory::observe_checkpoint(
                         crate::ingest_memory::Category::MergeJsonBuffer,
                         merged_json_buf.len(),
@@ -14762,9 +14837,10 @@ impl Index {
             return Err(EngineError::Common(xerj_common::XerjError::internal(
                 format!(
                     "merge pass aborted {failed} batch(es): an input segment could not \
-                     be fully read or the output could not be written; input segments \
-                     were preserved (no documents dropped, {merged_batches} other \
-                     batch(es) merged)"
+                     be fully read, the output could not be written, or there was not \
+                     enough memory to build the merged segment; input segments \
+                     were preserved (no documents dropped, the node stayed up, \
+                     {merged_batches} other batch(es) merged)"
                 ),
             )));
         }

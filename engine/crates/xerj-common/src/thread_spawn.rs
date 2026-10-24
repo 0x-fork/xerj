@@ -96,7 +96,32 @@ impl Spawn for StdSpawn {
         }
         #[cfg(not(unix))]
         {
-            spawn_std(name, job)
+            spawn_std(name, job, None)
+        }
+    }
+}
+
+/// [`StdSpawn`] with an explicit stack reservation.
+///
+/// The in-process shard call needs 8 MiB: a search future overflows the
+/// 2 MiB helper stack. On Unix this still uses `pthread_create`, so a
+/// stack the OS will not reserve is an `Err` instead of a panic inside
+/// the child after `Builder::spawn` has already returned `Ok` (#1122).
+#[derive(Debug, Clone, Copy)]
+pub struct StackSpawn {
+    pub stack_bytes: usize,
+}
+
+impl Spawn for StackSpawn {
+    fn spawn(&self, name: &str, job: BoxedJob) -> io::Result<SpawnedThread> {
+        #[cfg(unix)]
+        {
+            let _ = name;
+            spawn_pthread_with_stack(job, self.stack_bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            spawn_std(name, job, Some(self.stack_bytes))
         }
     }
 }
@@ -261,6 +286,107 @@ where
     F: FnOnce() + Send + 'static,
 {
     try_spawn_with(&StdSpawn, true, name, f)
+}
+
+/// [`try_spawn`] with an explicit stack size.
+///
+/// Used by the in-process shard call, whose handler does not fit on the
+/// 2 MiB helper stack. A refused or failed spawn returns the job; the
+/// caller must not run that job on its own stack (that is the overflow
+/// the extra stack exists to avoid). Drop it and answer the client.
+pub fn try_spawn_stack<F>(
+    name: &str,
+    stack_bytes: usize,
+    f: F,
+) -> Result<SpawnedThread, SpawnFailure<F>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    try_spawn_with(&StackSpawn { stack_bytes }, spawn_allowed(), name, f)
+}
+
+/// A thread whose job returns a value.
+///
+/// [`Spawn`] jobs return `()`. Callers that need the result (a pipe
+/// reader) send it through a channel. [`join`](Self::join) waits for the
+/// thread and then for that value.
+pub struct JoinedThread<T> {
+    handle: SpawnedThread,
+    rx: std::sync::mpsc::Receiver<T>,
+}
+
+impl<T> std::fmt::Debug for JoinedThread<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinedThread").finish_non_exhaustive()
+    }
+}
+
+impl<T> JoinedThread<T> {
+    /// Wait for the job to finish and return its value.
+    ///
+    /// `Err` means the thread ended without sending a value (it panicked
+    /// on an unwind build, where the panic is caught at the `extern "C"`
+    /// boundary). On the release profile a panic aborts the process before
+    /// this returns.
+    pub fn join(self) -> std::thread::Result<T> {
+        self.handle.join()?;
+        self.rx.recv().map_err(|_| {
+            Box::new(io::Error::other("helper thread ended without a result"))
+                as Box<dyn std::any::Any + Send>
+        })
+    }
+}
+
+/// [`try_spawn`] for a job that returns `T`.
+///
+/// Failure hands `f` back unrun, the same contract as [`try_spawn`]. The
+/// success path is one extra channel send of `T` after the job returns.
+pub fn try_spawn_returning<T, F>(name: &str, f: F) -> Result<JoinedThread<T>, SpawnFailure<F>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    try_spawn_returning_with(&StdSpawn, spawn_allowed(), name, f)
+}
+
+/// [`try_spawn_returning`] with an explicit spawner and gate verdict.
+pub fn try_spawn_returning_with<S, T, F>(
+    spawner: &S,
+    allowed: bool,
+    name: &str,
+    f: F,
+) -> Result<JoinedThread<T>, SpawnFailure<F>>
+where
+    S: Spawn + ?Sized,
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let slot = Arc::new(Mutex::new(Some(f)));
+    let thread_slot = Arc::clone(&slot);
+    match try_spawn_with(spawner, allowed, name, move || {
+        let job = thread_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(job) = job {
+            let _ = tx.send(job());
+        }
+    }) {
+        Ok(handle) => Ok(JoinedThread { handle, rx }),
+        Err(failure) => {
+            // The wrapper did not run, so `f` is still in the slot.
+            drop(failure.job);
+            let job = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            Err(SpawnFailure {
+                error: failure.error,
+                job,
+            })
+        }
+    }
 }
 
 /// [`try_spawn`] with an explicit spawner and gate verdict (for tests and
@@ -434,6 +560,11 @@ impl Drop for AttrGuard {
 
 #[cfg(unix)]
 fn spawn_pthread(job: BoxedJob) -> io::Result<SpawnedThread> {
+    spawn_pthread_with_stack(job, HELPER_STACK_BYTES)
+}
+
+#[cfg(unix)]
+fn spawn_pthread_with_stack(job: BoxedJob, stack_bytes: usize) -> io::Result<SpawnedThread> {
     // A second box so the fat pointer of `dyn FnOnce` survives the trip
     // through `pthread_create`'s thin `void*`. This is the same shape std
     // uses. The allocation is the caller's job box plus this one; if it
@@ -455,7 +586,7 @@ fn spawn_pthread(job: BoxedJob) -> io::Result<SpawnedThread> {
     // SAFETY: `attr` is initialized. Failure leaves the platform default
     // stack; pthread_create still returns an error if that cannot be reserved.
     unsafe {
-        let _ = libc::pthread_attr_setstacksize(&mut attr.0, HELPER_STACK_BYTES);
+        let _ = libc::pthread_attr_setstacksize(&mut attr.0, stack_bytes);
     }
 
     let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
@@ -508,13 +639,15 @@ fn run_job(job: BoxedJob) {
 }
 
 #[cfg(not(unix))]
-fn spawn_std(name: &str, job: BoxedJob) -> io::Result<SpawnedThread> {
+fn spawn_std(name: &str, job: BoxedJob, stack_bytes: Option<usize>) -> io::Result<SpawnedThread> {
     // Windows (and any other non-Unix target) has no sigaltstack mmap.
     // `CreateThread` failure is an `Err` from `Builder::spawn`, which is
     // the degrade path. A global-allocator abort is out of scope here.
-    let handle = std::thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(job)?;
+    let mut builder = std::thread::Builder::new().name(name.to_owned());
+    if let Some(stack_bytes) = stack_bytes {
+        builder = builder.stack_size(stack_bytes);
+    }
+    let handle = builder.spawn(job)?;
     Ok(SpawnedThread {
         inner: SpawnedInner::Std(Some(handle)),
     })
@@ -659,6 +792,60 @@ mod tests {
             "std::thread did not install an alternate signal stack in this \
              process, so the assertion above cannot tell the two spawners apart"
         );
+    }
+
+    /// The in-process shard call reserves 8 MiB. That reservation must not
+    /// go through `std::thread::Builder`: the child's sigaltstack mmap is
+    /// what aborted the node, and an 8 MiB stack is a larger mmap than the
+    /// 2 MiB helper.
+    #[cfg(unix)]
+    #[test]
+    fn an_eight_mebibyte_stack_does_not_install_an_alternate_signal_stack() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = try_spawn_with(
+            &StackSpawn {
+                stack_bytes: 8 * 1024 * 1024,
+            },
+            true,
+            "xerj-shard",
+            move || {
+                tx.send(alternate_signal_stack_flags()).unwrap();
+            },
+        )
+        .expect("8 MiB stack spawn");
+        handle.join().unwrap();
+        let (rc, flags) = rx.recv().unwrap();
+        assert_eq!(rc, 0, "sigaltstack query failed");
+        assert_ne!(
+            flags & libc::SS_DISABLE,
+            0,
+            "shard helper installed an alternate signal stack"
+        );
+    }
+
+    #[test]
+    fn a_returning_spawn_yields_the_value_and_a_failure_returns_the_job() {
+        let handle = try_spawn_returning("xerj-t1122-ret", || 7u32).expect("spawn");
+        assert_eq!(handle.join().expect("join"), 7);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let job_ran = Arc::clone(&ran);
+        let failure = try_spawn_returning_with(&FlakySpawn::new(1), true, "xerj-pdf-stdout", {
+            let job_ran = Arc::clone(&job_ran);
+            move || {
+                job_ran.fetch_add(1, Ordering::SeqCst);
+                9u32
+            }
+        })
+        .expect_err("spawner fails");
+        assert_eq!(failure.error.raw_os_error(), Some(libc::EAGAIN));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the job did not run on a thread"
+        );
+        assert_eq!((failure.job.expect("job handed back"))(), 9);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]
