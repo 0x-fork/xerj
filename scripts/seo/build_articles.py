@@ -28,6 +28,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import article_data  # noqa: E402
 import fix_links  # noqa: E402
+import stars_badge  # noqa: E402
 import pagedata  # noqa: E402
 import seo_head  # noqa: E402
 import urlmap  # noqa: E402
@@ -778,7 +779,10 @@ def render_article_sections(article: article_data.Article, context: BuildContext
 
 
 def primary_nav() -> str:
-    return """<nav class="nav" aria-label="Primary">
+    return _PRIMARY_NAV.replace(stars_badge.PLAIN_LINK, stars_badge.badge(), 1)
+
+
+_PRIMARY_NAV = """<nav class="nav" aria-label="Primary">
   <a href="/" class="brand">XERJ</a>
   <a href="/">HOME</a>
   <a href="/product">PRODUCT</a>

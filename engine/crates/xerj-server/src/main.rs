@@ -4248,7 +4248,32 @@ async fn async_main() -> Result<()> {
                     .filter(|id| id != &node_id)
                     .collect();
 
-                let node = ClusterNode::new(node_id.clone(), peer_ids, Box::new(transport));
+                // The ring's metadata lives in this directory. An in-memory log
+                // would boot a restarted node with no shard plan. Opening it
+                // is not optional: a failure here refuses to start, rather
+                // than serving single-node writes the peers still consider
+                // replicated.
+                let raft_dir = xerj_cluster::raft_log::raft_storage_dir(&cfg.server.data_dir);
+                let node = ClusterNode::with_storage(
+                    node_id.clone(),
+                    peer_ids,
+                    Box::new(transport),
+                    &raft_dir,
+                )
+                .with_context(|| {
+                    format!(
+                        "open the on-disk raft log at {}; refusing to start cluster mode \
+                         with an in-memory log",
+                        raft_dir.display()
+                    )
+                })?;
+                info!(
+                    node = %node_id,
+                    dir = %raft_dir.display(),
+                    commit = node.raft.commit_index(),
+                    entries = node.raft.log_len(),
+                    "opened on-disk raft log"
+                );
                 cluster_transport_outcome = xerj_api::state::ClusterTransportStatus::Running;
                 pending_cluster = Some((node, tick, shutdown_rx));
             }
@@ -4465,12 +4490,16 @@ async fn async_main() -> Result<()> {
         }));
         let node_id = node.raft.id.clone();
         let handle = node.handle();
+        // Attach before replay. Replica-store recovery asks which node this
+        // is; before attach, that id is the single-node "local" and no plan
+        // names it.
         state.engine.attach_cluster(handle.clone());
         // Document and search forwarding. Installed before the runner and
         // before HTTP accept, so a committed shard plan can be served.
         handle.set_shard_handler(std::sync::Arc::new(
             xerj_api::cluster_shard::ApiShardHandler::new(state.clone()),
         ));
+        node.replay_committed().await;
         let mut runner = ClusterRunner::new(node, tick, shutdown_rx);
         info!(node = %node_id, "Starting cluster runner (Raft mode)");
         tokio::spawn(async move { runner.run().await });

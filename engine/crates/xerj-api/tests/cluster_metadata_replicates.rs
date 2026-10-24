@@ -25,6 +25,7 @@ struct Member {
     handle: ClusterHandle,
     /// Held when the runner is not started, so the proposal channel stays open.
     _node: Option<ClusterNode>,
+    runner: Option<tokio::task::JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
 
@@ -55,16 +56,16 @@ async fn ring(start_runners: bool) -> Vec<Member> {
         handle.set_shard_handler(std::sync::Arc::new(ApiShardHandler::new(state.clone())));
         let engine = std::sync::Arc::clone(&state.engine);
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let kept = if start_runners {
+        let (kept, runner) = if start_runners {
             let mut runner = ClusterRunner::new(node, Duration::from_millis(5), shutdown_rx);
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 runner.run().await;
             });
-            None
+            (None, Some(task))
         } else {
             handle.set_timeout(Duration::from_millis(400));
             let _ = shutdown_rx;
-            Some(node)
+            (Some(node), None)
         };
         let app = xerj_api::router::build_es_compat_router(state.clone());
         members.push(Member {
@@ -74,6 +75,7 @@ async fn ring(start_runners: bool) -> Vec<Member> {
             shutdown,
             handle,
             _node: kept,
+            runner,
             _dir: dir,
         });
     }
@@ -855,6 +857,159 @@ async fn a_document_is_stored_on_its_shard_owner_and_search_sees_it_from_any_mem
         .await
         .expect("local get");
     assert!(still.is_none(), "delete reached the owner");
+
+    for member in &members {
+        let _ = member.shutdown.send(true);
+    }
+}
+
+async fn shutdown_and_keep(members: Vec<Member>) -> Vec<tempfile::TempDir> {
+    let mut dirs = Vec::with_capacity(members.len());
+    for mut member in members {
+        let _ = member.shutdown.send(true);
+        if let Some(task) = member.runner.take() {
+            match tokio::time::timeout(Duration::from_secs(5), task).await {
+                Ok(Ok(())) => {}
+                other => panic!("cluster runner did not stop: {other:?}"),
+            }
+        }
+        // ApiShardHandler holds AppState, which holds Engine, which holds
+        // this handle. The engine's data-dir node.lock stays taken until
+        // that cycle breaks, so a later Engine::new on the same directory
+        // sees this process as another running node.
+        member.handle.clear_shard_handler();
+        drop(member.app);
+        drop(member.state);
+        drop(member.engine);
+        drop(member.handle);
+        dirs.push(member._dir);
+    }
+    dirs
+}
+
+/// Same ring as [`ring`], but each member opens `{data_dir}/_raft` and
+/// replays the committed prefix before the runner starts.
+async fn durable_ring(dirs: Vec<tempfile::TempDir>) -> Vec<Member> {
+    let bus = InMemoryBus::new();
+    let ids = ["n1", "n2", "n3"];
+    let mut members = Vec::new();
+    for (id, dir) in ids.into_iter().zip(dirs) {
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        let state = xerj_api::state::AppState::new(config, engine, metrics);
+
+        let peers: Vec<String> = ids
+            .iter()
+            .filter(|peer| **peer != id)
+            .map(|peer| (*peer).to_string())
+            .collect();
+        let transport = InMemoryTransport::new(id.to_string(), bus.clone()).await;
+        let raft_dir = xerj_cluster::raft_log::raft_storage_dir(dir.path());
+        let mut node =
+            ClusterNode::with_storage(id.to_string(), peers, Box::new(transport), &raft_dir)
+                .expect("open raft log");
+        node.set_applier(std::sync::Arc::new(EngineMetadataApplier {
+            engine: std::sync::Arc::clone(&state.engine),
+        }));
+        let handle = node.handle();
+        state.engine.attach_cluster(handle.clone());
+        handle.set_shard_handler(std::sync::Arc::new(ApiShardHandler::new(state.clone())));
+        node.replay_committed().await;
+        let engine = std::sync::Arc::clone(&state.engine);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut runner = ClusterRunner::new(node, Duration::from_millis(5), shutdown_rx);
+        let task = tokio::spawn(async move {
+            runner.run().await;
+        });
+        let app = xerj_api::router::build_es_compat_router(state.clone());
+        members.push(Member {
+            app,
+            state,
+            engine,
+            shutdown,
+            handle,
+            _node: None,
+            runner: Some(task),
+            _dir: dir,
+        });
+    }
+    members
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_reloads_the_shard_plan_and_still_routes_the_document() {
+    let dirs = (0..3)
+        .map(|_| tempfile::tempdir().expect("tempdir"))
+        .collect();
+    let members = durable_ring(dirs).await;
+    let dead = [false, false, false];
+    let _leader = wait_leader(&members, &dead).await;
+
+    let (status, body) = put_json(&members[0].app, "/orders", json!({})).await;
+    assert!(status.is_success(), "create: {status} {body}");
+    for member in &members {
+        wait_status(&member.app, "/orders", StatusCode::OK).await;
+    }
+    let (status, body) = put_json(
+        &members[0].app,
+        "/orders/_doc/1",
+        json!({ "title": "kept" }),
+    )
+    .await;
+    assert!(status.is_success(), "write: {status} {body}");
+
+    let owner = members
+        .iter()
+        .position(|member| member.engine.owns_shard("orders", "1"))
+        .expect("one primary");
+    let owner_id = members[owner].handle.node_id().to_string();
+    let other = (0..3).find(|i| *i != owner).expect("a non-owner");
+    assert_eq!(
+        members[other].engine.route_write("orders", "1").as_deref(),
+        Some(owner_id.as_str()),
+        "before restart the non-owner forwards"
+    );
+    let (status, body) = post_json(&members[owner].app, "/orders/_refresh", json!({})).await;
+    assert!(
+        status.is_success(),
+        "refresh before restart: {status} {body}"
+    );
+
+    let dirs = shutdown_and_keep(members).await;
+    let members = durable_ring(dirs).await;
+
+    assert!(
+        members[owner].engine.owns_shard("orders", "1"),
+        "replay must put the primary back on {owner_id}"
+    );
+    assert_eq!(
+        members[other].engine.route_write("orders", "1").as_deref(),
+        Some(owner_id.as_str()),
+        "restart must not treat the index as unassigned"
+    );
+    let (status, body) = get(&members[other].app, "/orders/_doc/1").await;
+    assert!(
+        status.is_success(),
+        "GET from a non-owner after restart: {status} {body}"
+    );
+
+    let _leader = wait_leader(&members, &dead).await;
+    let (status, body) = put_json(
+        &members[other].app,
+        "/orders/_doc/2",
+        json!({ "title": "after" }),
+    )
+    .await;
+    assert!(status.is_success(), "write after restart: {status} {body}");
+    for member in &members {
+        let (status, body) = get(&member.app, "/orders/_doc/2").await;
+        assert!(
+            status.is_success(),
+            "doc 2 readable after restart: {status} {body}"
+        );
+    }
 
     for member in &members {
         let _ = member.shutdown.send(true);

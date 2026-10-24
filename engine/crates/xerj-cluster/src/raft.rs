@@ -99,8 +99,8 @@ pub enum ClusterCommand {
     /// `request_id` is unique on the node that accepted the caller. That node
     /// completes the waiting request when this entry is applied. Other nodes
     /// apply `inner` and ignore the id. The wrapper is persisted with the
-    /// log entry so a restarted node (once the server opens the file log)
-    /// can still tell client entries from internal ones.
+    /// log entry so a restarted node, which opens the file log, can still
+    /// tell client entries from internal ones.
     ClientMetadata {
         /// Node that accepted the caller. Only that node completes a waiter.
         origin: String,
@@ -356,6 +356,15 @@ impl RaftNode {
             }
         }
         node.commit_index = flog.commit_index();
+        // A vote is only valid in the term it was cast. A hard-state term
+        // ahead of the log (we campaigned or stepped down without appending)
+        // wins; a missing hard state leaves the term reconstructed from the log.
+        if flog.hard_term() > node.current_term {
+            node.current_term = flog.hard_term();
+        }
+        if flog.hard_term() == node.current_term && flog.hard_term() > 0 {
+            node.voted_for = flog.hard_vote().map(str::to_string);
+        }
         node.persistent = Some(flog);
         Ok(node)
     }
@@ -399,6 +408,14 @@ impl RaftNode {
                 new_term = msg_term,
                 "Higher term observed — stepping down to follower"
             );
+            // The vote from the previous term must not survive into this one.
+            if !self.write_hard_state(msg_term, None) {
+                warn!(
+                    node = %self.id,
+                    term = msg_term,
+                    "failed to persist the higher term; stepping down anyway"
+                );
+            }
             self.current_term = msg_term;
             self.voted_for = None;
             self.become_follower(None);
@@ -521,6 +538,11 @@ impl RaftNode {
                 .map_err(|e| anyhow::anyhow!("append raft log: {e}"))?;
             flog.fsync()
                 .map_err(|e| anyhow::anyhow!("fsync raft log: {e}"))?;
+            if let Err(e) = flog.set_log_end(index) {
+                flog.truncate_from(index);
+                let _ = flog.set_log_end(index.saturating_sub(1));
+                return Err(anyhow::anyhow!("persist raft log end: {e}"));
+            }
         }
 
         self.log.push(entry);
@@ -626,6 +648,97 @@ impl RaftNode {
         }
     }
 
+    /// Persist `term` and `voted_for` before they take effect.
+    ///
+    /// Returns `true` when there is no file log, or the write replaced
+    /// `hard.meta`. A `false` means the caller must not grant a vote or
+    /// start an election: a crash would otherwise forget the vote and
+    /// grant a second one in the same term.
+    fn write_hard_state(&mut self, term: u64, voted_for: Option<String>) -> bool {
+        let Some(flog) = self.persistent.as_mut() else {
+            return true;
+        };
+        match flog.set_hard_state(term, voted_for.as_deref()) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(node = %self.id, error = %e, term, "failed to persist raft term and vote");
+                false
+            }
+        }
+    }
+
+    /// Copy the in-memory log onto the file log and fsync it.
+    ///
+    /// Heartbeats that do not change the log do not fsync. Returns `false`
+    /// when the file log could not be updated; the caller must not tell the
+    /// leader the append succeeded.
+    fn mirror_log(&mut self) -> bool {
+        if self.persistent.is_none() {
+            return true;
+        }
+        let node_id = self.id.clone();
+        let mem_last = self.last_log_index();
+        let encoded: Vec<(u64, u64, Vec<u8>)> = match self
+            .log
+            .iter()
+            .map(|entry| {
+                serde_json::to_vec(&entry.command).map(|payload| (entry.index, entry.term, payload))
+            })
+            .collect()
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(node = %node_id, error = %e, "encode raft entry");
+                return false;
+            }
+        };
+        let flog = self
+            .persistent
+            .as_mut()
+            .expect("persistent log checked above");
+        let mut dirty = false;
+        if flog.last_index() > mem_last {
+            flog.truncate_from(mem_last + 1);
+            dirty = true;
+        }
+        for (index, term, payload) in &encoded {
+            match flog.term_of(*index) {
+                Some(have) if have == *term => {}
+                Some(_) => {
+                    flog.truncate_from(*index);
+                    if let Err(e) = flog.append(*term, *index, payload) {
+                        warn!(node = %node_id, error = %e, index, "append raft log");
+                        return false;
+                    }
+                    dirty = true;
+                }
+                None => {
+                    if let Err(e) = flog.append(*term, *index, payload) {
+                        warn!(node = %node_id, error = %e, index, "append raft log");
+                        return false;
+                    }
+                    dirty = true;
+                }
+            }
+        }
+        if !dirty {
+            match flog.persisted_log_end() {
+                Some(end) if end == mem_last => return true,
+                None if flog.last_index() == mem_last => return true,
+                _ => {}
+            }
+        }
+        if let Err(e) = flog.fsync() {
+            warn!(node = %node_id, error = %e, "fsync raft log");
+            return false;
+        }
+        if let Err(e) = flog.set_log_end(mem_last) {
+            warn!(node = %node_id, error = %e, "persist raft log end");
+            return false;
+        }
+        true
+    }
+
     fn cluster_size(&self) -> usize {
         self.peers.len() + 1 // peers + self
     }
@@ -691,9 +804,17 @@ impl RaftNode {
     }
 
     fn start_election(&mut self) -> Vec<OutboundMessage> {
-        self.current_term += 1;
+        let new_term = self.current_term + 1;
+        let vote = self.id.clone();
+        // The self-vote has to be durable before the RequestVote goes out.
+        // A failed disk stays a follower and tries again after the next timeout.
+        if !self.write_hard_state(new_term, Some(vote.clone())) {
+            self.last_heartbeat = Instant::now();
+            return vec![];
+        }
+        self.current_term = new_term;
         self.state = RaftState::Candidate;
-        self.voted_for = Some(self.id.clone()); // vote for self
+        self.voted_for = Some(vote);
         self.votes_received = 1; // count self-vote
         self.election_timeout = Self::random_election_timeout();
         self.last_heartbeat = Instant::now();
@@ -819,8 +940,11 @@ impl RaftNode {
                 Some(e) if e.term != prev_log_term => {
                     // 3. If an existing entry conflicts with a new one (same index,
                     //    different terms), delete the existing entry and all that
-                    //    follow it (§5.3)
+                    //    follow it (§5.3). The shortened log is durable before
+                    //    the rejection, so a crash cannot bring the tail back
+                    //    and win an election with it.
                     self.log.retain(|e| e.index < prev_log_index);
+                    let _ = self.mirror_log();
                     return vec![OutboundMessage {
                         to: leader_id,
                         msg: RaftMessage::AppendEntriesResponse {
@@ -851,6 +975,21 @@ impl RaftNode {
         }
         // Ensure log is sorted by index (should already be, but be safe)
         self.log.sort_by_key(|e| e.index);
+
+        // Durable before the success reply. A heartbeat that changes nothing
+        // does not fsync. A failed mirror is a rejection: the leader retries,
+        // and this process still has the entries in memory.
+        if !self.mirror_log() {
+            return vec![OutboundMessage {
+                to: leader_id,
+                msg: RaftMessage::AppendEntriesResponse {
+                    from: self.id.clone(),
+                    term: self.current_term,
+                    success: false,
+                    match_index: 0,
+                },
+            }];
+        }
 
         // 5. If leaderCommit > commitIndex, set commitIndex =
         //    min(leaderCommit, index of last new entry) (§5.3)
@@ -965,10 +1104,14 @@ impl RaftNode {
                     && last_log_index >= self.last_log_index());
 
             if can_vote && candidate_log_ok {
-                self.voted_for = Some(candidate_id.clone());
-                self.last_heartbeat = Instant::now(); // reset election timer
-                vote_granted = true;
-                debug!(node = %self.id, candidate = %candidate_id, "Granting vote");
+                // Grant only after the vote is durable. Otherwise a restart
+                // in this term would vote for someone else.
+                if self.write_hard_state(self.current_term, Some(candidate_id.clone())) {
+                    self.voted_for = Some(candidate_id.clone());
+                    self.last_heartbeat = Instant::now(); // reset election timer
+                    vote_granted = true;
+                    debug!(node = %self.id, candidate = %candidate_id, "Granting vote");
+                }
             }
         }
 

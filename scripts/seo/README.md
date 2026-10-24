@@ -76,6 +76,7 @@ landing/**/*.html  ── gen_sitemap.py ─> landing/sitemap.xml
 | every internal `<a href>` in `landing/` | `fix_links.py` | write the href you mean; the pass rewrites it to the served form |
 | `landing/sitemap.xml` | `gen_sitemap.py` | it is derived from the filesystem and from git |
 | `landing/og/xerj-card.png` | `mk_og_card.py` | edit the rasteriser; the brand tokens come from `landing/style.css` |
+| the `<a class="nav-stars">` GitHub stars badge in every primary nav (its fallback count) | `stars_badge.py` | run it to refresh the count from the GitHub API; `--check` verifies; `landing/theme.js` refreshes the number in the browser |
 
 Generated article pages and twins carry a first-line marker:
 

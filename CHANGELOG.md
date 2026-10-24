@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0-rc.99] - 2026-10-23
 
-Window since v1.0.0-rc.98: 91 merged pull requests. x86_64 release binaries
+Window since v1.0.0-rc.98: 93 merged pull requests. x86_64 release binaries
 run on CPUs without AVX2. Cluster mode replicates index metadata, routes a
 document write to the primary named at create, copies an acknowledged write
-onto replicas placed at create, and acknowledges that write once a quorum of
-the copies has confirmed; [#1170](https://github.com/xerj-org/xerj/issues/1170)
+onto replicas placed at create, acknowledges that write once a quorum of
+the copies has confirmed, and reloads the shard plan from an on-disk Raft
+log after a restart; [#1170](https://github.com/xerj-org/xerj/issues/1170)
 stays open. `ctutils` 0.4.5 closes RUSTSEC-2026-0385. Autoindex, corpus and
 search fixes landed, including partial work on
 [#1122](https://github.com/xerj-org/xerj/issues/1122); that issue stays open.
@@ -36,7 +37,7 @@ mgtf and mariomarcolongo.
 
 ### Added
 
-- Cluster replication, four slices of
+- Cluster replication, five slices of
   [#1170](https://github.com/xerj-org/xerj/issues/1170). The issue stays
   open. With `[cluster] enabled = false` every one of these paths is the
   previous local call.
@@ -47,8 +48,8 @@ mgtf and mariomarcolongo.
     not created locally. The accepting node applies index templates once and
     replicates the effective schema. Console system indices created before
     the handle is attached stay local. Document writes stay on the accepting
-    node. The server still does not open `FileRaftLog` (PR
-    [#2257](https://github.com/xerj-org/xerj/pull/2257)).
+    node. #2257 left that log in memory. The on-disk log is the slice below
+    (PR [#2257](https://github.com/xerj-org/xerj/pull/2257)).
   - The create entry names one primary per member (member ids sorted, shard
     `i` on the `i`th). `PUT` / `POST /{index}/_doc`, `PUT /{index}/_create/{id}`,
     `GET` and `DELETE /{index}/_doc/{id}` run on that primary. A search of
@@ -79,17 +80,27 @@ mgtf and mariomarcolongo.
     write, and retrying the index copies it to the replicas still in sync.
     Single-node mode does not take this path (PR
     [#2303](https://github.com/xerj-org/xerj/pull/2303)). #1170 stays open:
-    there is still no `wait_for_active_shards`, no replica promotion, and no
-    snapshot catch-up for a node that missed the log.
+    there is still no `wait_for_active_shards` and no replica promotion.
+  - With `[cluster] enabled = true`, the server opens an on-disk Raft log
+    at `{data_dir}/_raft` and replays its committed prefix before it
+    serves. A restart restores the shard plan and the in-sync set, so a
+    later document write is routed to the primary again. A member that
+    starts with an empty log copies the leader's log and applies it, which
+    installs index metadata (and an empty replica store when this node is
+    a replica). It does not copy documents written before it joined. A
+    replica removed from the in-sync set is not filled in. The log is not
+    compacted; there is no InstallSnapshot. Term and vote are stored with
+    the log, so a restarted node does not grant a second vote in the same
+    term. `[cluster] enabled = false` does not open the log. This improves
+    [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+    open (PR [#2313](https://github.com/xerj-org/xerj/pull/2313)).
   - What #1170 still does not do: `wait_for_active_shards`; relocating or
     backfilling when the replica count changes after create; `_bulk`,
     `_update`, update-by-query and native `/v1` ingest (they do not route or
     replicate); merging aggregations, suggest, collapse, rescore, profile,
-    `search_after` or scroll across owners; snapshot install; opening
-    `FileRaftLog` (a restart drops the in-memory plan, so later writes are
-    not routed and surviving replica bytes are not served); replica
-    promotion; replaying a dropped replica back into the in-sync set;
-    node-lifecycle APIs.
+    `search_after` or scroll across owners; InstallSnapshot and copying
+    documents onto a member that joined late; replica promotion; replaying a
+    dropped replica back into the in-sync set; node-lifecycle APIs.
 
 - A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0,
   version `1.0.0-rc.99`) inserts the README's `mcp-xerj` stdio row via
@@ -98,6 +109,7 @@ mgtf and mariomarcolongo.
   `landing/brandbook/xerj-mark-400.png` is a 400×400 PNG of the letter mark
   for directory submissions (PR
   [#2298](https://github.com/xerj-org/xerj/pull/2298)).
+
 
 - MCP `xerj_def` exposes local definition lookup, completing
   [#2080](https://github.com/xerj-org/xerj/issues/2080) (PR
@@ -537,6 +549,11 @@ mgtf and mariomarcolongo.
   `mcpServers` block against `xerj` v1.0.0-rc.98; `xerj_search` was in the
   tool list and one call ran. The IDE Configure button was not part of that
   run (PR [#2300](https://github.com/xerj-org/xerj/pull/2300)).
+  The primary nav's plain GITHUB link is a stars badge: the GitHub mark and
+  the star count, linking to the repository. The shipped count is 14,225,
+  read 2026-10-24T02:05:55Z. `theme.js` refreshes it from the GitHub API,
+  cached in the browser for 10 minutes, and keeps the shipped number if
+  that call fails (PR [#2311](https://github.com/xerj-org/xerj/pull/2311)).
 - A ready-to-paste DeepSeek Harness MCP config, with `env` and `cwd`
   ([#2286](https://github.com/xerj-org/xerj/issues/2286), PR
   [#2288](https://github.com/xerj-org/xerj/pull/2288)). Both Windows install

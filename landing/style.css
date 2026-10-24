@@ -2868,6 +2868,16 @@ svg.chart.is-interactive .ser:focus-visible {
   .prompt-copy { align-self: stretch; text-align: center; }
 }
 
+/* nav GitHub stars badge (scripts/seo/stars_badge.py writes it, theme.js refreshes
+   the count). Muted 1px frame so it never competes with the gold primary CTA; the
+   count box is fixed-width so a refreshed number causes no layout shift. */
+.nav a.nav-stars{display:inline-flex;align-items:center;gap:5px;
+  padding:2px 6px;border:1px solid var(--z-line);color:var(--z-mute);white-space:nowrap;
+  line-height:1;letter-spacing:.04em;font-variant-numeric:tabular-nums;}
+.nav a.nav-stars:hover{color:var(--z-ink);border-color:var(--z-mute);}
+.nav a.nav-stars svg{width:12px;height:12px;fill:currentColor;flex:none;display:block;}
+.nav .nav-stars-n{display:inline-block;min-width:7ch;}
+
 /* nav download button — latest release tag, links to /releases/latest */
 .nav .nav-dl{padding:.35rem .7rem;border:1px solid var(--z-accent);border-radius:4px;
   color:var(--z-accent);font-weight:700;white-space:nowrap;text-decoration:none;

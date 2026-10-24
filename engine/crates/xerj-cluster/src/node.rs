@@ -114,6 +114,40 @@ impl ClusterNode {
         }
     }
 
+    /// Like [`ClusterNode::new`], opening the Raft log at `storage_dir`.
+    ///
+    /// The committed entries are loaded into the Raft log and are not applied
+    /// yet. Call [`ClusterNode::replay_committed`] after [`ClusterNode::set_applier`]
+    /// so the engine sees the same entries the metadata store does. Applying
+    /// here would run before the applier exists and a restarted index plan
+    /// would stay in metadata only.
+    pub fn with_storage(
+        id: String,
+        peers: Vec<String>,
+        transport: Box<dyn ClusterTransport>,
+        storage_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let mut node = Self::new(id.clone(), peers, transport);
+        let peer_ids = node.raft.peers().to_vec();
+        node.raft = RaftNode::with_storage(id, peer_ids, storage_dir)?;
+        Ok(node)
+    }
+
+    /// Apply every committed log entry that this process has not applied yet.
+    ///
+    /// On a fresh open that is the whole committed prefix. The applier, when
+    /// one is installed, runs for each entry before this returns. Safe to call
+    /// again: a second call finds nothing pending.
+    pub async fn replay_committed(&mut self) {
+        let commit = self.raft.commit_index();
+        if commit == 0 {
+            info!(node = %self.raft.id, "raft log has no committed entries to replay");
+            return;
+        }
+        info!(node = %self.raft.id, commit, "replaying committed raft log");
+        self.apply_ready().await;
+    }
+
     /// Handle the engine layer uses to propose metadata and read leadership.
     pub fn handle(&self) -> ClusterHandle {
         self.handle.clone()

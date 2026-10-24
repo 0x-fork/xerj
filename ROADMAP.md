@@ -28,9 +28,11 @@ the primary named in the create entry (PR
 an acknowledged document write (PR
 [#2287](https://github.com/xerj-org/xerj/pull/2287)), and acknowledgement
 once a quorum of those copies confirms (PR
-[#2303](https://github.com/xerj-org/xerj/pull/2303)). Promotion, a
-durable Raft log, snapshot catch-up, and `_bulk` / native ingest routing
-stay open on #1170. The window since rc.98 is 91 merged pull requests; the
+[#2303](https://github.com/xerj-org/xerj/pull/2303)), and an on-disk Raft
+log replayed on restart (PR
+[#2313](https://github.com/xerj-org/xerj/pull/2313)). Promotion, document
+backfill, snapshot install, and `_bulk` / native ingest routing
+stay open on #1170. The window since rc.98 is 93 merged pull requests; the
 CHANGELOG lists every one. x86_64 binaries run without AVX2 (PR
 [#2253](https://github.com/xerj-org/xerj/pull/2253), which supersedes the
 installer refusal in PR
@@ -401,8 +403,10 @@ entry (PR [#2271](https://github.com/xerj-org/xerj/pull/2271)), an
 acknowledged document write copied onto replicas placed at create (PR
 [#2287](https://github.com/xerj-org/xerj/pull/2287)), and that write
 acknowledged once a quorum of the copies confirms (PR
-[#2303](https://github.com/xerj-org/xerj/pull/2303)). Promotion,
-a durable Raft log, snapshot catch-up, `_bulk` and native ingest stay
+[#2303](https://github.com/xerj-org/xerj/pull/2303)), and an on-disk Raft
+log at `{data_dir}/_raft` replayed before the node serves (PR
+[#2313](https://github.com/xerj-org/xerj/pull/2313)). Promotion,
+document backfill, snapshot install, `_bulk` and native ingest stay
 open.
 **Closed inside the rc.99 window and recorded in the CHANGELOG, not
 carried here:** #1110 (an unreadable corpus source fails the build
