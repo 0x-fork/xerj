@@ -152,6 +152,18 @@ impl ClusterMetadata {
                 self.config
                     .insert(format!("index_settings:{index}"), settings_json.clone());
             }
+            ClusterCommand::SetShardInSync {
+                index,
+                shard,
+                nodes,
+            } => {
+                let mut nodes = nodes.clone();
+                nodes.sort();
+                nodes.dedup();
+                info!(index = %index, shard, replicas = ?nodes, "Applying SetShardInSync");
+                self.config
+                    .insert(format!("shard_in_sync:{index}:{shard}"), nodes.join(","));
+            }
             ClusterCommand::ClientMetadata { .. } => {
                 warn!("nested ClientMetadata wrapper; not applied");
             }
@@ -197,6 +209,9 @@ impl ClusterMetadata {
         }
         // Clean up shard assignments for this index
         self.shard_assignments.retain(|(idx, _), _| idx != name);
+        let in_sync_prefix = format!("shard_in_sync:{name}:");
+        self.config
+            .retain(|key, _| !key.starts_with(&in_sync_prefix));
         info!(index = %name, "Applying DeleteIndex");
     }
 

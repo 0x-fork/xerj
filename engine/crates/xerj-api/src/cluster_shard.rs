@@ -3,9 +3,10 @@
 //! With a cluster handle attached, a replicated index carries a primary plan
 //! in the same Raft entry as the create. [`dispatch_index`] forwards a
 //! document to the owner [`Engine::route_write`] names. The primary then
-//! copies an acknowledged index or delete onto the replicas named by
-//! `index.number_of_replicas` at create time, and the caller is not
-//! acknowledged until those copies confirm. [`fanout_search`] asks every
+//! copies an index or delete onto the in-sync replicas and acknowledges the
+//! caller when a quorum of the copies has confirmed. A replica that does not
+//! confirm is dropped from the in-sync set when the rest already make a
+//! quorum. [`fanout_search`] asks every
 //! primary and merges hits. If a primary does not answer, a GET or a search
 //! of that shard reads a replica copy. Single-node mode (`has_cluster`
 //! false) returns before any of this.
@@ -21,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
-use xerj_cluster::{ShardOp, ShardResult};
+use xerj_cluster::{ApplyEffect, ClusterCommand, ShardOp, ShardResult};
 
 use crate::es_compat::{
     apply_get_doc_source_filter, search_shard_local, EsSearchBody, EsSearchJson,
@@ -870,6 +871,22 @@ fn doc_store(index: &str, replica: bool, shard: u32) -> Result<String, ShardResu
     })
 }
 
+fn quorum_nack(index: &str, needed: usize, got: usize, detail: &str) -> ShardResult {
+    ShardResult::http(
+        503,
+        json!({
+            "error": {
+                "type": "replica_not_acknowledged",
+                "reason": format!(
+                    "primary applied the write on [{index}] but only {got} of {needed} replica acknowledgements are in sync: {detail}. The primary has the write; retry the index so an in-sync replica can take the copy"
+                )
+            },
+            "status": 503
+        })
+        .to_string(),
+    )
+}
+
 fn replica_nack(index: &str, replica: &str, detail: &str) -> ShardResult {
     ShardResult::http(
         503,
@@ -886,10 +903,20 @@ fn replica_nack(index: &str, replica: &str, detail: &str) -> ShardResult {
     )
 }
 
-/// Copy `op` onto every replica. An empty replica list returns immediately.
+/// Copy `op` onto the in-sync replicas and wait for a quorum.
 ///
-/// The copy is an upsert or a delete without the caller's sequence check:
-/// the replica's own sequence numbers are not the primary's.
+/// The quorum is a majority of the copies placed at create (the primary,
+/// which already has the write, plus [`xerj_cluster::replica_quorum_acks`]
+/// replica confirmations). An empty placement returns immediately. The copy
+/// is an upsert or a delete without the caller's sequence check: the
+/// replica's own sequence numbers are not the primary's.
+///
+/// Every in-sync replica is asked. When enough confirm and some do not, the
+/// ones that confirmed are published through the Raft log before the caller
+/// is acknowledged, and later reads skip the rest. A replica that fell out
+/// is not added back: nothing in this process replays the writes it missed.
+/// Two writes of the same shard do not publish different sets; the primary
+/// holds `replica_sync_lock` across the copy and the publish.
 async fn replicate_write(
     state: &AppState,
     index: &str,
@@ -899,25 +926,100 @@ async fn replicate_write(
     let Some((shard, _)) = state.engine.primary_of(index, id) else {
         return Ok(());
     };
-    let replicas = state.engine.replica_nodes(index, shard);
-    if replicas.is_empty() {
+    let sync = state.engine.replica_sync_lock(index, shard);
+    let _sync = sync.lock().await;
+    let placed = state.engine.placed_replica_nodes(index, shard);
+    if placed.is_empty() {
         return Ok(());
     }
+    let targets = state.engine.replica_nodes(index, shard);
+    let needed = xerj_cluster::replica_quorum_acks(placed.len());
+    if targets.len() < needed {
+        return Err(quorum_nack(
+            index,
+            needed,
+            targets.len(),
+            "fewer replicas are in sync than the quorum requires",
+        ));
+    }
     let op = replica_copy(op, shard);
-    for replica in &replicas {
-        let deadline = Instant::now() + OWNER_READY_WAIT;
-        loop {
-            match state.engine.forward_shard(replica, op.clone()).await {
-                Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut acked: Vec<String> = Vec::new();
+    let mut failed: Option<(String, String)> = None;
+    for replica in &targets {
+        match confirm_replica(state, replica, &op).await {
+            Ok(()) => acked.push(replica.clone()),
+            Err(detail) => {
+                if failed.is_none() {
+                    failed = Some((replica.clone(), detail));
                 }
-                Ok(result) if replica_confirmed(&op, &result) => break,
-                Ok(result) => return Err(replica_nack(index, replica, &result.body)),
-                Err(err) => return Err(replica_nack(index, replica, &err.to_string())),
             }
         }
     }
-    Ok(())
+    if acked.len() < needed {
+        let (replica, detail) = failed.unwrap_or_else(|| {
+            (
+                "none".to_string(),
+                "no in-sync replica acknowledged the write".to_string(),
+            )
+        });
+        return Err(replica_nack(index, &replica, &detail));
+    }
+    if acked.len() == targets.len() {
+        return Ok(());
+    }
+    acked.sort();
+    acked.dedup();
+    let Some(handle) = state.engine.cluster_handle() else {
+        return Err(quorum_nack(
+            index,
+            needed,
+            acked.len(),
+            "no cluster handle to publish the in-sync set",
+        ));
+    };
+    match handle
+        .propose(ClusterCommand::SetShardInSync {
+            index: index.to_string(),
+            shard,
+            nodes: acked.clone(),
+        })
+        .await
+    {
+        Ok(ApplyEffect::Applied) => {
+            let published = state.engine.replica_nodes(index, shard);
+            if acked.iter().all(|id| published.iter().any(|got| got == id)) {
+                Ok(())
+            } else {
+                Err(quorum_nack(
+                    index,
+                    needed,
+                    acked.len(),
+                    "the in-sync set committed without the replicas that confirmed this write",
+                ))
+            }
+        }
+        Ok(other) => Err(quorum_nack(
+            index,
+            needed,
+            acked.len(),
+            &format!("in-sync update applied as {other:?}"),
+        )),
+        Err(err) => Err(quorum_nack(index, needed, acked.len(), &err.to_string())),
+    }
+}
+
+async fn confirm_replica(state: &AppState, replica: &str, op: &ShardOp) -> Result<(), String> {
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        match state.engine.forward_shard(replica, op.clone()).await {
+            Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(result) if replica_confirmed(op, &result) => return Ok(()),
+            Ok(result) => return Err(result.body),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
 }
 
 fn replica_copy(op: ShardOp, shard: u32) -> ShardOp {

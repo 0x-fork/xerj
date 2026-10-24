@@ -80,8 +80,8 @@ pub use router::ShardRouter;
 pub use runner::{ClusterRunner, ClusterRunnerBuilder};
 pub use search::{merge_search_responses, SearchHit, SearchMessage};
 pub use shard::{
-    number_of_replicas_from_settings, primary_shard_plan, replica_index_name, shard_plan,
-    shard_plan_from_schema_json, MemoryShardDir, MemoryShardRpc, NullShardRpc, ShardAssignment,
-    ShardError, ShardHandler, ShardOp, ShardResult, ShardRpc,
+    number_of_replicas_from_settings, primary_shard_plan, replica_index_name, replica_quorum_acks,
+    shard_plan, shard_plan_from_schema_json, MemoryShardDir, MemoryShardRpc, NullShardRpc,
+    ShardAssignment, ShardError, ShardHandler, ShardOp, ShardResult, ShardRpc,
 };
 pub use transport::TcpTransport;

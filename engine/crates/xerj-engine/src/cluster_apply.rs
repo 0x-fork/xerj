@@ -366,6 +366,14 @@ async fn apply_committed(engine: &Engine, command: &ClusterCommand) -> ApplyEffe
             engine.assign_one_shard(index, *shard, node_id);
             ApplyEffect::Applied
         }
+        ClusterCommand::SetShardInSync {
+            index,
+            shard,
+            nodes,
+        } => {
+            engine.set_shard_in_sync(index, *shard, nodes);
+            ApplyEffect::Applied
+        }
         // Membership and generic config are stored by ClusterMetadata.
         // They do not change this node's indices.
         _ => ApplyEffect::Applied,

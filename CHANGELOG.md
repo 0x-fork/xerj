@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- With `[cluster] enabled = true`, a single-document index or delete is
+  acknowledged when a quorum of the shard's copies has confirmed, not only
+  when every placed replica has. Copies are the primary plus the replicas
+  named by `index.number_of_replicas` at create. A quorum is
+  `copies / 2 + 1`, and the primary already counts, so one replica out of
+  two is enough. The replica that did not confirm is removed from the
+  in-sync set through the Raft log and is not used for a later read. Nothing
+  replays the writes it missed, so it stays out. `number_of_replicas` 0 or 1
+  is unchanged: there is no replica to wait for, or that one replica must
+  confirm. Fewer confirmations than the quorum is still HTTP 503
+  `replica_not_acknowledged` — the primary has the write, and retrying the
+  index copies it to the replicas still in sync. There is still no
+  `wait_for_active_shards`, no replica promotion, and no snapshot catch-up
+  for a node that missed the log (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170)). Single-node mode
+  does not take this path.
+
 - A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0)
   inserts the README's `mcp-xerj` stdio row via
   `@deepseek-ai/dsh-mcp-client`. The row is still untested on DSH.
