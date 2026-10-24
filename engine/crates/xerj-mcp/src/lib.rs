@@ -1994,7 +1994,7 @@ fn plain_search_demotes_test_paths(args: &Value, mapping: Option<&Value>) -> boo
 /// The penalty is [`xerj_autoindex::def::penalize_demoted_paths`] — the same
 /// `path_is_demoted` rules `xerj def` uses. A response that is not a search
 /// hit list is returned unchanged.
-fn apply_search_path_demotion(text: &str, page: usize) -> String {
+fn apply_search_path_demotion(text: &str, page: usize, query: &str) -> String {
     let Ok(mut resp) = serde_json::from_str::<Value>(text) else {
         return text.to_string();
     };
@@ -2003,6 +2003,7 @@ fn apply_search_path_demotion(text: &str, page: usize) -> String {
             return text.to_string();
         };
         xerj_autoindex::def::penalize_demoted_paths(hits);
+        xerj_common::xccode::render::demote_sparse_definition_hits(hits, query);
         hits.truncate(page);
     }
     serde_json::to_string(&resp).unwrap_or_else(|_| text.to_string())
@@ -3190,7 +3191,9 @@ async fn engine_request(
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
                 let text = match demote_page {
-                    Some(page) => apply_search_path_demotion(&text, page),
+                    Some(page) => {
+                        apply_search_path_demotion(&text, page, match_query.unwrap_or(""))
+                    }
                     None => text,
                 };
                 let text = match match_query {
@@ -3824,7 +3827,7 @@ mod tests {
             {"_id":"s","_score":30.0,"_source":{"ax_path":"tests/contract.rs"}},
             {"_id":"x","_score":1.0,"_source":{"ax_path":"src/extra.rs"}}
         ]}}"#;
-        let text = apply_search_path_demotion(raw, 3);
+        let text = apply_search_path_demotion(raw, 3, "");
         let resp: Value = serde_json::from_str(&text).unwrap();
         let paths: Vec<&str> = resp["hits"]["hits"]
             .as_array()
@@ -3842,7 +3845,7 @@ mod tests {
         );
         assert_eq!(resp["hits"]["hits"][2]["_score"], json!(6.0));
         assert_eq!(resp["hits"]["hits"][1]["_score"], json!(9.0));
-        assert_eq!(apply_search_path_demotion("not json", 3), "not json");
+        assert_eq!(apply_search_path_demotion("not json", 3, ""), "not json");
     }
 
     /// A numeric mapping of a code field drops that leg (#1284 via #1601):

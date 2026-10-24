@@ -201,6 +201,70 @@ pub fn normalize_code_search_query(query: &str) -> String {
 /// body's own BM25 score.
 pub const EXACT_PHRASE_BOOST: f64 = 4.0;
 
+/// Score added when a multi-term question matches on coverage, not on one
+/// short symbol field (#2327).
+///
+/// A `name^4` / `code^2` hit whose text is `type Token = string` collects a
+/// large BM25 score from field length. Definition pages in this crate's
+/// tests sit near 172. One thousand sits above that, so a hit that contains
+/// at least half the content terms sorts ahead of a one-term name. A hit
+/// that contains every term gets this boost a second time.
+pub const COVERAGE_MATCH_BOOST: f64 = 1000.0;
+
+/// Extra `constant_score` clauses for a question with at least three content
+/// tokens. Empty for a one- or two-token lookup — that is an identifier
+/// search, and the exact `name` term stays the strongest signal.
+///
+/// The first clause matches at least half the tokens (rounded up). The
+/// second matches every token. Both are filters: they do not multiply BM25,
+/// and a document that fails them still matches the recall clauses.
+pub fn coverage_match_clauses(query: &str, fields: &[String]) -> Vec<Value> {
+    let shaped = normalize_code_search_query(query);
+    let tokens: Vec<&str> = shaped.split_whitespace().collect();
+    if tokens.len() < 3 || fields.is_empty() {
+        return Vec::new();
+    }
+    let need = tokens.len().saturating_add(1) / 2;
+    let per_term: Vec<Value> = tokens
+        .iter()
+        .map(|token| {
+            json!({
+                "multi_match": {
+                    "query": token,
+                    "fields": fields,
+                    "type": "most_fields"
+                }
+            })
+        })
+        .collect();
+    vec![
+        json!({
+            "constant_score": {
+                "filter": {
+                    "bool": {
+                        "should": per_term,
+                        "minimum_should_match": need
+                    }
+                },
+                "boost": COVERAGE_MATCH_BOOST
+            }
+        }),
+        json!({
+            "constant_score": {
+                "filter": {
+                    "multi_match": {
+                        "query": shaped,
+                        "fields": fields,
+                        "type": "most_fields",
+                        "operator": "and"
+                    }
+                },
+                "boost": COVERAGE_MATCH_BOOST
+            }
+        }),
+    ]
+}
+
 /// The text an exact-phrase content clause matches, or `None` when the query
 /// is a single token.
 ///
@@ -490,6 +554,10 @@ fn build_search_query(
             }
         }
     }
+    // Appended last so the #916 clause positions do not move. A one-word
+    // symbol still matches the recall `multi_match`; these clauses only
+    // add score when the document covers the question (#2327).
+    should.extend(coverage_match_clauses(&shaped, &fields));
     json!({
         "size": k,
         "query": { "bool": { "should": should }},

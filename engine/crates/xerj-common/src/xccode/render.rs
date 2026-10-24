@@ -247,6 +247,95 @@ fn terms_covered(haystack: &str, terms: &[String]) -> usize {
         .count()
 }
 
+/// A directory or file name that marks archived documentation.
+fn path_is_archived(path: &str) -> bool {
+    path.split(['/', '\\']).any(|seg| {
+        let s = seg.to_ascii_lowercase();
+        matches!(
+            s.as_str(),
+            "archive" | "archived" | "archives" | "_archive" | "_archived"
+        ) || s.starts_with("archived.")
+            || s.ends_with(".archived")
+            || s.contains(".archived.")
+    })
+}
+
+/// True when the hit is an archived note or lives under an archive path.
+///
+/// Semantic pages mix current and archived docs with no other signal
+/// (#2327). The path is already on the hit; this is the explicit mark the
+/// header prints. A source file named `archive.ts` is not archived.
+pub fn source_looks_archived(src: &Value) -> bool {
+    if src.get("keep_archived").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let path = ["ax_path", "ax_file", "path", "file"]
+        .iter()
+        .find_map(|k| src.get(*k).and_then(Value::as_str))
+        .unwrap_or("");
+    path_is_archived(path)
+}
+
+/// Move a one-term symbol definition behind hits that cover more of a
+/// multi-term question (#2327).
+///
+/// The definition is the per-symbol document (`name` + `kind`) whose name
+/// matches exactly one content term and whose text matches no other. Hits
+/// that cover more terms keep their relative order, then the sparse
+/// definitions follow in theirs. A one- or two-term query is a lookup and
+/// is left alone, including two definitions that share one name. When no
+/// hit covers a second term, the page is unchanged.
+pub fn demote_sparse_definition_hits(hits: &mut [Value], query: &str) {
+    let terms = content_terms(query);
+    if terms.len() < MIN_TERMS_FOR_COVERAGE || hits.len() < 2 {
+        return;
+    }
+    let covered: Vec<usize> = hits
+        .iter()
+        .map(|hit| terms_covered(&hit_haystack(hit), &terms))
+        .collect();
+    if covered.iter().copied().max().unwrap_or(0) < 2 {
+        return;
+    }
+    let sparse: Vec<bool> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let src = hit.get("_source").unwrap_or(&Value::Null);
+            let Some(name) = src.get("name").and_then(Value::as_str) else {
+                return false;
+            };
+            if name.is_empty() || src.get("kind").and_then(Value::as_str).is_none() {
+                return false;
+            }
+            let name_l = name.to_lowercase();
+            let name_hits = terms.iter().filter(|t| name_l.contains(t.as_str())).count();
+            name_hits == 1 && covered[i] == 1
+        })
+        .collect();
+    if sparse.iter().all(|flag| !flag) {
+        return;
+    }
+    let mut order = Vec::with_capacity(hits.len());
+    for (i, flag) in sparse.iter().enumerate() {
+        if !flag {
+            order.push(i);
+        }
+    }
+    if order.is_empty() {
+        return;
+    }
+    for (i, flag) in sparse.iter().enumerate() {
+        if *flag {
+            order.push(i);
+        }
+    }
+    let original = hits.to_vec();
+    for (dest, src) in order.into_iter().enumerate() {
+        hits[dest] = original[src].clone();
+    }
+}
+
 /// One RRF leg at rank 1: `1/(k+1)`. Two legs at rank 1 — a typical strong
 /// hybrid hit — score twice that. k is [`super::RRF_K`] (60), the value the
 /// request sends.
@@ -569,7 +658,12 @@ fn render_hit(
             format!(" why={lic}")
         };
         let weak_tok = if weak { " weak" } else { "" };
-        return format!("@ok f={loc} {shown}{why}{weak_tok}\n");
+        let archived_tok = if source_looks_archived(&src) {
+            " archived"
+        } else {
+            ""
+        };
+        return format!("@ok f={loc} {shown}{why}{weak_tok}{archived_tok}\n");
     }
 
     let shown = if opts.rrf_scores {
@@ -583,7 +677,12 @@ fn render_hit(
         format!(", {lic}")
     };
     let weak_part = if weak { ", weak" } else { "" };
-    let mut out = format!("\n─── {loc}  ({shown}{lic_part}{weak_part})\n");
+    let archived_part = if source_looks_archived(&src) {
+        ", archived"
+    } else {
+        ""
+    };
+    let mut out = format!("\n─── {loc}  ({shown}{lic_part}{weak_part}{archived_part})\n");
 
     // `body` is the content field of every family EXCEPT plain text (`.txt`
     // mirrors put their passage in `text`, #1139) and `*-symbols` records
@@ -1491,6 +1590,122 @@ mod tests {
         assert!(page_is_weak_match(&prose, &opts, 5.0));
         let hit = vec![doc("a.md", 5.0, "Cold-start users receive a prior.")];
         assert!(!page_is_weak_match(&hit, &opts, 5.0));
+    }
+
+    /// #2327: synthetic TypeScript symbol + Markdown. The one-word `Token`
+    /// type outscores the note that answers the question; after the pass it
+    /// does not. `xerj def Token` (one term) keeps the type first.
+    #[test]
+    fn one_term_definition_does_not_outrank_a_multi_term_hit() {
+        let query = "session token refresh handler";
+        let token = json!({
+            "_score": 180.0,
+            "_source": {
+                "ax_path": "src/types.ts",
+                "name": "Token",
+                "kind": "type",
+                "line": 4,
+                "code": "export type Token = string;"
+            }
+        });
+        let refresh = json!({
+            "_score": 12.0,
+            "_source": {
+                "ax_path": "src/session.ts",
+                "name": "refreshSession",
+                "kind": "function",
+                "line": 20,
+                "code": "export function refreshSession(token: Token, handler: Handler): Session"
+            }
+        });
+        let note = json!({
+            "_score": 6.0,
+            "_source": {
+                "ax_path": "docs/session-token.md",
+                "title": "Refreshing a session token",
+                "body": "The refresh handler exchanges a session token for a new session."
+            }
+        });
+        let mut hits = vec![token, refresh, note];
+        demote_sparse_definition_hits(&mut hits, query);
+        let names: Vec<&str> = hits
+            .iter()
+            .map(|h| {
+                h["_source"]
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(h["_source"]["ax_path"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["refreshSession", "docs/session-token.md", "Token"],
+            "{names:?}"
+        );
+
+        let mut exact = vec![
+            json!({
+                "_score": 40.0,
+                "_source": { "name": "Token", "kind": "type", "line": 4, "code": "export type Token = string;", "ax_path": "src/types.ts" }
+            }),
+            json!({
+                "_score": 11.0,
+                "_source": { "name": "TokenStore", "kind": "class", "line": 8, "code": "export class TokenStore { token: Token }", "ax_path": "src/store.ts" }
+            }),
+        ];
+        let before = exact.clone();
+        demote_sparse_definition_hits(&mut exact, "Token");
+        assert_eq!(exact, before, "a one-term lookup keeps engine order");
+
+        // Nothing on the page covers a second term: leave the order alone.
+        let mut only = vec![
+            json!({
+                "_score": 90.0,
+                "_source": { "name": "Token", "kind": "type", "code": "export type Token = string" }
+            }),
+            json!({
+                "_score": 40.0,
+                "_source": { "name": "Handler", "kind": "type", "code": "export type Handler = object" }
+            }),
+        ];
+        let only_before = only.clone();
+        demote_sparse_definition_hits(&mut only, query);
+        assert_eq!(only, only_before);
+    }
+
+    #[test]
+    fn archived_path_is_marked_on_the_header() {
+        let current = doc(
+            "docs/session-token.md",
+            8.0,
+            "The refresh handler exchanges a session token.",
+        );
+        let archived = doc(
+            "docs/archive/session-token.md",
+            9.0,
+            "The refresh handler exchanges a session token.",
+        );
+        let text = render(
+            &[archived, current],
+            &HashMap::new(),
+            &prose_opts("session token refresh", false),
+            None,
+        );
+        assert!(
+            text.contains("docs/archive/session-token.md:10  (score 9.00, archived)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("docs/session-token.md:10  (score 8.00)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("session-token.md:10  (score 8.00, archived)"));
+        assert!(!source_looks_archived(
+            &json!({ "ax_path": "src/archive.ts" })
+        ));
+        assert!(source_looks_archived(
+            &json!({ "path": "notes/today.md", "keep_archived": true })
+        ));
     }
 
     #[test]

@@ -197,13 +197,13 @@ pub fn definition_query(
 /// Rank the fetched window, keep the best hit per location, and return `k`
 /// definitions. Only `hits.hits` is replaced: totals still describe engine
 /// matches before deduplication, just as in `xerj def --json`.
-pub fn finalize_definition_response(response: &mut Value, k: usize) -> Vec<Value> {
+pub fn finalize_definition_response(response: &mut Value, query: &str, k: usize) -> Vec<Value> {
     let mut hits = response
         .pointer("/hits/hits")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    rerank_def_hits(&mut hits);
+    rerank_def_hits(&mut hits, query);
     let mut hits = unique_locations(hits);
     hits.truncate(k);
     if let Some(slot) = response.pointer_mut("/hits/hits") {
@@ -261,6 +261,12 @@ fn build_def_query(
             "type": "most_fields"
         }}));
     }
+    // Same coverage clauses as `xerj search` (#2327). An identifier does not
+    // grow them: `coverage_match_clauses` is empty below three tokens, so
+    // `xerj def Token` stays an exact `name` lookup.
+    should.extend(xerj_common::code_query::coverage_match_clauses(
+        query, &fields,
+    ));
     if is_identifier(query) && field_lookup_ok(mapped, numeric, "code") {
         // `code` holds the declaration text; a phrase hit there ("def <name>(",
         // "class <name>:") is a definition even when `name` casing differs.
@@ -431,7 +437,7 @@ fn declaration_is_public(code: &str) -> bool {
 /// returned, then sort. A preferred kind scores +20 unless the path is a
 /// test, example, fuzz target, or bench. A public declaration scores +5.
 /// Ties keep the engine order.
-pub(crate) fn rerank_def_hits(hits: &mut [Value]) {
+pub(crate) fn rerank_def_hits(hits: &mut [Value], query: &str) {
     const KIND_WEIGHT: f64 = 20.0;
     const PUB_WEIGHT: f64 = 5.0;
     let adjusted: Vec<f64> = hits
@@ -469,6 +475,9 @@ pub(crate) fn rerank_def_hits(hits: &mut [Value]) {
         }
         hits[place] = hit;
     }
+    // After the kind/visibility sort, so a +20 preferred kind cannot put a
+    // one-word type back above a definition that covers the question (#2327).
+    xerj_common::xccode::render::demote_sparse_definition_hits(hits, query);
 }
 
 /// Entry point for the `def` subcommand. Returns a process exit code.
@@ -600,7 +609,7 @@ pub fn run_def_cli() -> i32 {
         }
     };
 
-    let hits = finalize_definition_response(&mut resp, k);
+    let hits = finalize_definition_response(&mut resp, &query, k);
 
     if as_json {
         println!(
@@ -857,7 +866,7 @@ mod tests {
             }
         });
         let mut hits = vec![test_struct, alias.clone(), src_struct];
-        rerank_def_hits(&mut hits);
+        rerank_def_hits(&mut hits, "");
         assert_eq!(
             hits[0]["_source"]["ax_path"],
             "tokio/src/runtime/runtime.rs"
@@ -885,6 +894,51 @@ mod tests {
         assert!(!declaration_is_public("struct Runtime"));
         assert!(declaration_is_public("pub(crate) struct Runtime"));
         assert!(!declaration_is_public("publication"));
+    }
+
+    /// #2327: kind and `pub` weights run first. A one-word type with a higher
+    /// score still finishes behind the definition that covers the question.
+    /// An exact `Token` lookup does not move.
+    #[test]
+    fn a_one_word_type_does_not_outrank_a_multi_term_definition() {
+        let token = json!({
+            "_score": 400.0,
+            "_source": {
+                "ax_path": "src/types.ts",
+                "name": "Token",
+                "kind": "type",
+                "line": 1,
+                "code": "export type Token = string"
+            }
+        });
+        let refresh = json!({
+            "_score": 3.0,
+            "_source": {
+                "ax_path": "src/session.ts",
+                "name": "refreshSession",
+                "kind": "function",
+                "line": 12,
+                "code": "export function refreshSession(token: Token, handler: Handler): Session"
+            }
+        });
+        let mut hits = vec![token, refresh];
+        rerank_def_hits(&mut hits, "session token refresh handler");
+        assert_eq!(hits[0]["_source"]["name"], "refreshSession");
+        assert_eq!(hits[1]["_source"]["name"], "Token");
+
+        let mut exact = vec![
+            json!({
+                "_score": 50.0,
+                "_source": { "name": "Token", "kind": "type", "code": "export type Token = string", "ax_path": "a.ts" }
+            }),
+            json!({
+                "_score": 10.0,
+                "_source": { "name": "Alias", "kind": "type", "code": "type Alias = number", "ax_path": "b.ts" }
+            }),
+        ];
+        rerank_def_hits(&mut exact, "Token");
+        assert_eq!(exact[0]["_source"]["name"], "Token");
+        assert_eq!(exact[1]["_source"]["name"], "Alias");
     }
 
     /// "flush the tree to disk" has to search the symbol body. An identifier

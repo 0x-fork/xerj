@@ -102,7 +102,7 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
             true,
         );
     }
-    finalize_definition_response(&mut response, k);
+    finalize_definition_response(&mut response, symbol, k);
     let text = response.to_string();
     tool_text(
         match budget {

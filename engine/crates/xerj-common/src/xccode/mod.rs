@@ -542,6 +542,8 @@ pub fn run_code_query(
     //    that shrank says so in the note, naming only the caps that fired.
     // #1504: translation catalogs and minified bundles repeat every UI phrase
     // and win natural-language queries. They stay searchable, behind source.
+    let mut hits = hits;
+    render::demote_sparse_definition_hits(&mut hits, &query);
     let hits = demote_catalog_noise(hits);
     let (hits, file_dropped, index_dropped) = diversify(hits, params.k);
     if file_dropped > 0 || index_dropped > 0 {
@@ -849,14 +851,16 @@ pub(crate) fn bm25_body(query: &str, k: usize, lang: &Option<String>, fields: &[
     if let Some(lg) = lang {
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "size": k,
         "query": { "bool": { "must": must } },
         // Response-only. `_passage.ordinal` is the 0-based line of a lexical
         // window (#174). It is not a highlight block, which changes ranking
         // (#177). The scored fast path does not serve text `multi_match`.
         "fields": ["_passage"]
-    })
+    });
+    attach_coverage_clauses(&mut body, query, fields);
+    body
 }
 
 /// #1237: second BM25 leg over symbol-record `impl` fields. Excludes `impl`
@@ -870,11 +874,29 @@ pub(crate) fn symbol_bm25_body(query: &str, k: usize, lang: &Option<String>) -> 
     if let Some(lg) = lang {
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
-    serde_json::json!({
+    let fields = vec!["impl".to_string()];
+    let mut body = serde_json::json!({
         "size": k,
         "_source": { "excludes": ["impl", "body"] },
         "query": { "bool": { "must": must } }
-    })
+    });
+    attach_coverage_clauses(&mut body, query, &fields);
+    body
+}
+
+/// `should` coverage clauses for a multi-term question (#2327). A one-token
+/// lookup leaves the body untouched, so the measured BM25 shape stays.
+fn attach_coverage_clauses(body: &mut Value, query: &str, fields: &[String]) {
+    let clauses = crate::code_query::coverage_match_clauses(query, fields);
+    if clauses.is_empty() {
+        return;
+    }
+    if let Some(obj) = body
+        .pointer_mut("/query/bool")
+        .and_then(Value::as_object_mut)
+    {
+        obj.insert("should".into(), Value::Array(clauses));
+    }
 }
 
 fn hit_file_key(hit: &Value) -> Option<String> {

@@ -349,10 +349,19 @@ pub fn search_fetch_size(k: usize) -> usize {
 /// of test/example/fuzz/bench paths and the page is trimmed back to `page`
 /// after the existing same-path and catalog passes. A prose corpus skips
 /// the penalty and the trim — the node was asked for `page` hits already.
-pub(crate) fn rank_plain_search_hits(hits: &mut Vec<Value>, code_corpus: bool, page: usize) {
+pub(crate) fn rank_plain_search_hits(
+    hits: &mut Vec<Value>,
+    code_corpus: bool,
+    page: usize,
+    query: &str,
+) {
     if code_corpus {
         crate::def::penalize_demoted_paths(hits);
     }
+    // A one-word symbol (`type Token`) must not stay ahead of a hit that
+    // covers more terms of a multi-term question (#2327). One-token lookups
+    // are unchanged inside that pass.
+    xerj_common::xccode::render::demote_sparse_definition_hits(hits, query);
     prefer_citable_line_on_the_same_path(hits);
     let mut ordered = demote_catalog_noise(std::mem::take(hits));
     if code_corpus {
@@ -800,7 +809,7 @@ pub fn run_search_cli() -> i32 {
     // catalog partition (#1504). `--json` sees the same order as the printer.
     // The penalty trims the wider fetch back to `-k`.
     if let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) {
-        rank_plain_search_hits(hits, code_corpus, k);
+        rank_plain_search_hits(hits, code_corpus, k, &query);
     }
     // Same annotation `xerj_search` adds (#2266), so `--json` and the printed
     // header cite the matched line. `xerj code --json` is the raw server
@@ -842,7 +851,12 @@ pub fn run_search_cli() -> i32 {
         } else {
             format!("  [{kind}]")
         };
-        println!("\n─── {loc}{tag}  (score {score:.2})");
+        let archived = if xerj_common::xccode::render::source_looks_archived(&src) {
+            ", archived"
+        } else {
+            ""
+        };
+        println!("\n─── {loc}{tag}  (score {score:.2}{archived})");
         // Passage-first: `_passage` is the engine's matching snippet (an
         // array-wrapped object with a text payload); `code` is the symbol
         // declaration. Never the whole file body — that is the 9x token flood
@@ -1516,9 +1530,17 @@ mod tests {
         let mapped = names_of(&["message", "ts", "host"]);
         let body = search_query_body_for_mapping("SIP 403 Forbidden", 3, Some(&mapped), None);
         let should = body["query"]["bool"]["should"].as_array().unwrap();
-        assert_eq!(should.len(), 2, "{body}");
+        // Recall multi_match, the exact-phrase leg, then the two coverage
+        // clauses a three-token question adds (#2327).
+        assert_eq!(should.len(), 4, "{body}");
         assert_eq!(should[0]["multi_match"]["fields"], json!(["message"]));
+        assert!(should[2].get("constant_score").is_some(), "{body}");
+        assert!(should[3].get("constant_score").is_some(), "{body}");
         assert_eq!(phrase_fields(&body), vec!["message"], "{body}");
+        let rendered = body["query"].to_string();
+        assert!(!rendered.contains("\"code\""), "{rendered}");
+        assert!(!rendered.contains("\"name\""), "{rendered}");
+        assert!(!rendered.contains("\"defs\""), "{rendered}");
     }
 
     /// Fields named by the exact-phrase legs, in order. The `defs` phrase
@@ -1571,6 +1593,18 @@ mod tests {
         assert!(should[1].pointer("/match_phrase/defs").is_some(), "{body}");
         assert!(should[2].pointer("/term/name").is_some(), "{body}");
         assert_eq!(phrase_fields(&body), vec!["body"], "{body}");
+        // Three content tokens (glue word "the" is dropped) grow the coverage
+        // clauses. A one-token lookup above does not.
+        assert!(
+            should.iter().any(|c| c.get("constant_score").is_some()),
+            "{body}"
+        );
+        assert!(
+            !search_query_body("Token", 5)
+                .to_string()
+                .contains("constant_score"),
+            "an exact symbol lookup must not grow a coverage clause"
+        );
     }
 
     /// A content field some index maps as numeric is dropped from the
@@ -1892,7 +1926,7 @@ mod tests {
             hit("ax_path", "src/Foo.test.tsx", 14.0),
             hit("ax_path", "src/fixtures/transcript.json", 8.0),
         ];
-        rank_plain_search_hits(&mut hits, true, 5);
+        rank_plain_search_hits(&mut hits, true, 5, "");
         let paths: Vec<&str> = hits
             .iter()
             .map(|h| {
@@ -1921,7 +1955,7 @@ mod tests {
             hit("ax_path", "examples/App.tsx", 11.0),
             hit("ax_path", "src/render.tsx", 9.0),
         ];
-        rank_plain_search_hits(&mut wide, true, 5);
+        rank_plain_search_hits(&mut wide, true, 5, "");
         assert_eq!(wide.len(), 2, "a demoted hit stays when it still fits");
         assert_eq!(wide[0]["_source"]["ax_path"], "src/render.tsx");
         assert_eq!(wide[1]["_source"]["ax_path"], "examples/App.tsx");
@@ -1932,7 +1966,7 @@ mod tests {
             hit("ax_path", "tests/a.rs", 10.0),
             hit("ax_path", "fuzz/targets/b.rs", 8.0),
         ];
-        rank_plain_search_hits(&mut only_tests, true, 5);
+        rank_plain_search_hits(&mut only_tests, true, 5, "");
         assert_eq!(only_tests[0]["_source"]["ax_path"], "tests/a.rs");
         assert_eq!(only_tests[1]["_source"]["ax_path"], "fuzz/targets/b.rs");
         assert_eq!(only_tests[0]["_score"], json!(5.0));
@@ -1941,7 +1975,7 @@ mod tests {
             hit("ax_path", "tests/a.rs", 12.0),
             hit("ax_path", "src/render.tsx", 9.0),
         ];
-        rank_plain_search_hits(&mut prose, false, 1);
+        rank_plain_search_hits(&mut prose, false, 1, "");
         assert_eq!(prose.len(), 2, "a prose page is not trimmed");
         assert_eq!(prose[0]["_source"]["ax_path"], "tests/a.rs");
         assert_eq!(prose[0]["_score"], json!(12.0));
@@ -1968,7 +2002,7 @@ mod tests {
             hit("ax_path", "tests/test_model.py", 12.0),
             hit("ax_path", "src/model.py", 9.0),
         ];
-        rank_plain_search_hits(&mut hits, true, 5);
+        rank_plain_search_hits(&mut hits, true, 5, "");
         let paths: Vec<&str> = hits
             .iter()
             .map(|h| h["_source"]["ax_path"].as_str().unwrap())
