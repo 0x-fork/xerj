@@ -2,15 +2,15 @@
 ---
 title: "Single-binary local search engine, no Docker or JVM"
 canonical: "https://xerj.org/answers/search-engine-without-docker"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/answers/search-engine-without-docker.md"
 ---
 
 # Is there a single-binary local search engine I can just run?
 
-**Short answer** (updated 2026-10-19): Is there a single-binary local search engine I can just run? Yes. XERJ runs from one native Rust binary with no container and no JVM. A first-party capture on Linux x86-64 shows 3 dynamically linked libraries and a 67,174,440-byte executable, and a cold start of 1.071 s to the first HTTP 200 on an empty data directory.
+**Short answer** (updated 2026-10-23): Is there a single-binary local search engine I can just run? Yes. XERJ runs from one native Rust binary with no container and no JVM. A first-party capture on Linux x86-64 shows 3 dynamically linked libraries and a 67,174,440-byte executable, and a cold start of 1.071 s to the first HTTP 200 on an empty data directory.
 
-**Key number:** XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases from that single binary. (as of 2026-10-19; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
+**Key number:** XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases from that single binary. (as of 2026-10-23; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
 
 **TL;DR** — XERJ runs a search engine from one native binary, with no container and no JVM. A first-party capture on Linux x86-64 shows 3 dynamically linked libraries and a 67,174,440-byte executable. Cold start measured 1.071 s to the first HTTP 200 on an empty data directory.
 

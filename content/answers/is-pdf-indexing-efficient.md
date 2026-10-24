@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with --insecure, run xerj autoindex on a PDF folder with --prefix pdfx, then query autoindex-catalog for doc_kind run and report pdf_workers, resource_notes, wall_seconds and the pdf_extraction_reuse counters, and query doc_kind file with status junk to report every PDF that failed and its reason string."
 answer: "Is it inefficient to index PDF files into a search engine? Compared with opening every file by hand, no, though PDF is the slowest family XERJ parses. Extraction runs in an isolated worker process sized from free memory, capped five ways, and each file is parsed once. Image-only PDFs are refused with a reason string."
 key_fact: "XERJ runs at most 4 concurrent PDF worker processes (`MAX_PDF_WORKERS`) and reads at most 100,000 pages per file (`MAX_PAGES`)."

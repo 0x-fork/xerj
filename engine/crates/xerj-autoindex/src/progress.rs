@@ -89,8 +89,19 @@ use std::time::{Duration, Instant};
 const EWMA_ALPHA: f64 = 0.2;
 /// No ETA until the phase has run at least this long.
 const ETA_MIN_PHASE_SECS: f64 = 5.0;
-/// No ETA until this fraction of the phase is complete.
+/// No numeric ETA until this fraction of the phase is complete.
+///
+/// This gate used to also suppress [`Eta::Stalled`]. A phase sitting at 0/N
+/// (fraction 0, which is under 2%) therefore stayed `eta_quality=unknown` for
+/// as long as it hung — the 11-hour `corpus index` in #1981, journal not yet
+/// written, looked like "still starting". The fraction still blocks a numeric
+/// ETA. It does not block the stall label.
 const ETA_MIN_FRACTION: f64 = 0.02;
+/// A phase with no denominator (`walk`, before the tree is counted) has
+/// nothing to increment, so the ordinary stall window would flag every walk
+/// longer than 15 s. Flag that shape only once the silence is far past a
+/// healthy walk. A phase that *has* a denominator uses [`Progress::stall_threshold`].
+const UNKNOWN_TOTAL_STALL: Duration = Duration::from_secs(10 * 60);
 /// Below this fraction a computed ETA is labelled `rough`, not `good`.
 const ETA_GOOD_FRACTION: f64 = 0.10;
 /// A displayed ETA may not move by more than this fraction per tick.
@@ -762,14 +773,27 @@ impl Progress {
         } else {
             0.0
         };
-        let eta = if total == 0 || phase_elapsed < ETA_MIN_PHASE_SECS || fraction < ETA_MIN_FRACTION
-        {
+        // A phase with no denominator can legitimately run with `done == 0`
+        // (the walk has not returned a count yet). One that published a
+        // denominator and then completes nothing is the hang: 0/N is still
+        // nothing completed, even though its fraction is under
+        // `ETA_MIN_FRACTION` (#1981).
+        let stall_after = if total == 0 {
+            self.stall_threshold()
+                .as_secs_f64()
+                .max(UNKNOWN_TOTAL_STALL.as_secs_f64())
+        } else {
+            self.stall_threshold().as_secs_f64()
+        };
+        let eta = if phase_elapsed < ETA_MIN_PHASE_SECS {
             Eta::Unknown
-        } else if since_progress > self.stall_threshold().as_secs_f64() {
+        } else if since_progress > stall_after {
             // The last measurement is too old to extrapolate from. The named
             // straggler below is the real answer to "what is it doing?" — an
             // extrapolated number here would be pure invention.
             Eta::Stalled
+        } else if total == 0 || fraction < ETA_MIN_FRACTION {
+            Eta::Unknown
         } else {
             match state.rate {
                 Some(rate) if rate > 0.0 => {
@@ -948,42 +972,44 @@ impl Progress {
         }
         let progress = Arc::clone(self);
         let interval = self.interval;
-        let handle = std::thread::Builder::new()
-            .name("autoindex-progress".into())
-            .spawn(move || {
-                // Hold the guard across the loop and test the flag BEFORE
-                // waiting. A condvar notification reaches only threads already
-                // parked in `wait`, so a `stop()` that lands while this thread
-                // is anywhere else — above all before its very first wait — is
-                // delivered to nobody and is gone. Re-checking the predicate
-                // under the lock is what makes it impossible to miss: the flag
-                // is set under the same mutex, so either we see it here or we
-                // are already parked and the notify wakes us.
-                //
-                // Getting this wrong is not a latency detail. `Ticker::drop`
-                // joins this thread, so a lost stop turns every early exit —
-                // `es.ping()` refused, `no-files`, a small `--dry-run` — into a
-                // full `--progress-interval` of silence AFTER the terminal line
-                // has printed, and `--progress-interval 3600` makes that an
-                // hour.
-                let mut stopped = progress.stopped.lock().unwrap();
-                while !*stopped {
-                    let (guard, _timeout) = progress
-                        .wake
-                        .wait_timeout(stopped, interval)
-                        .expect("progress ticker mutex poisoned");
-                    stopped = guard;
-                    if *stopped {
-                        break;
-                    }
-                    // Never emit while holding `stopped`: `stop()` would block
-                    // behind a write to a slow pipe.
-                    drop(stopped);
-                    progress.emit();
-                    stopped = progress.stopped.lock().unwrap();
+        // #1122: `Builder::spawn` returns `Ok` and then panics in the child
+        // when the alternate signal stack cannot be mapped. `.ok()` only
+        // sees the `Err` from `pthread_create`. `try_spawn` does not install
+        // that stack, so a refusal is a missing ticker, not a dead process.
+        let handle = xerj_common::thread_spawn::try_spawn("autoindex-progress", move || {
+            // Hold the guard across the loop and test the flag BEFORE
+            // waiting. A condvar notification reaches only threads already
+            // parked in `wait`, so a `stop()` that lands while this thread
+            // is anywhere else — above all before its very first wait — is
+            // delivered to nobody and is gone. Re-checking the predicate
+            // under the lock is what makes it impossible to miss: the flag
+            // is set under the same mutex, so either we see it here or we
+            // are already parked and the notify wakes us.
+            //
+            // Getting this wrong is not a latency detail. `Ticker::drop`
+            // joins this thread, so a lost stop turns every early exit —
+            // `es.ping()` refused, `no-files`, a small `--dry-run` — into a
+            // full `--progress-interval` of silence AFTER the terminal line
+            // has printed, and `--progress-interval 3600` makes that an
+            // hour.
+            let mut stopped = progress.stopped.lock().unwrap();
+            while !*stopped {
+                let (guard, _timeout) = progress
+                    .wake
+                    .wait_timeout(stopped, interval)
+                    .expect("progress ticker mutex poisoned");
+                stopped = guard;
+                if *stopped {
+                    break;
                 }
-            })
-            .ok();
+                // Never emit while holding `stopped`: `stop()` would block
+                // behind a write to a slow pipe.
+                drop(stopped);
+                progress.emit();
+                stopped = progress.stopped.lock().unwrap();
+            }
+        })
+        .ok();
         Ticker {
             progress: Arc::clone(self),
             handle,
@@ -1063,7 +1089,7 @@ impl Drop for WatchGuard<'_> {
 /// called `finish` — closes the stream with an honest `ok=false` line.
 pub struct Ticker {
     progress: Arc<Progress>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<xerj_common::thread_spawn::SpawnedThread>,
 }
 
 impl Drop for Ticker {
@@ -2332,6 +2358,101 @@ mod tests {
         // only a third of the bytes are.
         assert!(line.contains("pct=32.9"), "{line}");
         drop(big);
+    }
+
+    /// #1981: a phase that has a denominator and completes nothing — including
+    /// 0/N, whose fraction is under [`ETA_MIN_FRACTION`] — reports a stall.
+    /// The old gate forced `eta_quality=unknown` for the whole hang, which is
+    /// what an 11-hour `corpus index` (journal not yet written) looked like.
+    #[test]
+    fn a_phase_at_zero_reports_a_stall_once_nothing_completes() {
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(5));
+        progress.phase("index", 17448, 0);
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.phase_started = Instant::now() - Duration::from_secs(120);
+            state.last_advance_at = Instant::now() - Duration::from_secs(120);
+            state.last_bar_at = Some(Instant::now() - Duration::from_secs(20));
+        }
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .expect("a machine line")
+            .to_string();
+        assert!(
+            line.contains("items=0/17448") && line.contains("eta_quality=stalled"),
+            "0/N past the stall window is a stall, not an unknown ETA: {line}"
+        );
+        assert!(
+            captured(&buffer).contains("no progress for"),
+            "the relayed bar must say the phase is stalled: {}",
+            captured(&buffer)
+        );
+
+        // The first seconds of a real phase are not a stall, and a phase
+        // with no denominator (the walk) is not a stall at the short window.
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(5));
+        progress.phase("index", 10, 0);
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.phase_started = Instant::now() - Duration::from_secs(2);
+            state.last_advance_at = Instant::now() - Duration::from_secs(2);
+        }
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(
+            line.contains("eta_quality=unknown") && !line.contains("eta_quality=stalled"),
+            "two seconds at 0/N is still starting: {line}"
+        );
+
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(5));
+        progress.phase("walk", 0, 0);
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.phase_started = Instant::now() - Duration::from_secs(30);
+            state.last_advance_at = Instant::now() - Duration::from_secs(30);
+        }
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(
+            line.contains("pct=unknown") && line.contains("eta_quality=unknown"),
+            "a 30s walk has no denominator yet and is not a stall: {line}"
+        );
+
+        // The same unknown-total phase, silent for far longer than a walk,
+        // does report the stall. That is the hang with no journal.
+        let (progress, buffer) = Progress::capture(Surface::Plain, Duration::from_secs(5));
+        progress.phase("walk", 0, 0);
+        {
+            let mut state = progress.state.lock().unwrap();
+            let silent = UNKNOWN_TOTAL_STALL + Duration::from_secs(1);
+            state.phase_started = Instant::now() - silent;
+            state.last_advance_at = Instant::now() - silent;
+            state.last_bar_at = Some(Instant::now() - Duration::from_secs(20));
+        }
+        progress.tick();
+        let line = captured(&buffer)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap()
+            .to_string();
+        assert!(
+            line.contains("eta_quality=stalled"),
+            "ten minutes with no denominator and no progress is a stall: {line}"
+        );
     }
 
     /// #2058: a hash read that has not returned for a few seconds is named even

@@ -16,7 +16,7 @@
 /// by these words' meaning, and a corpus called "index" or "list" makes the
 /// lifecycle's own help text ambiguous.
 pub const RESERVED_CORPUS_NAMES: &[&str] = &[
-    "code", "corpus", "add", "index", "list", "def", "search", "help",
+    "code", "corpus", "add", "index", "list", "own", "def", "search", "help",
 ];
 
 /// Validate a corpus name: no `/` (no path escape), no `*` (no glob

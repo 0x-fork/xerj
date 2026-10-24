@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node. Export the repo issues to JSONL, run xerj autoindex on that folder, and search the draft title before you file. Report the top hit's number, state and title, and say when a reworded query does not rank the same issue first."
 answer: "Find duplicate GitHub issues before you file. Export the issues to JSONL, index the folder with `xerj autoindex`, and search the draft title. On 2026-10-20 that search over 1,532 records ranked issue 960 first and took 7 ms. A paraphrase of the same bug did not rank it first."
 key_fact: "A search over 1,532 indexed records ranked issue 960 first and took 7 ms."

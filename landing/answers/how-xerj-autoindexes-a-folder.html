@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/how-xerj-autoindexes-a-folder"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "I want to point something at a folder and then ask questions about what's in it. What should I use?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the folder with xerj autoindex, read xerj autoindex map to see what it found, then let the agent query the index over MCP. No configuration file is involved."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can ChatGPT search a folder on my laptop, or do I need something else?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A hosted chat cannot reach your disk on its own. It needs a local server it can call, such as an MCP server over an indexed folder."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I give Claude or ChatGPT access to files on my machine?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the folder, then register xerj mcp with the agent host. The agent calls a search tool and gets hits with file paths, and no file is uploaded."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is a web search API the right tool for a folder on disk?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. A web search API reads pages that are on the public web, and a private folder is not. Index the folder locally and keep the web API for web pages."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I have to tell it what kind of files are in there?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. xerj autoindex detects each file family from the content rather than the file extension, then infers a dataset and its field types per file shape."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I see what it did before I trust it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run the command with --dry-run first: it walks, sniffs and infers, prints the plan and the ignore accounting, and writes nothing."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Some of my files did not show up. Why?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Every run prints what it dropped and by which ignore rule, and files it opened but refused land in autoindex-catalog with a reason string. Hidden files are always skipped."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,9 +228,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>I WANT TO POINT SOMETHING AT A FOLDER AND THEN ASK QUESTIONS ABOUT WHAT'S IN IT. WHAT SHOULD I USE?</div>
   <div class="kicker"><span>ANSWERS · FOLDER INDEXING</span></div>
   <h1 class="h1-long">I want to point something at a folder and then ask questions about what's in it. What should I use?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>What should I use to point something at a folder and then ask questions about what is in it? Run xerj autoindex on the folder: it detects file types, builds typed indices and needs no configuration. Then xerj autoindex map shows which index and field to query, and an agent asks over HTTP or xerj mcp.</p>
     <p class="key-fact"><strong>Key number:</strong> The README's sample run indexed 25,329 files into 593 datasets and 83,103 records in 158.1 s with 8 workers. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
   </div>
@@ -215,7 +287,7 @@ xerj autoindex ./notes --url http://127.0.0.1:9200 --prefix notes --progress pla
 </code></pre>
   <p>An agent answers from the returned passage and cites <code class="inline">ax_path</code>, rather than reading whole files into its context to find the paragraph.</p>
   <h2>Hand the indexed folder to an agent</h2>
-  <p><code class="inline">xerj mcp</code> exposes the indexed folder to an agent host as a stdio tool server, serving 17 tools against a node that is already running. The agent sends a query and reads hits with file paths, instead of opening files one by one.</p>
+  <p><code class="inline">xerj mcp</code> exposes the indexed folder to an agent host as a stdio tool server, serving 22 tools against a node that is already running. The agent sends a query and reads hits with file paths, instead of opening files one by one.</p>
   <p>The node and the MCP server both run on your machine. No file content is uploaded, because the agent host calls a local process rather than a hosted API.</p>
   <h2>Why a web search API cannot do this</h2>
   <p>A web search API reads pages that are on the public web, and its documented input is a query string or a URL. A folder on your own disk has no URL, so no web API can reach it.</p>

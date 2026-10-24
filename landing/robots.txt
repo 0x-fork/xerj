@@ -1,4 +1,7 @@
+# Content signals (https://contentsignals.org): search engines, AI answers that
+# cite this site, and model training are all welcome to use it.
 User-agent: *
+Content-Signal: search=yes, ai-input=yes, ai-train=yes
 Allow: /
 
 # AI agents: start here — concise capability + API map

@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/search-engine-without-docker"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Is there a single-binary local search engine I can just run?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XERJ is one native executable. The captured binary links only libgcc_s.so.1, libm.so.6 and libc.so.6, and answered its first HTTP 200 in 1.071 s from process start."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is there a search engine I can run locally without Docker?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. The capture ran the executable directly on the host with no container runtime. Docker remains optional packaging."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "I want local search that works offline, no cloud embeddings. What are my options?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run the binary on the host and index the folder in place. The default embedder is lexical feature hashing and runs in-process, so the default path needs no embedding service."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "I just want to search logs on my laptop. I don't want Elasticsearch in Docker.",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Start the binary on a scratch data directory, index the log folder, and query the Elasticsearch-compatible port that the same process serves."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ need a JVM?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The captured binary links only libgcc_s.so.1, libm.so.6 and libc.so.6, so no Java runtime is present on the dependency list."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How large is the XERJ binary?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The captured release build measured 67,174,440 bytes and carries debug symbols. The project's own stripped measurement is 36.06 MiB."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can XERJ run as a multi-node cluster?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ is single-node: there is no data-plane replication and no failover, so plan for snapshot and restore instead."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,11 +228,11 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>IS THERE A SINGLE-BINARY LOCAL SEARCH ENGINE I CAN JUST RUN?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: INSTALLATION</span></div>
   <h1>Is there a single-binary local search engine I can just run?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>Is there a single-binary local search engine I can just run? Yes. XERJ runs from one native Rust binary with no container and no JVM. A first-party capture on Linux x86-64 shows 3 dynamically linked libraries and a 67,174,440-byte executable, and a cold start of 1.071 s to the first HTTP 200 on an empty data directory.</p>
-    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases from that single binary. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
+    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases from that single binary. <span class="mute">(as of 2026-10-23 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
   </div>
   <p><strong>TL;DR</strong> — XERJ runs a search engine from one native binary, with no container and no JVM. A first-party capture on Linux x86-64 shows 3 dynamically linked libraries and a 67,174,440-byte executable. Cold start measured 1.071 s to the first HTTP 200 on an empty data directory.</p>
   <div class="prompt-card">

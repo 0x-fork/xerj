@@ -106,8 +106,9 @@ tree-sitter-elixir = "0.3"
 # tree-sitter-language (core is a dev-dependency only), so it loads fine.
 tree-sitter-clojure-orchard = "0.2"
 tree-sitter-scheme = "0.24"
-# NOT tree-sitter-sql: 0.0.2 is immature (the issue itself says evaluate
-# first or defer) and `.sql` routing must not steal sqldump files — deferred.
+# `.sql` DDL is indexed as code by extract/sqlsrc.rs (statement scanner,
+# #2337). It is not a registry extension: claiming `.sql` would steal
+# sqldump files. tree-sitter-sql 0.0.2 is a different, abandoned crate.
 tree-sitter-erlang = "0.20"
 tree-sitter-ocaml = "0.25"
 tree-sitter-zig = "1.1"

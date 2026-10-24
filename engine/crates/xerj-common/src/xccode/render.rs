@@ -73,6 +73,10 @@ pub struct RenderOpts<'a> {
     /// line, and their passage ordinal counts lines of the re-flowed SECTION,
     /// not of the file; with the checkout the line is found in the file itself.
     pub checkout: Option<&'a std::path::Path>,
+    /// Corpus marked first-party (#2339). An unidentified licence stays in
+    /// the header and loses the do-not-copy banner. A named restricted
+    /// licence still warns and still honours `strict_licence`.
+    pub own: bool,
 }
 
 /// The longest non-empty string field of a source object (excluding `ax_*`
@@ -245,6 +249,95 @@ fn terms_covered(haystack: &str, terms: &[String]) -> usize {
         .iter()
         .filter(|term| haystack.contains(term.as_str()))
         .count()
+}
+
+/// A directory or file name that marks archived documentation.
+fn path_is_archived(path: &str) -> bool {
+    path.split(['/', '\\']).any(|seg| {
+        let s = seg.to_ascii_lowercase();
+        matches!(
+            s.as_str(),
+            "archive" | "archived" | "archives" | "_archive" | "_archived"
+        ) || s.starts_with("archived.")
+            || s.ends_with(".archived")
+            || s.contains(".archived.")
+    })
+}
+
+/// True when the hit is an archived note or lives under an archive path.
+///
+/// Semantic pages mix current and archived docs with no other signal
+/// (#2327). The path is already on the hit; this is the explicit mark the
+/// header prints. A source file named `archive.ts` is not archived.
+pub fn source_looks_archived(src: &Value) -> bool {
+    if src.get("keep_archived").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let path = ["ax_path", "ax_file", "path", "file"]
+        .iter()
+        .find_map(|k| src.get(*k).and_then(Value::as_str))
+        .unwrap_or("");
+    path_is_archived(path)
+}
+
+/// Move a one-term symbol definition behind hits that cover more of a
+/// multi-term question (#2327).
+///
+/// The definition is the per-symbol document (`name` + `kind`) whose name
+/// matches exactly one content term and whose text matches no other. Hits
+/// that cover more terms keep their relative order, then the sparse
+/// definitions follow in theirs. A one- or two-term query is a lookup and
+/// is left alone, including two definitions that share one name. When no
+/// hit covers a second term, the page is unchanged.
+pub fn demote_sparse_definition_hits(hits: &mut [Value], query: &str) {
+    let terms = content_terms(query);
+    if terms.len() < MIN_TERMS_FOR_COVERAGE || hits.len() < 2 {
+        return;
+    }
+    let covered: Vec<usize> = hits
+        .iter()
+        .map(|hit| terms_covered(&hit_haystack(hit), &terms))
+        .collect();
+    if covered.iter().copied().max().unwrap_or(0) < 2 {
+        return;
+    }
+    let sparse: Vec<bool> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let src = hit.get("_source").unwrap_or(&Value::Null);
+            let Some(name) = src.get("name").and_then(Value::as_str) else {
+                return false;
+            };
+            if name.is_empty() || src.get("kind").and_then(Value::as_str).is_none() {
+                return false;
+            }
+            let name_l = name.to_lowercase();
+            let name_hits = terms.iter().filter(|t| name_l.contains(t.as_str())).count();
+            name_hits == 1 && covered[i] == 1
+        })
+        .collect();
+    if sparse.iter().all(|flag| !flag) {
+        return;
+    }
+    let mut order = Vec::with_capacity(hits.len());
+    for (i, flag) in sparse.iter().enumerate() {
+        if !flag {
+            order.push(i);
+        }
+    }
+    if order.is_empty() {
+        return;
+    }
+    for (i, flag) in sparse.iter().enumerate() {
+        if *flag {
+            order.push(i);
+        }
+    }
+    let original = hits.to_vec();
+    for (dest, src) in order.into_iter().enumerate() {
+        hits[dest] = original[src].clone();
+    }
 }
 
 /// One RRF leg at rank 1: `1/(k+1)`. Two legs at rank 1 — a typical strong
@@ -555,7 +648,10 @@ fn render_hit(
         .get(locator_repo(&loc))
         .cloned()
         .unwrap_or_default();
-    let restricted = !lic.is_empty() && licence::is_restricted(&lic);
+    // The header still names `lic` (including UNKNOWN / NONE-FOUND). The
+    // banner and the strict withhold follow the copy-warning rule, which
+    // drops only an unidentified licence on an own corpus.
+    let restricted = licence::copy_warning_applies(&lic, opts.own);
 
     if opts.meatl {
         let shown = if opts.rrf_scores {
@@ -569,7 +665,12 @@ fn render_hit(
             format!(" why={lic}")
         };
         let weak_tok = if weak { " weak" } else { "" };
-        return format!("@ok f={loc} {shown}{why}{weak_tok}\n");
+        let archived_tok = if source_looks_archived(&src) {
+            " archived"
+        } else {
+            ""
+        };
+        return format!("@ok f={loc} {shown}{why}{weak_tok}{archived_tok}\n");
     }
 
     let shown = if opts.rrf_scores {
@@ -583,7 +684,12 @@ fn render_hit(
         format!(", {lic}")
     };
     let weak_part = if weak { ", weak" } else { "" };
-    let mut out = format!("\n─── {loc}  ({shown}{lic_part}{weak_part})\n");
+    let archived_part = if source_looks_archived(&src) {
+        ", archived"
+    } else {
+        ""
+    };
+    let mut out = format!("\n─── {loc}  ({shown}{lic_part}{weak_part}{archived_part})\n");
 
     // `body` is the content field of every family EXCEPT plain text (`.txt`
     // mirrors put their passage in `text`, #1139) and `*-symbols` records
@@ -719,6 +825,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: Some(3),
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -752,6 +859,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -763,6 +871,62 @@ mod tests {
             .expect("warning");
         assert!(warn_at > passage_at, "the warning sits UNDER the passage");
         assert!(text.contains("(score 9.01, AGPL)"), "{text}");
+    }
+
+    /// #2339: an own corpus keeps UNKNOWN / NONE-FOUND in the header and drops
+    /// the do-not-copy banner. A named restricted licence still warns, and
+    /// strict mode still withholds that named licence's passage. Strict mode
+    /// does not withhold the owner's unidentified passage.
+    #[test]
+    fn own_corpus_omits_the_banner_for_an_unidentified_licence_only() {
+        let unknown = hit(
+            json!({ "ax_path": "mine/src/lib.rs", "line": 4 }),
+            "fn mine() {}\n",
+            json!(null),
+            3.5,
+        );
+        let map = HashMap::from([("mine".to_string(), "NONE-FOUND".to_string())]);
+        let mut opts = RenderOpts {
+            corpus: "mine",
+            query: "fn mine",
+            full: 800,
+            no_symbol: true,
+            meatl: false,
+            rrf_scores: false,
+            age_days: None,
+            strict_licence: false,
+            own: true,
+            lexical_lines: false,
+            checkout: None,
+        };
+        let text = render(std::slice::from_ref(&unknown), &map, &opts, None);
+        assert!(text.contains("(score 3.50, NONE-FOUND)"), "{text}");
+        assert!(text.contains("fn mine()"), "{text}");
+        assert!(!text.contains("!!"), "{text}");
+        assert!(!text.contains("do not copy"), "{text}");
+
+        opts.own = false;
+        let warned = render(std::slice::from_ref(&unknown), &map, &opts, None);
+        assert!(warned.contains("(score 3.50, NONE-FOUND)"), "{warned}");
+        assert!(
+            warned.contains("!! NONE-FOUND: adapt the APPROACH, do not copy the code"),
+            "{warned}"
+        );
+
+        opts.own = true;
+        opts.strict_licence = true;
+        let strict_own = render(std::slice::from_ref(&unknown), &map, &opts, None);
+        assert!(strict_own.contains("fn mine()"), "{strict_own}");
+        assert!(!strict_own.contains("!!"), "{strict_own}");
+
+        opts.strict_licence = true;
+        let strict_agpl = render(&[agpl_hit()], &licences(), &opts, None);
+        assert!(!strict_agpl.contains("void start()"), "{strict_agpl}");
+        assert!(
+            strict_agpl.contains("!! AGPL: adapt the APPROACH, do not copy the code"),
+            "{strict_agpl}"
+        );
+        assert!(strict_agpl.contains("(score 9.01, AGPL)"), "{strict_agpl}");
     }
 
     /// #1158: a raw-JSON record has neither `body` nor `text` — its content
@@ -793,6 +957,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -828,6 +993,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -869,6 +1035,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -909,6 +1076,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -951,6 +1119,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -977,6 +1146,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: true,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -1004,6 +1174,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: true,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -1026,6 +1197,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -1056,6 +1228,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: Some(2),
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -1095,6 +1268,7 @@ mod tests {
                 rrf_scores: true,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -1147,6 +1321,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: true,
                 checkout: None,
             },
@@ -1381,6 +1556,7 @@ mod tests {
             rrf_scores: rrf,
             age_days: None,
             strict_licence: false,
+            own: false,
             lexical_lines: false,
             checkout: None,
         }
@@ -1493,6 +1669,122 @@ mod tests {
         assert!(!page_is_weak_match(&hit, &opts, 5.0));
     }
 
+    /// #2327: synthetic TypeScript symbol + Markdown. The one-word `Token`
+    /// type outscores the note that answers the question; after the pass it
+    /// does not. `xerj def Token` (one term) keeps the type first.
+    #[test]
+    fn one_term_definition_does_not_outrank_a_multi_term_hit() {
+        let query = "session token refresh handler";
+        let token = json!({
+            "_score": 180.0,
+            "_source": {
+                "ax_path": "src/types.ts",
+                "name": "Token",
+                "kind": "type",
+                "line": 4,
+                "code": "export type Token = string;"
+            }
+        });
+        let refresh = json!({
+            "_score": 12.0,
+            "_source": {
+                "ax_path": "src/session.ts",
+                "name": "refreshSession",
+                "kind": "function",
+                "line": 20,
+                "code": "export function refreshSession(token: Token, handler: Handler): Session"
+            }
+        });
+        let note = json!({
+            "_score": 6.0,
+            "_source": {
+                "ax_path": "docs/session-token.md",
+                "title": "Refreshing a session token",
+                "body": "The refresh handler exchanges a session token for a new session."
+            }
+        });
+        let mut hits = vec![token, refresh, note];
+        demote_sparse_definition_hits(&mut hits, query);
+        let names: Vec<&str> = hits
+            .iter()
+            .map(|h| {
+                h["_source"]
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(h["_source"]["ax_path"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["refreshSession", "docs/session-token.md", "Token"],
+            "{names:?}"
+        );
+
+        let mut exact = vec![
+            json!({
+                "_score": 40.0,
+                "_source": { "name": "Token", "kind": "type", "line": 4, "code": "export type Token = string;", "ax_path": "src/types.ts" }
+            }),
+            json!({
+                "_score": 11.0,
+                "_source": { "name": "TokenStore", "kind": "class", "line": 8, "code": "export class TokenStore { token: Token }", "ax_path": "src/store.ts" }
+            }),
+        ];
+        let before = exact.clone();
+        demote_sparse_definition_hits(&mut exact, "Token");
+        assert_eq!(exact, before, "a one-term lookup keeps engine order");
+
+        // Nothing on the page covers a second term: leave the order alone.
+        let mut only = vec![
+            json!({
+                "_score": 90.0,
+                "_source": { "name": "Token", "kind": "type", "code": "export type Token = string" }
+            }),
+            json!({
+                "_score": 40.0,
+                "_source": { "name": "Handler", "kind": "type", "code": "export type Handler = object" }
+            }),
+        ];
+        let only_before = only.clone();
+        demote_sparse_definition_hits(&mut only, query);
+        assert_eq!(only, only_before);
+    }
+
+    #[test]
+    fn archived_path_is_marked_on_the_header() {
+        let current = doc(
+            "docs/session-token.md",
+            8.0,
+            "The refresh handler exchanges a session token.",
+        );
+        let archived = doc(
+            "docs/archive/session-token.md",
+            9.0,
+            "The refresh handler exchanges a session token.",
+        );
+        let text = render(
+            &[archived, current],
+            &HashMap::new(),
+            &prose_opts("session token refresh", false),
+            None,
+        );
+        assert!(
+            text.contains("docs/archive/session-token.md:10  (score 9.00, archived)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("docs/session-token.md:10  (score 8.00)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("session-token.md:10  (score 8.00, archived)"));
+        assert!(!source_looks_archived(
+            &json!({ "ax_path": "src/archive.ts" })
+        ));
+        assert!(source_looks_archived(
+            &json!({ "path": "notes/today.md", "keep_archived": true })
+        ));
+    }
+
     #[test]
     fn a_passage_below_half_the_top_score_is_marked_and_the_top_is_not() {
         assert!(
@@ -1519,6 +1811,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },
@@ -1579,6 +1872,7 @@ mod tests {
                 rrf_scores: true,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: false,
                 checkout: None,
             },

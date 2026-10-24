@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-18",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/share-folder-read-only-search-without-uploading"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "I need my accountant to search a folder of emails and PDFs. How do I do that without uploading everything somewhere?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj brain on the folder, then xerj share on the same folder. Your accountant gets a link and a passcode and searches from a browser. The documents and the index stay on your machine."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does the other person have to install anything?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. They open the link in a browser and type the passcode. The page is served by your node and loads nothing from anywhere else."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can they change or delete my files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The guest key is read-only and reaches only the shared index. Writes, deletes and every other index on the node are refused by the server, not by the page."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I stop the access?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run the xerj share --revoke command that was printed when you created the share. The guest's next request is refused. A share also ends on its own: the default lifetime is 24h."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What if they are not on my network?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Add --tunnel. XERJ starts your own cloudflared, prints a public link, and closes the tunnel and revokes the share when you press Ctrl-C. That traffic passes through Cloudflare, which can read it: the passcode, the guest key, the searches and the documents. The command prints this with the link."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can they come back to the link later?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Only while the browser tab stays open, unless you allow more than one open. One open is one browser tab. Opening the same link again in that tab keeps the session. A closed tab is a spent open, so give --max-claims 5 to someone who will read over several days."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is the search AI? Does it write answers?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. It is search and reading only: no text is generated and no model is called. The default embedder is lexical feature hashing, so ranking is by word and sub-word overlap plus BM25."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./mixed6 --url http://127.0.0.1:9200 --prefix mx --progress plain --dry-run` to read the planned datasets, run the same command without --dry-run, then POST a match_phrase query to /mx-*/_search and report every ax_path that matched."
 answer: "I have a folder of PDFs, Word docs and Markdown; how do I search all of them at once? Run xerj autoindex on the folder. In a captured run over 6 formats, XERJ indexed 51 documents into 2 indices with 0 junk files, and one match_phrase query returned 3 hits from an HTML, a JSON and a Markdown file."
 key_fact: "The README's sample run indexed 25,329 files into 593 datasets and 83,103 records in 158.1 s."

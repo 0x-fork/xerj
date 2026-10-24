@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node. Export issues and pull requests to JSONL, run xerj autoindex, then search with a _search body that lists _source fields. Report number, title and state. If a passage is cited as line 1 for two different issues, trust number and title, not the line."
 answer: "Search a repo's issues and pull requests locally. Export them to JSONL, index the folder, and query that index instead of reading `gh` JSON. On 2026-10-20 the `gh` capture file was 36,550 bytes and the `xerj search` capture file was 1,865 bytes. Two of the three passages were cited as line 1."
 key_fact: "The captured gh search file was 36,550 bytes and the xerj search file was 1,865 bytes."

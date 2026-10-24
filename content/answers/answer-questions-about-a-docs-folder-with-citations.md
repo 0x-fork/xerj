@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node, run xerj autoindex on the docs folder, then run xerj autoindex map and query the prose field it names. Cite ax_path for every passage you use. If xerj search returns code identifiers, say so and run a match_phrase on the prose field."
 answer: "Answer questions about a docs folder by indexing it with `xerj autoindex`, then running a phrase query. Each hit carries `ax_path`, so the agent can cite the file. On 2026-10-20 a phrase query for \"what is in here\" returned `WHY_XERJ.md` and took 1 ms. `xerj search` on the same words did not."
 key_fact: "A phrase query for \"what is in here\" returned WHY_XERJ.md and took 1 ms."

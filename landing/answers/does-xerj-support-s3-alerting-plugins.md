@@ -2,15 +2,15 @@
 ---
 title: "Does XERJ support S3, alerting or custom plugins?"
 canonical: "https://xerj.org/answers/does-xerj-support-s3-alerting-plugins"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/answers/does-xerj-support-s3-alerting-plugins.md"
 ---
 
 # Does XERJ support S3 storage, alerting or custom plugins yet?
 
-**Short answer** (updated 2026-10-19): Can XERJ store its index in S3, send alerts, or run my own ingest plugin? Partly. Since v1.0.0-rc.77 an index can live in an S3-compatible bucket. Since rc.80 _watcher evaluates exactly one watch shape and refuses every other with a 501. User-supplied ingest plugins are not supported; transforms are built-in only.
+**Short answer** (updated 2026-10-23): Can XERJ store its index in S3, send alerts, or run my own ingest plugin? Partly. Since v1.0.0-rc.77 an index can live in an S3-compatible bucket. Since rc.80 _watcher evaluates exactly one watch shape and refuses every other with a 501. User-supplied ingest plugins are not supported; transforms are built-in only.
 
-**Key number:** XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases; the remaining gaps are listed in the suite. (as of 2026-10-19; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
+**Key number:** XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases, with 0 failures and 10 skipped. (as of 2026-10-23; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
 
 **TL;DR** — The scoreboard moved twice since this page was written: an index can live in an S3-compatible bucket since v1.0.0-rc.77, record corpus packs shipped in rc.78, and alerting became PARTIAL in rc.80 (`_watcher` evaluates exactly one watch shape and refuses every other loudly). User-supplied ingest plugins remain built-in-only. This page says exactly what exists, with the file that proves it. The authoritative list is [`ROADMAP.md`](https://github.com/xerj-org/xerj/blob/main/ROADMAP.md).
 

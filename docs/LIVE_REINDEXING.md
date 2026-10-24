@@ -21,29 +21,32 @@ is worth stating exactly what it means:
   against a committed generation. Added, changed, renamed and deleted files are
   all handled (`lib.rs::project_reconcile_plan`,
   `reconcile_plan::reconcile_plan`).
-* On the **default graph path**, a re-run *resumes a frozen plan*, and what that
-  costs depends on the kind of change. Measured on a 10,000-file tree
-  (`docs/measurements/autoindex-watch-2026-09-19.md`, section 4):
+* On the **default graph path**, a re-run resumes a frozen plan. A file whose
+  content changed is indexed. A deleted file is swept: its documents, catalog
+  rows and graph edges are removed, including under `--fresh`, and that run
+  finishes exit 3 with `reason=files-removed` (the next unchanged rerun is
+  exit 0). An added file that fits a frozen dataset is indexed on the rerun.
+  A file that needs a new dataset is not: the run exits 3 with
+  `reason=stale-resume-plan` and names `--fresh`. The table below is the
+  2026-09-19 capture, from before that reconcile, on a 10,000-file tree
+  (`docs/measurements/autoindex-watch-2026-09-19.md`, section 4). Those
+  timings were not re-measured for the reconcile.
 
-  | Graph-route re-run after… | Result |
+  | Graph-route re-run after… (2026-09-19 capture) | Result |
   |---|---|
   | a file's **content** changed | indexed: 3.07 s, `files=1`, exit 0, the new text searchable |
   | a file was **added** | 3.32 s, **exit 3**, `1 file(s) appeared after the resume plan was frozen and were NOT indexed`; the new file stays unsearchable until `--fresh` |
   | a file was **deleted** | **exit 1, aborted in 0.24 s** — "removing files from an indexed folder is not reconciled yet". Its documents stay live, and every later re-run aborts the same way until the corpus is rebuilt |
 
-A current graph-path resume still does not index a file the frozen plan
-predates. It reports `reason=stale-resume-plan` and `skipped_appeared=N`,
-leaves `junk_files` for unusable input, and names `--fresh` as the flag that
-rebuilds the plan in place. The 3.32 s row above is that measurement; the
-capture's reason was `completed-with-junk`.
+A file that needs a new dataset still waits for `--fresh`. An added file that
+fits a frozen dataset, and a deleted file, no longer do. The 3.32 s row above
+is that measurement; the capture's reason was `completed-with-junk`.
 
-So the limitation is **additions and deletions**, not edits. A watcher on the
-graph path would serve a folder that goes stale on the first new file and stops
-reindexing entirely on the first deletion — worse than no watcher at all. That is
-why `--watch` requires the route that reconciles all four cases, and says so
-instead of quietly downgrading. (An earlier version of this page said a *changed*
-file is not indexed on the graph path. It is; that claim came from a measurement
-whose shell append had created a file instead of modifying one.) The cost of
+`--watch` still requires `--no-graph`. The watcher re-runs the generated route,
+which also reconciles a file that would be a new dataset. It does not watch a
+graph corpus. (An earlier version of this page said a *changed* file is not
+indexed on the graph path. It is; that claim came from a measurement whose
+shell append had created a file instead of modifying one.) The cost of
 `--no-graph` is relationship detection: no wikilink, local-link, section-order or
 directory-chain edges, so no second-brain graph over a watched corpus.
 

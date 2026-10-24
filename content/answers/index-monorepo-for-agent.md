@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with --insecure, run xerj autoindex ./code --prefix code --dry-run and record files, ignored_files and ignored_dirs from the xerj-done line, run it again without --dry-run, then aggregate language and symbol_count over code-*/_search and answer with a defs query instead of opening any source file."
 answer: "How do I stop my agent from reading the whole repo into context? Index the tree once with xerj autoindex and let the agent query the defs and symbols fields instead of opening files. Run --dry-run first: in our capture it reported files=3, ignored_files=2 and ignored_dirs=3, naming every ignore rule."
 key_fact: "A reference-coding study measured 9,982 output tokens for the indexed agent against 26,477 for grep-driven Claude Code, 2.7 times fewer, both solving 16/16."

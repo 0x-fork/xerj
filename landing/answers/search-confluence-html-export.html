@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/search-confluence-html-export"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I search a Confluence HTML export?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Unzip the export to local disk and run xerj autoindex on the folder. In the captured run a phrase on a nested page returned 1 hit with its page title attached."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do Confluence page titles survive the export?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. The captured run returned titles as Confluence writes them, for example PLAT : Recovery procedure, including the space key and the separator."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why do I see 2 titles for one page?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Each page yields both the HTML title and the file name as titles on different documents. A listing query therefore prints PLAT : Change window and Change-window_262148.html."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Are Confluence attachments searchable?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. A phrase inside the PDF under attachments/262146/393217/1/ returned 1 hit with ax_locator p1-s0, which names page 1, passage 0."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ connect to a Confluence server?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ reads the unzipped folder from local disk. The captured node observed 0 non-loopback peers across 185 samples over its whole life."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens to the CSS and image files in the export?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The captured run detected styles/site.css as csv and indexed 2 documents from it, and refused images/icons/bullet_blue.gif as binary content."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Where do these results come from?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "All results come from run RUN-B, captured on 2026-08-21 on a 16-core AMD EPYC 9645 host."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

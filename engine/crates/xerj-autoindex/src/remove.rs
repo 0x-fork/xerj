@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -101,6 +102,10 @@ pub struct RemoveRequest {
     /// Read a `y`/`yes` line from stdin. The CLI sets this only on a terminal.
     /// MCP leaves it false: an agent passes `confirm: true` instead.
     pub prompt: bool,
+    /// Explicit `--state-dir`. The default journal (keyed by folder, URL, and
+    /// prefix) is always removed after a successful delete; this one is too,
+    /// because the default hash cannot find a journal the operator moved.
+    pub state_dir: Option<PathBuf>,
 }
 
 pub struct RemoveReport {
@@ -142,7 +147,36 @@ pub fn execute(req: RemoveRequest) -> Result<RemoveReport> {
         return Ok(report(&plan, EXIT_NEEDS_DECISION, false, None));
     }
     match apply(&es, &plan) {
-        Ok(()) => Ok(report(&plan, 0, true, None)),
+        Ok(()) => {
+            let root = selected_root_display(&plan);
+            let journals = match root.as_deref() {
+                Some(root) => {
+                    discard_resume_journals(root, &req.url, &req.prefix, req.state_dir.as_deref())
+                }
+                None => Ok(Vec::new()),
+            };
+            match journals {
+                Ok(removed) => {
+                    let mut out = report(&plan, 0, true, None);
+                    out.body["resume_journals_removed"] = json!(removed);
+                    if !removed.is_empty() {
+                        out.summary
+                            .push_str(&format!("\nRemoved resume state: {}.", removed.join(", ")));
+                    }
+                    Ok(out)
+                }
+                Err(err) => Ok(report(
+                    &plan,
+                    1,
+                    true,
+                    Some(format!(
+                        "the indices and catalog rows were deleted, but the resume journal was \
+                         not: {err:#}. The next autoindex of this folder will abort on that \
+                         journal until it is removed"
+                    )),
+                )),
+            }
+        }
         Err(err) => {
             let left = match refetch(&es, &req.prefix, req.root.as_deref()) {
                 Ok(left) => Some(left),
@@ -813,6 +847,68 @@ fn apply(es: &Es, plan: &RemovePlan) -> Result<()> {
     Ok(())
 }
 
+fn selected_root_display(plan: &RemovePlan) -> Option<String> {
+    let key = plan.selected_key.as_ref()?;
+    plan.roots
+        .iter()
+        .find(|group| group.key == *key)
+        .map(|group| group.display.clone())
+}
+
+/// State directories whose `journal.ndjson` would make the next autoindex of
+/// `root_display` resume a corpus this command just deleted (#2314).
+fn resume_state_dirs(
+    root_display: &str,
+    url: &str,
+    prefix: &str,
+    explicit: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = vec![crate::state::default_state_dir(root_display, url, prefix)];
+    if let Ok(canonical) = std::fs::canonicalize(root_display) {
+        let text = canonical.to_string_lossy();
+        if text != root_display {
+            dirs.push(crate::state::default_state_dir(&text, url, prefix));
+        }
+    }
+    if let Some(explicit) = explicit {
+        dirs.push(explicit.to_path_buf());
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Delete `journal.ndjson` and `sync-snapshots` for one removed folder.
+///
+/// The directory itself stays: it may hold notes the operator put there. A
+/// missing journal is success. A journal for a different root is a different
+/// directory, because the default path hashes the root.
+pub fn discard_resume_journals(
+    root_display: &str,
+    url: &str,
+    prefix: &str,
+    explicit: Option<&Path>,
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for dir in resume_state_dirs(root_display, url, prefix, explicit) {
+        let journal = dir.join("journal.ndjson");
+        match std::fs::remove_file(&journal) {
+            Ok(()) => removed.push(journal.display().to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                anyhow::bail!("remove {}: {err}", journal.display());
+            }
+        }
+        let snapshots = dir.join("sync-snapshots");
+        if snapshots.is_dir() {
+            std::fs::remove_dir_all(&snapshots)
+                .with_context(|| format!("remove {}", snapshots.display()))?;
+            removed.push(snapshots.display().to_string());
+        }
+    }
+    Ok(removed)
+}
+
 fn path_escape(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -1276,6 +1372,7 @@ mod tests {
             root: None,
             yes: false,
             prompt: false,
+            state_dir: None,
         })
         .expect("plan");
         assert_eq!(report.exit_code, EXIT_NEEDS_DECISION, "{}", report.summary);
@@ -1308,6 +1405,7 @@ mod tests {
             root: None,
             yes: true,
             prompt: false,
+            state_dir: None,
         })
         .expect("plan");
         assert_eq!(report.exit_code, EXIT_NEEDS_DECISION, "{}", report.summary);
@@ -1335,6 +1433,7 @@ mod tests {
             root: Some("/data/a".into()),
             yes: true,
             prompt: false,
+            state_dir: None,
         })
         .expect("remove");
         assert_eq!(report.exit_code, 0, "{}\n{}", report.summary, report.body);
@@ -1486,5 +1585,54 @@ mod tests {
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json_body}",
             json_body.len()
         )
+    }
+
+    /// #2314: `remove` used to leave `journal.ndjson`, and the next autoindex
+    /// of that folder aborted on it. Only the selected root's default journal
+    /// and an explicit `--state-dir` are deleted. A sibling folder's journal
+    /// and an unrelated file in the explicit directory stay.
+    #[test]
+    fn discard_resume_journals_removes_the_selected_roots_journal_only() {
+        let root = tempfile::tempdir().unwrap();
+        let root_s = root.path().to_string_lossy().to_string();
+        let url = "http://127.0.0.1:9200";
+        let prefix = "proj";
+        let selected = crate::state::default_state_dir(&root_s, url, prefix);
+        let sibling = crate::state::default_state_dir("/other/folder", url, prefix);
+        let explicit = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::create_dir_all(selected.join("sync-snapshots").join("gen")).unwrap();
+        std::fs::write(selected.join("journal.ndjson"), "{}\n").unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("journal.ndjson"), "{}\n").unwrap();
+        std::fs::write(explicit.path().join("journal.ndjson"), "{}\n").unwrap();
+        std::fs::create_dir_all(explicit.path().join("sync-snapshots")).unwrap();
+        std::fs::write(explicit.path().join("notes.txt"), "keep\n").unwrap();
+
+        let removed = discard_resume_journals(&root_s, url, prefix, Some(explicit.path())).unwrap();
+        assert!(
+            removed.iter().any(|path| path.ends_with("journal.ndjson")),
+            "{removed:?}"
+        );
+        assert!(!selected.join("journal.ndjson").exists());
+        assert!(!selected.join("sync-snapshots").exists());
+        assert!(
+            sibling.join("journal.ndjson").exists(),
+            "a sibling journal stays"
+        );
+        assert!(!explicit.path().join("journal.ndjson").exists());
+        assert!(!explicit.path().join("sync-snapshots").exists());
+        assert_eq!(
+            std::fs::read_to_string(explicit.path().join("notes.txt")).unwrap(),
+            "keep\n"
+        );
+
+        let again = discard_resume_journals(&root_s, url, prefix, Some(explicit.path())).unwrap();
+        assert!(
+            again.is_empty(),
+            "a missing journal is not an error: {again:?}"
+        );
+        let _ = std::fs::remove_dir_all(&selected);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 }

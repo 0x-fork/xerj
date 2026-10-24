@@ -253,3 +253,47 @@ fn pdf_worker_accepts_non_utf8_unix_paths() {
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["records"][0]["fields"]["page"], 1);
 }
+
+/// The parent spawn path (`extract` → `pre_exec`) is what #2336 broke: a
+/// refused `RLIMIT_AS` failed `Command::spawn` before `exec`, so
+/// `XERJ_PDF_WORKER_BIN` never ran. This calls that path with the real
+/// worker. On Linux the 1536 MiB cap is applied; on a kernel that returns
+/// `EINVAL` or `EPERM` the worker still starts.
+#[cfg(unix)]
+#[test]
+fn parent_spawn_extracts_a_small_pdf_when_the_address_space_cap_is_refused_or_applied() {
+    let _env = env_guard();
+    let previous = std::env::var_os("XERJ_PDF_WORKER_BIN");
+    std::env::set_var("XERJ_PDF_WORKER_BIN", env!("CARGO_BIN_EXE_xerj"));
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("XERJ_PDF_WORKER_BIN", value),
+                None => std::env::remove_var("XERJ_PDF_WORKER_BIN"),
+            }
+        }
+    }
+    let _restore = Restore(previous);
+
+    let temp = tempfile::tempdir().unwrap();
+    let pdf = temp.path().join("quarterly-report.pdf");
+    write_prose_pdf(&pdf);
+
+    let mut bodies = Vec::new();
+    let mut sink = |record: xerj_autoindex::extract::RawRecord| {
+        if let Some(body) = record.fields.get("body").and_then(|value| value.as_str()) {
+            bodies.push(body.to_string());
+        }
+        true
+    };
+    let stats = xerj_autoindex::extract::pdf::extract(&pdf, &mut sink)
+        .expect("isolated PDF parser starts even if RLIMIT_AS is refused");
+    assert!(stats.records >= 1, "records={}", stats.records);
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("operating margin improved")),
+        "{bodies:?}"
+    );
+}

@@ -19,8 +19,11 @@ pub mod mbox;
 pub(crate) mod opc;
 pub mod pdf;
 pub mod pptx;
+#[cfg(unix)]
+pub(crate) mod rlimit;
 pub mod sqldump;
 pub mod sqlite_x;
+pub mod sqlsrc;
 pub mod txt;
 pub mod unity;
 pub mod xls;
@@ -366,7 +369,31 @@ pub fn extract(
             sink,
         ),
         Family::Sqlite => sqlite_x::extract(path, limit_bytes.map(|_| 500), sink),
-        Family::SqlDump => sqldump::extract(path, sn.gzip, limit_bytes, sink),
+        Family::SqlDump => {
+            let stats = sqldump::extract(path, sn.gzip, limit_bytes, sink)?;
+            // #2337: COPY dumps and other row formats this parser does not
+            // read yield zero records, and `scan_file` then junks the whole
+            // file — schema included. A `.sql` file in that state is source
+            // when it has DDL, and an explicit skip when it is only row data.
+            if stats.records == 0
+                && stats.refusal.is_none()
+                && crate::sniff::is_sql_filename(sn.logical_name.as_deref().unwrap_or(path))
+            {
+                let alt = sqlsrc::extract(
+                    path,
+                    sn.logical_name.as_deref().unwrap_or(path),
+                    sn.gzip,
+                    sink,
+                )?;
+                if alt.records > 0 {
+                    return Ok(alt);
+                }
+                let mut stats = stats;
+                stats.refusal = Some(sqlsrc::DATA_ONLY_DUMP_REASON.to_string());
+                return Ok(stats);
+            }
+            Ok(stats)
+        }
         Family::Code => code::extract(path, sn, sink),
         Family::UnityYaml => unity::extract_unity(path, sn.gzip, limit_bytes, sink),
         Family::UnityMeta => unity::extract_meta(path, sn.gzip, sink),

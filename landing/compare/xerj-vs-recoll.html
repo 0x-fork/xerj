@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/compare/xerj-vs-recoll"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Recoll vs a search engine I can call from an agent?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Recoll is built for a person at a desk, with a GUI, email indexing and OCR hooks. XERJ is built for a program that calls HTTP or MCP. Pick the one that matches the caller."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is Recoll enough for AI agents or do I need an API?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Recoll is enough if you write the wrapper. It answers on the command line through recollq and through a Python API, so an agent can call it through a subprocess you maintain. XERJ answers HTTP and MCP with no wrapper."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search my documents folder from Claude or ChatGPT?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the folder with xerj autoindex, then attach the folder to the agent through xerj mcp, a stdio MCP server that serves 22 tools against a running node."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Did you run a head-to-head benchmark between XERJ and Recoll?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. No shared corpus was frozen and no recall or timing numbers were measured, so this page publishes documented capabilities and no win counts."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which tool indexes email, mbox and attachments?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Recoll, once mail is more than a plain mailbox. XERJ reads .mbox and .eml, detected by content since v1.0.0-rc.75. PST, OST and Maildir are still unhandled, and archives are never opened. Recoll handles mail folders and the documents inside attachments, to an arbitrary depth."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ read image-only PDFs?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ has no OCR, so a PDF with no text layer produces no text. Recoll has OCR hooks for tesseract and ABBYY, and that is the correct tool for that folder."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,9 +220,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>WHAT'S THE BEST LOCAL DESKTOP SEARCH FOR A FOLDER OF PDFS AND DOCS?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: DESKTOP SEARCH</span></div>
   <h1>What's the best local desktop search for a folder of PDFs and docs?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>What is the best local desktop search for a folder of PDFs and docs? For a person at a desk, Recoll: a GUI, email folders and attachments, OCR hooks and open-at-page. For an agent, XERJ, a search engine called over HTTP or MCP. No head-to-head benchmark was run; this page compares documented capabilities.</p>
     <p class="key-fact"><strong>Key number:</strong> XERJ reads at most 100,000 pages per PDF and runs no OCR; Recoll's OCR goes through tesseract or ABBYY FineReader. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/resources.rs">engine/crates/xerj-autoindex/src/resources.rs</a>)</span></p>
   </div>
@@ -207,7 +271,7 @@
   <p>The command takes no configuration file and no mapping.</p>
   <p>The node answers the Elasticsearch REST API. A <code class="inline">match_phrase</code> query and a filter on a keyword field work over plain HTTP. <code class="inline">xerj autoindex map</code> prints a data map of what the folder became.</p>
   <p>An agent reads that map first. It then names a real index and a real field in the query.</p>
-  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary. It serves 17 tools against a node you already started. Agent memory lives in the engine under <code class="inline">/_memory/{namespace}</code>.</p>
+  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary. It serves 22 tools against a node you already started. Agent memory lives in the engine under <code class="inline">/_memory/{namespace}</code>.</p>
   <p>XERJ is single-node. There is no replication and no failover. The index is as durable as the one host it lives on.</p>
   <p>The default embedder is lexical feature hashing, not a neural model. Neural retrieval is opt-in through <code class="inline">--embed-mode neural</code>.</p>
   <h2>Capabilities, side by side</h2>
@@ -224,7 +288,7 @@
       <tr><td>format detection</td><td>file name and MIME configuration</td><td>content sniffing per family</td></tr>
       <tr><td>helper programs on the host</td><td>many handlers are external</td><td>none, the binary parses in process</td></tr>
       <tr><td>HTTP query API</td><td>not in the core application</td><td>yes, Elasticsearch REST API</td></tr>
-      <tr><td>MCP server for an agent</td><td>not in the core application</td><td>yes, <code class="inline">xerj mcp</code>, 17 tools</td></tr>
+      <tr><td>MCP server for an agent</td><td>not in the core application</td><td>yes, <code class="inline">xerj mcp</code>, 22 tools</td></tr>
       <tr><td>catalog of refused files</td><td>index failures are reported</td><td><code class="inline">autoindex-catalog</code>, one reason per file</td></tr>
       <tr><td>agent memory in the engine</td><td>no</td><td>yes, <code class="inline">/_memory/{namespace}</code></td></tr>
     </tbody>
@@ -244,7 +308,7 @@
   <p>Choose Elasticsearch instead when the documents must live on more than one host. XERJ has no replication and no failover. XERJ speaks the same REST API on one node.</p>
   <h2>When XERJ is the better fit</h2>
   <p>Choose XERJ when the caller is a program. An agent that speaks HTTP or MCP needs no wrapper and no subprocess protocol.</p>
-  <p><code class="inline">xerj mcp</code> serves 17 tools. A coding agent can start the node itself.</p>
+  <p><code class="inline">xerj mcp</code> serves 22 tools. A coding agent can start the node itself.</p>
   <p>Choose XERJ when the folder is mixed. Format detection reads content, not the file extension. A CSV file with the wrong file extension still lands in a typed dataset.</p>
   <p>Refused files land in <code class="inline">autoindex-catalog</code> with a reason string. A missing file is explainable, not silent.</p>
   <p>Choose XERJ when the answer must carry provenance. Every document carries <code class="inline">ax_path</code>, <code class="inline">ax_file</code>, <code class="inline">ax_format</code> and four more keyword fields. A hit names its source file, so an agent can cite it.</p>
@@ -263,7 +327,7 @@
   <h3>Is Recoll enough for AI agents or do I need an API?</h3>
   <p>Recoll is enough if you write the wrapper. It answers on the command line through recollq and through a Python API, so an agent can call it through a subprocess you maintain. XERJ answers HTTP and MCP with no wrapper.</p>
   <h3>How do I search my documents folder from Claude or ChatGPT?</h3>
-  <p>Index the folder with <code class="inline">xerj autoindex</code>, then attach the folder to the agent through <code class="inline">xerj mcp</code>, a stdio MCP server that serves 17 tools against a running node.</p>
+  <p>Index the folder with <code class="inline">xerj autoindex</code>, then attach the folder to the agent through <code class="inline">xerj mcp</code>, a stdio MCP server that serves 22 tools against a running node.</p>
   <h3>Did you run a head-to-head benchmark between XERJ and Recoll?</h3>
   <p>No. No shared corpus was frozen and no recall or timing numbers were measured, so this page publishes documented capabilities and no win counts.</p>
   <h3>Which tool indexes email, mbox and attachments?</h3>

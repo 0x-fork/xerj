@@ -14,7 +14,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/agent-memory-without-postgres-qdrant</loc>
@@ -90,7 +90,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/does-xerj-support-s3-alerting-plugins</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/estimate-autoindex-time-before-running</loc>
@@ -122,11 +122,11 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/give-chatgpt-claude-local-file-access</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/how-xerj-autoindexes-a-folder</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/how-xerj-combines-search</loc>
@@ -146,7 +146,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/index-markdown-into-elasticsearch-api</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/index-monorepo-for-agent</loc>
@@ -166,7 +166,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/keep-index-current-as-files-change</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/keep-s3-bucket-index-current</loc>
@@ -178,7 +178,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/local-code-search-mcp-fewer-tokens-than-grep</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/local-embeddings-without-openai-api</loc>
@@ -258,7 +258,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/search-engine-without-docker</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/search-file-contents-in-a-folder</loc>
@@ -366,7 +366,7 @@
   </url>
   <url>
     <loc>https://xerj.org/answers/what-is-xerj</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/answers/why-autoindex-skipped-files</loc>
@@ -382,15 +382,15 @@
   </url>
   <url>
     <loc>https://xerj.org/benchmarks/elasticsearch</loc>
-    <lastmod>2026-10-22</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/blog/</loc>
-    <lastmod>2026-09-30</lastmod>
+    <lastmod>2026-10-19</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/blog/corpus-hub-v2</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-20</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/blog/cutting-the-index-28-percent</loc>
@@ -454,7 +454,7 @@
   </url>
   <url>
     <loc>https://xerj.org/compare/</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/best-grep-alternative-for-ai-coding-agents-2026</loc>
@@ -462,7 +462,7 @@
   </url>
   <url>
     <loc>https://xerj.org/compare/best-lightweight-elasticsearch-compatible-server-2026</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/best-local-full-text-search-jsonl-csv-2026</loc>
@@ -470,51 +470,51 @@
   </url>
   <url>
     <loc>https://xerj.org/compare/best-mcp-server-local-code-search-2026</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-ast-grep</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-docfetcher</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-elasticsearch-local</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-houdahspot</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-khoj</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-localsynapse</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-meilisearch</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-obsidian-omnisearch</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-pagefind</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-recoll</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-ripgrep-all</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents</loc>
@@ -522,11 +522,11 @@
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-spotlight</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-typesense</loc>
-    <lastmod>2026-10-19</lastmod>
+    <lastmod>2026-10-23</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/compare/xerj-vs-vector-database</loc>
@@ -538,7 +538,7 @@
   </url>
   <url>
     <loc>https://xerj.org/demo/</loc>
-    <lastmod>2026-10-20</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/docs/</loc>
@@ -778,38 +778,38 @@
   </url>
   <url>
     <loc>https://xerj.org/use-cases/ai-search-retrieval</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/code-security-audit</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/elasticsearch-replacement</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/operational-intelligence</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/second-brain</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/security-analytics</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/semantic-analytics</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/unified-observability</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
   <url>
     <loc>https://xerj.org/use-cases/zero-token-ai-search</loc>
-    <lastmod>2026-08-30</lastmod>
+    <lastmod>2026-10-24</lastmod>
   </url>
 </urlset>

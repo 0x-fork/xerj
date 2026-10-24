@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with a non-default data directory, store one memory, stop the node, start it again against the same directory, and report both the recalled ids and the .xerj-memory-* directory you find on disk."
 answer: "Why does the memory MCP ignore my custom storage path setting? XERJ has no memory-specific path. Agent memory is an ordinary index named .xerj-memory-{namespace} inside the node data directory, so --data-dir sets it, and the MCP server stores nothing itself. Our capture stored a memory, restarted on the same directory, and recalled it."
 key_fact: "xerj mcp exposes 2 memory tools out of 17, and both proxy to the node; neither writes a file of its own."

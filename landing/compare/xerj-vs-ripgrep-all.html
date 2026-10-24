@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/compare/xerj-vs-ripgrep-all"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Is ripgrep-all enough or do I need a real index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "ripgrep-all is enough while the folder is small and the questions are few. An index pays for itself when the same folder answers many questions, because the PDFs are parsed once instead of once per search."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What's the difference between rga and a local search engine?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "rga converts each file and matches a regular expression over the text. A search engine parses the folder once into typed documents, then ranks and filters them, and answers over an API."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search SQLite and PDFs without building an index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run rga with its sqlite and poppler adapters. Install poppler-utils and pandoc first, because rga calls those programs for the conversion."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Did you run a head-to-head benchmark between XERJ and ripgrep-all?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. No shared corpus was frozen and no hit counts or timings were measured, so this page publishes documented capabilities and no win counts."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which tool searches inside zip and tar archives?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "ripgrep-all. It descends into zip, tar and compressed files up to a default depth. XERJ has no archive handler and never opens a zip or a tar. A single gzipped file is the exception: autoindex decompresses .gz on every parsed family."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can ripgrep-all read image-only PDFs?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not with the shipped adapters. Its config file accepts custom subprocess adapters, so an OCR program can be added by hand. XERJ has no OCR at all."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,9 +220,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>HOW DO I GREP PDFS AND WORD DOCS FROM THE COMMAND LINE?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: DESKTOP SEARCH</span></div>
   <h1>How do I grep PDFs and Word docs from the command line?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>How do I grep PDFs and Word docs from the command line? For one question today, ripgrep-all: it converts PDFs and Office files as it goes, walks into archives, and needs no daemon or index. For an agent asking many questions, XERJ indexes the folder once. No head-to-head benchmark was run.</p>
     <p class="key-fact"><strong>Key number:</strong> ripgrep-all has 9,883 GitHub stars and its latest release is v0.10.10 (2025-11-09). <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/phiresky/ripgrep-all">github.com/phiresky/ripgrep-all</a>)</span></p>
   </div>
@@ -219,7 +283,7 @@
   <p>XERJ is a single Rust binary that runs one search node. <code class="inline">xerj autoindex &lt;folder&gt;</code> reads the folder and detects each file family by content. It infers a dataset per file shape and writes the documents.</p>
   <p>The command takes no configuration file and no mapping. It also needs no helper program on the host, because the binary parses the formats in process.</p>
   <p>The node answers the Elasticsearch REST API. <code class="inline">xerj autoindex map</code> prints a data map of what the folder became. An agent reads that map, then names a real index and a real field.</p>
-  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary. It serves 17 tools against a node you already started. Agent memory lives in the engine under <code class="inline">/_memory/{namespace}</code>.</p>
+  <p><code class="inline">xerj mcp</code> is a stdio MCP server in the same binary. It serves 22 tools against a node you already started. Agent memory lives in the engine under <code class="inline">/_memory/{namespace}</code>.</p>
   <p>XERJ is single-node. There is no replication and no failover. The default embedder is lexical feature hashing, not a neural model, and neural retrieval is opt-in through <code class="inline">--embed-mode neural</code>.</p>
   <h2>Capabilities, side by side</h2>
   <p>Every row is a documented capability of each tool. No row is a measured result.</p>
@@ -238,7 +302,7 @@
       <tr><td>ranking of results</td><td>none, matches in file order</td><td>BM25 over the extracted text</td></tr>
       <tr><td>filter by file family or path</td><td>shell globs and ripgrep flags</td><td>keyword fields, <code class="inline">ax_format</code> and <code class="inline">ax_path</code></td></tr>
       <tr><td>HTTP query API</td><td>none</td><td>yes, Elasticsearch REST API</td></tr>
-      <tr><td>MCP server for an agent</td><td>none</td><td>yes, <code class="inline">xerj mcp</code>, 17 tools</td></tr>
+      <tr><td>MCP server for an agent</td><td>none</td><td>yes, <code class="inline">xerj mcp</code>, 22 tools</td></tr>
       <tr><td>catalog of refused files</td><td>messages on standard error</td><td><code class="inline">autoindex-catalog</code>, one reason per file</td></tr>
       <tr><td>agent memory in the engine</td><td>none</td><td>yes, <code class="inline">/_memory/{namespace}</code></td></tr>
     </tbody>
@@ -258,7 +322,7 @@
   <p>Choose Elasticsearch instead when the documents must live on more than one host. XERJ has no replication and no failover. XERJ speaks the same REST API on one node.</p>
   <h2>When XERJ is the better fit</h2>
   <p>Choose XERJ when the same folder answers many questions. The parse happens once, and every later query reads the index rather than the PDFs.</p>
-  <p>Choose XERJ when the caller is a program. An agent that speaks HTTP or MCP needs no wrapper and no output parser. <code class="inline">xerj mcp</code> serves 17 tools.</p>
+  <p>Choose XERJ when the caller is a program. An agent that speaks HTTP or MCP needs no wrapper and no output parser. <code class="inline">xerj mcp</code> serves 22 tools.</p>
   <p>Choose XERJ when the order of the answers matters. rga returns every match in file order. BM25 puts the best documents first.</p>
   <p>Choose XERJ when the answer must carry provenance. Every document carries <code class="inline">ax_path</code>, <code class="inline">ax_file</code>, <code class="inline">ax_format</code> and four more keyword fields, so an agent can cite the source file.</p>
   <p>Choose XERJ when a refused file must be explainable. Files that XERJ does not parse land in <code class="inline">autoindex-catalog</code> with a reason string, rather than passing in silence.</p>

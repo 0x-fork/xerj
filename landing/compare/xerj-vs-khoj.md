@@ -2,13 +2,13 @@
 ---
 title: "XERJ vs Khoj for searching your own documents"
 canonical: "https://xerj.org/compare/xerj-vs-khoj"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/compare/xerj-vs-khoj.md"
 ---
 
 # What's a simpler alternative to Khoj if I only need search and memory?
 
-**Short answer** (updated 2026-10-19): What's a simpler alternative to Khoj if I only need search and memory? XERJ: the search and memory engine that sits under an agent you already run. Khoj is a whole application with chat, custom agents, scheduled research, voice, image generation and clients from Obsidian to WhatsApp. No head-to-head was run.
+**Short answer** (updated 2026-10-23): What's a simpler alternative to Khoj if I only need search and memory? XERJ: the search and memory engine that sits under an agent you already run. Khoj is a whole application with chat, custom agents, scheduled research, voice, image generation and clients from Obsidian to WhatsApp. No head-to-head was run.
 
 **Key number:** Khoj has 37,752 GitHub stars, is AGPL-3.0, and its latest release is 2.0.0-beta.28 (2026-03-26). (as of 2026-10-19; source: [github.com/khoj-ai/khoj](https://github.com/khoj-ai/khoj))
 
@@ -40,7 +40,7 @@ xerj autoindex ./my-docs --prefix docs --state-dir ./state-docs
 
 ### Command 3
 
-Note: Attach the running node to the agent you already run. This stdio MCP server serves 17 tools and starts no node of its own.
+Note: Attach the running node to the agent you already run. This stdio MCP server serves 22 tools and starts no node of its own.
 
 ```sh
 xerj mcp --url http://127.0.0.1:9200
@@ -95,7 +95,7 @@ Read that plainly: on the shipped default, Khoj's retrieval understands a paraph
 
 Khoj can connect to a Model Context Protocol server built by somebody else, which makes it a client of that ecosystem. Its documentation does not describe Khoj exposing an MCP server of its own, and it does expose an HTTP API with key or bearer authentication for third-party applications.
 
-XERJ sits on the other side of that line. `xerj mcp` is a stdio MCP server in the same binary, serving 17 tools, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
+XERJ sits on the other side of that line. `xerj mcp` is a stdio MCP server in the same binary, serving 22 tools, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
 
 ## The limits you inherit with XERJ
 

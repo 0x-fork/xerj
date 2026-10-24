@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-22",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/audit-php-codebase-with-an-index"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I search a large PHP repo for dangerous sinks without reading every file?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Compile the shape you are hunting into indexed facts, then query for the shape. The published audit filtered on a request source, a SQL sink and no sanitizer in one function, and got 4 functions back out of 11,990."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What's a cheaper way than loading WordPress core into context?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Do not load it. The published accounting is about 26,000 tokens for the whole audit against an estimated 5,200,000 to read the code once, because the index decides what is worth reading."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can an agent audit a codebase from an index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It can triage from an index. It still has to read the survivors, and the published limitations say so: XERJ stores and queries the candidates, and the AST model is what produces them."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I audit a PHP codebase with an index instead of grepping 1,400 files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index once, query the bug shape, read only the survivors. Real WordPress core is 1,492 PHP files, and the published run indexed it as queryable facts in about 3.6 s."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Did the audit find a WordPress 0-day?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No, and that is the published result. Core came back hardened: 0 missing-capability IDOR across 226 handlers and 0 auto-triggered deserialization gadgets. The clean negative is the finding."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "So what was the one real weakness?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "wp_http_validate_url does not block 169.254.169.254, the cloud-metadata address, and it is reachable unauthenticated through pingback_ping. The write-up states it as a known-class limitation core punts to a filter, not a novel 0-day."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why can't grep express this?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Grep is file-scoped. 'A request source and a SQL sink in the same function with no sanitizer between them' is not a literal string, so grep answers with 51 whole files where the indexed query answers with 4 functions."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Where does grep still win?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On recall. Grep's literal recall is perfect and the model's is not: a source at file scope, or laundered through $GLOBALS, is invisible to the extracted facts. The trade is recall for precision and tokens, and the counter-examples are published."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

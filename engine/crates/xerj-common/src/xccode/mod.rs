@@ -542,6 +542,8 @@ pub fn run_code_query(
     //    that shrank says so in the note, naming only the caps that fired.
     // #1504: translation catalogs and minified bundles repeat every UI phrase
     // and win natural-language queries. They stay searchable, behind source.
+    let mut hits = hits;
+    render::demote_sparse_definition_hits(&mut hits, &query);
     let hits = demote_catalog_noise(hits);
     let (hits, file_dropped, index_dropped) = diversify(hits, params.k);
     if file_dropped > 0 || index_dropped > 0 {
@@ -608,6 +610,9 @@ pub fn run_code_query(
     //    re-derived at query time, never from prose.
     let licences = manifest::licence_map(root, &corpus);
     let checkout = root.join("corpora").join(&corpus);
+    // #2339: first-party marker lives on corpus.json, beside the licence
+    // record. It does not change the licence string the header prints.
+    let own = manifest::corpus_is_own(root, &corpus);
 
     let text = render::render(
         &hits,
@@ -624,6 +629,7 @@ pub fn run_code_query(
             lexical_lines: params.mode == Mode::Bm25
                 || note.as_deref().is_some_and(|n| n.starts_with("BM25 only")),
             checkout: Some(&checkout),
+            own,
         },
         note.as_deref(),
     );
@@ -849,14 +855,16 @@ pub(crate) fn bm25_body(query: &str, k: usize, lang: &Option<String>, fields: &[
     if let Some(lg) = lang {
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "size": k,
         "query": { "bool": { "must": must } },
         // Response-only. `_passage.ordinal` is the 0-based line of a lexical
         // window (#174). It is not a highlight block, which changes ranking
         // (#177). The scored fast path does not serve text `multi_match`.
         "fields": ["_passage"]
-    })
+    });
+    attach_coverage_clauses(&mut body, query, fields);
+    body
 }
 
 /// #1237: second BM25 leg over symbol-record `impl` fields. Excludes `impl`
@@ -870,11 +878,29 @@ pub(crate) fn symbol_bm25_body(query: &str, k: usize, lang: &Option<String>) -> 
     if let Some(lg) = lang {
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
-    serde_json::json!({
+    let fields = vec!["impl".to_string()];
+    let mut body = serde_json::json!({
         "size": k,
         "_source": { "excludes": ["impl", "body"] },
         "query": { "bool": { "must": must } }
-    })
+    });
+    attach_coverage_clauses(&mut body, query, &fields);
+    body
+}
+
+/// `should` coverage clauses for a multi-term question (#2327). A one-token
+/// lookup leaves the body untouched, so the measured BM25 shape stays.
+fn attach_coverage_clauses(body: &mut Value, query: &str, fields: &[String]) {
+    let clauses = crate::code_query::coverage_match_clauses(query, fields);
+    if clauses.is_empty() {
+        return;
+    }
+    if let Some(obj) = body
+        .pointer_mut("/query/bool")
+        .and_then(Value::as_object_mut)
+    {
+        obj.insert("should".into(), Value::Array(clauses));
+    }
 }
 
 fn hit_file_key(hit: &Value) -> Option<String> {
@@ -1451,6 +1477,77 @@ mod tests {
         assert!(out
             .text
             .contains("!! AGPL: adapt the APPROACH, do not copy the code"));
+    }
+
+    /// #2339: the CLI pipeline (`xerj code` calls this) and the MCP tool share
+    /// this function. An own corpus keeps the unidentified licence in the
+    /// header and drops the banner. The same corpus without the marker, and
+    /// a named restricted licence, still warn.
+    #[test]
+    fn own_corpus_query_omits_the_unidentified_banner_and_keeps_the_licence() {
+        let root = root_with_state();
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"own\":true,\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(out.text.contains(", UNKNOWN)"), "{text}", text = out.text);
+        assert!(out.text.contains("void addReplyNull"), "{}", out.text);
+        assert!(!out.text.contains("!!"), "{}", out.text);
+        assert!(!out.text.contains("do not copy"), "{}", out.text);
+
+        let mut strict = CodeParams::new("kv", "q");
+        strict.strict_licence = true;
+        let out = run_code_query(&root, &FakeHttp::new(), "u", &strict, "`--stale-ok`");
+        assert!(out.text.contains("void addReplyNull"), "{}", out.text);
+        assert!(!out.text.contains("!!"), "{}", out.text);
+
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert!(
+            out.text
+                .contains("!! UNKNOWN: adapt the APPROACH, do not copy the code"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains(", UNKNOWN)"), "{}", out.text);
+
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"own\":true,\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"AGPL\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert!(
+            out.text
+                .contains("!! AGPL: adapt the APPROACH, do not copy the code"),
+            "own does not silence a detected AGPL: {}",
+            out.text
+        );
     }
 
     #[test]

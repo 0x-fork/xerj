@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, unzip a Slack export so that channels.json sits beside one folder per channel, run `xerj autoindex ./slack-export --url http://127.0.0.1:9200 --prefix sl --progress plain`, then POST a match_phrase on text for a string written inside a threaded reply, GET the mapping for one channel index, and report the hit ax_path, ax_locator, ts, thread_ts and user for every hit."
 answer: "How do I search a Slack or Discord JSON export? Unzip the export to local disk and run xerj autoindex on the folder. In a captured run, a phrase inside a threaded reply returned 2 hits at incidents/2026-01-15.json with ax_locator e1, and the ts, thread_ts and user values all survived, as did Japanese text."
 key_fact: "Records keep up to 512 fields each (`MAX_FIELDS_PER_RECORD`), so nested Slack message fields map without a schema."

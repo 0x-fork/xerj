@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj autoindex with --dry-run against the folder, capture the ignore-rule lines from stderr, then query the autoindex-catalog index for doc_kind file and report the status and reason of every file."
 answer: "Why would a folder search miss files that I can see on disk? XERJ prints one line per ignore rule with an exact file count, and stores a refusal reason for every file it opened. A capture over 26 files on disk indexed 1, refused 2 with named reasons, excluded 23 through ignore rules, and exited 3."
 key_fact: "The captured run reconciled 26 files on disk as 1 indexed, 2 refused and 23 excluded."

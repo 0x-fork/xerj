@@ -1,16 +1,17 @@
 ---
 title: "MCP server to search local files from ChatGPT or Claude"
 h1: "Can ChatGPT search a folder on my laptop, or do I need something else?"
-description: "xerj mcp is a stdio MCP server that proxies 17 tools to a running XERJ node, so ChatGPT, Claude or Cursor search an indexed local folder instead of opening files."
+description: "xerj mcp is a stdio MCP server that proxies 22 tools to a running XERJ node, so ChatGPT, Claude or Cursor search an indexed local folder instead of opening files."
 slug: "give-chatgpt-claude-local-file-access"
 cluster: "Agent access and memory"
 question: "Can ChatGPT search a folder on my laptop, or do I need something else?"
 intent: "how-to"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-23"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with --insecure, index a local folder with xerj autoindex --prefix mcpdocs, add xerj mcp to your MCP host config with the absolute binary path and XERJ_URL, then call tools/list and one xerj_search over mcpdocs-* and report the ax_path of every hit instead of opening a file."
 answer: "Can ChatGPT or Claude search a folder on my laptop, or do I need something else? You need a local MCP server. Install XERJ, start a node, index the folder with xerj autoindex, and point the agent host at xerj mcp with an absolute path. One xerj_search call then reads the indexed local files."
 key_fact: "A live `tools/list` from xerj v1.0.0-rc.97 returned 17 tools, each with an inputSchema."
@@ -61,7 +62,7 @@ The command does not start a node. Start one first, otherwise every tool call fa
 
 ```text
 Speaks MCP over stdio (newline-delimited JSON-RPC 2.0 on stdin/stdout) and
-proxies 17 tools — xerj_search, xerj_semantic_search, ... xerj_hub_ask — to a
+proxies 22 tools — xerj_def, xerj_batch_search, ... xerj_hub_ask — to a
 XERJ node that
 is ALREADY RUNNING. This command does not start a node; start one first with
 `xerj --insecure --data-dir ~/xerj-data`.
@@ -115,9 +116,9 @@ The agent host opens with `initialize`. XERJ echoes the protocol version, names 
 
 The server also returns an `instructions` string that tells the agent which tool to reach for. Diagnostics go to stderr, so stdout carries only the JSON-RPC stream.
 
-## Seventeen tools, with their required arguments
+## The tools, with their required arguments
 
-A live `tools/list` from v1.0.0-rc.97 (2026-10-19) returned 17 tools, and all 17 carried an `inputSchema`. The first capture for this page, in August 2026, returned 10.
+A live `tools/list` from v1.0.0-rc.97 (2026-10-19) returned 17 tools, and all 17 carried an `inputSchema`. The first capture for this page, in August 2026, returned 10. On main the list has 22, and `mcp-tools.json` carries every schema.
 
 | tool | required arguments |
 | --- | --- |
@@ -178,7 +179,7 @@ A call against a missing index passes the node's own 404 `index_not_found_except
 
 ## The published tool schemas are stale
 
-The binary serves 17 tools. The published `openai-tools.json` and `anthropic-tools.json` still list 6 (checked 2026-10-19), so 11 are missing: the 4 `xerj_brain_*` tools, `xerj_map`, `xerj_code_search`, `xerj_plan`, `xerj_field_report` and the 3 `xerj_hub_*` tools. The MCP schema at `/docs/agents/schemas/mcp-tools.json` is generated from a live `tools/list` and lists all 17.
+On main the binary serves 22 tools. The published `openai-tools.json` and `anthropic-tools.json` still list 6 (checked 2026-10-23), so 16 are missing: `xerj_def`, `xerj_batch_search`, the 4 `xerj_brain_*` tools, `xerj_map`, `xerj_index_budget`, `xerj_autoindex_remove`, `xerj_code_search`, `xerj_plan`, `xerj_field_report`, `xerj_corpus_feedback` and the 3 `xerj_hub_*` tools. The MCP schema at `/docs/agents/schemas/mcp-tools.json` lists all 22, and a test keeps it in step with the server source.
 
 That is a documentation defect, confirmed against the source that generates the tool list. If you wire either vendor schema into an agent by hand, add the missing tools yourself or read `tools/list` from a live server instead.
 

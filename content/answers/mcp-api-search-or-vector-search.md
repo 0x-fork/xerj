@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index a small labeled corpus into one XERJ index with a semantic_text field, then ask the same question through xerj_search, xerj_semantic_search, xerj_vector_search and xerj_hybrid_search over MCP, print the returned ids side by side, and say which tool you would call by default and why."
 answer: "Which should an agent call, MCP or API search, or vector search? Start with xerj_search, because XERJ's default embedder is lexical feature hashing. In our MCP capture the same question through 4 XERJ tools returned 3 different result sets, and the fused xerj_hybrid_search call returned 6 documents against 4, 3 and 3 for the single-signal tools."
 key_fact: "Four of the 17 XERJ MCP tools retrieve: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search` and `xerj_hybrid_search`."

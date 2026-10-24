@@ -205,6 +205,9 @@ pub struct RemoveCfg {
     pub json: bool,
     pub quiet: bool,
     pub xerj_url_note: Option<String>,
+    /// When set, `remove` also deletes `journal.ndjson` here. The default
+    /// journal for the selected folder is deleted either way.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `xerj autoindex s3://bucket/prefix --watch`: poll a bucket and emit a change
@@ -275,12 +278,13 @@ const FRESH_HELP: &str =
     "ignore an existing resume journal and restart, rebuild the plan in place\n\
      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(ids stay idempotent for unchanged bytes). A file republished\n\
      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20under a new content key drops the documents previously published for that path.\n\
-     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20It does not remove documents for a file that disappeared, and is refused on a\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20It removes documents for a file that disappeared. It is refused on a\n\
      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20durable corpus generation — see RESUME POLICY";
 const RESUME_POLICY_HELP: &str =
     "generated --no-graph journals reconcile add, change, delete, rename, and no-op runs; \
 a --no-graph state directory written before the generation format must be rebuilt into a new \
---state-dir and --prefix; graph-enabled journals keep the existing crash-resume behaviour";
+--state-dir and --prefix; graph-enabled journals reconcile added files that fit a frozen \
+dataset, delete documents for files that disappeared, and keep crash-resume of an interrupted run";
 
 pub fn print_help() {
     println!("{}", help_text());
@@ -350,7 +354,10 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Prints those folders and continues. Without\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20this flag that run is refused and nothing\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20is written. --dry-run does not bypass it\n\
-         \x20\x20\x20\x20--state-dir <PATH>   resume journal location (default ~/.xerj/autoindex/<hash>/);\n\
+         \x20\x20\x20\x20--state-dir <PATH>   resume journal location (default ~/.xerj/autoindex/<hash>/).\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20On `autoindex remove`, also deletes journal.ndjson in\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20this directory after the folder's indices are removed;\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20the default journal is deleted either way.\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20for an s3:// source this is also where the local\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20object mirror lives, so point it at a disk with room\n\
          \x20\x20\x20\x20--endpoint-url <URL> S3-compatible endpoint for an s3:// source (MinIO,\n\
@@ -407,12 +414,13 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20--no-graph           skip relationship detection (wikilinks, local links,\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20section order, directory chains) — no edges are written\n\
          \x20\x20\x20\x20--watch              index once, then stay resident and reindex what changes.\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Needs --no-graph: the graph route refuses an ADDED file\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(exit 3, skipped until --fresh) and ABORTS on a deletion\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(exit 1, and every later re-run aborts too). It does\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20reindex a MODIFIED file. One OS watch per indexed\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20directory, no polling; respects the same ignore rules as\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20a re-run. docs/LIVE_REINDEXING.md has the measurements.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Needs --no-graph. A graph-path rerun sweeps a deleted\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20file (exit 3, files-removed) and indexes an added file\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20that fits a frozen dataset. A file that needs a new\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20dataset still stops (exit 3, stale-resume-plan) until\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20--fresh. One OS watch per indexed directory, no polling;\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20respects the same ignore rules as a re-run.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20docs/LIVE_REINDEXING.md has the measurements.\n\
          \x20\x20\x20\x20--debounce <MS>      --watch quiet period before a pass (default 400, max\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x2060000). One editor save is several filesystem events.\n\
          \x20\x20\x20\x20--max-minutes <N>    stop and ask before indexing if phase A's MEASURED estimate\n\
@@ -549,8 +557,10 @@ pub fn help_text_with(feedback: bool) -> String {
          \n\
          PDF EXTRACTION:\n\
          \x20\x20\x20\x20Each PDF uses a fresh process. Limits: 512 MiB input, 32 MiB worker output,\n\
-         \x20\x20\x20\x20100,000 pages, and 1.5 GiB address space on Unix. This is crash/resource\n\
-         \x20\x20\x20\x20isolation, not a security sandbox; non-Unix platforms have no OS memory cap.\n\
+         \x20\x20\x20\x20100,000 pages, and a 1.5 GiB address-space cap on Unix where the OS accepts\n\
+         \x20\x20\x20\x20RLIMIT_AS. If the OS refuses that cap (EINVAL or EPERM, as on macOS 27), the\n\
+         \x20\x20\x20\x20refusal is logged once and the worker still starts. The cap is crash isolation,\n\
+         \x20\x20\x20\x20not a security sandbox; non-Unix platforms have no OS memory cap.\n\
          \x20\x20\x20\x20Image-only pages need OCR. Page parse failures reject the whole PDF instead\n\
          \x20\x20\x20\x20of silently creating a partial index. XERJ_PDF_WORKER_BIN is a trusted,\n\
          \x20\x20\x20\x20developer-only executable override.\n\
@@ -565,7 +575,9 @@ pub fn help_text_with(feedback: bool) -> String {
          \n\
          INCREMENTAL RECONCILIATION:\n\
          \x20\x20\x20\x20Generated journals with --no-graph reconcile added, removed, moved, and changed\n\
-         \x20\x20\x20\x20files. Legacy journals and graph-enabled generations remain fail-closed. Each\n\
+         \x20\x20\x20\x20files. Graph-enabled journals absorb an added file that fits a frozen dataset,\n\
+         \x20\x20\x20\x20delete documents for a file that disappeared, and leave a file that needs a new\n\
+         \x20\x20\x20\x20dataset unindexed until --fresh rebuilds the plan. Each\n\
          \x20\x20\x20\x20changed generation currently copies and prepares the full corpus (O(N)); the\n\
          \x20\x20\x20\x20latest full snapshot remains retained, and cleanup re-reads protected artifacts\n\
          \x20\x20\x20\x20to verify them. --snapshot-max-gb limits logical staged payload bytes before each\n\
@@ -775,6 +787,11 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20`skipped_appeared` names them. Re-run with --fresh to\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20rebuild the plan in place and include them. Read `reason`\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20to tell this apart from completed-with-junk;\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20or files-removed — a graph-path rerun deleted documents,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20catalog rows and edges for files that left the folder.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20The index matches the folder; the next unchanged rerun is\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20exit 0. Read `reason` to tell this apart from\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20completed-with-junk;\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x204 NEEDS A DECISION — the estimate exceeded --max-minutes, the\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20estimated index does not fit the disk budget, a reduced\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20plan would delete files that are already indexed, or a\n\
@@ -783,8 +800,11 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20that does not fit is not started, including with --yes.\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Already-indexed files are not deleted unless --drop-indexed\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20is also set;\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x202 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20refused unsafe state transition\n",
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x202 usage; 1 endpoint/journal failure, a refused corpus removal, a\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20refused unsafe state transition, or pdf-worker-unavailable — every PDF\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20failed because the isolated parser could not start. Other files may\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20already be indexed. Read `reason` on the xerj-done line; the summary\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20on stdout opens with `not ok:`\n",
         feedback_block = xerj_common::feedback::block(feedback),
         default_poll = crate::objwatch::cost::DEFAULT_POLL_INTERVAL_SECS,
         default_budget = crate::objwatch::cost::DEFAULT_MAX_MONTHLY_CLASS_A,
@@ -1534,16 +1554,14 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         if !no_graph {
             return Err(
                 "--watch needs --no-graph today, and that is a real limitation rather than a \
-                 formality: reconciling an ADDED or DELETED file exists only on the --no-graph \
-                 (generated) route. On the default graph path a re-run resumes a frozen plan, \
-                 so a file created after that plan was frozen is reported as 'appeared after \
-                 the resume plan was frozen' and is NOT indexed until the corpus is rebuilt \
-                 with --fresh, and a file deleted from the folder ABORTS the run — and every \
-                 re-run after it — because its documents are still live in the destination. \
-                 (A file whose CONTENT changed is reconciled there; additions and deletions \
-                 are what a watcher on that route could not keep current.) Re-run as `xerj \
-                 autoindex <folder> --watch --no-graph` (relationship detection off), or keep \
-                 rebuilding a graph corpus with `xerj autoindex <folder> --fresh`"
+                 formality: the watcher re-runs the generated route, which reconciles added, \
+                 changed, renamed and deleted files against a committed generation, including \
+                 a file that would be a new dataset. The default graph path sweeps a deleted \
+                 file and indexes an added file that fits a frozen dataset, but a file that \
+                 needs a new dataset still stops with reason=stale-resume-plan until --fresh, \
+                 and this watcher is not built on that route. Re-run as `xerj autoindex \
+                 <folder> --watch --no-graph` (relationship detection off), or keep rebuilding \
+                 a graph corpus with `xerj autoindex <folder> --fresh`"
                     .into(),
             );
         }
@@ -1819,6 +1837,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 json,
                 quiet,
                 xerj_url_note,
+                state_dir: state_dir.clone(),
             },
             prefix_explicit,
             approve_set: approve.is_some(),
@@ -1826,7 +1845,6 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             reject: RemoveReject {
                 dry_run,
                 replace_prefix,
-                state_dir: state_dir.is_some(),
                 fresh,
                 workers: workers.is_some(),
                 pdf_workers: pdf_workers.is_some(),
@@ -2049,7 +2067,6 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
 struct RemoveReject {
     dry_run: bool,
     replace_prefix: bool,
-    state_dir: bool,
     fresh: bool,
     workers: bool,
     pdf_workers: bool,
@@ -2108,14 +2125,6 @@ fn remove_cmd(input: RemoveParse) -> Result<Cmd, String> {
         return Err(
             "--approve is the indexing decision gate. `autoindex remove` confirms with --yes, \
              after it has printed what it will delete."
-                .into(),
-        );
-    }
-    if reject.state_dir {
-        return Err(
-            "--state-dir is the local resume journal. `autoindex remove` does not read or delete \
-             it. The journal key includes the folder, so a later index of that folder still \
-             resumes from it. Drop --state-dir."
                 .into(),
         );
     }
@@ -2533,14 +2542,12 @@ mod tests {
         parse(args.iter().map(|s| s.to_string()).collect()).expect_err("must be refused")
     }
 
-    /// The `--watch` refusal must name the limitation it actually has. Measured
-    /// on the graph route against a 10,000-file corpus
-    /// (`docs/measurements/autoindex-watch-2026-09-19.md`, section 4): a re-run
-    /// after a file's CONTENT changed indexes it (3.07 s, `files=1`, searchable),
-    /// a re-run after an ADDITION skips the file with exit 3, and a re-run after a
-    /// DELETION aborts with exit 1 and keeps aborting. The message used to claim
-    /// the opposite about a changed file, which came from a measurement whose
-    /// shell append had created a new file rather than modifying one.
+    /// The `--watch` refusal must name the limitation it actually has.
+    /// The watcher is the generated route. On the default graph path a deleted
+    /// file is swept and an added file that fits a frozen dataset is indexed;
+    /// a file that needs a new dataset still waits for `--fresh`. The message
+    /// used to claim a content change was lost, which came from a measurement
+    /// whose shell append had created a new file rather than modifying one.
     #[test]
     fn the_watch_refusal_names_additions_and_deletions_not_content_changes() {
         let text = err(&["data", "--watch"]);
@@ -2549,12 +2556,16 @@ mod tests {
             "the message must name the flag that makes it work: {text}"
         );
         assert!(
-            text.contains("ADDED") && text.contains("DELETED"),
-            "the message must say which changes the graph route cannot reconcile: {text}"
+            text.contains("sweeps a deleted") && text.contains("fits a frozen dataset"),
+            "the message must say what the graph path does with a deletion and an addition: {text}"
         );
         assert!(
-            text.contains("CONTENT changed is reconciled"),
-            "the message must not leave the operator thinking an edit is lost too: {text}"
+            text.contains("stale-resume-plan"),
+            "a new dataset still waits for --fresh: {text}"
+        );
+        assert!(
+            !text.contains("ABORTS the run"),
+            "a deletion is swept, not aborted: {text}"
         );
         assert!(
             !text.contains("a file whose content changed is reported"),
@@ -2756,7 +2767,7 @@ mod tests {
         assert!(help.contains("ignore an existing resume journal and restart"));
         assert!(help.contains("durable corpus generation"));
         assert!(help.contains("drops the documents previously published for that path"));
-        assert!(help.contains("does not remove documents for a file that disappeared"));
+        assert!(help.contains("removes documents for a file that disappeared"));
     }
 
     #[test]
@@ -2766,7 +2777,7 @@ mod tests {
             "generated --no-graph journals",
             "add, change, delete, rename, and no-op",
             "written before the generation format must be rebuilt",
-            "graph-enabled journals keep the existing crash-resume behaviour",
+            "graph-enabled journals reconcile added files that fit a frozen",
         ] {
             assert!(help.contains(claim), "missing resume-policy claim: {claim}");
         }
@@ -2995,8 +3006,28 @@ mod tests {
         let walk = err(&["remove", "--prefix", "proj", "--walk-only"]);
         assert!(walk.contains("--walk-only"), "{walk}");
         assert!(walk.contains("not `autoindex remove`"), "{walk}");
-        let journal = err(&["remove", "--prefix", "proj", "--state-dir", "/tmp/j"]);
-        assert!(journal.contains("resume journal"), "{journal}");
+        let cfg = match parse(
+            [
+                "remove",
+                "--prefix",
+                "proj",
+                "--state-dir",
+                "/tmp/j",
+                "--yes",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .unwrap()
+        {
+            Cmd::Remove(cfg) => cfg,
+            other => panic!("expected remove, got {other:?}"),
+        };
+        assert_eq!(
+            cfg.state_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/j"))
+        );
         assert!(err(&["data", "--root", "/tmp/a"]).contains("only supported with"));
         assert!(err(&["remove", "--prefix", "proj", "--approve", "proceed"]).contains("--yes"));
         assert!(super::help_text().contains("autoindex remove"));
@@ -3107,9 +3138,9 @@ mod tests {
         }
     }
 
-    /// The graph route DOES reindex a modified file; what it cannot do is an
-    /// add or a delete. The help asserted the retracted version for as long as
-    /// the docs did, and pointed at a help section that does not exist.
+    /// The graph route sweeps a deletion and indexes an addition that fits a
+    /// frozen dataset. The help used to say a deletion aborts, and pointed at
+    /// a help section that does not exist.
     #[test]
     fn the_watch_help_does_not_repeat_the_retracted_graph_claim() {
         let help = super::help_text();
@@ -3117,7 +3148,11 @@ mod tests {
             !help.contains("only that route reindexes"),
             "the --watch help repeats the retracted claim about the graph route"
         );
-        for expected in ["refuses an ADDED file", "ABORTS on a deletion"] {
+        assert!(
+            !help.contains("ABORTS on a deletion"),
+            "the --watch help still says a deletion aborts"
+        );
+        for expected in ["sweeps a deleted", "files-removed", "stale-resume-plan"] {
             assert!(
                 help.contains(expected),
                 "--watch help is missing {expected:?}"

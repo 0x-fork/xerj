@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/search-unity-project-assets"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I search a Unity project's assets?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the project folder. XERJ detects .unity scenes and .meta files as their own families and extracts typed fields from both."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search Unity scenes and the C# in the same project?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run one autoindex over the project root. Scene and .meta files get the Unity families and .cs files are parsed as source code, so both land under one index prefix."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Unity YAML is unreadable. How do I search it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The scene is split into one index per Unity class with typed fields instead of raw YAML. A term on m_Name matched QuokkaSpawner and returned unity_class, unity_class_id, file_id and m_TagString."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I find every prefab that references a script?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XERJ indexes the guid field on the .meta document, and it does not resolve a GUID reference to the asset it names. Our capture joined an asset to its own .meta record by path and did not verify a prefab-to-script lookup."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What indices does a Unity scene create?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "One per Unity class in the scene. Our 1-scene fixture created unity-assets-scenes-gameobject and unity-assets-scenes-occlusioncullingsettings."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I join an asset to its .meta file?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. The .meta document carries asset_path, and the asset document carries the same value in ax_path. One bool should query returns both."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does the unity family produce a body field?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The scene indices carry typed Unity fields such as m_Name and unity_class, so a match query on body returns 0 hits against them."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

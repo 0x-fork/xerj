@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index this repository with xerj autoindex --prefix mcpcode, add xerj mcp to your MCP host with the absolute binary path, then answer 'where is merge_segments defined' with one xerj_search call on the defs field and quote the file and line from the symbols array without opening the file."
 answer: "How do I make my agent find a passage and cite the file, not dump the whole tree? Index the repository with xerj autoindex, register xerj mcp in the agent host, and query the defs field. One captured xerj_search call returned 2 documents whose symbols arrays gave file and line, including merge_segments at src/lib.rs line 17."
 key_fact: "XERJ's tree-sitter registry covers 36 languages, a count pinned by a unit test so the docs cannot drift."

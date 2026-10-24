@@ -225,6 +225,59 @@ pub enum ShardOp {
         #[serde(default)]
         shard: u32,
     },
+    /// Partial or scripted update. The primary applies it, then copies the
+    /// stored document onto the in-sync replicas the same way an index does.
+    ///
+    /// `index` is the name the caller used. An alias is resolved on the
+    /// primary before the write is placed.
+    UpdateDoc {
+        index: String,
+        id: String,
+        /// JSON update body (`doc`, `upsert`, `doc_as_upsert`, `script`).
+        body_json: String,
+        /// JSON update query params (`refresh`, `_source`, includes, excludes).
+        params_json: String,
+    },
+    /// A bulk body whose actions belong to shards this node owns.
+    ///
+    /// The coordinating node assigns missing ids and groups actions by
+    /// primary. This node runs the local bulk pipeline, then copies each
+    /// successful index, create, update, and delete onto the in-sync replicas.
+    Bulk {
+        /// NDJSON. Action lines name `_index` and `_id`.
+        body: String,
+        default_index: Option<String>,
+        require_alias: Option<bool>,
+        default_pipeline: Option<String>,
+        /// JSON value of the URL-level `_source` filter, when one was set.
+        default_source_req_json: Option<String>,
+    },
+    /// Run `_update_by_query` on this primary's shard only.
+    ///
+    /// The coordinating node sends one of these to every primary. This node
+    /// updates documents in its user index and copies each updated document
+    /// onto the in-sync replicas. `check_only` confirms the index is open and
+    /// the pipeline can run, and writes nothing.
+    UpdateByQuery {
+        index: String,
+        /// JSON query object. Already combined with any alias filter.
+        query_json: String,
+        /// Painless source. Absent when the request has no script.
+        #[serde(default)]
+        script_source: Option<String>,
+        /// JSON script params. Absent when there is no script.
+        #[serde(default)]
+        script_params_json: Option<String>,
+        /// Ingest pipeline name. The primary runs it; pipelines are not
+        /// replicated with the index.
+        #[serde(default)]
+        pipeline: Option<String>,
+        #[serde(default)]
+        max_docs: Option<u64>,
+        scroll_size: u64,
+        #[serde(default)]
+        check_only: bool,
+    },
     /// Search this member's local shard only. The caller merges hits.
     Search {
         index: String,
@@ -233,6 +286,28 @@ pub enum ShardOp {
         body_json: String,
         /// JSON [`crate`] search query params. `from` and `size` match the body.
         params_json: String,
+    },
+    /// Copy this primary's live documents onto `replica_id` and, once that
+    /// copy matches, publish `replica_id` in the in-sync set.
+    ///
+    /// The caller is a replica that is placed for `shard` and is not in the
+    /// in-sync set. The primary holds the shard's replica lock across the
+    /// copy and the publish, so a document write that lands during the copy
+    /// is replicated to the new set when the lock is released. Documents are
+    /// not part of the Raft snapshot; this is the copy that fills them in.
+    BackfillReplica {
+        index: String,
+        shard: u32,
+        replica_id: String,
+    },
+    /// Delete replica-store documents whose ids are not in `ids`.
+    ///
+    /// Sent by the primary at the end of [`ShardOp::BackfillReplica`], after
+    /// the live documents have been upserted. Does not replicate further.
+    RetainReplicaDocs {
+        index: String,
+        shard: u32,
+        ids: Vec<String>,
     },
 }
 
@@ -318,6 +393,29 @@ impl MemoryShardDir {
     }
 }
 
+/// Stack reserved for one in-process shard call. Smaller than this overflows
+/// `search_impl`'s future; `std::thread` at this size is the sigaltstack
+/// abort #1122 hit.
+const SHARD_CALL_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Map a spawn that did not happen into the error the HTTP caller sees.
+///
+/// The job is dropped. Running it on the caller's stack is the overflow
+/// this thread exists to avoid, and dropping it does not write the document.
+pub(crate) fn map_shard_spawn_failure<F>(
+    to: &str,
+    failure: xerj_common::thread_spawn::SpawnFailure<F>,
+) -> ShardError {
+    let error = failure.error;
+    drop(failure.job);
+    ShardError::Unavailable {
+        to: to.to_string(),
+        reason: format!(
+            "could not start the shard call: {error}; the node stayed up and this call was not run"
+        ),
+    }
+}
+
 /// In-process [`ShardRpc`]. A call runs the target's handler on a fresh
 /// stack and waits for it.
 ///
@@ -328,6 +426,12 @@ impl MemoryShardDir {
 /// index-visibility guard is intentionally not carried across: a TCP handler
 /// has none, and an absent guard is how cluster-internal replica stores stay
 /// reachable.
+///
+/// The thread is 8 MiB and is started with [`xerj_common::thread_spawn`], not
+/// `std::thread::Builder`. Builder returns `Ok` and then panics in the child
+/// when the alternate signal stack cannot be mapped; with `panic = "abort"`
+/// that kills the node (#1122). A failed spawn answers the caller and does
+/// not run the handler on this stack.
 pub struct MemoryShardRpc {
     node_id: String,
     dir: Arc<MemoryShardDir>,
@@ -355,21 +459,25 @@ impl ShardRpc for MemoryShardRpc {
         let runtime = tokio::runtime::Handle::current();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let target = to.to_string();
-        std::thread::Builder::new()
-            .name("xerj-shard".into())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
+        let handle = match xerj_common::thread_spawn::try_spawn_stack(
+            "xerj-shard",
+            SHARD_CALL_STACK_BYTES,
+            move || {
                 let result = runtime.block_on(handler.handle(op));
                 let _ = tx.send(result);
-            })
-            .map_err(|err| ShardError::Unavailable {
-                to: target.clone(),
-                reason: format!("could not start the shard call: {err}"),
-            })?;
-        rx.await.map_err(|_| ShardError::Unavailable {
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(failure) => return Err(map_shard_spawn_failure(&target, failure)),
+        };
+        let received = rx.await.map_err(|_| ShardError::Unavailable {
             to: target,
             reason: "shard call stopped before answering".to_string(),
-        })
+        });
+        // Reap the helper. It has already sent (or dropped the sender);
+        // join does not run the handler again.
+        drop(handle);
+        received
     }
 
     fn set_handler(&self, handler: Arc<dyn ShardHandler>) {
@@ -458,5 +566,82 @@ mod tests {
                 replicas: Vec::new(),
             }]
         );
+    }
+
+    /// #1122: `std::thread::Builder::spawn` panics in the child when the
+    /// alternate signal stack cannot be mapped (os error 12), after the
+    /// parent has been told the thread exists. The shard call must surface
+    /// that as [`ShardError`] and must not run the handler.
+    #[test]
+    fn a_shard_call_that_cannot_spawn_is_an_error_and_does_not_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use xerj_common::thread_spawn::{try_spawn_with, Spawn, SpawnedThread};
+
+        struct Refuse;
+
+        impl Spawn for Refuse {
+            fn spawn(
+                &self,
+                _name: &str,
+                job: xerj_common::thread_spawn::BoxedJob,
+            ) -> std::io::Result<SpawnedThread> {
+                drop(job);
+                Err(std::io::Error::from_raw_os_error(12))
+            }
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let job_ran = Arc::clone(&ran);
+        let failure = try_spawn_with(&Refuse, true, "xerj-shard", move || {
+            job_ran.store(true, Ordering::SeqCst);
+        })
+        .expect_err("spawn refused");
+        let err = super::map_shard_spawn_failure("n2", failure);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "handler ran after a failed spawn"
+        );
+        let text = err.to_string();
+        assert!(text.contains("n2"), "{text}");
+        assert!(text.contains("could not start the shard call"), "{text}");
+        assert!(text.contains("stayed up"), "{text}");
+        assert!(
+            text.contains("12") || text.contains("Cannot allocate memory"),
+            "{text}"
+        );
+    }
+
+    struct EchoHandler;
+
+    #[async_trait::async_trait]
+    impl ShardHandler for EchoHandler {
+        async fn handle(&self, op: ShardOp) -> ShardResult {
+            ShardResult::http(200, format!("{op:?}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_process_shard_call_runs_the_handler_on_the_helper_stack() {
+        let dir = MemoryShardDir::new();
+        let rpc = MemoryShardRpc::new("n1", Arc::clone(&dir));
+        rpc.set_handler(Arc::new(EchoHandler));
+        let result = rpc
+            .call(
+                "n1",
+                ShardOp::GetDoc {
+                    index: "orders".into(),
+                    id: "1".into(),
+                    source: None,
+                    source_includes: None,
+                    source_excludes: None,
+                    replica: false,
+                    shard: 0,
+                },
+            )
+            .await
+            .expect("spawn and call");
+        assert_eq!(result.status, 200);
+        assert!(result.body.contains("orders"), "{}", result.body);
     }
 }

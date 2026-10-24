@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-18",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/autoindex-dataset-refused-by-server"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why did xerj autoindex say a dataset was refused by the server?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The server answered HTTP 400 to that dataset's create-index or put-mapping request. xerj autoindex records the dataset's files as junk with the server's reason, indexes every other dataset, and exits 3."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "One dataset was REFUSED by the server. Did I lose the whole index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Only that dataset's files are missing. Every other dataset is indexed and searchable, and the terminal line carries datasets_refused and files_refused so the gap is countable."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which exit code does a refused dataset produce?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Exit 3, completed-with-junk. A refused dataset is never exit 0, because the corpus lacks files, and never exit 1, because the run finished."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Will re-running the same command index the refused dataset?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. On the --no-graph path the refusal is part of the committed generation, so a re-run reports it again and exits 3. Fix the cause, then rebuild under a new --prefix and a new --state-dir."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does a 503 or a 401 count as a refusal?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Only HTTP 400 does. A 401 or 403 is your credentials and a 5xx is the endpoint, so neither says anything about the dataset, and both still abort the run with exit 1."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I find which files a refused dataset cost me?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Read autoindex-catalog for file documents with status junk. A refused file's reason names the dataset and quotes the server's response."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why is there an empty index for the refused dataset?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The create-index call can succeed before the mapping update is refused. xerj autoindex does not delete an index it cannot prove it created, so an empty one may remain. It holds no documents."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

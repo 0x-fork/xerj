@@ -2,15 +2,15 @@
 ---
 title: "Best lightweight Elasticsearch-compatible server (2026)"
 canonical: "https://xerj.org/compare/best-lightweight-elasticsearch-compatible-server-2026"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/compare/best-lightweight-elasticsearch-compatible-server-2026.md"
 ---
 
 # The best lightweight Elasticsearch-compatible search servers in 2026
 
-**Short answer** (updated 2026-10-19): What is the best lightweight Elasticsearch-compatible server in 2026? If you need the whole API and a cluster, OpenSearch. For one small node, ZincSearch or XERJ. For logs on object storage, Quickwit or OpenObserve. Manticore suits teams that prefer SQL. Each covers a different slice of the Elasticsearch API.
+**Short answer** (updated 2026-10-23): What is the best lightweight Elasticsearch-compatible server in 2026? If you need the whole API and a cluster, OpenSearch. For one small node, ZincSearch or XERJ. For logs on object storage, Quickwit or OpenObserve. Manticore suits teams that prefer SQL. Each covers a different slice of the Elasticsearch API.
 
-**Key number:** XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases on every commit; OpenSearch, the full-API option, has 13,892 GitHub stars and released 3.9.0 on 2026-09-29. (as of 2026-10-19; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
+**Key number:** XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases on every commit; OpenSearch, the full-API option, has 13,892 GitHub stars and released 3.9.0 on 2026-09-29. (as of 2026-10-23; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
 
 Last checked: 2026-10-19. Every third-party fact on this page was re-read from the tool's own docs or repository on that date.
 
@@ -42,7 +42,7 @@ Act as a coding agent. Read https://xerj.org/llms.txt, then pick an Elasticsearc
 | Manticore Search | GPL-3.0-or-later | `curl https://manticoresearch.com \| sh` | Elasticsearch-compatible writes; SQL native | multi-node | 12,063 · 29.9.0 (2026-09-11) |
 | OpenObserve | AGPL-3.0 | `docker run … openobserve` | Elasticsearch-compatible ingest | HA deployment | 22,436 · v1.1.1 (2026-10-16) |
 | Elasticsearch | AGPL-3.0 / SSPL / ELv2 | `curl -fsSL https://elastic.co/start-local \| sh` | the reference | cluster | 78,319 · v9.5.5 (2026-10-06) |
-| XERJ | Apache-2.0 | `curl -fsSL https://xerj.org/get \| sh` | 1366 of 1369 conformance cases | single node only | 10,569 · v1.0.0-rc.97 (2026-10-19) |
+| XERJ | Apache-2.0 | `curl -fsSL https://xerj.org/get \| sh` | 1444 of 1454 conformance cases | single node only | 10,569 · v1.0.0-rc.97 (2026-10-19) |
 
 ## OpenSearch: the full API, the full weight
 
@@ -68,7 +68,7 @@ Manticore treats SQL as its native language and speaks the MySQL protocol, with 
 
 ## XERJ: a conformance-tested single node
 
-XERJ speaks the Elasticsearch REST API from one binary, and its conformance suite passes 1366 of 1369 cases on every commit. One published board measured it against a live Elasticsearch 8.13.4 on one host at 100,000 documents: 55 wins, 26 ties, 4 losses and 3 not-applicable. All 4 losses were read p99 under a write flood ([XERJ vs Elasticsearch](/compare/xerj-vs-elasticsearch-local)).
+XERJ speaks the Elasticsearch REST API from one binary, and its conformance suite passes 1444 of 1454 cases on every commit, with 0 failures and 10 skipped. One published board measured it against a live Elasticsearch 8.13.4 on one host at 100,000 documents: 55 wins, 26 ties, 4 losses and 3 not-applicable. All 4 losses were read p99 under a write flood ([XERJ vs Elasticsearch](/compare/xerj-vs-elasticsearch-local)).
 
 What it gives up: it is single-node only, it is a release candidate, and indexing can use a lot of memory. Our [JSONL benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) recorded a 9.1 GiB peak on one 9.7 MB file.
 
@@ -114,7 +114,7 @@ No. Manticore, Quickwit and OpenObserve publish their own speed and cost compari
 - Manticore Search is SQL-first and MySQL-compatible, offers an HTTP JSON API with Elasticsearch-compatible writes, and is distributed under GPLv3 or later. — [https://github.com/manticoresoftware/manticoresearch](https://github.com/manticoresoftware/manticoresearch)
 - OpenObserve is an AGPL-3.0 observability platform for logs, metrics and traces with Parquet columnar storage on S3-compatible object storage. — [https://github.com/openobserve/openobserve](https://github.com/openobserve/openobserve)
 - Elasticsearch's default licence is a choice of AGPL-3.0, SSPL v1 or Elastic License 2.0, and start-local runs it with Kibana in Docker for local development. — [https://github.com/elastic/elasticsearch](https://github.com/elastic/elasticsearch)
-- XERJ's conformance suite runs on every commit and passes 1366 of 1369 cases. — `README.md`
+- XERJ's conformance suite runs on every commit and passes 1444 of 1454 cases. — `README.md`
 - The published board against a live Elasticsearch 8.13.4 at 100,000 documents on one host is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells. — `demo/playbooks/SCORECARD.md`
 - In the JSONL benchmark of 2026-10-19 the XERJ node peaked at 9,578,548 kB (about 9.1 GiB) resident while indexing one 9.7 MB file of 50,000 records. — `benchmarks/best-of-jsonl-search-2026/README.md`
 

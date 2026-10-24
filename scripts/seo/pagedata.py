@@ -51,7 +51,11 @@ PAGES: dict[str, dict[str, str]] = {
     # ── root / product ──────────────────────────────────────────────────────
     "index.html": dict(
         label="Home", kind="software",
-        description="The unified search engine for AI: connect it, run xerj autoindex, and it works. One Rust binary replaces search, vector DB, embeddings and agent memory.",
+        title="XERJ: the search engine for AI agents",
+        # The canonical description (seo_head.ORG_DESCRIPTION). seo_lint gates
+        # duplicate descriptions, so /product, /for-agents and
+        # /answers/what-is-xerj carry the same clause behind a short lead-in.
+        description="A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
     ),
     # `404.html` is what makes Cloudflare Pages return a real HTTP 404.  With
     # no top-level 404.html the project is treated as a single-page app and
@@ -69,12 +73,12 @@ PAGES: dict[str, dict[str, str]] = {
         # Rewritten 2026-10-23 against the v1.0.0-rc.98 release binary
         # (xerj --help, xerj mcp --help, a tools/list, and one xerj ask run)
         # plus the files and fetches named on the page.
-        description="Local search for AI agents in one Apache-2.0 Rust binary: the xerj CLI and xerj ask, 20 MCP tools on rc.98, signed Corpus Hub packs, and published benchmarks.",
+        description="XERJ, the search engine for AI agents: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
     ),
     "for-agents.html": dict(
         label="For AI agents", kind="software",
         title="XERJ.ai — For AI agents: search, data & memory",
-        description="The search, data and memory layer for AI agents. One binary: zero-config folder indexing, keyword, semantic, vector and hybrid search, per-agent memory.",
+        description="For AI agents over MCP: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
     ),
     "playground.html": dict(
         label="Playground", kind="software",
@@ -287,42 +291,42 @@ PAGES: dict[str, dict[str, str]] = {
         description="Seven enterprise retrieval workloads on one binary — no Logstash, no Beats, no separate vector database — each with a reproducible ES 8.13 benchmark.",
     ),
     "use-cases/ai-search-retrieval.html": dict(
-        label="AI search & retrieval", kind="webpage",
+        label="AI search & retrieval", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: AI-native search & retrieval",
         description="XERJ runs BM25 and exact vector kNN in one query tree and one execution pass, so hybrid retrieval for RAG is a feature rather than an integration project.",
     ),
     "use-cases/elasticsearch-replacement.html": dict(
-        label="Elasticsearch replacement", kind="webpage",
+        label="Elasticsearch replacement", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: Elasticsearch replacement",
         description="A drop-in Elasticsearch replacement — same :9200 API, same query DSL, same client libraries — on one binary instead of a JVM cluster. Measured vs ES 8.13.",
     ),
     "use-cases/operational-intelligence.html": dict(
-        label="Operational intelligence", kind="webpage",
+        label="Operational intelligence", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: operational intelligence",
         description="Replace Beats, Logstash, Elasticsearch and cold storage with one ingest endpoint, one storage engine and one retention number. Measured against ES 8.13.",
     ),
     "use-cases/security-analytics.html": dict(
-        label="Security analytics", kind="webpage",
+        label="Security analytics", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: security analytics at scale",
         description="SOC search-and-aggregate workloads — filters, term lookups, aggregations — on a single XERJ node instead of a four-node Elasticsearch 8.13 cluster.",
     ),
     "use-cases/unified-observability.html": dict(
-        label="Unified observability", kind="webpage",
+        label="Unified observability", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: unified observability",
         description="Logs, metrics and traces in one engine with one query language and one bill, instead of Loki or Splunk plus Prometheus plus Tempo. Measured vs ES 8.13.",
     ),
     "use-cases/code-security-audit.html": dict(
-        label="AI code-security audit", kind="webpage",
+        label="AI code-security audit", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: AI code-security audit",
         description="Index a codebase as security facts, compile the rule into a queryable invariant, then read only the violators — ~26,000 tokens to audit WordPress core.",
     ),
     "use-cases/second-brain.html": dict(
-        label="Second brain", kind="webpage",
+        label="Second brain", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: a second brain from a folder",
         description="xerj brain <folder> turns notes into a bi-temporal, evidence-carrying knowledge graph. Every link shows the text that taught it; 121 files to 364 links.",
     ),
     "use-cases/semantic-analytics.html": dict(
-        label="Semantic analytics", kind="webpage",
+        label="Semantic analytics", kind="webpage", updated="2026-10-24",
         title="XERJ.ai — Use case: semantic analytics in one call",
         description="Retrieval and aggregation in one POST /_search: XERJ runs aggregations over the retrieved top-k neighbour set, so text and vectors are queried together.",
     ),
@@ -330,7 +334,7 @@ PAGES: dict[str, dict[str, str]] = {
     # <meta name="description"> are unique and correctly sized, so both are
     # kept verbatim and only the breadcrumb label and JSON-LD kind are set.
     "use-cases/zero-token-ai-search.html": dict(
-        label="Zero-token AI search", kind="webpage",
+        label="Zero-token AI search", kind="webpage", updated="2026-10-24",
     ),
 
     # ── case studies ────────────────────────────────────────────────────────

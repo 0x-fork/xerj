@@ -80,6 +80,13 @@ const KNOWN: &[(&str, Role)] = &[
         Role::Node("**Cluster transport**"),
     ),
     ("xerj-mcp/src/lib.rs", Role::Client("`xerj mcp`")),
+    // Batch retrieval uses the same operator-selected node URL and auth as
+    // `xerj mcp` (localhost:9200 by default). It sends queries to /_msearch
+    // and optionally reads mappings; it adds no node-side egress path.
+    (
+        "xerj-mcp/src/batch_cli.rs",
+        Role::Client("`xerj batch-search`"),
+    ),
     (
         "xerj-autoindex/src/esclient.rs",
         Role::Client("`xerj autoindex`"),

@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/compare-best-lightweight-elasticsearch-compatible-server-2026.png",
   "inLanguage": "en",
   "datePublished": "2026-10-19",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/compare/best-lightweight-elasticsearch-compatible-server-2026"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Which Elasticsearch alternative is a drop-in replacement?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "OpenSearch is the closest, because it includes Apache-licensed Elasticsearch code and keeps clustering. The lighter servers each cover a slice: ZincSearch covers ingest with its own search UI, Quickwit a documented subset aimed at logs, Manticore writes, and XERJ a conformance-tested single node."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which one runs as a single binary?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "ZincSearch, OpenObserve and XERJ each describe themselves as a single binary. OpenSearch and Elasticsearch run on the JVM and are usually started with Docker for local use."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which one scales past one machine?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "OpenSearch, Elasticsearch, Quickwit, OpenObserve and Manticore support multi-node setups. ZincSearch's README lists high availability as not available, and XERJ is single-node only."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I keep using Kibana?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Kibana is Elastic's own UI. ZincSearch says Kibana is not supported and ships its own UI; OpenSearch has OpenSearch Dashboards; OpenObserve and Quickwit ship their own UIs. Check your exact Kibana version against any alternative before switching."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How does XERJ compare with Elasticsearch on the same host?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "One published board measured both on one host at 100,000 documents: 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4. All 4 losses are read p99 under a write flood. XERJ is single-node only."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Were the vendors' speed claims verified?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Manticore, Quickwit and OpenObserve publish their own speed and cost comparisons against Elasticsearch. This page quotes none of them as fact and ran no cross-vendor benchmark."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -252,11 +316,11 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>THE BEST LIGHTWEIGHT ELASTICSEARCH-COMPATIBLE SEARCH SERVERS IN 2026</div>
   <div class="kicker"><span>COMPARE · COMPARISON: SEARCH ENGINES</span></div>
   <h1>The best lightweight Elasticsearch-compatible search servers in 2026</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-10-19 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-10-19 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>What is the best lightweight Elasticsearch-compatible server in 2026? If you need the whole API and a cluster, OpenSearch. For one small node, ZincSearch or XERJ. For logs on object storage, Quickwit or OpenObserve. Manticore suits teams that prefer SQL. Each covers a different slice of the Elasticsearch API.</p>
-    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases on every commit; OpenSearch, the full-API option, has 13,892 GitHub stars and released 3.9.0 on 2026-09-29. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
+    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases on every commit; OpenSearch, the full-API option, has 13,892 GitHub stars and released 3.9.0 on 2026-09-29. <span class="mute">(as of 2026-10-23 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
     <p class="mute">Last checked: 2026-10-19. Every third-party fact on this page was re-read from the tool's own docs or repository on that date.</p>
   </div>
   <p><strong>TL;DR</strong> — "Elasticsearch-compatible" means a different slice of the API for each server. OpenSearch keeps the whole API and the cluster. ZincSearch and XERJ are small single nodes. Quickwit and OpenObserve are built for logs on object storage. Manticore is SQL-first with Elasticsearch-compatible writes.</p>
@@ -285,7 +349,7 @@
       <tr><td>Manticore Search</td><td>GPL-3.0-or-later</td><td><code class="inline">curl https://manticoresearch.com | sh</code></td><td>Elasticsearch-compatible writes; SQL native</td><td>multi-node</td><td>12,063 · 29.9.0 (2026-09-11)</td></tr>
       <tr><td>OpenObserve</td><td>AGPL-3.0</td><td><code class="inline">docker run … openobserve</code></td><td>Elasticsearch-compatible ingest</td><td>HA deployment</td><td>22,436 · v1.1.1 (2026-10-16)</td></tr>
       <tr><td>Elasticsearch</td><td>AGPL-3.0 / SSPL / ELv2</td><td><code class="inline">curl -fsSL https://elastic.co/start-local | sh</code></td><td>the reference</td><td>cluster</td><td>78,319 · v9.5.5 (2026-10-06)</td></tr>
-      <tr><td>XERJ</td><td>Apache-2.0</td><td><code class="inline">curl -fsSL https://xerj.org/get | sh</code></td><td>1366 of 1369 conformance cases</td><td>single node only</td><td>10,569 · v1.0.0-rc.97 (2026-10-19)</td></tr>
+      <tr><td>XERJ</td><td>Apache-2.0</td><td><code class="inline">curl -fsSL https://xerj.org/get | sh</code></td><td>1444 of 1454 conformance cases</td><td>single node only</td><td>10,569 · v1.0.0-rc.97 (2026-10-19)</td></tr>
     </tbody>
   </table>
   <h2>OpenSearch: the full API, the full weight</h2>
@@ -300,7 +364,7 @@
   <h2>Manticore Search: SQL first</h2>
   <p>Manticore treats SQL as its native language and speaks the MySQL protocol, with an HTTP JSON API and Elasticsearch-compatible writes on top. If your team thinks in SQL, it may suit you better than any Elasticsearch look-alike.</p>
   <h2>XERJ: a conformance-tested single node</h2>
-  <p>XERJ speaks the Elasticsearch REST API from one binary, and its conformance suite passes 1366 of 1369 cases on every commit. One published board measured it against a live Elasticsearch 8.13.4 on one host at 100,000 documents: 55 wins, 26 ties, 4 losses and 3 not-applicable. All 4 losses were read p99 under a write flood (<a href="/compare/xerj-vs-elasticsearch-local">XERJ vs Elasticsearch</a>).</p>
+  <p>XERJ speaks the Elasticsearch REST API from one binary, and its conformance suite passes 1444 of 1454 cases on every commit, with 0 failures and 10 skipped. One published board measured it against a live Elasticsearch 8.13.4 on one host at 100,000 documents: 55 wins, 26 ties, 4 losses and 3 not-applicable. All 4 losses were read p99 under a write flood (<a href="/compare/xerj-vs-elasticsearch-local">XERJ vs Elasticsearch</a>).</p>
   <p>What it gives up: it is single-node only, it is a release candidate, and indexing can use a lot of memory. Our <a href="/compare/best-local-full-text-search-jsonl-csv-2026">JSONL benchmark</a> recorded a 9.1 GiB peak on one 9.7 MB file.</p>
   <h2>When to choose Elasticsearch instead</h2>
   <p>Choose Elasticsearch when you need Elastic's own features, Kibana, or a vendor support contract, and its licences suit you. Every server above covers only part of what it does, and the board above measured XERJ against 8.13.4 on one host, not against a cluster.</p>
@@ -327,7 +391,7 @@
     <li>Manticore Search is SQL-first and MySQL-compatible, offers an HTTP JSON API with Elasticsearch-compatible writes, and is distributed under GPLv3 or later. — <a href="https://github.com/manticoresoftware/manticoresearch">https://github.com/manticoresoftware/manticoresearch</a></li>
     <li>OpenObserve is an AGPL-3.0 observability platform for logs, metrics and traces with Parquet columnar storage on S3-compatible object storage. — <a href="https://github.com/openobserve/openobserve">https://github.com/openobserve/openobserve</a></li>
     <li>Elasticsearch's default licence is a choice of AGPL-3.0, SSPL v1 or Elastic License 2.0, and start-local runs it with Kibana in Docker for local development. — <a href="https://github.com/elastic/elasticsearch">https://github.com/elastic/elasticsearch</a></li>
-    <li>XERJ's conformance suite runs on every commit and passes 1366 of 1369 cases. — <code>README.md</code></li>
+    <li>XERJ's conformance suite runs on every commit and passes 1444 of 1454 cases. — <code>README.md</code></li>
     <li>The published board against a live Elasticsearch 8.13.4 at 100,000 documents on one host is 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells. — <code>demo/playbooks/SCORECARD.md</code></li>
     <li>In the JSONL benchmark of 2026-10-19 the XERJ node peaked at 9,578,548 kB (about 9.1 GiB) resident while indexing one 9.7 MB file of 50,000 records. — <code>benchmarks/best-of-jsonl-search-2026/README.md</code></li>
   </ul>

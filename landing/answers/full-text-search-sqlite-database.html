@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/full-text-search-sqlite-database"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I full-text search a SQLite database?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the folder holding the .db file, then send a match_phrase query. XERJ turns each table into an index and each row into a document."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "I have a .sqlite file. How do I search all the text in it without writing FTS5?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Let the indexer do it. XERJ indexes the text columns itself and ranks with BM25, so the source database needs no FTS5 table and no triggers."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I search inside a SQLite file the way I search a folder?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. A database file in a folder is one more format to autoindex: it is picked up in the same run as the other files, and each table lands in its own index."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What's the easiest way to grep a SQLite database?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index it first, then query it. A byte scan reads the file container rather than the rows, while autoindex opens the database read-only and turns each row into a document."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ modify my SQLite file?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ opens the file read-only and immutable. In the captured run the SHA-256 of the .db, -wal and -shm files was identical before and after."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ read rows that are still in the WAL?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The captured run indexed the 400 checkpointed rows and returned 0 hits for the 50 rows that lived only in support.db-wal."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I avoid missing recent rows?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run PRAGMA wal_checkpoint(TRUNCATE) on the database before you index it, or index a copy taken after a checkpoint."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

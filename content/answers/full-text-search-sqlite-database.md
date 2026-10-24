@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run sqlite3 on the target database with PRAGMA wal_checkpoint(TRUNCATE) so no committed row is left in the -wal file, record sha256sum of the .db, -wal and -shm files, start a local XERJ node, run `xerj autoindex ./sqlite --url http://127.0.0.1:9200 --prefix sq --progress plain`, compare the checksums again, then POST a match_phrase query to /sq-*/_search and report the hit total against the row count you expected."
 answer: "How do I full-text search a SQLite database? Run xerj autoindex on it: the file is read read-only and each table becomes an index. In a captured WAL-mode run XERJ created sq-tickets with 400 documents and sq-agents with 13, left all 3 files byte-identical, and missed rows still in the write-ahead log."
 key_fact: "XERJ maps each existing SQLite table without an FTS5 virtual table, keeping up to 512 fields per record (`MAX_FIELDS_PER_RECORD`)."

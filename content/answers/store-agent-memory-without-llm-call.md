@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, then POST the same fact twice to /_memory/agentmem on a running XERJ node with dedup true and dedup_threshold 0.95, confirm the second response carries created false and deduplicated true and the same id, POST a reworded version of the same fact and report whether it deduplicated, then recall the namespace and report how many documents it holds."
 answer: "How do I dedup agent memory so it stops filling with duplicate notes? Send dedup: true on the store call. XERJ compares the new memory against what the namespace already holds and returns the existing id with deduplicated: true instead of writing a second document. No model or summarization runs on the write path."
 key_fact: "The default dedup threshold is a cosine similarity of 0.95."

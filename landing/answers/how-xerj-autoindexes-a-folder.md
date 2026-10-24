@@ -2,13 +2,13 @@
 ---
 title: "Point a tool at a folder and ask questions about the files"
 canonical: "https://xerj.org/answers/how-xerj-autoindexes-a-folder"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/answers/how-xerj-autoindexes-a-folder.md"
 ---
 
 # I want to point something at a folder and then ask questions about what's in it. What should I use?
 
-**Short answer** (updated 2026-10-19): What should I use to point something at a folder and then ask questions about what is in it? Run xerj autoindex on the folder: it detects file types, builds typed indices and needs no configuration. Then xerj autoindex map shows which index and field to query, and an agent asks over HTTP or xerj mcp.
+**Short answer** (updated 2026-10-23): What should I use to point something at a folder and then ask questions about what is in it? Run xerj autoindex on the folder: it detects file types, builds typed indices and needs no configuration. Then xerj autoindex map shows which index and field to query, and an agent asks over HTTP or xerj mcp.
 
 **Key number:** The README's sample run indexed 25,329 files into 593 datasets and 83,103 records in 158.1 s with 8 workers. (as of 2026-10-19; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
 
@@ -93,7 +93,7 @@ An agent answers from the returned passage and cites `ax_path`, rather than read
 
 ## Hand the indexed folder to an agent
 
-`xerj mcp` exposes the indexed folder to an agent host as a stdio tool server, serving 17 tools against a node that is already running. The agent sends a query and reads hits with file paths, instead of opening files one by one.
+`xerj mcp` exposes the indexed folder to an agent host as a stdio tool server, serving 22 tools against a node that is already running. The agent sends a query and reads hits with file paths, instead of opening files one by one.
 
 The node and the MCP server both run on your machine. No file content is uploaded, because the agent host calls a local process rather than a hosted API.
 

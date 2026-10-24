@@ -454,11 +454,17 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 .retain(|_, doc| doc.get("file_key").and_then(Value::as_str) != Some(key.as_str()));
         }
         // Catalog only: every by-`_id` delete this client issues names
-        // `catalog::CATALOG_INDEX`.
+        // `catalog::CATALOG_INDEX`. Report how many documents this pass
+        // actually removed. `delete_by_query` repeats until a pass reports
+        // zero, so answering `ids.len()` after the documents are gone loops
+        // until the client gives up (#2314).
+        let mut removed = 0u64;
         for id in &ids {
-            locked.catalog_docs.remove(id);
+            if locked.catalog_docs.remove(id).is_some() {
+                removed += 1;
+            }
         }
-        (200, json!({"deleted": ids.len(), "failures": []}))
+        (200, json!({"deleted": removed, "failures": []}))
     } else if method == "GET" && path.ends_with("/_count") {
         if state.lock().unwrap().fail_counts {
             (200, json!({"error": "count unavailable"}))
@@ -606,6 +612,61 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                     }),
                 )
             }
+        } else if path.contains(catalog::CATALOG_INDEX)
+            && query.pointer("/query/bool/filter").is_some()
+        {
+            // #2314: a deletion sweep reads catalog candidates with a
+            // `bool.filter` of term clauses and deletes the hits by `_id`.
+            // An empty `hits` array made that sweep a no-op.
+            let filters = query
+                .pointer("/query/bool/filter")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let locked = state.lock().unwrap();
+            let mut hits: Vec<Value> = locked
+                .catalog_docs
+                .iter()
+                .filter(|(_, doc)| {
+                    filters.iter().all(|clause| {
+                        clause
+                            .get("term")
+                            .and_then(Value::as_object)
+                            .is_none_or(|term| {
+                                term.iter()
+                                    .all(|(field, value)| doc.get(field) == Some(value))
+                            })
+                            && clause
+                                .get("terms")
+                                .and_then(Value::as_object)
+                                .and_then(|terms| terms.iter().next())
+                                .is_none_or(|(field, values)| {
+                                    values.as_array().is_some_and(|values| {
+                                        values.iter().any(|value| doc.get(field) == Some(value))
+                                    })
+                                })
+                    })
+                })
+                .map(|(id, doc)| json!({"_id": id, "_source": doc}))
+                .collect();
+            hits.sort_by(|left, right| left["_id"].as_str().cmp(&right["_id"].as_str()));
+            let total = hits.len();
+            let from = query.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let size = query
+                .get("size")
+                .and_then(Value::as_u64)
+                .map(|size| size as usize)
+                .unwrap_or(total);
+            let page: Vec<Value> = hits.into_iter().skip(from).take(size).collect();
+            (
+                200,
+                json!({
+                    "hits": {
+                        "total": {"value": total, "relation": "eq"},
+                        "hits": page
+                    }
+                }),
+            )
         } else {
             let ax_file = query
                 .pointer("/query/term/ax_file")
@@ -982,63 +1043,6 @@ fn dataset_catalog_docs(endpoint: &MockEndpoint) -> Vec<Value> {
             .to_string()
     });
     docs
-}
-
-fn assert_unsupported_delta_without_remote_mutation(
-    endpoint: &MockEndpoint,
-    config: IndexCfg,
-    expected_added: &[&str],
-    expected_vanished: &[&str],
-) {
-    let request_start = endpoint.state.lock().unwrap().requests.len();
-    let journal_path = config.state_dir.as_ref().unwrap().join("journal.ndjson");
-    let journal_before = fs::read(&journal_path).unwrap();
-    let error = run_index(config).unwrap_err();
-    let attempted_requests = endpoint.state.lock().unwrap().requests[request_start..].to_vec();
-    assert_eq!(
-        attempted_requests,
-        [
-            ("GET".to_owned(), "/".to_owned()),
-            ("GET".to_owned(), "/_cat/allocation?format=json".to_owned(),),
-        ],
-        "a refused attempt may perform only the readiness GET and the read-only flood-stage probe"
-    );
-    assert_eq!(
-        fs::read(journal_path).unwrap(),
-        journal_before,
-        "preflight refusal must not append a resume event or rewrite the journal"
-    );
-    let message = format!("{error:#}");
-    assert!(message.contains("made no remote mutations"), "{message}");
-    assert!(
-        message.contains("no longer exist in the folder"),
-        "{message}"
-    );
-    assert!(
-        message.contains("restore the DELETED file(s) and rerun"),
-        "{message}"
-    );
-    assert!(
-        message.contains("rebuild in place by deleting the indices"),
-        "{message}"
-    );
-    assert!(
-        message.contains("new --state-dir, a new --prefix"),
-        "{message}"
-    );
-    assert!(message.contains("new --brain"), "{message}");
-    for path in expected_added {
-        assert!(
-            message.contains(path),
-            "missing added path {path}: {message}"
-        );
-    }
-    for path in expected_vanished {
-        assert!(
-            message.contains(path),
-            "missing vanished path {path}: {message}"
-        );
-    }
 }
 
 /// The documented headline workflow: point autoindex at a folder, add a file,
@@ -1451,44 +1455,28 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
     assert_eq!(run_index(config.clone()).unwrap(), 0);
 
     fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
-    // 3 = stale-resume-plan: the added file is reported as skipped, not
-    // indexed, because the frozen plan cannot absorb it. It is not junk.
+    // #2314: a csv that fits the frozen dataset is indexed on the rerun.
+    // It is not a stale plan and not junk.
     let (code, report) = run_index_report(config.clone()).unwrap();
-    assert_eq!(code, 3);
+    assert_eq!(code, 0, "{report:?}");
     let report = report.unwrap();
-    assert_eq!(
-        report["files_junk"], 0,
-        "a post-plan file is not junk: {report}"
+    assert_eq!(report["files_junk"], 0, "{report}");
+    assert!(
+        report.get("skipped_appeared").is_none(),
+        "a same-schema addition is indexed, not skipped: {report}"
     );
-    // #346 / #2076: the file that appeared after the plan was frozen is
-    // `skipped_appeared`, and it is not folded into `files_junk`.
-    assert_eq!(report["skipped_appeared"], 1, "{report}");
-    // `records_total` is the live server-side count (#195), so it still reports
-    // the record the first run published. What must be zero is the run-local
-    // counter: this rerun indexed nothing, because the frozen plan cannot
-    // absorb a file that appeared after it was written.
-    assert_eq!(report["records_submitted_this_run"], 0, "{report}");
-    assert_eq!(report["files_submitted_this_run"], 0, "{report}");
-    // Two live documents for the one indexed source, not one: this module now
-    // indexes graph-enabled (`--no-graph` takes the generated executor), and a
-    // graph-enabled run publishes a file-level node document alongside the row.
-    // `second.csv` still published nothing — that is what the counters above
-    // pin.
-    assert_eq!(report["records_total"], 2, "{report}");
     {
         let locked = endpoint.state.lock().unwrap();
-        let live: Vec<&str> = locked
+        let live: std::collections::HashSet<&str> = locked
             .docs
             .values()
             .filter_map(|doc| doc["ax_path"].as_str())
             .collect();
-        assert!(
-            live.iter().all(|path| *path == "first.csv"),
-            "the added file must not be published by a plan that predates it: {live:?}"
-        );
+        assert!(live.contains("first.csv"), "{live:?}");
+        assert!(live.contains("second.csv"), "{live:?}");
     }
 
-    // --fresh rebuilds the plan in place and picks the new file up.
+    // --fresh still rebuilds in place and keeps both files.
     config.fresh = true;
     assert_eq!(run_index(config).unwrap(), 0);
     let locked = endpoint.state.lock().unwrap();
@@ -1696,7 +1684,7 @@ fn a_file_that_changes_mid_run_is_skipped_and_the_run_finishes() {
 }
 
 #[test]
-fn completed_plan_rejects_vanished_content_group_before_remote_mutation() {
+fn completed_plan_sweeps_a_vanished_content_group() {
     let _guard = FAILPOINT_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -1712,11 +1700,26 @@ fn completed_plan_rejects_vanished_content_group_before_remote_mutation() {
     assert_eq!(run_index(config.clone()).unwrap(), 0);
 
     fs::remove_file(corpus.path().join("second.csv")).unwrap();
-    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["second.csv"]);
+    assert_eq!(run_index(config).unwrap(), 3);
+    let locked = endpoint.state.lock().unwrap();
+    let live: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(live.contains("first.csv"), "{live:?}");
+    assert!(!live.contains("second.csv"), "{live:?}");
+    assert!(locked
+        .catalog_docs
+        .values()
+        .all(|doc| doc["path"].as_str() != Some("second.csv")));
 }
 
 #[test]
-fn completed_plan_rejects_mixed_membership_delta_in_stable_order() {
+/// #2314: a rerun that both deletes indexed files and adds same-schema files
+/// used to refuse before any mutation. The deletions are swept and the
+/// additions are indexed.
+fn completed_plan_sweeps_deletions_and_indexes_same_schema_additions() {
     let _guard = FAILPOINT_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -1728,44 +1731,28 @@ fn completed_plan_rejects_mixed_membership_delta_in_stable_order() {
     fs::write(corpus.path().join("b-old.csv"), "id,value\n1,b\n").unwrap();
     fs::write(corpus.path().join("a-old.csv"), "id,value\n2,a\n").unwrap();
     let endpoint = MockEndpoint::start(usize::MAX);
-    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     assert_eq!(run_index(config.clone()).unwrap(), 0);
 
     fs::remove_file(corpus.path().join("b-old.csv")).unwrap();
     fs::remove_file(corpus.path().join("a-old.csv")).unwrap();
     fs::write(corpus.path().join("z-new.csv"), "id,value\n3,z\n").unwrap();
     fs::write(corpus.path().join("m-new.csv"), "id,value\n4,m\n").unwrap();
-    config.json = true;
-    let request_start = endpoint.state.lock().unwrap().requests.len();
-    let error = run_index(config).unwrap_err();
-    assert_eq!(
-        endpoint.state.lock().unwrap().requests[request_start..],
-        [
-            ("GET".to_owned(), "/".to_owned()),
-            ("GET".to_owned(), "/_cat/allocation?format=json".to_owned(),),
-        ]
+    assert_eq!(run_index(config).unwrap(), 3);
+    let locked = endpoint.state.lock().unwrap();
+    let live: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(
+        live.contains("m-new.csv") && live.contains("z-new.csv"),
+        "{live:?}"
     );
-
-    let typed = error
-        .downcast_ref::<UnsupportedInventoryDeltaError>()
-        .unwrap();
-    let value = typed.to_json();
-    assert_eq!(value["schema"], "xerj.autoindex.unsupported_sync_delta.v1");
-    assert_eq!(value["status"], "error");
-    let added: Vec<&str> = value["added_content_groups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["path"].as_str().unwrap())
-        .collect();
-    let vanished: Vec<&str> = value["vanished_content_groups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["path"].as_str().unwrap())
-        .collect();
-    assert_eq!(added, ["m-new.csv", "z-new.csv"]);
-    assert_eq!(vanished, ["a-old.csv", "b-old.csv"]);
+    assert!(
+        !live.contains("a-old.csv") && !live.contains("b-old.csv"),
+        "{live:?}"
+    );
 }
 
 /// An in-place EDIT is a replacement, not a removal. `--fresh` is the route
@@ -2052,9 +2039,8 @@ impl Jobs {\n\
 }\n\
 ";
 
-/// The composite workflow the run's own stderr recommends: index, then add one
-/// file and edit another, rerun (added file reported and skipped by the frozen
-/// plan), then `--fresh` to absorb both.
+/// Index, then add one file and edit another. The rerun replaces the edit and
+/// indexes the addition (#2314). `--fresh` afterwards keeps both.
 #[test]
 fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
     let _guard = FAILPOINT_TEST_LOCK
@@ -2072,10 +2058,27 @@ fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
 
     fs::write(corpus.path().join("first.csv"), "id,value\n1,after\n").unwrap();
     fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
-    // 3 = stale-resume-plan: the frozen plan cannot absorb the added file,
-    // so the rerun reports it as skipped rather than refusing, and does not
-    // count it as junk.
-    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    assert_eq!(
+        run_index(config.clone()).unwrap(),
+        0,
+        "an edit is replaced and a same-schema addition is indexed"
+    );
+    {
+        let locked = endpoint.state.lock().unwrap();
+        let live: std::collections::HashSet<&str> = locked
+            .docs
+            .values()
+            .filter_map(|doc| doc["ax_path"].as_str())
+            .collect();
+        assert!(
+            live.contains("first.csv") && live.contains("second.csv"),
+            "{live:?}"
+        );
+        assert!(locked
+            .docs
+            .values()
+            .any(|doc| doc["value"].as_str() == Some("after")));
+    }
 
     config.fresh = true;
     assert_eq!(
@@ -2101,8 +2104,11 @@ fn fresh_absorbs_an_addition_and_an_edit_after_a_reported_rerun() {
     );
 }
 
+/// #2314: `--fresh` used to be refused when a file had disappeared, because
+/// discarding the journal does not delete documents. The sweep runs first, so
+/// the deleted file's documents are gone and the added file is indexed.
 #[test]
-fn fresh_cannot_erase_the_plan_and_bypass_the_removal_gate() {
+fn fresh_sweeps_a_deleted_file_and_indexes_the_addition() {
     let _guard = FAILPOINT_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -2119,7 +2125,15 @@ fn fresh_cannot_erase_the_plan_and_bypass_the_removal_gate() {
     fs::remove_file(corpus.path().join("old.csv")).unwrap();
     fs::write(corpus.path().join("new.csv"), "id,value\n2,new\n").unwrap();
     config.fresh = true;
-    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &["new.csv"], &["old.csv"]);
+    assert_eq!(run_index(config).unwrap(), 3);
+    let locked = endpoint.state.lock().unwrap();
+    let live: std::collections::HashSet<&str> = locked
+        .docs
+        .values()
+        .filter_map(|doc| doc["ax_path"].as_str())
+        .collect();
+    assert!(live.contains("new.csv"), "{live:?}");
+    assert!(!live.contains("old.csv"), "{live:?}");
 }
 
 /// #345. A byte-identical duplicate is the ONLY thing that makes a run issue
@@ -2332,13 +2346,25 @@ fn deleted_planned_junk_is_swept_rather_than_refused() {
         );
     }
 
-    // Deleting the INDEXED file is still refused: its documents are live.
+    // Deleting the indexed file sweeps its documents too (#2314).
     fs::remove_file(corpus.path().join("rows.csv")).unwrap();
-    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["rows.csv"]);
+    assert_eq!(run_index(config).unwrap(), 3);
+    let locked = endpoint.state.lock().unwrap();
+    assert!(locked
+        .docs
+        .values()
+        .all(|doc| doc["ax_path"].as_str() != Some("rows.csv")));
+    assert!(locked
+        .catalog_docs
+        .values()
+        .all(|doc| doc["path"].as_str() != Some("rows.csv")));
 }
 
 #[test]
-fn completed_plan_rejects_empty_current_folder_before_remote_mutation() {
+/// #2314: emptying the folder sweeps the indexed file, including under
+/// `--fresh`. Discarding the journal used to leave the documents live and
+/// the command refused rather than recover.
+fn emptying_the_folder_sweeps_the_indexed_file_including_fresh() {
     let _guard = FAILPOINT_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -2353,11 +2379,23 @@ fn completed_plan_rejects_empty_current_folder_before_remote_mutation() {
     assert_eq!(run_index(config.clone()).unwrap(), 0);
 
     fs::remove_file(corpus.path().join("only.csv")).unwrap();
-    assert_unsupported_delta_without_remote_mutation(&endpoint, config.clone(), &[], &["only.csv"]);
-    // Even `--fresh` must not erase the only durable inventory evidence and
-    // then report success while the destination still contains the document.
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
+    assert!(endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .values()
+        .all(|doc| doc["ax_path"].as_str() != Some("only.csv")));
     config.fresh = true;
-    assert_unsupported_delta_without_remote_mutation(&endpoint, config, &[], &["only.csv"]);
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert!(endpoint
+        .state
+        .lock()
+        .unwrap()
+        .docs
+        .values()
+        .all(|doc| doc["ax_path"].as_str() != Some("only.csv")));
 }
 
 #[test]
@@ -2584,7 +2622,10 @@ fn changed_source_replaces_durable_dataset_bytes_across_reopen() {
 }
 
 #[test]
-fn deleted_path_bytes_remain_while_its_documents_remain_live() {
+/// #2314: deleting one of two indexed files removes its documents. Dataset
+/// bytes then describe what is still live, and a second rerun sees the same
+/// settled corpus.
+fn deleted_path_documents_are_swept_and_bytes_follow_the_survivor() {
     let _guard = FAILPOINT_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -2613,28 +2654,19 @@ fn deleted_path_bytes_remain_while_its_documents_remain_live() {
     assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 4);
 
     fs::remove_file(&removed).unwrap();
-    // Autoindex still does not reconcile a missing canonical path: its indexed
-    // documents and FileDone stay live, so dataset bytes must keep describing
-    // that durable live index rather than silently pretend deletion (#249).
-    // What changed is the exit: the rerun that used to return 0 while leaving
-    // those documents stranded now refuses before any remote mutation. Run
-    // twice — a refusal is a stop, not a state change, so the second attempt
-    // must see exactly what the first one saw.
-    for _ in 0..2 {
-        assert_unsupported_delta_without_remote_mutation(
-            &endpoint,
-            config.clone(),
-            &[],
-            &["removed.csv"],
-        );
-        // Row documents only: this module indexes graph-enabled now that
-        // `--no-graph` takes the generated executor, so each source also
-        // publishes one file-level node document.
-        assert_eq!(data_rows(&endpoint.state.lock().unwrap()).len(), 4);
-        assert_eq!(
-            dataset_catalog_docs(&endpoint)[0]["bytes"],
-            durable_live_bytes
-        );
+    let retained_bytes = fs::metadata(&retained).unwrap().len();
+    // The sweep is exit 3 (files-removed). The next rerun of the settled
+    // folder is exit 0: nothing left to remove.
+    for expected in [3, 0] {
+        assert_eq!(run_index(config.clone()).unwrap(), expected);
+        let locked = endpoint.state.lock().unwrap();
+        let rows = data_rows(&locked);
+        assert_eq!(rows.len(), 2, "the removed file's rows are gone");
+        assert!(rows
+            .iter()
+            .all(|doc| doc["ax_path"].as_str() == Some("retained.csv")));
+        drop(locked);
+        assert_eq!(dataset_catalog_docs(&endpoint)[0]["bytes"], retained_bytes);
     }
 }
 
@@ -3365,12 +3397,10 @@ fn a_planned_key_never_gains_two_owners_when_old_content_moves_paths() {
         .all(|doc| doc["value"].as_str() == Some("rewritten")));
 }
 
-/// #238: a file added after the plan was frozen is skipped and reported in the
-/// catalog. That report used to be immortal — `new_unplanned` was a per-run
-/// `Vec`, so once the file left the corpus nothing remembered the document had
-/// ever been written and no run could remove it. The catalog is the data map
-/// every `map`/`status`/agent query reads; it must not keep advertising a file
-/// that is gone.
+/// #2314: a same-schema file added after the plan was frozen is indexed.
+/// Deleting it afterwards must take its catalog row with it. The catalog is
+/// the data map every `map`/`status`/agent query reads; it must not keep
+/// advertising a file that is gone.
 
 #[test]
 fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
@@ -3391,56 +3421,34 @@ fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
     let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     assert_eq!(run_index(config.clone()).unwrap(), 0);
 
-    // Appears after the plan froze: not indexed, but reported as skipped.
+    // Appears after the plan froze and fits the frozen dataset: indexed.
     fs::write(
         corpus.path().join("added.csv"),
         "id,value\n2,added\n3,added\n",
     )
     .unwrap();
-    assert_eq!(run_index(config.clone()).unwrap(), 3);
-    let skipped_id = {
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let indexed_id = {
         let locked = endpoint.state.lock().unwrap();
         let (id, doc) = locked
             .catalog_docs
             .iter()
             .find(|(_, doc)| doc["path"].as_str() == Some("added.csv"))
-            .expect("a file skipped for being post-freeze is reported in the catalog");
-        assert_eq!(doc["status"].as_str(), Some("stale-plan"));
+            .expect("a same-schema addition is reported in the catalog");
         assert_eq!(doc["doc_kind"].as_str(), Some("file"));
+        assert_ne!(doc["status"].as_str(), Some("stale-plan"));
         id.clone()
     };
 
-    // The durable plan is the only record that the document exists. Without
-    // it no later run can ever delete it.
-    let replay = state::Journal::open(
-        state_dir.path(),
-        &config.root.to_string_lossy(),
-        &config.url,
-        &config.prefix,
-        config.bulk_timeout_secs,
-        false,
-    )
-    .unwrap();
-    assert!(
-        replay
-            .plan
-            .as_ref()
-            .unwrap()
-            .junk_files
-            .iter()
-            .any(|junk| junk.rel == "added.csv"),
-        "the skipped file must be recorded in the durable plan"
-    );
-    drop(replay);
-
-    // Delete it: the catalog entry goes with it, and the run is clean again.
+    // Delete it: the catalog entry goes with it. Exit 3 names the removal;
+    // the following rerun of the settled folder is exit 0.
     fs::remove_file(corpus.path().join("added.csv")).unwrap();
-    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    assert_eq!(run_index(config.clone()).unwrap(), 3);
     {
         let locked = endpoint.state.lock().unwrap();
         assert!(
-            !locked.catalog_docs.contains_key(&skipped_id),
-            "the catalog entry for a deleted skipped file must not survive"
+            !locked.catalog_docs.contains_key(&indexed_id),
+            "the catalog entry for a deleted added file must not survive"
         );
         assert!(
             locked
@@ -3449,6 +3457,10 @@ fn an_added_then_deleted_file_leaves_no_immortal_catalog_entry() {
                 .all(|doc| doc["path"].as_str() != Some("added.csv")),
             "no catalog document may still name the deleted file"
         );
+        assert!(locked
+            .docs
+            .values()
+            .all(|doc| doc["ax_path"].as_str() != Some("added.csv")));
         // The file that is still there keeps its entry.
         assert!(locked
             .catalog_docs
@@ -3484,20 +3496,13 @@ fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
     assert_eq!(run_index(config.clone()).unwrap(), 0);
     let starts = event_count(state_dir.path(), "file_replace_start");
 
-    // The whole duplicate group disappears: its documents stay live with no
-    // source file, so the rerun is refused. The original invariant still
-    // holds and is still checked — a key with no current file must never get
-    // a replacement intent journaled, which would be re-appended forever
-    // without ever committing.
+    // The whole duplicate group disappears. Its documents are swept (#2314).
+    // A key with no current file must still never get a replacement intent
+    // journaled, which would be re-appended forever without ever committing.
     fs::remove_file(corpus.path().join("dup-a.csv")).unwrap();
     fs::remove_file(corpus.path().join("dup-b.csv")).unwrap();
-    for _ in 0..2 {
-        assert_unsupported_delta_without_remote_mutation(
-            &endpoint,
-            config.clone(),
-            &[],
-            &["dup-a.csv"],
-        );
+    for expected in [3, 0] {
+        assert_eq!(run_index(config.clone()).unwrap(), expected);
         assert_eq!(
             event_count(state_dir.path(), "file_replace_start"),
             starts,
@@ -3513,6 +3518,25 @@ fn deleting_an_entire_duplicate_group_strands_no_pending_replacement() {
         )
         .unwrap();
         assert!(replay.pending_replacements.is_empty());
+        let locked = endpoint.state.lock().unwrap();
+        let live: std::collections::HashSet<&str> = locked
+            .docs
+            .values()
+            .filter_map(|doc| doc["ax_path"].as_str())
+            .collect();
+        assert!(live.contains("keep.csv"), "{live:?}");
+        assert!(
+            !live.contains("dup-a.csv") && !live.contains("dup-b.csv"),
+            "{live:?}"
+        );
+        assert!(locked.catalog_docs.values().all(|doc| {
+            let path = doc["path"].as_str();
+            path != Some("dup-a.csv") && path != Some("dup-b.csv")
+        }));
+        assert!(replay
+            .done
+            .values()
+            .all(|done| done.path != "dup-a.csv" && done.path != "dup-b.csv"));
     }
 }
 

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run the same query through a BM25 request and a kNN request against one XERJ index, then run it once more through the hybrid clause with fusion rrf, and confirm each fused score equals the sum of 1/(60+rank) over the lists that returned the document."
 answer: "What is reciprocal rank fusion, and when should I use it? RRF scores a document by the sum of weight over k plus its rank in every list that returned it. Use it to merge BM25 and kNN results whose scores are not comparable. XERJ uses k = 60, and our captured fused score was exactly 1/61 plus 1/61."
 key_fact: "The captured fused score for document d02, ranked first in both lists, was 0.032787 with k = 60."

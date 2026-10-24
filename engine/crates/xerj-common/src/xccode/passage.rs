@@ -101,11 +101,12 @@ fn symbol_spans(src: &Value) -> Vec<(String, String, i64, Option<i64>)> {
 
 /// The best matching DEFINITION, as `(text, label)`.
 ///
-/// Query terms score by count-in-span; a term appearing in the symbol's NAME
-/// adds 25 — the strongest signal an agent can act on: a query mentioning
-/// `addReplyNull` should return addReplyNull, not whichever unrelated span
-/// repeats a common word most often. Truncation keeps the label so the
-/// truncation is visible.
+/// Distinct query terms in the span rank first. A term appearing in the
+/// symbol's NAME adds 25 only when the query is a single identifier, or the
+/// name contains every query term — `addReplyNull` still returns
+/// addReplyNull. A multi-term question must not let a generic one-word name
+/// (`type Token`) outrank the span that covers the rest of the question
+/// (#2327). Truncation keeps the label so the truncation is visible.
 pub fn symbol_passage(
     body: &str,
     src: &Value,
@@ -124,7 +125,8 @@ pub fn symbol_passage(
     if terms.is_empty() {
         return None;
     }
-    let mut best: Option<(i64, String, String, i64, String)> = None;
+    // (distinct terms covered, score, name, kind, line, text)
+    let mut best: Option<(usize, i64, String, String, i64, String)> = None;
     for (name, kind, start, end) in spans {
         let lo = (start - 1).max(0) as usize;
         let hi = end
@@ -137,16 +139,23 @@ pub fn symbol_passage(
         let text = lines[lo..hi].join("\n");
         let low = text.to_lowercase();
         let nm = name.to_lowercase();
+        let covered = terms.iter().filter(|t| low.contains(t.as_str())).count();
+        let name_hits = terms.iter().filter(|t| nm.contains(t.as_str())).count();
         let mut score: i64 = terms.iter().map(|t| count_occurrences(&low, t)).sum();
-        score += 25 * terms.iter().filter(|t| nm.contains(t.as_str())).count() as i64;
+        if terms.len() <= 1 || name_hits == terms.len() {
+            score += 25 * name_hits as i64;
+        }
         if score <= 0 {
             continue;
         }
-        if best.as_ref().is_none_or(|b| score > b.0) {
-            best = Some((score, name, kind, start, text));
+        if best
+            .as_ref()
+            .is_none_or(|b| covered > b.0 || (covered == b.0 && score > b.1))
+        {
+            best = Some((covered, score, name, kind, start, text));
         }
     }
-    let (_, name, kind, start, mut text) = best?;
+    let (_, _, name, kind, start, mut text) = best?;
     if py_len(&text) > width {
         text = format!(
             "{}\n    ... [{kind} {name} truncated at {width} chars]",
@@ -807,6 +816,38 @@ mod tests {
         // No symbols / no matching term -> None (caller falls back).
         assert!(symbol_passage(body, &json!({}), "addReplyNull", 800).is_none());
         assert!(symbol_passage(body, &src, "zzzzz", 800).is_none());
+    }
+
+    /// #2327: a multi-term question must not prefer a one-word type whose
+    /// name matches a single term. An exact one-word lookup still prefers
+    /// the definition that carries that name.
+    #[test]
+    fn multi_term_query_prefers_the_span_covering_more_terms() {
+        let body = "\
+export type Token = string;\n\
+\n\
+export function apply(token: Token, handler: Handler): Session {\n\
+  return handler.refresh(token);\n\
+}\n\
+\n\
+export type Handler = { refresh(token: Token): Session };\n\
+";
+        let src = json!({
+            "symbols": [
+                { "name": "Token", "kind": "type", "line": 1, "end_line": 1 },
+                { "name": "apply", "kind": "function", "line": 3, "end_line": 5 },
+                { "name": "Handler", "kind": "type", "line": 7, "end_line": 7 }
+            ]
+        });
+        let (text, label) =
+            symbol_passage(body, &src, "session token refresh handler", 800).unwrap();
+        assert_eq!(label, "function apply @ line 3");
+        assert!(text.contains("handler.refresh"), "{text}");
+        assert!(!text.contains("export type Token"), "{text}");
+
+        let (exact, exact_label) = symbol_passage(body, &src, "Token", 800).unwrap();
+        assert_eq!(exact_label, "type Token @ line 1");
+        assert!(exact.contains("type Token"), "{exact}");
     }
 
     #[test]

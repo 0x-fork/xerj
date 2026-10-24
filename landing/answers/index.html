@@ -48,8 +48,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -75,7 +77,7 @@
   "url": "https://xerj.org/answers/",
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
-  "dateModified": "2026-10-20",
+  "dateModified": "2026-10-24",
   "isPartOf": {
     "@id": "https://xerj.org/#website"
   },
@@ -140,7 +142,7 @@
   <p>Direct answers about XERJ search, indexing and agent workflows, with evidence links and practical guidance for AI builders.</p>
   <h2>Agent access and memory</h2>
   <ul>
-    <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a> — xerj mcp is a stdio MCP server that proxies 17 tools to a running XERJ node, so ChatGPT, Claude or Cursor search an indexed local folder instead of opening files.</li>
+    <li><a href="/answers/give-chatgpt-claude-local-file-access">Can ChatGPT search a folder on my laptop, or do I need something else?</a> — xerj mcp is a stdio MCP server that proxies 22 tools to a running XERJ node, so ChatGPT, Claude or Cursor search an indexed local folder instead of opening files.</li>
     <li><a href="/answers/code-search-mcp-for-claude-code">I need my agent to find a passage and cite the file, not dump the whole tree. How?</a> — Local code search MCP for Claude Code with file:line citations: index with xerj autoindex, call xerj_search. One captured call cited 2 symbols without opening files.</li>
     <li><a href="/answers/local-search-mcp-for-codex-and-cursor">Search tool for a Codex agent, on the files you have</a> — xerj init writes the MCP entry for Claude Code, Cursor and Codex when those folders exist. A 2026-10-20 tools/list from xerj mcp returned 17 tools.</li>
     <li><a href="/answers/mcp-api-search-or-vector-search">Should an agent use API search or vector search?</a> — One question through 4 XERJ MCP tools returned 3 different result sets. Hybrid RRF returned 6 documents and merged both lists on the default lexical embedder.</li>
@@ -336,7 +338,7 @@
   </ul>
   <h2>Product identity</h2>
   <ul>
-    <li><a href="/answers/what-is-xerj">What is XERJ?</a> — XERJ is an Apache-2.0 single Rust binary that indexes a local folder with one command and answers search, agent memory and MCP calls from the same process.</li>
+    <li><a href="/answers/what-is-xerj">What is XERJ?</a> — XERJ is a new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.</li>
   </ul>
   <h2>RAG: troubleshooting</h2>
   <ul>

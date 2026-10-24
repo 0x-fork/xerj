@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node. In a project that already has .codex and .cursor, run xerj init with the node URL. Restart the agent. Call xerj_search only after tools/list shows it. xerj mcp does not start a node."
 answer: "A search tool for a Codex agent starts with `xerj init`. The command writes the MCP entry for Claude Code, and it writes Cursor and Codex only when those folders already exist. Codex reads the entry in trusted projects only. On 2026-10-20 `xerj mcp` returned 17 tools from a running node."
 key_fact: "xerj mcp tools/list returned 17 tools from the running node."

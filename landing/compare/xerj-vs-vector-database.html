@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/compare/xerj-vs-vector-database"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Should my agent call a search API or a vector store?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A search API is enough when one host holds the corpus. XERJ serves _memory/{namespace} and _search from the same process, so an agent that already calls the search API gets persistent memory with no second endpoint to run."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need a vector database for this, or am I overcomplicating it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "For a laptop-sized memory store you are probably overcomplicating it. A vector database earns its keep at filtered vector search at scale, or when a node loss must not lose service, and XERJ answers neither."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need Postgres or Qdrant to keep agent memory between sessions?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Memory persists in a reserved .xerj-memory-{namespace} index under the node data directory, so it survives a restart without a second data service."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is there a measured Qdrant head-to-head on this page?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The numbers here come from a 20-document retrieval capture on XERJ alone. No Qdrant index was built and no memory recall was scored against one."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which retrieval mode won the measured test?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Hybrid linear fusion, at precision@3 0.4583 and recall 0.7708 on the lexical default. It beat BM25, semantic and kNN on the same 8 judged queries."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does the default embedder do semantic matching?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The default embedder is lexical feature hashing and cannot connect synonyms. Semantic matching needs --embed-mode neural, which is opt-in and CPU-only."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When should I choose Qdrant instead?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Choose Qdrant when you need filtered vector search at scale, a Kubernetes operator, or DBSF fusion. Its built-in inference is Cloud only."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can XERJ replace a vector database for a large filtered workload?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ is single-node with no data-plane replication, and filtered kNN falls back to an exact scan rather than the graph index."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

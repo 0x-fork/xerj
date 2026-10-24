@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, then index the bucket with xerj autoindex s3://bucket/prefix, taking credentials from the environment and adding --endpoint-url for any store that is not Amazon S3. Re-run the same command to pick up changes: objects whose ETag and size are unchanged are not downloaded again. Report the LIST and GET counts the run prints before you put the command in a schedule, and remember the index itself is on the node's local disk, not in the bucket."
 answer: "How do I search files that live in an S3 bucket? Run xerj autoindex s3://bucket/prefix against a running node. XERJ lists the prefix, streams in only the objects whose ETag or size changed, and indexes them with the same extractors it uses for a folder. Credentials come from the environment; the index stays local."
 key_fact: "Measured against MinIO: an unchanged re-run over 4 keys cost 1 LIST and 0 GET requests, 0 bytes."

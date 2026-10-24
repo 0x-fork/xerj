@@ -7,21 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0-rc.99] - 2026-10-23
+## [1.0.0-rc.99] - 2026-10-24
 
-Window since v1.0.0-rc.98: 93 merged pull requests. x86_64 release binaries
+Window since v1.0.0-rc.98: 115 merged pull requests. x86_64 release binaries
 run on CPUs without AVX2. Cluster mode replicates index metadata, routes a
 document write to the primary named at create, copies an acknowledged write
 onto replicas placed at create, acknowledges that write once a quorum of
-the copies has confirmed, and reloads the shard plan from an on-disk Raft
-log after a restart; [#1170](https://github.com/xerj-org/xerj/issues/1170)
-stays open. `ctutils` 0.4.5 closes RUSTSEC-2026-0385. Autoindex, corpus and
-search fixes landed, including partial work on
+the copies has confirmed, reloads the shard plan from an on-disk Raft log
+after a restart, installs a compacted Raft snapshot on a lagging member,
+copies the primary's live documents onto a replica that is behind, and runs
+`_bulk`, `_update` and `_update_by_query` on the shard primary;
+[#1170](https://github.com/xerj-org/xerj/issues/1170) stays open. `ctutils`
+0.4.5 closes RUSTSEC-2026-0385. Autoindex, corpus and search fixes landed,
+including partial work on
 [#1122](https://github.com/xerj-org/xerj/issues/1122); that issue stays open.
-MCP gained local definition lookup. A DeepSeek Harness profile bundle ships
-in `dsh/`. Contributors in this window: Jarvis636431, Tong-bit-art,
-redwolf2019, ArkNill, pallidev, samuelmbabhazi, elewashy, WYSTAF, kamwoh,
-mgtf and mariomarcolongo.
+MCP gained local definition lookup and ordered batch retrieval. A DeepSeek
+Harness profile bundle ships in `dsh/`. Contributors in this window:
+Jarvis636431, Tong-bit-art, redwolf2019, ArkNill, pallidev,
+samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
 
 ### Security
 
@@ -37,7 +40,7 @@ mgtf and mariomarcolongo.
 
 ### Added
 
-- Cluster replication, five slices of
+- Cluster replication, nine slices of
   [#1170](https://github.com/xerj-org/xerj/issues/1170). The issue stays
   open. With `[cluster] enabled = false` every one of these paths is the
   previous local call.
@@ -71,14 +74,14 @@ mgtf and mariomarcolongo.
     when every placed replica has. Copies are the primary plus the replicas
     named by `index.number_of_replicas` at create. A quorum is
     `copies / 2 + 1`, and the primary already counts, so one replica out of
-    two is enough. The replica that did not confirm is removed from the
-    in-sync set through the Raft log and is not used for a later read.
-    Nothing replays the writes it missed, so it stays out.
-    `number_of_replicas` 0 or 1 is unchanged: there is no replica to wait
-    for, or that one replica must confirm. Fewer confirmations than the
-    quorum is still HTTP 503 `replica_not_acknowledged`: the primary has the
-    write, and retrying the index copies it to the replicas still in sync.
-    Single-node mode does not take this path (PR
+    two is enough.     The replica that did not confirm is removed from the
+    in-sync set through the Raft log and is not used for a later read until
+    the backfill slice below has copied the primary's live documents onto
+    it. `number_of_replicas` 0 or 1 is unchanged: there is no replica to
+    wait for, or that one replica must confirm. Fewer confirmations than
+    the quorum is still HTTP 503 `replica_not_acknowledged`: the primary
+    has the write, and retrying the index copies it to the replicas still
+    in sync. Single-node mode does not take this path (PR
     [#2303](https://github.com/xerj-org/xerj/pull/2303)). #1170 stays open:
     there is still no `wait_for_active_shards` and no replica promotion.
   - With `[cluster] enabled = true`, the server opens an on-disk Raft log
@@ -87,20 +90,87 @@ mgtf and mariomarcolongo.
     later document write is routed to the primary again. A member that
     starts with an empty log copies the leader's log and applies it, which
     installs index metadata (and an empty replica store when this node is
-    a replica). It does not copy documents written before it joined. A
-    replica removed from the in-sync set is not filled in. The log is not
-    compacted; there is no InstallSnapshot. Term and vote are stored with
-    the log, so a restarted node does not grant a second vote in the same
-    term. `[cluster] enabled = false` does not open the log. This improves
+    a replica). Documents written before it joined are copied by the
+    backfill slice below. Term and vote are stored with the log, so a
+    restarted node does not grant a second vote in the same term.
+    `[cluster] enabled = false` does not open the log. Log compaction and
+    InstallSnapshot are the next slice. This improves
     [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
     open (PR [#2313](https://github.com/xerj-org/xerj/pull/2313)).
-  - What #1170 still does not do: `wait_for_active_shards`; relocating or
-    backfilling when the replica count changes after create; `_bulk`,
-    `_update`, update-by-query and native `/v1` ingest (they do not route or
-    replicate); merging aggregations, suggest, collapse, rescore, profile,
-    `search_after` or scroll across owners; InstallSnapshot and copying
-    documents onto a member that joined late; replica promotion; replaying a
-    dropped replica back into the in-sync set; node-lifecycle APIs.
+  - A member compacts its Raft log once 64 metadata entries have been
+    applied since the previous snapshot. The compacted prefix is stored in
+    `{data_dir}/_raft/snapshot.meta` and removed from `raft.log`. A peer
+    whose log does not overlap that prefix receives InstallSnapshot and
+    applies those commands, which installs the same index metadata an
+    AppendEntries catch-up would have. The snapshot is that command prefix,
+    not a smaller folded image and not the documents. A history that does
+    not fit in 8 MiB stays in the log. Restart replays the snapshot and
+    then the entries after it. Copying the documents themselves is the
+    backfill slice below. Part of
+    [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+    open (PR [#2320](https://github.com/xerj-org/xerj/pull/2320)).
+  - A replica that does not have the primary's live documents copies them
+    and then rejoins the in-sync set. That covers a member that starts
+    after the writes (the create entry opens an empty replica store), a
+    replica removed from the in-sync set because it missed an
+    acknowledgement, and a process that stops and later opens the same
+    data directory: documents inserted, updated, or deleted while it was
+    down are applied to its replica store before the enlarged set is
+    published. The primary sends the live documents, drops ids the replica
+    still has that the primary no longer does, and publishes the enlarged
+    in-sync set through the Raft log. The primary holds that shard's
+    replica lock across the copy, so a write that arrives during the copy
+    is replicated to the new set when the lock is released. A later
+    single-document index or delete is copied to that replica with the
+    others. A write still needs the primary. Changing membership does not
+    move copies. `[cluster] enabled = false` does not do this. Part of
+    [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+    open (PR [#2328](https://github.com/xerj-org/xerj/pull/2328)). The
+    outage case (insert, update and delete, then reopen the same data
+    directory) is covered by the test-only pull request
+    [#2341](https://github.com/xerj-org/xerj/pull/2341).
+  - `POST /_bulk`, `POST /{index}/_bulk` and `POST /{index}/_update/{id}`
+    run on the shard primary, whichever member accepted the request. A
+    bulk body is split by primary. An action whose primary is another
+    member is forwarded there and is not indexed on the receiver. The
+    primary then copies the stored document (or the delete) onto the
+    in-sync replicas and acknowledges it with the same quorum as
+    `PUT /{index}/_doc/{id}`. `_bulk` covers index, create, update and
+    delete. `_update` covers a partial document and a script; the script
+    runs on the primary, where the current source is. A missing `_id` on
+    index or create is chosen before the owner is selected, so the stored
+    id is the id that was routed. An update that does not change the
+    source is not copied again. A copy that misses quorum is
+    `503 replica_not_acknowledged` for that item: the primary has the
+    write. Native `/v1` ingest still writes on the receiving node.
+    `_update_by_query` is the next slice. A write still needs the primary.
+    `[cluster] enabled = false` does not take this path. Part of
+    [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+    open (PR [#2344](https://github.com/xerj-org/xerj/pull/2344)).
+  - `POST /{index}/_update_by_query` runs on every shard primary, whichever
+    member accepted the request. Each primary updates the documents in its
+    own shard and copies those updates to the in-sync replicas, with the
+    same quorum as `PUT /{index}/_doc/{id}`. `max_docs` is one budget for
+    the index, spent across primaries in node-id order, not once per shard.
+    A primary that does not answer refuses the request before any document
+    is written. A copy that misses quorum is HTTP 503
+    `replica_not_acknowledged`: the primaries that ran have the update, and
+    the response still reports `updated` and `failures`. `?pipeline=` runs
+    on the primary; a missing or unrunnable pipeline there is HTTP 400 and
+    writes nothing. Pipelines are not replicated. `wait_for_completion=false`
+    uses the same path. `_delete_by_query` and native `/v1` ingest still
+    write on the receiving node. A write still needs the primary.
+    `[cluster] enabled = false` does not take this path. Part of
+    [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+    open (PR [#2347](https://github.com/xerj-org/xerj/pull/2347)).
+  - What #1170 still does not do: `wait_for_active_shards`; replica
+    promotion (a write still needs the primary); native `/v1` ingest and
+    `_delete_by_query` (they stay on the receiving node); replicating
+    pipelines; moving copies when membership changes; merging aggregations,
+    suggest, collapse, rescore, profile, `search_after` or scroll across
+    owners; node-lifecycle APIs. The snapshot is the command prefix, not
+    the documents, and a history that does not fit in 8 MiB stays in the
+    log.
 
 - A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0,
   version `1.0.0-rc.99`) inserts the README's `mcp-xerj` stdio row via
@@ -110,6 +180,15 @@ mgtf and mariomarcolongo.
   for directory submissions (PR
   [#2298](https://github.com/xerj-org/xerj/pull/2298)).
 
+- `xerj batch-search --input <file|->` and MCP `xerj_batch_search` retrieve
+  up to 50 IDs or questions in input order through one `_msearch` call.
+  Each item returns cited evidence, an explicit empty-result abstention, or
+  an independent error. Exact IDs require an indexed keyword field. Optional
+  whole-response token budgets preserve outcomes and at least one citation
+  per matched item, or refuse explicitly. This is retrieval, not generated
+  answers or calibrated confidence. Partial implementation of
+  [#1801](https://github.com/xerj-org/xerj/issues/1801) (PR
+  [#2333](https://github.com/xerj-org/xerj/pull/2333), Jarvis636431).
 
 - MCP `xerj_def` exposes local definition lookup, completing
   [#2080](https://github.com/xerj-org/xerj/issues/2080) (PR
@@ -127,6 +206,169 @@ mgtf and mariomarcolongo.
   prefix half of #2080).
 
 ### Fixed
+
+- `xerj autoindex` no longer junks every PDF on an OS that rejects
+  `setrlimit(RLIMIT_AS)` (macOS 27 returns `EINVAL`; a hard limit below
+  1536 MiB returns `EPERM`)
+  ([#2336](https://github.com/xerj-org/xerj/issues/2336), PR
+  [#2338](https://github.com/xerj-org/xerj/pull/2338)). The address-space
+  cap is crash isolation: the refusal is logged once and the worker still
+  starts. Linux still applies the 1536 MiB cap. The same refusal is ignored
+  for the isolated `.xls` reader. If every PDF fails because the worker
+  could not start, the run finishes `ok=false exit=1
+  reason=pdf-worker-unavailable` instead of looking like completed-with-junk.
+
+- `xerj autoindex` indexes `.sql` schema, migration and routine files as
+  code
+  ([#2337](https://github.com/xerj-org/xerj/issues/2337), PR
+  [#2342](https://github.com/xerj-org/xerj/pull/2342)). `CREATE TABLE` /
+  `VIEW` / `FUNCTION` / `PROCEDURE` / `INDEX` / `TRIGGER` / `TYPE` /
+  `SCHEMA` / `SEQUENCE` become symbols, and the source stays searchable. A
+  comment, a quoted literal, a dollar-quoted body, or an `INSERT` / `COPY`
+  nested inside another statement is not a dump. Those files used to be
+  sniffed as an empty SQL dump and skipped (`no records extracted`), which
+  dropped hand-written DDL. A file with a top-level `INSERT … VALUES` is
+  still a row dump. A data-only `COPY … FROM stdin` dump, which the row
+  parser does not read, is skipped with that reason; when the same file
+  also contains schema statements, those statements are indexed as code.
+
+- A full process memtable budget now flushes instead of leaving
+  `xerj autoindex` on HTTP 429 until it gives up
+  ([#2321](https://github.com/xerj-org/xerj/issues/2321), PR
+  [#2325](https://github.com/xerj-org/xerj/pull/2325)). The rejection
+  requests a drain (largest memtable first) rather than waiting for the
+  next memory sample, and a search issued while that breaker is engaged
+  publishes those memtables before it scans them. `xerj search` /
+  `xerj def` saying `no indices named …` names the prefixes on the node in
+  that same line, including a prefix recorded only on a catalog dataset
+  document.
+
+- The default process memory cap on a host under 16 GiB is half of that
+  RAM, and segment merges follow it. This improves
+  [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays
+  open (PR [#2340](https://github.com/xerj-org/xerj/pull/2340)). An 8 GiB
+  machine used to take the 8 GiB step, so the budget was the whole machine;
+  a merge storm on Windows 10 stayed up only after
+  `XERJ_MAX_PROCESS_MEMORY_MB=4096`. That host now gets a 4 GiB cap. A
+  merge batch on a budget that cannot hold the historical 512 MiB input
+  (8× working set plus the 2 GiB memtable floor) is sized to `budget / 64`
+  (64 MiB at 4 GiB) and concurrent merges share a quarter of the budget. A
+  batch that would still cross the RSS watermark waits for the next check;
+  one batch still runs, because a merge is what retires per-segment caches.
+  Hosts at 16 GiB and above keep the 8 / 16 / 32 GiB steps, the 512 MiB
+  batch, and the configured merge parallelism. A single JSON document over
+  50 MiB is still refused at the 8 MiB ceiling, before it is parsed, and
+  the rest of the bulk is indexed. The memory-ceiling class and the WSL2
+  VM death are not addressed.
+
+- A multi-term question no longer ranks a one-word symbol definition
+  (`type Token`) above a hit that covers more of the question
+  ([#2327](https://github.com/xerj-org/xerj/issues/2327), PR
+  [#2329](https://github.com/xerj-org/xerj/pull/2329)). `xerj search`,
+  `xerj def`, `xerj code` and the plain-string `xerj_search` tool add a
+  coverage score when the question has three or more content tokens, and
+  drop a one-term `name`+`kind` hit behind those results. A one-token
+  lookup (`xerj def Token`) is unchanged. A nested test callback larger
+  than a passage is no longer returned whole: the line-snapped window is
+  kept, with its line. An archived path (`archive/`, `archived/`, or
+  `keep_archived`) is marked on the `xerj code` header and on `xerj search`.
+
+- Graph-mode `xerj autoindex` re-indexes a folder after files are added or
+  deleted
+  ([#2314](https://github.com/xerj-org/xerj/issues/2314), PR
+  [#2317](https://github.com/xerj-org/xerj/pull/2317)). An added file that
+  fits a frozen dataset is indexed on the rerun; a file that needs a new
+  dataset stays unindexed until `--fresh`. Documents, catalog rows and
+  graph edges for a file that left the folder are removed, and the run
+  names that file, including when `--fresh` rebuilds the plan.
+  `xerj autoindex remove` deletes that folder's resume journal and
+  `sync-snapshots`, and an explicit `--state-dir` on `remove` deletes the
+  journal there too. A file whose size changes while a run is reading it
+  is skipped with a warning instead of aborting the run, on the graph path
+  and on `--no-graph` snapshot sealing. The catalog canonical/alias count
+  refreshes and recounts before it aborts a generation. A rerun that
+  removes documents for files that left the folder finishes exit 3
+  (`reason=files-removed`); the next unchanged rerun is exit 0.
+
+- Scoped autoindex threads and `POST /{index}/_update/{id}` no longer abort
+  the process when a thread stack or a large body cannot be allocated.
+  This improves [#1122](https://github.com/xerj-org/xerj/issues/1122); the
+  issue stays open (PR [#2322](https://github.com/xerj-org/xerj/pull/2322)).
+  Indexing workers, sync replay, object-watch fetches and mailbox parsers
+  start with `pthread_create` and do not map an alternate signal stack. A
+  spawn the OS refuses is an error: the job does not run, workers that
+  already started keep going, and the caller runs the work on the calling
+  thread or records the failure. An update body over two 8 MiB documents
+  plus 256 KiB of envelope is refused before `serde_json`, and the existing
+  document is left as it was. The memory-ceiling class and the WSL2 VM
+  death are not addressed.
+
+- An idle node whose resident set sits flat at or above the memory
+  watermark no longer drains every 2 seconds for the rest of the process
+  ([#1981](https://github.com/xerj-org/xerj/issues/1981), PR
+  [#2232](https://github.com/xerj-org/xerj/pull/2232)). The breaker releases
+  once RSS has not fallen by more than 4 MiB for 2 seconds, and does not
+  re-arm inside that band (page-sized `ri_phys_footprint` noise is not a
+  new working set); a climb past it engages again. While the breaker stays
+  engaged, drain requests double their spacing up to 15 minutes when a
+  drain does not lower RSS by more than 4 MiB. `corpus index` / `autoindex`
+  report `eta_quality=stalled` when a phase with a known total completes
+  nothing (including 0/N), and when a phase with no total has been silent
+  for 10 minutes.
+
+- Semantic `xerj autoindex` against `--embed-mode proxy` resumes after a
+  mid-run failure and does not re-embed documents already indexed, when the
+  backend, configured model, endpoint and confirmed vector width are
+  unchanged
+  ([#2306](https://github.com/xerj-org/xerj/issues/2306), PR
+  [#2307](https://github.com/xerj-org/xerj/pull/2307)). The proxy digest is
+  still the model and endpoint (#533); the width is learned with one probe
+  (and remembered under the data directory) and compared on resume, so a
+  successful probe does not change the hash an existing index was recorded
+  under. A proxy whose endpoint has not confirmed a width stays
+  non-resumable, and the refusal says to make the endpoint reachable and
+  rerun — already-indexed documents are kept — or to rebuild with a new
+  `--state-dir` and `--prefix` only to discard the corpus. A provider that
+  swaps weights without changing the name, endpoint or width is still not
+  detectable.
+
+- The node no longer aborts when a helper thread or a merge buffer cannot
+  be allocated. This improves
+  [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays
+  open (PR [#2315](https://github.com/xerj-org/xerj/pull/2315)). An
+  in-process shard call starts its 8 MiB thread with `pthread_create` and,
+  if the OS refuses, returns `could not start the shard call` without
+  running the handler. `PUT /{index}/_doc/{id}` and
+  `PUT /{index}/_create/{id}` refuse a body over the 8 MiB document ceiling
+  before parsing it, the same way `POST /{index}/_doc` already did. A merge
+  that cannot reserve its output buffer, document map, or the next survivor
+  keeps the input segments and stays up. PDF and `.xls` output readers, the
+  autoindex progress ticker, and the finalize-verify search use the same
+  fallible spawn: a refusal fails that file, skips the ticker, or runs the
+  search on the calling thread. The memory-ceiling class and the WSL2 VM
+  death are not addressed.
+
+- `POST /_aliases` stores and enforces the alias metadata it is given:
+  `filter`, routing, `is_write_index` and `is_hidden` (PR
+  [#2319](https://github.com/xerj-org/xerj/pull/2319), Tong-bit-art). Those
+  fields were dropped by the action parser, so a filtered alias created
+  through the standard API exposed every document while the same alias
+  created with `PUT /{index}/_alias/{name}` worked. `_cat/aliases` printed
+  `-` for the filter; it now renders `*` for a filtered alias. Removing an
+  alias, or re-adding it without a filter, clears the stored metadata, so
+  a stale filter cannot outlive its definition.
+
+- `xerj corpus add --own` and `xerj corpus own <name>` (`--off` clears it)
+  mark a corpus as your own first-party code (`"own": true` in its
+  `corpus.json`)
+  ([#2339](https://github.com/xerj-org/xerj/issues/2339), PR
+  [#2343](https://github.com/xerj-org/xerj/pull/2343)). `xerj code` and MCP
+  `xerj_code_search` still name an unidentified licence (`UNKNOWN` or
+  `NONE-FOUND`) on each hit and omit the do-not-copy banner for that
+  unidentified licence. A licence the detector actually named still warns.
+  A local path is not marked own unless the flag is passed, and a `--from`
+  manifest cannot set the marker. `xerj corpus index` prints a per-file-class
+  indexed vs ignored-data summary at the end.
 
 - An existing index's persisted `index.default_pipeline` runs again after a
   clean restart
@@ -529,9 +771,14 @@ mgtf and mariomarcolongo.
 
 ### Testing
 
-- No test-only pull request merged in this window. The MCP tool-count
-  assertion was updated in the same change as local definition lookup (PR
-  [#2166](https://github.com/xerj-org/xerj/pull/2166)).
+- A dropped replica is refilled to the primary's live set before it
+  rejoins: insert, update and delete during the outage, then reopen the
+  same data directory. Test only; no production change. It exercises the
+  backfill in PR [#2328](https://github.com/xerj-org/xerj/pull/2328). Part
+  of [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+  open (PR [#2341](https://github.com/xerj-org/xerj/pull/2341)).
+- The MCP tool-count assertion was updated in the same change as local
+  definition lookup (PR [#2166](https://github.com/xerj-org/xerj/pull/2166)).
 
 ### Documentation & site
 
@@ -554,6 +801,16 @@ mgtf and mariomarcolongo.
   read 2026-10-24T02:05:55Z. `theme.js` refreshes it from the GitHub API,
   cached in the browser for 10 minutes, and keeps the shipped number if
   that call fails (PR [#2311](https://github.com/xerj-org/xerj/pull/2311)).
+  The site states the MCP tool count main registers: 22 with a hub signing
+  key (`xerj_def` and `xerj_batch_search` included), 19 when the three
+  `xerj_hub_*` tools are dropped. The published `mcp-tools.json` already
+  lists 22. The v1.0.0-rc.98 figure stays 20 and now names both tools that
+  binary lacks (PR [#2350](https://github.com/xerj-org/xerj/pull/2350)).
+  Canonical description, synced figures, FAQPage JSON-LD, robots
+  Content-Signal, `llms.txt`, an IndexNow key, and MCP listing manifests
+  (`server.json`, the mcpb manifest, and a Docker MCP Dockerfile). The
+  registry manifest names the tagged release v1.0.0-rc.98 (PR
+  [#2323](https://github.com/xerj-org/xerj/pull/2323)).
 - A ready-to-paste DeepSeek Harness MCP config, with `env` and `cwd`
   ([#2286](https://github.com/xerj-org/xerj/issues/2286), PR
   [#2288](https://github.com/xerj-org/xerj/pull/2288)). Both Windows install
@@ -585,16 +842,22 @@ mgtf and mariomarcolongo.
   `corpus add` plus a hub-manifest pull request (PR
   [#2270](https://github.com/xerj-org/xerj/pull/2270), kamwoh); a Cline MCP
   setup from the README block, CLI only (PR
-  [#2301](https://github.com/xerj-org/xerj/pull/2301)).
+  [#2301](https://github.com/xerj-org/xerj/pull/2301)); batch retrieval
+  against a fresh isolated node with synthetic advisories — usage only,
+  not a quality or performance evaluation (PR
+  [#2334](https://github.com/xerj-org/xerj/pull/2334), Jarvis636431, written
+  with OpenAI Codex).
 - CLA signatures: ArkNill (#2153), pallidev (#2165), samuelmbabhazi (#2168),
   elewashy (#2173), WYSTAF (#2175), kamwoh (#2264), mgtf (#2275),
-  mariomarcolongo (#2292).
+  mariomarcolongo (#2292). Jun516 joined the contributor list (PR
+  [#2335](https://github.com/xerj-org/xerj/pull/2335)).
 
 ### Housekeeping
 
 - Release-download counters landed as `[skip ci]` chores, not pull requests:
-  2026-10-22 (30,604 assets, 25,047 binaries) and 2026-10-23 (31,411 assets,
-  25,591 binaries). The figures are the commit subjects.
+  2026-10-22 (30,604 assets, 25,047 binaries), 2026-10-23 (31,411 assets,
+  25,591 binaries) and 2026-10-24 (33,978 assets, 27,993 binaries). The
+  figures are the commit subjects.
 
 
 ## [1.0.0-rc.98] - 2026-10-21

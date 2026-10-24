@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a single-node XERJ, count the source index, POST /_reindex into a fresh destination index, then compare the response took, batches, created and failures fields against a _count of the destination before you report progress."
 answer: "Reindexing my files is taking forever; what usually causes it? Usually batch size and write cost, and sometimes a stalled call. Read created against a _count of the destination index to tell slow progress from none. A measured XERJ _reindex of 100,000 documents took 20,836 ms in 100 batches with 0 failures on one node."
 key_fact: "A single-node `_reindex` of 100,000 documents reported took 20,836 ms, 100 batches and 0 failures."

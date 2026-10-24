@@ -3941,6 +3941,34 @@ fn resolve_effective_pipeline(
     }
 }
 
+/// Parse one indexed document from raw bytes.
+///
+/// The size check runs before `serde_json`. `PUT /{index}/_doc/{id}` used
+/// to take `Json<Value>`, which builds the DOM inside axum before the
+/// handler runs. A body between the 8 MiB document ceiling and
+/// `limits.max_body_bytes` (100 MiB) was parsed, then refused, and the
+/// parse itself is what aborted the node under a memory cap (#1122).
+/// Bytes that are not valid JSON and are also over the ceiling report the
+/// size refusal, not a parse error — that is how a test can see the check
+/// ran first.
+pub(crate) fn parse_indexed_document_body(body: &[u8]) -> Result<Value, xerj_common::XerjError> {
+    if xerj_common::document_limit::indexed_document_too_large(body.len()) {
+        return Err(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::indexed_document_refusal(body.len()),
+        ));
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| xerj_common::XerjError::invalid_query(format!("invalid JSON body: {e}")))
+}
+
+/// Serialize a document the in-process callers already hold as a [`Value`]
+/// into the raw body [`index_doc`] parses. Those callers (brain edges,
+/// agent memory) are small; the HTTP routes pass the request bytes through
+/// unchanged.
+pub(crate) fn document_body(doc: &Value) -> bytes::Bytes {
+    bytes::Bytes::from(serde_json::to_vec(doc).unwrap_or_else(|_| Vec::from(&b"{}"[..])))
+}
+
 /// Fast path for `POST /{index}/_doc`: receives raw bytes to skip the axum
 /// JSON extractor's extra validation pass and parse directly with simd_json /
 /// serde_json.  No schema validation is performed here; the engine layer handles
@@ -3951,22 +3979,9 @@ pub async fn index_doc_auto(
     Query(params): Query<IndexDocAutoParams>,
     body: bytes::Bytes,
 ) -> impl IntoResponse {
-    if xerj_common::document_limit::indexed_document_too_large(body.len()) {
-        return ApiError::new(xerj_common::XerjError::invalid_document_json(
-            xerj_common::document_limit::indexed_document_refusal(body.len()),
-        ))
-        .into_response();
-    }
-    // Parse the raw body directly — avoids the axum Json extractor's extra
-    // content-type enforcement and serde_json::from_str double-pass.
-    let doc: Value = match serde_json::from_slice(&body) {
+    let doc = match parse_indexed_document_body(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return ApiError::new(xerj_common::XerjError::invalid_query(format!(
-                "invalid JSON body: {e}"
-            )))
-            .into_response();
-        }
+        Err(e) => return ApiError::new(e).into_response(),
     };
 
     let doc = apply_ignore_malformed(&state, &index, doc);
@@ -4115,8 +4130,13 @@ pub async fn index_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<IndexDocParams>,
-    Json(doc): Json<Value>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    // Size check before the DOM exists. See [`parse_indexed_document_body`].
+    let doc = match parse_indexed_document_body(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     // Apply ignore_malformed validation — remove malformed values and add
     // field names to _ignored[] per the index mapping. No-op when the index
     // has no mapping yet.
@@ -4321,8 +4341,12 @@ pub async fn create_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<CreateDocParams>,
-    Json(doc): Json<Value>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    let doc = match parse_indexed_document_body(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     // Execute ingest pipeline if one is specified (explicit `?pipeline=`) or
     // resolved from the index's `index.default_pipeline` setting.
     let effective_pipeline = resolve_effective_pipeline(&state, &index, params.pipeline.as_deref());
@@ -4393,6 +4417,207 @@ pub async fn create_doc(
             (StatusCode::CREATED, Json(er)).into_response()
         }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod oversized_single_doc {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::config::{Config, WalSync};
+    use xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES;
+    use xerj_common::metrics::Metrics;
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn an_oversized_body_is_refused_before_it_is_parsed() {
+        let body = vec![b'x'; MAX_INDEXED_DOCUMENT_BYTES + 1];
+        let err = parse_indexed_document_body(&body).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("not indexed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size check must run before parse: {text}"
+        );
+        let small = parse_indexed_document_body(br#"{"name":"ada"}"#).unwrap();
+        assert_eq!(small["name"], "ada");
+    }
+
+    #[tokio::test]
+    async fn put_and_create_refuse_an_oversized_body_and_a_small_put_indexes() {
+        let app = crate::router::build_es_compat_router(test_state());
+        let body = vec![b'x'; MAX_INDEXED_DOCUMENT_BYTES + 1];
+        for path in ["/oversize/_doc/1", "/oversize/_create/1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+                "{path}: {text}"
+            );
+            assert!(text.contains("not indexed"), "{path}: {text}");
+            assert!(
+                !text.contains("invalid JSON"),
+                "{path} parsed before the size check: {text}"
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::put("/oversize/_doc/ok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"ada"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+}
+
+#[cfg(test)]
+mod oversized_update {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::config::{Config, WalSync};
+    use xerj_common::document_limit::MAX_UPDATE_BODY_BYTES;
+    use xerj_common::metrics::Metrics;
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn an_oversized_update_body_is_refused_before_it_is_parsed() {
+        let body = vec![b'x'; MAX_UPDATE_BODY_BYTES + 1];
+        let err = parse_update_body(&body).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size check must run before parse: {text}"
+        );
+        let small = parse_update_body(br#"{"doc":{"name":"ada"}}"#).unwrap();
+        assert_eq!(small.doc.unwrap()["name"], "ada");
+    }
+
+    #[tokio::test]
+    async fn post_update_refuses_an_oversized_body_and_a_small_update_applies() {
+        let app = crate::router::build_es_compat_router(test_state());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::put("/upd/_doc/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"ada","n":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        // Valid JSON, over the envelope. A parse-first path would accept
+        // the syntax and answer with the document ceiling (or index it).
+        // The size refusal names the update limit and does not say the
+        // body was invalid JSON.
+        let mut big = Vec::new();
+        big.extend_from_slice(br#"{"doc":{"blob":""#);
+        big.extend(std::iter::repeat_n(b'a', MAX_UPDATE_BODY_BYTES));
+        big.extend_from_slice(br#""}}"#);
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::post("/upd/_update/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "parsed before the size check: {text}"
+        );
+
+        let fetched = app
+            .clone()
+            .oneshot(Request::get("/upd/_doc/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["_source"]["name"], json!("ada"));
+        assert_eq!(doc["_source"]["n"], json!(1));
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::post("/upd/_update/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"doc":{"name":"ada2"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let fetched = app
+            .oneshot(Request::get("/upd/_doc/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["_source"]["name"], json!("ada2"));
+        assert_eq!(
+            doc["_source"]["n"],
+            json!(1),
+            "fields the update did not name stay"
+        );
     }
 }
 
@@ -12863,6 +13088,35 @@ pub(crate) async fn search_shard_local(
     .await
 }
 
+/// Heap-allocate the publish future before it is polled.
+///
+/// `publish_memtables_if_budget_engaged` awaits `Index::flush`. That future
+/// is large enough that building it inside `search_impl` overflows the worker
+/// stack (#2321). A sync function creates it here, on the task that is about
+/// to poll it, and only the box escapes.
+#[inline(never)]
+fn boxed_memtable_publish(
+    engine: std::sync::Arc<xerj_engine::Engine>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send>> {
+    Box::pin(async move { engine.publish_memtables_if_budget_engaged().await })
+}
+
+/// Publish memtables that are holding the process budget, on a fresh task.
+///
+/// A no-op — and no spawn — when the memtable breaker is off, so an ordinary
+/// search does not flush. The spawn keeps `Index::flush`'s frame off
+/// `search_impl`'s stack.
+async fn publish_engaged_memtables(engine: std::sync::Arc<xerj_engine::Engine>) {
+    if !xerj_engine::governor::global().is_some_and(|governor| governor.memtable_breaker_engaged())
+    {
+        return;
+    }
+    let _ = tokio::spawn(async move {
+        let _published = boxed_memtable_publish(engine).await;
+    })
+    .await;
+}
+
 async fn search_impl(
     state: AppState,
     index: String,
@@ -12874,6 +13128,10 @@ async fn search_impl(
     // Read once, before the first `.await`: what the in-process hub caller asked
     // of this search. A request off the wire gets the default and is unaffected.
     let in_process = in_process_search();
+    // #2321: a memtable sitting on the process budget is what a `{prefix}-*`
+    // search scans. Publish it before this request walks it. No-op unless
+    // that breaker is engaged. Read `in_process` first — it is task-local.
+    publish_engaged_memtables(std::sync::Arc::clone(&state.engine)).await;
     // Closed-index handling is deferred to after index resolution below so
     // `ignore_unavailable` / `expand_wildcards` are honored per ES semantics.
 
@@ -20191,9 +20449,19 @@ async fn process_bulk_body(
         )
     });
 
-    let result =
-        xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, text_ref, opts)
-            .await;
+    // Cluster mode routes each action to its shard primary and copies the
+    // stored document. No cluster handle: the local bulk pipeline, unchanged.
+    // `wire` is the primary's `_version` / `_seq_no`. The accepting node does
+    // not have the document, so the lookup below would report a fresh id.
+    let (result, wire) = if state.engine.has_cluster() {
+        crate::cluster_shard::bulk_on_primaries(state, default_index, text_ref, opts).await
+    } else {
+        (
+            xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, text_ref, opts)
+                .await,
+            Vec::new(),
+        )
+    };
     let took_ms = result.took_ms;
     let errors = result.errors;
 
@@ -20218,7 +20486,7 @@ async fn process_bulk_body(
     let mut audited_index_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     let mut items: Vec<EsBulkItem> = Vec::with_capacity(result.items.len());
-    for item in result.items {
+    for (ordinal, item) in result.items.into_iter().enumerate() {
         let failed = item.error.is_some() || !(200..300).contains(&item.status);
         if failed {
             failed_items += 1;
@@ -20240,6 +20508,13 @@ async fn process_bulk_body(
         // `status: 400` reads as "this write landed".
         let (version, seq_no, primary_term, shards) = if failed {
             (None, None, None, None)
+        } else if let Some((version, seq_no)) = wire.get(ordinal).copied().flatten() {
+            (
+                Some(version),
+                Some(seq_no),
+                Some(1),
+                Some(crate::responses::EsShards::single_success()),
+            )
         } else {
             let (version, seq_no) = state
                 .engine
@@ -22798,7 +23073,7 @@ fn format_date(dt: chrono::DateTime<chrono::Utc>, fmt: &str) -> String {
 // POST /{index}/_update/{id}
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EsUpdateBody {
     /// Partial document fields to merge into existing source.
     pub doc: Option<Value>,
@@ -22818,7 +23093,7 @@ pub struct EsUpdateBody {
 }
 
 /// Query parameters for the `_update` endpoint.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateDocParams {
     /// `refresh=true|wait_for` — accepted without error; memtable is always visible.
     pub refresh: Option<String>,
@@ -22879,15 +23154,80 @@ async fn build_update_get_field(
     }
 }
 
+/// Parse an `_update` body from raw bytes.
+///
+/// The size check runs before `serde_json`. The route used to take
+/// `Json<EsUpdateBody>`, so axum built the DOM before the handler. A body
+/// between this envelope and `limits.max_body_bytes` (100 MiB) was parsed
+/// even when it could not be applied, and that parse is an infallible
+/// allocation (`panic = "abort"`, #1122). Bytes that are not JSON and are
+/// also over the limit report the size refusal, not a parse error.
+pub(crate) fn parse_update_body(body: &[u8]) -> Result<EsUpdateBody, xerj_common::XerjError> {
+    if xerj_common::document_limit::update_body_too_large(body.len()) {
+        let len = body.len();
+        tracing::warn!(
+            bytes = len,
+            limit = xerj_common::document_limit::MAX_UPDATE_BODY_BYTES,
+            "update body refused before parse; the existing document was not changed (#1122)"
+        );
+        return Err(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::update_body_refusal(len),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        xerj_common::XerjError::invalid_document_json(format!("invalid JSON body: {e}"))
+    })
+}
+
+pub(crate) struct LocalUpdate {
+    pub response: axum::response::Response,
+    /// The primary stored a new source. A cluster caller copies it. A noop,
+    /// a miss, and every error leave this false.
+    pub replicate: bool,
+}
+
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(query_params): Query<UpdateDocParams>,
-    Json(body): Json<EsUpdateBody>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_or_create_index(&index) {
+    // Before `get_or_create_index`, so a refused body does not create an
+    // index and does not read or write the document.
+    let body = match parse_update_body(&body) {
+        Ok(body) => body,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_update(&state, &index, &id, &body, &query_params).await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+    apply_local_update(&state, &index, &id, body, &query_params)
+        .await
+        .response
+}
+
+pub(crate) async fn apply_local_update(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    body: EsUpdateBody,
+    query_params: &UpdateDocParams,
+) -> LocalUpdate {
+    fn settled(response: impl IntoResponse, replicate: bool) -> LocalUpdate {
+        LocalUpdate {
+            response: response.into_response(),
+            replicate,
+        }
+    }
+    let idx = match state.engine.get_or_create_index(index) {
         Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        Err(e) => {
+            return settled(ApiError::new(xerj_common::XerjError::from(e)), false);
+        }
     };
 
     // ── Scripted update path ────────────────────────────────────────────────
@@ -22897,7 +23237,10 @@ pub async fn update_doc(
     if let Some(script_val) = body.script.as_ref() {
         let (src, params) = extract_update_script(script_val);
         if src.is_empty() {
-            return update_script_bad_request("script source is required".to_string());
+            return settled(
+                update_script_bad_request("script source is required".to_string()),
+                false,
+            );
         }
         let upsert_body = body.upsert.clone().or_else(|| {
             if body.doc_as_upsert {
@@ -22913,7 +23256,7 @@ pub async fn update_doc(
         let (transformed, fault) = xerj_engine::painless::with_script_fault_capture(
             xerj_engine::painless::with_script_deadline(
                 deadline,
-                idx.transform_document_serialized(&id, upsert_body, move |mut current| {
+                idx.transform_document_serialized(id, upsert_body, move |mut current| {
                     apply_painless_update(&mut current, &src, &params)?;
                     Ok::<_, String>(current)
                 }),
@@ -22921,65 +23264,66 @@ pub async fn update_doc(
         )
         .await;
         if let Some(reason) = fault {
-            return script_limit_response(&reason);
+            return settled(script_limit_response(&reason), false);
         }
         match transformed {
             Ok(Ok(Some(outcome))) => {
-                state.metrics.record_doc_indexed(&index);
+                state.metrics.record_doc_indexed(index);
                 let resp = outcome.response;
                 let mut er = if outcome.created {
                     crate::responses::EsDocResponse::created(
-                        &index,
+                        index,
                         &resp.id,
                         resp.version,
                         resp.seq_no.saturating_sub(1),
                     )
                 } else {
                     crate::responses::EsDocResponse::updated(
-                        &index,
+                        index,
                         &resp.id,
                         resp.version,
                         resp.seq_no.saturating_sub(1),
                     )
                 };
-                if update_wants_get(&query_params) {
-                    er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+                if update_wants_get(query_params) {
+                    er.get = Some(build_update_get_field(&idx, &resp.id, query_params).await);
                 }
-                return Json(er).into_response();
+                return settled(Json(er), true);
             }
             Ok(Ok(None)) => {
-                let e = xerj_common::XerjError::document_not_found(&id, &index);
-                return ApiError::new(e).into_response();
+                let e = xerj_common::XerjError::document_not_found(id, index);
+                return settled(ApiError::new(e), false);
             }
-            Ok(Err(error)) => return update_script_bad_request(error),
+            Ok(Err(error)) => return settled(update_script_bad_request(error), false),
             Err(error) => {
-                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                return settled(ApiError::new(xerj_common::XerjError::from(error)), false);
             }
         }
     }
 
     match idx
-        .update_document_with_upsert(&id, body.doc, body.upsert, body.doc_as_upsert)
+        .update_document_with_upsert(id, body.doc, body.upsert, body.doc_as_upsert)
         .await
     {
         Ok(Some(resp)) => {
-            state.metrics.record_doc_indexed(&index);
+            let replicate = resp.result != "noop";
+            state.metrics.record_doc_indexed(index);
             let mut er = crate::responses::EsDocResponse::updated(
-                &index,
+                index,
                 &resp.id,
                 resp.version,
                 resp.seq_no.saturating_sub(1),
             );
-            if update_wants_get(&query_params) {
-                er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+            if update_wants_get(query_params) {
+                er.get = Some(build_update_get_field(&idx, &resp.id, query_params).await);
             }
-            Json(er).into_response()
+            settled(Json(er), replicate)
         }
         Ok(None) => {
-            let e = xerj_common::XerjError::document_not_found(&id, &index);
-            ApiError::new(e).into_response()
+            let e = xerj_common::XerjError::document_not_found(id, index);
+            settled(ApiError::new(e), false)
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        Err(e) => settled(ApiError::new(xerj_common::XerjError::from(e)), false),
     }
 }
 
@@ -25110,6 +25454,98 @@ pub struct AliasAction {
 pub struct AliasActionParams {
     pub index: String,
     pub alias: String,
+    /// `POST /_aliases` carries the same per-alias metadata `PUT
+    /// /{index}/_alias/{name}` does. These used to be missing from this struct,
+    /// so serde silently discarded them and a filtered alias created through
+    /// the standard action API exposed every document.
+    #[serde(default)]
+    pub filter: Option<Value>,
+    #[serde(default)]
+    pub routing: Option<Value>,
+    #[serde(default)]
+    pub index_routing: Option<Value>,
+    #[serde(default)]
+    pub search_routing: Option<Value>,
+    #[serde(default)]
+    pub is_write_index: Option<bool>,
+    #[serde(default)]
+    pub is_hidden: Option<bool>,
+}
+
+/// The metadata object `PUT /{index}/_alias/{name}` and `POST /_aliases` both
+/// persist for an alias. Empty means "no metadata" (and clears any stale
+/// entry on a re-add).
+fn alias_action_meta(add: &AliasActionParams) -> Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = &add.filter {
+        obj.insert("filter".to_string(), v.clone());
+    }
+    if let Some(v) = &add.routing {
+        obj.insert("routing".to_string(), v.clone());
+    }
+    if let Some(v) = &add.index_routing {
+        obj.insert("index_routing".to_string(), v.clone());
+    }
+    if let Some(v) = &add.search_routing {
+        obj.insert("search_routing".to_string(), v.clone());
+    }
+    if let Some(v) = add.is_write_index {
+        obj.insert("is_write_index".to_string(), Value::Bool(v));
+    }
+    if let Some(v) = add.is_hidden {
+        obj.insert("is_hidden".to_string(), Value::Bool(v));
+    }
+    Value::Object(obj)
+}
+
+/// Replace (or clear, for empty metadata) one alias's metadata on one index
+/// and persist it. Clearing matters: re-adding an alias without a filter must
+/// not leave the previous filter enforced.
+fn store_alias_meta(state: &AppState, index: &str, alias: &str, meta: &Value) {
+    let mut existing = state
+        .engine
+        .index_alias_metadata
+        .get(index)
+        .map(|v| v.clone())
+        .unwrap_or_else(|| json!({}));
+    if !existing.is_object() {
+        existing = json!({});
+    }
+    if let Some(obj) = existing.as_object_mut() {
+        if meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            obj.remove(alias);
+        } else {
+            obj.insert(alias.to_string(), meta.clone());
+        }
+    }
+    state
+        .engine
+        .index_alias_metadata
+        .insert(index.to_string(), existing);
+    state.engine.flush_alias_metadata();
+}
+
+/// Drop one alias's stored metadata after the alias itself was removed.
+fn clear_alias_meta(state: &AppState, index: &str, alias: &str) {
+    let Some(mut existing) = state
+        .engine
+        .index_alias_metadata
+        .get(index)
+        .map(|v| v.clone())
+    else {
+        return;
+    };
+    let Some(obj) = existing.as_object_mut() else {
+        return;
+    };
+    if obj.remove(alias).is_none() {
+        return;
+    }
+    state
+        .engine
+        .index_alias_metadata
+        .insert(index.to_string(), existing);
+    state.engine.flush_alias_metadata();
 }
 
 #[derive(Debug, Deserialize)]
@@ -25178,10 +25614,15 @@ pub async fn post_aliases(
     for step in &plan {
         match step {
             Resolved::Add(add, targets) => {
+                let meta = alias_action_meta(add);
+                if let Some(reason) = alias_value_type_error(&add.alias, &meta) {
+                    return es_bad_request("illegal_argument_exception", &reason, None);
+                }
                 for target in targets {
                     if let Err(error) = state.engine.add_alias(&add.alias, target) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
+                    store_alias_meta(&state, target, &add.alias, &meta);
                 }
             }
             Resolved::Remove(remove, targets) => {
@@ -25189,6 +25630,7 @@ pub async fn post_aliases(
                     if let Err(error) = state.engine.remove_alias(&remove.alias, target) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
+                    clear_alias_meta(&state, target, &remove.alias);
                 }
             }
         }
@@ -25478,24 +25920,9 @@ pub async fn put_alias(
 
     let attach = |idx_name: &str| -> xerj_engine::Result<()> {
         state.engine.add_alias(&alias, idx_name)?;
-        if !alias_meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-            let mut existing = state
-                .engine
-                .index_alias_metadata
-                .get(idx_name)
-                .map(|v| v.clone())
-                .unwrap_or(json!({}));
-            if let Some(obj) = existing.as_object_mut() {
-                obj.insert(alias.clone(), alias_meta.clone());
-            } else {
-                existing = json!({ alias.clone(): alias_meta.clone() });
-            }
-            state
-                .engine
-                .index_alias_metadata
-                .insert(idx_name.to_string(), existing);
-            state.engine.flush_alias_metadata();
-        }
+        // Re-putting an alias replaces its definition: an empty body clears a
+        // previous filter instead of leaving it enforced.
+        store_alias_meta(&state, idx_name, &alias, &alias_meta);
         Ok(())
     };
 
@@ -25528,11 +25955,13 @@ pub async fn delete_alias(
         if let Err(error) = state.engine.remove_alias(&alias, &index) {
             return ApiError::new(xerj_common::XerjError::from(error)).into_response();
         }
+        clear_alias_meta(&state, &index, &alias);
     } else {
         for idx in &targets {
             if let Err(error) = state.engine.remove_alias(&alias, idx) {
                 return ApiError::new(xerj_common::XerjError::from(error)).into_response();
             }
+            clear_alias_meta(&state, idx, &alias);
         }
     }
     Json(json!({ "acknowledged": true })).into_response()
@@ -31030,7 +31459,10 @@ async fn resolve_by_query_targets(
     state: &AppState,
     spec: &str,
     user_query: Value,
-) -> std::result::Result<(Vec<std::sync::Arc<xerj_engine::Index>>, Value), xerj_common::XerjError> {
+) -> std::result::Result<
+    (Vec<std::sync::Arc<xerj_engine::Index>>, Vec<String>, Value),
+    xerj_common::XerjError,
+> {
     let member_names = resolve_index_selector(state, spec).await;
 
     // Alias filters are keyed on the name AS WRITTEN (the alias, not its
@@ -31062,7 +31494,7 @@ async fn resolve_by_query_targets(
                 .map_err(xerj_common::XerjError::from)?,
         );
     }
-    Ok((indices, effective_query))
+    Ok((indices, member_names, effective_query))
 }
 
 /// Combine the per-member results of a fanned-out by-query into one response.
@@ -31073,7 +31505,7 @@ async fn resolve_by_query_targets(
 /// concatenated; if any member produced an error body (it carries a `status`),
 /// that error is surfaced rather than a clean aggregate — a destructive
 /// by-query that partially failed must not report success.
-fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
+pub(crate) fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
     if results.len() == 1 {
         return results.pop().unwrap();
     }
@@ -31133,7 +31565,7 @@ pub async fn delete_by_query(
 ) -> impl IntoResponse {
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
-    let (indices, effective_query) =
+    let (indices, _index_names, effective_query) =
         match resolve_by_query_targets(&state, &index, body.query.clone()).await {
             Ok(t) => t,
             Err(e) => return ApiError::new(e).into_response(),
@@ -31544,6 +31976,137 @@ pub struct UpdateByQueryBody {
     pub scroll_size: Option<u64>,
 }
 
+/// Why `pipeline` cannot run on this engine, in the same words the
+/// `_update_by_query?pipeline=` handler has always used.
+pub(crate) fn unrunnable_pipeline_reason(
+    engine: &xerj_engine::Engine,
+    pipeline: &str,
+) -> Option<String> {
+    if !engine.pipelines.contains_key(pipeline) {
+        Some(format!("pipeline with id [{pipeline}] does not exist"))
+    } else {
+        engine.unrunnable_pipelines.get(pipeline).map(|reason| {
+            format!(
+                "pipeline with id [{pipeline}] cannot be run: {}",
+                reason.value()
+            )
+        })
+    }
+}
+
+pub(crate) fn pipeline_rejected_body(reason: &str) -> Value {
+    json!({
+        "error": {
+            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+            "type": "illegal_argument_exception",
+            "reason": reason,
+        },
+        "status": 400,
+    })
+}
+
+/// Build the cluster fan-out off this handler's state machine.
+///
+/// `update_by_query` is already large enough that a debug build's worker
+/// stack (2 MiB, the `#[tokio::test]` default) overflows once a second copy
+/// of the runner is inlined into the same future. `[cluster] enabled = false`
+/// never polls the fan-out, so the future is allocated here and only the
+/// pointer is stored on the handler. The server runtime is 4 MiB; this keeps
+/// the single-node path the size it was before the fan-out existed.
+fn begin_cluster_update_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::UpdateByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    Box::pin(cluster_update_by_query(
+        state,
+        index_names,
+        parts,
+        wait_for_completion,
+        handle,
+    ))
+}
+
+async fn cluster_update_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::UpdateByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> Response {
+    if !wait_for_completion {
+        let task_key = handle.key().to_string();
+        let spawned_key = task_key.clone();
+        let tasks = state.tasks.clone();
+        let names = index_names.clone();
+        // The fan-out calls `Engine::get_index` on the detached task, so
+        // the request's visibility rule has to come with it. See
+        // `xerj_engine::index_guard`.
+        let rule = xerj_engine::index_guard::current();
+        tokio::spawn(xerj_engine::index_guard::scoped_opt(rule, async move {
+            let mut results = Vec::with_capacity(names.len());
+            for name in &names {
+                results.push(
+                    crate::cluster_shard::pin_update_by_query_on_primaries(
+                        state.clone(),
+                        name.clone(),
+                        parts.clone(),
+                    )
+                    .await,
+                );
+            }
+            tasks.complete(&spawned_key, aggregate_by_query_results(results, "updated"));
+            drop(handle);
+        }));
+        return Json(json!({ "task": task_key })).into_response();
+    }
+    let mut results = Vec::with_capacity(index_names.len());
+    for name in &index_names {
+        results.push(
+            crate::cluster_shard::pin_update_by_query_on_primaries(
+                state.clone(),
+                name.clone(),
+                parts.clone(),
+            )
+            .await,
+        );
+    }
+    drop(handle);
+    by_query_response(aggregate_by_query_results(results, "updated"))
+}
+
+/// Own the runner's arguments, then box it.
+///
+/// A primary's `_update_by_query` runs on the coordinator's task when this
+/// node is that primary. Inlining the runner into the fan-out future puts
+/// two copies of it on the stack under `search_inner` and overflows a debug
+/// worker. The box is the same split `MemoryShardRpc` uses for a remote
+/// primary: the heavy future is not built on the caller's state machine.
+pub(crate) fn run_update_by_query_recorded_boxed(
+    idx: std::sync::Arc<xerj_engine::Index>,
+    query: Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+    updated_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    Box::pin(async move {
+        run_update_by_query_recorded(
+            &idx,
+            &query,
+            max_docs,
+            scroll_size,
+            script,
+            pipeline,
+            updated_ids,
+        )
+        .await
+    })
+}
+
 pub async fn update_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -31553,11 +32116,11 @@ pub async fn update_by_query(
     let query_val = body.query.clone().unwrap_or(json!({ "match_all": {} }));
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
-    let (indices, effective_query) = match resolve_by_query_targets(&state, &index, query_val).await
-    {
-        Ok(t) => t,
-        Err(e) => return ApiError::new(e).into_response(),
-    };
+    let (indices, index_names, effective_query) =
+        match resolve_by_query_targets(&state, &index, query_val).await {
+            Ok(t) => t,
+            Err(e) => return ApiError::new(e).into_response(),
+        };
 
     // Validate the (alias-filter-ANDed) query once, up front, so a malformed
     // body is an immediate 400 before a task is registered or any member is
@@ -31588,34 +32151,27 @@ pub async fn update_by_query(
     // rewritten every document EXACTLY as it was. Resolved and validated
     // before any document is touched: an unknown or unrunnable name fails the
     // whole request rather than half of it.
-    let pipeline = match params.get("pipeline").map(String::as_str) {
+    //
+    // With a cluster handle the pipeline runs on each primary, which is where
+    // the current source is. The check is that primary's, before it writes.
+    // Single-node mode still refuses here, on the node that accepted the call.
+    let pipeline_name = match params.get("pipeline").map(String::as_str) {
         None | Some("_none") => None,
-        Some(p) => {
-            let reason = if !state.engine.pipelines.contains_key(p) {
-                Some(format!("pipeline with id [{p}] does not exist"))
-            } else {
-                state
-                    .engine
-                    .unrunnable_pipelines
-                    .get(p)
-                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
-            };
-            if let Some(reason) = reason {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
-                            "type": "illegal_argument_exception",
-                            "reason": reason,
-                        },
-                        "status": 400,
-                    })),
-                )
-                    .into_response();
-            }
-            Some((state.engine.clone(), p.to_string()))
+        Some(p) => Some(p.to_string()),
+    };
+    let pipeline = if state.engine.has_cluster() {
+        None
+    } else if let Some(p) = pipeline_name.as_deref() {
+        if let Some(reason) = unrunnable_pipeline_reason(&state.engine, p) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(pipeline_rejected_body(&reason)),
+            )
+                .into_response();
         }
+        Some((state.engine.clone(), p.to_string()))
+    } else {
+        None
     };
 
     // ES defaults `wait_for_completion` to true (synchronous); only an
@@ -31625,6 +32181,24 @@ pub async fn update_by_query(
         .map(|v| v != "false")
         .unwrap_or(true);
     let handle = state.tasks.register("indices:data/write/update/byquery");
+
+    if state.engine.has_cluster() {
+        let parts = crate::cluster_shard::UpdateByQueryParts {
+            query: effective_query,
+            script,
+            pipeline: pipeline_name,
+            max_docs: body.max_docs,
+            scroll_size,
+        };
+        return begin_cluster_update_by_query(
+            state,
+            index_names,
+            parts,
+            wait_for_completion,
+            handle,
+        )
+        .await;
+    }
 
     if !wait_for_completion {
         let task_key = handle.key().to_string();
@@ -31754,6 +32328,15 @@ fn apply_pipeline_or_fail(
 /// no-script write is blind — XERJ cannot produce a version conflict);
 /// `noops` stays 0 (the mini-painless tolerates `ctx.*` statements without
 /// skipping the write).
+fn record_updated(updated_ids: &Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>, id: &str) {
+    let Some(ids) = updated_ids else {
+        return;
+    };
+    ids.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(id.to_string());
+}
+
 async fn run_update_by_query(
     idx: &std::sync::Arc<xerj_engine::Index>,
     query: &Value,
@@ -31761,6 +32344,18 @@ async fn run_update_by_query(
     scroll_size: usize,
     script: Option<(String, Value)>,
     pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+) -> Value {
+    run_update_by_query_recorded(idx, query, max_docs, scroll_size, script, pipeline, None).await
+}
+
+pub(crate) async fn run_update_by_query_recorded(
+    idx: &std::sync::Arc<xerj_engine::Index>,
+    query: &Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+    updated_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> Value {
     let started = Instant::now();
 
@@ -31871,7 +32466,10 @@ async fn run_update_by_query(
                                 processed += 1;
                                 if let Some(f) = transform_one(idx, id, &script, &pipeline).await {
                                     match f {
-                                        Ok(()) => updated += 1,
+                                        Ok(()) => {
+                                            updated += 1;
+                                            record_updated(&updated_ids, id);
+                                        }
                                         Err(reason) => failures.push(json!({
                                             "id": id,
                                             "cause": { "reason": reason },
@@ -32003,6 +32601,7 @@ async fn run_update_by_query(
                                     Ok(()) => {
                                         updated += 1;
                                         mutated_in_batch += 1;
+                                        record_updated(&updated_ids, &hit.id);
                                     }
                                     Err(reason) => failures.push(json!({
                                         "id": hit.id,
@@ -32037,6 +32636,7 @@ async fn run_update_by_query(
                                 Ok(_) => {
                                     updated += 1;
                                     mutated_in_batch += 1;
+                                    record_updated(&updated_ids, &hit.id);
                                 }
                                 Err(e) => {
                                     failures.push(json!({
@@ -32193,13 +32793,10 @@ mod scripted_update_publication_tests {
                     State(state),
                     Path(("script-counter".to_string(), "counter".to_string())),
                     Query(UpdateDocParams::default()),
-                    Json(EsUpdateBody {
-                        doc: None,
-                        doc_as_upsert: false,
-                        upsert: None,
-                        script: Some(json!("ctx._source.n += 1")),
-                        detect_noop: None,
-                    }),
+                    bytes::Bytes::from(
+                        serde_json::to_vec(&json!({"script": "ctx._source.n += 1"}))
+                            .expect("script update body"),
+                    ),
                 )
                 .await
                 .into_response()
@@ -32417,17 +33014,44 @@ pub async fn cat_aliases(
         }
     }
 
+    // `_cat/aliases` used to print a literal `-` for every metadata column, so
+    // a filtered alias created by `POST /_aliases` (or PUT …/_alias/…) looked
+    // unfiltered here even after the read paths honoured the filter. `*` is
+    // ES's text/JSON rendering for "this alias has a filter".
+    let cat_cell = |meta: &Value, key: &str| -> String {
+        match meta.get(key) {
+            None | Some(Value::Null) => "-".to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        }
+    };
+    let render = |alias: &str, index: &str| -> (String, String, String, String) {
+        let meta = alias_meta_for(&state, index, alias);
+        let filter = if meta.get("filter").is_some() {
+            "*".to_string()
+        } else {
+            "-".to_string()
+        };
+        (
+            filter,
+            cat_cell(&meta, "index_routing"),
+            cat_cell(&meta, "search_routing"),
+            cat_cell(&meta, "is_write_index"),
+        )
+    };
+
     if params.format.as_deref() == Some("json") {
         let arr: Vec<Value> = rows
             .iter()
             .map(|(alias, index)| {
+                let (filter, ri, rs, iw) = render(alias, index);
                 json!({
                     "alias": alias,
                     "index": index,
-                    "filter": "-",
-                    "routing.index": "-",
-                    "routing.search": "-",
-                    "is_write_index": "-",
+                    "filter": filter,
+                    "routing.index": ri,
+                    "routing.search": rs,
+                    "is_write_index": iw,
                 })
             })
             .collect();
@@ -32436,7 +33060,10 @@ pub async fn cat_aliases(
 
     let lines: Vec<String> = rows
         .iter()
-        .map(|(alias, index)| format!("{alias} {index} - - - -"))
+        .map(|(alias, index)| {
+            let (filter, ri, rs, iw) = render(alias, index);
+            format!("{alias} {index} {filter} {ri} {rs} {iw}")
+        })
         .collect();
     let body = if lines.is_empty() {
         String::new()

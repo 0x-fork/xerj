@@ -4,7 +4,9 @@
 //! codes as Latin-1. `pdf_oxide` resolves the object graph and font mappings
 //! before returning Unicode text. Each document runs in a fresh worker process
 //! so parser state or failure cannot contaminate the server. On Unix the worker
-//! also gets a process group and an address-space limit. This is crash/resource
+//! also gets a process group and, where the kernel accepts `RLIMIT_AS`, a
+//! 1536 MiB address-space cap. A kernel that rejects that cap (`EINVAL` /
+//! `EPERM`, as on macOS 27) still runs the worker. This is crash/resource
 //! isolation, not a security sandbox: the worker retains the user's authority.
 
 use super::{split_sections, ExtractStats, FieldOrigin, RawRecord, Sink};
@@ -950,7 +952,8 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     set_worker_memory_limit(&mut command);
     let mut child = command.spawn().with_context(|| {
         format!(
-            "could not start the isolated PDF parser for {}; check process/resource limits",
+            "{} for {}; check process/resource limits",
+            crate::state::PDF_WORKER_START_FAILURE,
             path.display()
         )
     })?;
@@ -967,41 +970,41 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     // so one failed spawn here used to abort the whole run. A failed spawn
     // now stops the worker and fails this one file, like any other worker
     // start-up failure.
-    let out_reader = match std::thread::Builder::new()
-        .name("xerj-pdf-stdout".into())
-        .spawn(move || {
+    let out_reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-pdf-stdout", move || {
             let _closed = out_closed;
             read_capped(stdout, MAX_WORKER_OUTPUT)
         }) {
-        Ok(reader) => reader,
-        Err(error) => {
-            terminate_worker_tree(&mut child);
-            return Err(error).with_context(|| {
-                format!(
-                    "could not start the PDF parser's output reader for {}",
-                    path.display()
-                )
-            });
-        }
-    };
-    let err_reader = match std::thread::Builder::new()
-        .name("xerj-pdf-stderr".into())
-        .spawn(move || {
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                terminate_worker_tree(&mut child);
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the PDF parser's output reader for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+    let err_reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-pdf-stderr", move || {
             let _closed = err_closed;
             read_capped(stderr, MAX_WORKER_STDERR as usize)
         }) {
-        Ok(reader) => reader,
-        Err(error) => {
-            terminate_worker_tree(&mut child);
-            let _ = out_reader.join();
-            return Err(error).with_context(|| {
-                format!(
-                    "could not start the PDF parser's error reader for {}",
-                    path.display()
-                )
-            });
-        }
-    };
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                terminate_worker_tree(&mut child);
+                let _ = out_reader.join();
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the PDF parser's error reader for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
 
     let started = Instant::now();
     let timeout = Duration::from_secs(WORKER_TIMEOUT_SECS.load(Ordering::Relaxed));
@@ -1178,19 +1181,25 @@ fn read_capped(mut input: impl Read, cap: usize) -> Result<CappedRead> {
 #[cfg(unix)]
 fn set_worker_memory_limit(command: &mut Command) {
     use std::os::unix::process::CommandExt;
+    // Probe in the parent so a refusal can be logged once on the progress
+    // stream. The child still decides: `pre_exec` skips EINVAL/EPERM and
+    // fails the spawn only for some other errno. `setrlimit` and the errno
+    // read are async-signal-safe; `from_raw_os_error` runs only on that
+    // fatal path, which is the same allocation the old code made for every
+    // failure.
+    let _ = super::rlimit::address_space_cap_supported();
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let limit = libc::rlimit {
-                rlim_cur: WORKER_ADDRESS_SPACE,
-                rlim_max: WORKER_ADDRESS_SPACE,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                return Err(std::io::Error::last_os_error());
+            match super::rlimit::apply_address_space_cap(WORKER_ADDRESS_SPACE) {
+                super::rlimit::AddressSpaceCap::Applied
+                | super::rlimit::AddressSpaceCap::Skipped => Ok(()),
+                super::rlimit::AddressSpaceCap::Failed(errno) => {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                }
             }
-            Ok(())
         });
     }
 }
@@ -1225,7 +1234,11 @@ fn terminate_worker_descendants(_process_group: u32) {}
 
 #[cfg(unix)]
 fn containment_description() -> &'static str {
-    "fresh process; Unix process-group cleanup; 1536 MiB RLIMIT_AS; not a security sandbox"
+    if super::rlimit::current_address_space_is_capped(WORKER_ADDRESS_SPACE) {
+        "fresh process; Unix process-group cleanup; 1536 MiB RLIMIT_AS; not a security sandbox"
+    } else {
+        "fresh process; Unix process-group cleanup; no RLIMIT_AS cap on this process; not a security sandbox"
+    }
 }
 
 #[cfg(not(unix))]

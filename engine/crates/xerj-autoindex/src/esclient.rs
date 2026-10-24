@@ -1141,10 +1141,11 @@ pub struct EmbeddingExecutionIdentity {
     pub version: u32,
     pub backend: String,
     pub identity_sha256: String,
-    /// Absent for backends whose vector width the server does not pin
-    /// (`proxy`, and a `neural` node that could not resolve its model assets;
-    /// a resolved `neural` node reports its `config.json` `hidden_size` since
-    /// #487). An absent width must not be read as 384.
+    /// Absent when the server has not pinned a vector width: a `proxy` whose
+    /// endpoint has not confirmed one (#2306), and a `neural` node that could
+    /// not resolve its model assets. A confirmed proxy reports the probed
+    /// width, and a resolved `neural` node reports its `config.json`
+    /// `hidden_size` (#487). An absent width must not be read as 384.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
     pub semantic_contract: String,
@@ -2353,12 +2354,24 @@ impl Es {
         let es = self.clone();
         let index_owned = index.to_owned();
         let body = body.clone();
-        std::thread::Builder::new()
-            .name("xerj-verify-search".to_owned())
-            .spawn(move || {
+        // #1122: `Builder::spawn` panics in the child on a failed signal-stack
+        // mmap after returning `Ok`. A failed `try_spawn` runs the search on
+        // this thread instead: the parallel HEAD probe is the optimization,
+        // and the process stays up.
+        if let Err(failure) =
+            xerj_common::thread_spawn::try_spawn("xerj-verify-search", move || {
                 let _ = tx.send(es.search(&index_owned, &body));
             })
-            .context("spawn finalize-verify search")?;
+        {
+            if let Some(job) = failure.job {
+                job();
+            } else {
+                anyhow::bail!(
+                    "could not start finalize-verify search for {index}: {}; the process stayed up",
+                    failure.error
+                );
+            }
+        }
         loop {
             match rx.recv_timeout(Self::VERIFY_INDEX_POLL) {
                 Ok(Ok(value)) => return Ok(value),

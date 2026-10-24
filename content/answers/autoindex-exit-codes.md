@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj autoindex on the folder, then branch on the process exit code before you report anything: 0 and 3 are finished runs, 4 is a decision request on stdout that you answer with --approve, 2 is a bad command line, and 1 is a real failure to retry or escalate."
 answer: "What does indexer exit code 3 mean for xerj autoindex? It means success: the run completed and recorded some junk files. Exit 0 is a clean completion, 4 means the estimate exceeded --max-minutes and nothing was indexed, 2 is a usage error, and 1 is an endpoint or journal failure. Only exit 4 asks you a question."
 key_fact: "The decision gate that produces exit 4 defaults to 10 minutes of estimated work (`DEFAULT_MAX_MINUTES`)."

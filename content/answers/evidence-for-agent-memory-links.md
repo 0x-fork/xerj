@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, build a XERJ brain over a notes folder, search the .xerj-memory-<brain>-edges index for documents with a src field, and report how many edges carry an evidence quote and what each quote says."
 answer: "Knowledge graphs aren't enough for agent memory; how do you get a know-how graph with evidence? XERJ stores the line that taught each link. All 7 detected edges in our capture carried an evidence object with a quote, a filename and an offset, and retiring a link wrote a tombstone instead of deleting the edge."
 key_fact: "The shared-term link detector keeps at most 5 edges per document (`MAX_EDGES_PER_DOC`), which bounds the link index."

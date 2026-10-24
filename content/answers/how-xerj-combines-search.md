@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, GET /_mapping on the target index to find the companion vector field, GET /v1/embedding/identity to learn which embedder the node loaded, then POST one hybrid request whose queries array holds a match sub-query and a knn sub-query with fusion rrf, and report the fused ranking beside the ranking each sub-query returns on its own."
 answer: "How does XERJ combine BM25 and kNN? One hybrid request carries a BM25 sub-query and a kNN sub-query against a single index, and Reciprocal Rank Fusion merges the two ranked lists. Fusion reads rank positions, not scores, so the BM25 and cosine scales never need to be normalized against each other."
 key_fact: "XERJ's RRF uses a default k of 60, so a document ranked first in both lists scores 1/61 + 1/61 = 0.032787."

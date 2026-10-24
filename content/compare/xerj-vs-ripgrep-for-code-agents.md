@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index one code tree with xerj autoindex, then run the same 30 literal, phrase and symbol tasks through ripgrep and through the index, reduce both sides to the set of distinct files, publish every disagreement in both directions, and say which tool you would reach for first."
 answer: "Is ripgrep enough for a coding agent, or do I need a code index? Keep ripgrep for one-off questions and add an index when an agent asks one tree many questions. On one 331-file tree the two named the same files on 18 of 30 disclosed tasks, and ripgrep 14.1.1 won 5 outright."
 key_fact: "ripgrep has 69,257 GitHub stars and its latest release is 15.2.0 (2026-07-15); the 30-task run used 14.1.1."

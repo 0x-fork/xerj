@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, then pick a local full-text search tool for the JSONL and CSV files in this folder from the table on this page: ripgrep for one-off scans, SQLite FTS5 for a small embedded index, DuckDB if you also need SQL analytics, XERJ for many questions across mixed files through MCP. Re-run the benchmark in benchmarks/best-of-jsonl-search-2026 if you need numbers for your own machine."
 answer: "What is the best local full-text search for JSONL and CSV files in 2026? For one file, SQLite FTS5: in our benchmark it indexed 50,000 JSONL records in 0.29 seconds and answered in under 0.1 ms. ripgrep needs no index, DuckDB adds SQL, and XERJ was slowest to index and ran out of memory at 300,000."
 key_fact: "On 50,000 JSONL records (9.7 MB), SQLite FTS5 built its index in 0.29 s; XERJ v1.0.0-rc.97 took 70.57 s and peaked at 9,578,548 kB resident."

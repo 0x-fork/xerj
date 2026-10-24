@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with --insecure, run xerj autoindex on the messy folder you were handed, then run xerj autoindex map --json and report every dataset, its index name, its formats, its field names with types, its time field and time range, and finally query autoindex-catalog for doc_kind file to list every file the run refused and the reason it gave."
 answer: "How should an agent figure out what is inside a messy data folder before searching? Run xerj autoindex on the folder, then read xerj autoindex map. The map lists every dataset it inferred, each field with type, cardinality and null share, the time range, a ready query, and every file it refused."
 key_fact: "Type inference keeps at most 512 fields per dataset (`MAX_FIELDS_PER_DATASET`), so a map never lists more than that for one dataset."

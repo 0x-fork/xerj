@@ -54,6 +54,10 @@ pub struct ClusterView {
     pub node_id: String,
     pub state: RaftState,
     pub leader_id: Option<String>,
+    /// Highest index in this node's snapshot. 0 when it has not compacted.
+    pub snapshot_index: u64,
+    /// Log entries that are not covered by the snapshot.
+    pub log_len: usize,
 }
 
 /// A metadata command waiting to be proposed or forwarded by the run loop.
@@ -155,6 +159,17 @@ impl ClusterHandle {
         self.view().leader_id
     }
 
+    /// Highest snapshotted index, or 0. Updated by the run loop, so a caller
+    /// can see it only after the next step.
+    pub fn snapshot_index(&self) -> u64 {
+        self.view().snapshot_index
+    }
+
+    /// Entries still in the log, not counting a compacted prefix.
+    pub fn log_len(&self) -> usize {
+        self.view().log_len
+    }
+
     fn view(&self) -> ClusterView {
         self.inner
             .view
@@ -198,10 +213,18 @@ impl ClusterHandle {
 /// Applies a committed metadata command to the local engine.
 ///
 /// Called on the cluster run loop for every committed entry, on every member.
-/// Implementations must be deterministic: the same command against the same
-/// prior state does the same thing on every node. They must not propose a
-/// new command.
+/// Implementations of [`MetadataApplier::apply_metadata`] must be
+/// deterministic: the same command against the same prior state does the
+/// same thing on every node, and that method must not propose a new command.
 #[async_trait::async_trait]
 pub trait MetadataApplier: Send + Sync {
     async fn apply_metadata(&self, command: &ClusterCommand) -> ApplyEffect;
+
+    /// Copy documents this node is missing as a replica.
+    ///
+    /// The runner calls this off the Raft step. The default does nothing.
+    /// The engine implementation asks each primary to copy that shard's live
+    /// documents and to publish this node into the in-sync set. That call
+    /// may propose. It is not part of applying a log entry.
+    async fn backfill_local_replicas(&self) {}
 }

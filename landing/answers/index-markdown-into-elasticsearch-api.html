@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/answers/index-markdown-into-elasticsearch-api"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Does XERJ have a Markdown format?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Markdown lands in the txt-prose family. Our capture detected all 6 Markdown documents as txt-prose and created no Markdown-specific field."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ extract Markdown headings into a field?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The captured md-docs mapping has no headings field, and the run recorded that as a failed expectation. The HTML family does produce one."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does the title start with a hash character?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XERJ takes the raw first line of the file as the title. In our capture 01-runbook.md returned the title # Runbook, hash included."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which fields does a Markdown index have?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Nine: body as semantic_text, title as keyword, and the 7 ax_* provenance fields as keyword. Nothing else is mapped."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I query a Markdown index with an Elasticsearch client?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. XERJ answers _mapping and _search on the Elasticsearch-compatible port, and the captured response carried hits.total, _score, _source and highlight."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I find text under one Markdown heading?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Send a match_phrase query on body for the heading text. No headings field exists on a Markdown index, so the heading is body text."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,11 +220,11 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I INDEX MARKDOWN INTO THE ELASTICSEARCH API?</div>
   <div class="kicker"><span>ANSWERS · FILES AND FORMATS</span></div>
   <h1>How do I index Markdown into the Elasticsearch API?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>What is the best way to index Markdown documents into Elasticsearch? XERJ indexes a Markdown folder with xerj autoindex and serves it on the Elasticsearch REST API. Markdown lands in the txt-prose family; in our capture XERJ mapped 9 fields, kept the title as the literal '# Runbook', and produced no headings array.</p>
-    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases, so ES clients query the Markdown index unchanged. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
+    <p class="key-fact"><strong>Key number:</strong> XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases, so ES clients query the Markdown index unchanged. <span class="mute">(as of 2026-10-23 · source: <a href="https://github.com/xerj-org/xerj/blob/main/README.md">README.md</a>)</span></p>
   </div>
   <p><strong>TL;DR</strong> — XERJ indexes a Markdown folder with <code class="inline">xerj autoindex</code> and serves it on the Elasticsearch REST API. Markdown lands in the <code class="inline">txt-prose</code> family, not in a Markdown family. In our capture XERJ mapped 9 fields, extracted the title as the literal <code class="inline"># Runbook</code>, and produced no <code class="inline">headings</code> array.</p>
   <div class="prompt-card">

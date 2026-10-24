@@ -664,6 +664,21 @@ impl VersionMap {
         self.inner.is_empty()
     }
 
+    /// Live document ids, sorted by id.
+    ///
+    /// Tombstones are left out. The order is the id string, not sequence
+    /// number, so two copies of the same primary agree on the list.
+    pub fn live_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .inner
+            .iter()
+            .filter(|entry| !entry.value().deleted)
+            .map(|entry| entry.key().clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Return the count of live (non-deleted) documents.
     ///
     /// O(1) — reads the maintained counter instead of iterating the map
@@ -701,6 +716,16 @@ impl Default for VersionMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_ids_skips_tombstones_and_is_sorted() {
+        let vm = VersionMap::new();
+        vm.set("b", 1, "s", false);
+        vm.set("a", 2, "s", false);
+        vm.set("c", 3, "s", false);
+        assert!(vm.delete("b", 4, "s").unwrap());
+        assert_eq!(vm.live_ids(), vec!["a".to_string(), "c".to_string()]);
+    }
 
     #[test]
     fn basic_set_and_get() {

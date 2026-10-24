@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-18",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/read-indexed-email-and-pdf-folder"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "I indexed a folder of email and PDFs. How do I actually read what it found?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Open the console the run printed. The Corpus page lists what was indexed, and the Reader opens any record by id: an email with its headers, body text and attachment list, or one page of a PDF."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does the Reader show the original PDF or the HTML version of an email?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. It shows the text the extractor indexed. XERJ stores extracted text, not attachment bytes, and the Reader never renders email HTML: an HTML body is displayed as its source."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How are an email and its attachments connected in the index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Every record that came out of one .eml file carries the same ax_file, and that is what the Reader joins on. A PDF attachment becomes one record per page section, so the Reader lists each attachment once. The email_message_id field is also copied to the attachments, but only when the message has a Message-ID header."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does the panel of linked records say the links belong to the file?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The same-folder, Markdown-link and path-citation detectors link file records, not the records inside a file. The Reader reads the links of the email's file as well and marks them FILE."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is it safe to open a hostile email in the Reader?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The Reader builds the page from text nodes, never from markup, and links no URL found in a document. In the recorded run a script-bearing subject and attachment name were displayed as text and nothing executed. That is a tested design, not a guarantee against every browser bug."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does the linked-records panel say the graph API refused my session?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On a node with auth on, which is the default, the console holds a passkey session and the graph API wants an API key. Search, records and attachments still work. The panel works on a node started with --insecure."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I let someone else read one index without giving them my node?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The console has a read-only guest mode driven by a share record that names one key, the shared indices, an optional brain and an expiry. It can only search and read those indices, and it logs out on expiry."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

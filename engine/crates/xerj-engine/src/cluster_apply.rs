@@ -38,6 +38,10 @@ impl MetadataApplier for EngineMetadataApplier {
     async fn apply_metadata(&self, command: &ClusterCommand) -> ApplyEffect {
         apply_committed(&self.engine, command.as_metadata()).await
     }
+
+    async fn backfill_local_replicas(&self) {
+        self.engine.backfill_out_of_sync_replicas().await;
+    }
 }
 
 pub(crate) fn propose_error(err: ProposeError) -> EngineError {
@@ -148,6 +152,68 @@ impl Engine {
             Ok(()) => Ok(()),
             Err(e) if is_already_exists(&e) => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Ask each primary to copy live documents onto a replica shard this
+    /// node holds that is not in the in-sync set.
+    ///
+    /// One pass. The cluster runner calls it again. A shard that is already
+    /// in sync, or whose replica store is not open yet, is skipped. The
+    /// primary copies the documents and publishes this node into the in-sync
+    /// set. A pass that finds nothing out of sync does not call a peer.
+    pub async fn backfill_out_of_sync_replicas(&self) {
+        let me = self.routing_node_id();
+        for index in self.index_name_list() {
+            // Replica stores are hidden indices. The plan lives on the user
+            // index, and that is the name the primary copies from.
+            if index.starts_with('.') {
+                continue;
+            }
+            for shard in self.local_replica_shards(&index) {
+                if self.replica_nodes(&index, shard).iter().any(|id| id == &me) {
+                    continue;
+                }
+                let Some(store) = xerj_cluster::replica_index_name(&index, shard) else {
+                    continue;
+                };
+                if self.get_index(&store).is_err() {
+                    continue;
+                }
+                let Some(primary) = self.shard_primary(&index, shard) else {
+                    continue;
+                };
+                if primary == me {
+                    continue;
+                }
+                let op = xerj_cluster::ShardOp::BackfillReplica {
+                    index: index.clone(),
+                    shard,
+                    replica_id: me.clone(),
+                };
+                match self.forward_shard(&primary, op).await {
+                    Ok(result) if (200..300).contains(&result.status) => {}
+                    Ok(result) => {
+                        tracing::debug!(
+                            index = %index,
+                            shard,
+                            primary = %primary,
+                            status = result.status,
+                            body = %result.body,
+                            "replica backfill was not applied"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            index = %index,
+                            shard,
+                            primary = %primary,
+                            error = %err,
+                            "replica backfill call failed"
+                        );
+                    }
+                }
+            }
         }
     }
 

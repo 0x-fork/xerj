@@ -38,7 +38,9 @@
 //!   on a failed spawn (#1122): Unix threads are created with `pthread_create`
 //!   so a signal-stack allocation failure is an error instead of a panic in
 //!   the child, the closure comes back, and a process-wide memory spawn gate
-//!   skips best-effort spawns once the breaker is engaged
+//!   skips best-effort spawns once the breaker is engaged. Scoped borrows
+//!   use the same `pthread_create` path and are joined before the scope
+//!   returns
 //! - [`hub`]     — Corpus Hub v2 shared types: the catalogue, pack manifest,
 //!   definition record, and the [`hub::Answer`] every surface renders (#1374)
 

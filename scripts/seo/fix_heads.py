@@ -153,10 +153,12 @@ def transform(rel: str, src: str, dates: urlmap.DateSource,
     # changes the date the next run computes, so `--check` fails on main the
     # first time a merge touches the file on a later date. build_articles.py
     # dates those hubs from the articles they list; keep what it wrote.
+    # A pinned `updated` in pagedata.py still wins, so a content edit can
+    # move dateModified forward on purpose.
     if not meta.get("_source_path"):
         kept = _existing_ld_dates(src)
-        published = kept.get("datePublished", published)
-        modified = kept.get("dateModified", modified)
+        published = meta.get("published") or kept.get("datePublished", published)
+        modified = meta.get("updated") or kept.get("dateModified", modified)
     block = build_block(rel, title, desc, published, modified, meta)
     head = head.rstrip("\n \t") + "\n" + block + "\n"
 

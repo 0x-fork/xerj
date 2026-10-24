@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/search-json-and-jsonl-logs"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What's the easiest way to search JSON logs plus some old gzip text logs in the same folder?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the folder once. Gzip is transparent to autoindex, so a .log.gz file is read like the plain file beside it, and one index pattern such as /jlog-*/_search queries both."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search JSON or JSONL log files without grepping blindly?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the folder, then send a filtered _search request. XERJ maps each JSON key to a typed field, so a term filter on level works at once."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "I just want to search logs on my laptop. I don't want Elasticsearch in Docker.",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. XERJ is one native binary that serves the Elasticsearch-compatible port itself, so the log folder is indexed and queried on the host with no container runtime."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ handle JSONL as well as a JSON array?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. XERJ detects both from file content and gives each its own index. The captured run produced jlog-jsonl and jlog-json from one folder."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ find the timestamp field by itself?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. The captured run inferred timestamp as a date in one file and ts as a date in the other, with no configuration."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Are the error counts exact or estimated?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Exact. The captured filter returned 386 hits and the aggregations reported doc_count_error_upper_bound 0 and sum_other_doc_count 0."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do gzipped log files work the same way?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Gzip is transparent on every parsed family, so a .jsonl.gz file indexes like the plain file next to it and lands in the same query pattern."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

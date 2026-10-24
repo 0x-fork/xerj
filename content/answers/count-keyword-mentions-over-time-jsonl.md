@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node, run xerj autoindex on the JSONL folder, and read xerj autoindex map before you aggregate. Send one _search with size 0, a match_phrase, and a date_histogram on the field the map types as date. If that field is double, say the histogram is empty and do not invent months."
 answer: "Count mentions of a word over time in a posts dataset. Index the JSONL, check the date field, and send one date histogram. On 2026-10-20 the phrase autoindex in issue titles returned 88 hits and took 123 ms: 1 in July, 50 in August, 11 in September, 26 in October. A fractional epoch field returned no months."
 key_fact: "A date histogram for the phrase autoindex returned 88 hits and took 123 ms."

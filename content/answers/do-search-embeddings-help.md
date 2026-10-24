@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index a small judged corpus into one XERJ index, run each query as BM25 and as kNN on the default node, then restart the node with --embed-mode neural and run the same queries again. Report precision at 3 and every miss for all three modes."
 answer: "Do I even need embeddings for search, or is full-text enough? On XERJ's default lexical embedder, full-text BM25 is close: 0.4167 precision at 3 against BM25's 0.375 on 8 judged queries. Embeddings clearly helped only after opting into --embed-mode neural, which moved precision at 3 to 0.6667 and recall to 1.0."
 key_fact: "On BEIR SciFact, hybrid RRF with the neural embedder scored nDCG@10 0.6993 against 0.6572 for BM25 alone."

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj autoindex with --progress plain, parse the xerj-progress lines on stderr into phase, pct, since_progress_s and waiting_on fields, and report the terminal xerj-done line rather than guessing from the bar."
 answer: "How can I see whether folder indexing is still working? Pass --progress plain and read the xerj-progress lines on stderr. A captured 22.2 s run emitted 12 phases in order and ended with xerj-done ok=true. On a single 16 MB file the percentage stays at 0.0%, so read since_progress_s and waiting_on instead."
 key_fact: "With --no-graph, a 231-file repository reported 9 phases in order, and its index phase read pct=81.7 at 169/231 items."

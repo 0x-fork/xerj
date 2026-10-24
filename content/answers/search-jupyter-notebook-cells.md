@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./notebooks --url http://127.0.0.1:9200 --prefix jp --progress plain`, then POST a match on body for a function name, a match_phrase on body for text printed only by an executed cell, and report ax_path, ax_locator, heading, heading_path and cell for every hit."
 answer: "How do I search all my .ipynb files for a function I wrote months ago? Run xerj autoindex on the folder. XERJ writes one document per Markdown-heading section of a notebook, with the heading path and starting cell. A captured query for okapi_transform found both notebooks and the .py file that defines it."
 key_fact: "The captured section `Okapi retrieval sweep > Run the sweep` started at cell 3 and returned the printed line `okapi accuracy 0.9137`."

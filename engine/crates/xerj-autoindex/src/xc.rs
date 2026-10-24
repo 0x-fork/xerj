@@ -427,7 +427,8 @@ fn code_cli_outcome(args: &[String]) -> CodeCliDone {
 // ── xerj corpus add ─────────────────────────────────────────────────────────
 
 const CORPUS_USAGE: &str =
-    "usage: xerj corpus add <name> <git-url>... | --from <manifest.json|pack-dir|pack.zip> [--as <name>] [--verify-sig <pubkey-file>]
+    "usage: xerj corpus add [--own] <name> <git-url>... | --from <manifest.json|pack-dir|pack.zip> [--as <name>] [--verify-sig <pubkey-file>]
+       xerj corpus own <name> [--off]
        xerj corpus build <name> [--recipe <path>] [--fresh]
        xerj corpus sign <pack-dir> --key <seed-file>
        xerj corpus keygen --out <prefix>
@@ -456,6 +457,17 @@ index builds/verifies/switches the corpus (exit 3 skips junk — normal); it
 skips CSV/HDF/simulation output by default (reference corpora are code and
 docs, and a test-output folder can out-record the whole corpus) —
 --include-data indexes those files too, reporting how many were left out;
+at the end it prints a short per-file-class summary of what was indexed
+and what data files were left out;
+--own marks THIS corpus as your own first-party code and writes \"own\":true
+in its corpus.json. An unidentified licence (UNKNOWN or NONE-FOUND) stays
+recorded and is still printed on each hit, but xerj code and xerj_code_search
+omit the do-not-copy banner for that unidentified licence. A licence the
+detector actually named (GPL, AGPL, MPL, …) still warns. A local path is
+not marked own unless you pass the flag, and a --from manifest cannot set
+it — that file is untrusted. Re-adding the corpus keeps a marker already
+recorded. `xerj corpus own <name>` sets it on an existing corpus; `--off`
+clears it. Hub pack licence classes are unchanged;
 list shows what is loaded on this node.";
 
 pub(crate) fn git(dir: Option<&Path>, args: &[&str]) -> Result<(i32, String)> {
@@ -901,6 +913,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
     let mut as_name: Option<String> = None;
     let mut from: Option<String> = None;
     let mut verify_sig: Option<String> = None;
+    let mut own_flag = false;
     let mut urls: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -931,6 +944,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            "--own" => own_flag = true,
             "--as" => match args.get(i + 1) {
                 Some(v) => {
                     as_name = Some(v.clone());
@@ -978,7 +992,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
             Ok(FromPack::NotAPack) => {}
             Ok(FromPack::Dir(dir)) => {
                 let share = dir.display().to_string();
-                return run_corpus_add_pack(&dir, explicit_name, &share, verify_sig.as_deref());
+                return run_corpus_add_pack(
+                    &dir,
+                    explicit_name,
+                    &share,
+                    verify_sig.as_deref(),
+                    own_flag,
+                );
             }
             Ok(FromPack::Zip(zip)) => {
                 // transient staging, never build state — it dies with this
@@ -1010,7 +1030,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
                         }
                     }
                 }
-                return run_corpus_add_pack(&dir, explicit_name, &zip, verify_sig.as_deref());
+                return run_corpus_add_pack(
+                    &dir,
+                    explicit_name,
+                    &zip,
+                    verify_sig.as_deref(),
+                    own_flag,
+                );
             }
             Err(e) => {
                 eprintln!("xerj corpus add: {e}");
@@ -1128,6 +1154,11 @@ fn run_corpus_add(args: &[String]) -> i32 {
     // review{} blocks are PRESERVED across a rebuild when repo+sha match —
     // a human's licence review survives a re-clone (additive, never edited).
     let previous = manifest::read_corpus_manifest(&dest.join("corpus.json")).ok();
+    // #2339: the marker is the operator's, not the manifest they handed us.
+    // `--own` sets it; a re-add without the flag keeps one already recorded
+    // so a refresh cannot silently drop it. A `--from` file's own key is
+    // never read.
+    let own = own_flag || previous.as_ref().is_some_and(|m| m.own);
     // A hub pin's review of the same repo at the same sha comes next: it is
     // the review the registry shipped for exactly this checkout (#1893).
     let carry = |repo: &str, sha: &str| -> Option<Value> {
@@ -1209,6 +1240,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                     &declared,
                     &paths,
                     &carry,
+                    own,
                 );
                 continue;
             }
@@ -1227,6 +1259,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 &declared,
                 &paths,
                 &carry,
+                own,
             );
             continue;
         }
@@ -1241,6 +1274,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 &declared,
                 &paths,
                 &carry,
+                own,
             );
             continue;
         }
@@ -1280,6 +1314,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
             &declared,
             &paths,
             &carry,
+            own,
         );
     }
 
@@ -1302,6 +1337,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
         &cloned_at,
         &entries,
         pin_query.as_ref(),
+        own,
     );
     println!();
     println!(
@@ -1313,6 +1349,12 @@ fn run_corpus_add(args: &[String]) -> i32 {
         "share it: {}  (rebuild with xerj corpus add <name> --from <that file>)",
         manifest_path.display()
     );
+    if own {
+        println!(
+            "corpus '{name}' is marked own (first-party): an unidentified licence stays recorded, \
+             and xerj code omits the do-not-copy banner for it. Clear with: xerj corpus own {name} --off"
+        );
+    }
 
     if !skipped.is_empty() {
         eprintln!();
@@ -1404,6 +1446,7 @@ fn run_corpus_add_pack(
     explicit_name: Option<String>,
     share_path: &str,
     verify_sig: Option<&str>,
+    own_flag: bool,
 ) -> i32 {
     // Origin check first, before a byte of the pack is trusted: checksums
     // prove integrity, the signature proves who built it. A pack that
@@ -1479,6 +1522,10 @@ fn run_corpus_add_pack(
     let root = code_root();
     let dest = root.join("corpora").join(&name);
     // Same one-kind-per-name rule the git arm enforces, from the other side.
+    let previous_own = manifest::read_corpus_manifest(&dest.join("corpus.json"))
+        .ok()
+        .is_some_and(|m| m.own);
+    let own = own_flag || previous_own;
     if let Ok(prev) = manifest::read_corpus_manifest(&dest.join("corpus.json")) {
         if prev.kind.as_deref() != Some("harvested") {
             eprintln!(
@@ -1493,7 +1540,7 @@ fn run_corpus_add_pack(
         "materializing corpus '{name}' from pack generation {}",
         meta.generation
     );
-    if let Err(e) = add_pack_materialize(&dest, pack_dir, &meta) {
+    if let Err(e) = add_pack_materialize(&dest, pack_dir, &meta, own) {
         eprintln!("xerj corpus add: {e:#}");
         return 1;
     }
@@ -1504,9 +1551,17 @@ fn run_corpus_add_pack(
             .unwrap_or(0);
         total += count;
         println!("  [pack] {}: {} record(s) ({})", s.slug, count, s.licence);
-        if let Some(w) = xccode::licence::clone_warning_line(&s.licence) {
-            eprintln!("{w}");
+        if xccode::licence::copy_warning_applies(&s.licence, own) {
+            if let Some(w) = xccode::licence::clone_warning_line(&s.licence) {
+                eprintln!("{w}");
+            }
         }
+    }
+    if own {
+        println!(
+            "corpus '{name}' is marked own (first-party): an unidentified licence stays recorded, \
+             and xerj code omits the do-not-copy banner for it. Clear with: xerj corpus own {name} --off"
+        );
     }
     println!(
         "corpus '{name}': {} records from {} source(s) at {}",
@@ -1533,6 +1588,7 @@ fn add_pack_materialize(
     dest: &Path,
     pack_dir: &Path,
     meta: &crate::harvest::pack::PackMeta,
+    own: bool,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, BufReader, Write};
@@ -1627,10 +1683,12 @@ fn add_pack_materialize(
         &chrono_now_stamp(),
         &entries,
         None,
+        own,
     );
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(
     entries: &mut Vec<manifest::ManifestRepo>,
     repo_name: &str,
@@ -1639,6 +1697,7 @@ fn record(
     declared: &str,
     paths: &[String],
     carry: &dyn Fn(&str, &str) -> Option<Value>,
+    own: bool,
 ) {
     let lic = xccode::licence::detect_licence(target);
     let (sha, files, bytes) = dir_stats(target);
@@ -1661,8 +1720,10 @@ fn record(
             "          licence {shown} per the manifest's review by {by} (the detector read {lic})"
         );
     }
-    if let Some(w) = xccode::licence::clone_warning_line(&shown) {
-        eprintln!("{w}");
+    if xccode::licence::copy_warning_applies(&shown, own) {
+        if let Some(w) = xccode::licence::clone_warning_line(&shown) {
+            eprintln!("{w}");
+        }
     }
     // The detector is text-matching heuristics and has been wrong before.
     // When a manifest disagrees with the checkout, say so rather than
@@ -1687,6 +1748,66 @@ fn record(
 
 fn chrono_now_stamp() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+// ── xerj corpus own ─────────────────────────────────────────────────────────
+
+/// Set or clear the first-party marker on a corpus that already exists.
+/// Does not clone, detect licences, or touch the index.
+fn run_corpus_own(args: &[String]) -> i32 {
+    let mut name: Option<String> = None;
+    let mut off = false;
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("{CORPUS_USAGE}");
+                return 0;
+            }
+            "--off" => off = true,
+            a if a.starts_with('-') => {
+                eprintln!("xerj corpus own: unknown flag '{a}'\n\n{CORPUS_USAGE}");
+                return 2;
+            }
+            a if name.is_none() => name = Some(a.to_string()),
+            a => {
+                eprintln!("xerj corpus own: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("xerj corpus own: <name> is required\n\n{CORPUS_USAGE}");
+        return 2;
+    };
+    if let Err(e) = xccode::pathgate::valid_corpus_name(&name) {
+        eprintln!("xerj corpus own: {e}");
+        return 2;
+    }
+    let path = code_root().join("corpora").join(&name).join("corpus.json");
+    if !path.is_file() {
+        eprintln!(
+            "xerj corpus own: no corpus '{name}' at {} — run `xerj corpus add {name} …` first",
+            path.display()
+        );
+        return 2;
+    }
+    let own = !off;
+    if let Err(e) = manifest::set_corpus_own(&path, &name, own) {
+        eprintln!("xerj corpus own: {e}");
+        return 1;
+    }
+    if own {
+        println!(
+            "corpus '{name}' is marked own (first-party): an unidentified licence stays recorded, \
+             and xerj code omits the do-not-copy banner for it. Clear with: xerj corpus own {name} --off"
+        );
+    } else {
+        println!(
+            "corpus '{name}' is no longer marked own. Unidentified licences warn again: \
+             adapt the approach, do not copy the code."
+        );
+    }
+    0
 }
 
 // ── xerj corpus index ───────────────────────────────────────────────────────
@@ -1985,7 +2106,13 @@ fn report_footer(name: &str, rc: i32, docs: &str) -> Vec<String> {
     }
 }
 
-fn report(name: &str, rc: i32, docs: &str) {
+fn report(root: &Path, name: &str, rc: i32, docs: &str, include_data: bool) {
+    // #2339 / #1985: the walk's file-class accounting, printed with the
+    // verdict so it is in the tail of `xerj corpus index` rather than only
+    // in the progress notes from the start of the run.
+    for line in crate::corpus_file_class_summary(&root.join("corpora").join(name), include_data) {
+        println!("xerj corpus index: {line}");
+    }
     for line in report_footer(name, rc, docs) {
         println!("{line}");
     }
@@ -2090,6 +2217,7 @@ fn run_corpus_index(args: &[String]) -> i32 {
         &url,
         &name,
         fresh,
+        include_data,
     )
 }
 
@@ -2464,6 +2592,7 @@ fn resume_unfinished_build(
     url: &str,
     name: &str,
     unfinished: &UnfinishedBuild,
+    include_data: bool,
 ) -> i32 {
     let build = &unfinished.build;
     let prefix = &unfinished.prefix;
@@ -2500,7 +2629,7 @@ fn resume_unfinished_build(
             warn_short_of_pack_records(name, root, Some(n));
             record(false);
             report_leftovers(node, name, root, prefix);
-            report(name, rc, &n.to_string());
+            report(root, name, rc, &n.to_string(), include_data);
             0
         }
         ResumeVerdict::Salvaged => {
@@ -2516,7 +2645,7 @@ fn resume_unfinished_build(
             );
             record(true);
             report_leftovers(node, name, root, prefix);
-            report(name, rc, &n.to_string());
+            report(root, name, rc, &n.to_string(), include_data);
             0
         }
         ResumeVerdict::Unverified => {
@@ -2569,6 +2698,7 @@ fn resume_unfinished_build(
 /// real `crate::run_with_options` in production, with `--no-graph` set
 /// (reference code needs ranked passages, not a relationship map) — and
 /// `--fresh` is NEVER forwarded: this flow owns the swap.
+#[allow(clippy::too_many_arguments)]
 fn corpus_index_flow(
     node: &dyn CorpusNode,
     run_autoindex: &dyn Fn(&str, Option<&Path>) -> i32,
@@ -2577,6 +2707,7 @@ fn corpus_index_flow(
     url: &str,
     name: &str,
     fresh: bool,
+    include_data: bool,
 ) -> i32 {
     let state_file = root.join("state").join(format!("{name}.json"));
     let state_root = root.join("autoindex-state");
@@ -2876,7 +3007,7 @@ fn corpus_index_flow(
                     }
                 }
             }
-            report(name, rc, &docs.to_string());
+            report(root, name, rc, &docs.to_string(), include_data);
             0
         }
         "update" => {
@@ -2914,14 +3045,22 @@ fn corpus_index_flow(
                 Some(&prefix),
                 old_state_dir.as_deref(),
             );
-            report(name, rc, &docs);
+            report(root, name, rc, &docs, include_data);
             0
         }
         "resume" => {
             let unfinished = unfinished
                 .as_ref()
                 .expect("resume mode is set only when an unfinished build was found");
-            resume_unfinished_build(node, run_autoindex, root, url, name, unfinished)
+            resume_unfinished_build(
+                node,
+                run_autoindex,
+                root,
+                url,
+                name,
+                unfinished,
+                include_data,
+            )
         }
         _ => {
             // Legacy: recorded before the run so a failure can tell "this run
@@ -2993,7 +3132,7 @@ fn corpus_index_flow(
                      stale generations (if any) were NOT retired; re-run when the node answers."
                 );
             }
-            report(name, rc, &docs_s);
+            report(root, name, rc, &docs_s, include_data);
             0
         }
     }
@@ -3160,6 +3299,11 @@ fn corpus_list_text(args: &[String]) -> (i32, Captured) {
             Ok(v) => v.len(),
             Err(_) => usize::MAX,
         };
+        let own_note = if xccode::manifest::corpus_is_own(&root, name) {
+            ", own"
+        } else {
+            ""
+        };
         let uses = xccode::corpus_review_uses(&root, name);
         let use_note = uses
             .keys()
@@ -3167,9 +3311,9 @@ fn corpus_list_text(args: &[String]) -> (i32, Captured) {
             .and_then(|k| uses.get(k).map(|u| format!("\n  use: {u}")))
             .unwrap_or_default();
         match live {
-            usize::MAX => push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}")),
+            usize::MAX => push_line(&mut stdout, &format!("{name}  (indexed {indexed}{own_note}, prefix {prefix}) — server unreachable/ambiguous at {url}")),
             0 => {
-                push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"));
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}{own_note}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"));
                 // #1846: a name the index prefix rewrites (`curl_cffi`) was
                 // indexed under another spelling, so "0 indices" is not the
                 // whole story — say which name to move it to.
@@ -3179,7 +3323,7 @@ fn corpus_list_text(args: &[String]) -> (i32, Captured) {
             }
             n => {
                 loaded += 1;
-                push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}"));
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}{own_note}, prefix {prefix}) — loaded — {n} index(es){use_note}"));
             }
         }
         if let Some(w) = state::incomplete_coverage(&st) {
@@ -3208,7 +3352,7 @@ fn corpus_list_text(args: &[String]) -> (i32, Captured) {
 fn corpus_verb(arg: &str) -> bool {
     matches!(
         arg,
-        "add" | "build" | "sign" | "keygen" | "index" | "list" | "help" | "-h" | "--help"
+        "add" | "build" | "sign" | "keygen" | "index" | "list" | "own" | "help" | "-h" | "--help"
     )
 }
 
@@ -3223,6 +3367,7 @@ pub fn run_corpus_cli(args: &[String]) -> i32 {
     let rest: Vec<String> = args[1..].to_vec();
     match sub.as_str() {
         "add" => run_corpus_add(&rest),
+        "own" => run_corpus_own(&rest),
         "build" => crate::harvest::run_build(&rest),
         "sign" | "keygen" => crate::harvest::sign::run_sign_cli(sub, &rest),
         "index" => run_corpus_index(&rest),
@@ -3651,7 +3796,7 @@ mod tests {
         url: &str,
     ) -> i32 {
         with_fast_count_retries(|| {
-            corpus_index_flow(node, &auto.runner(), clock, root, url, name, fresh)
+            corpus_index_flow(node, &auto.runner(), clock, root, url, name, fresh, false)
         })
     }
 
@@ -4042,6 +4187,7 @@ mod tests {
                 "http://x",
                 "kv",
                 false,
+                false,
             )
         });
         assert_eq!(rc, 0, "control: a queryable salvage still succeeds");
@@ -4068,6 +4214,7 @@ mod tests {
                 &root,
                 "http://x",
                 "kv",
+                false,
                 false,
             )
         });
@@ -5125,6 +5272,7 @@ precedence = ["a", "b"]
                 paths: Vec::new(),
             }],
             None,
+            false,
         );
         let _h = code_home(home.path());
         let rc = run_corpus_add(&[
@@ -5263,6 +5411,83 @@ precedence = ["a", "b"]
             Some(dir.path())
         );
         assert!(local_checkout_root("file://localhost/no/such/xerj-path-2199").is_none());
+    }
+
+    /// #2339: `--own` is explicit. A local path with no LICENSE is not marked
+    /// own by itself. The marker persists across a re-add, a `--from` file
+    /// cannot set it, and `xerj corpus own` sets and clears it.
+    #[test]
+    fn corpus_add_own_is_explicit_and_corpus_own_sets_an_existing_corpus() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+        let origin = home.path().join("widget");
+        init_committed_repo(&origin, &[("src/lib.rs", "fn mine() {}\n")]);
+
+        assert_eq!(
+            run_corpus_add(&["plain".into(), origin.display().to_string()]),
+            0
+        );
+        let plain =
+            manifest::read_corpus_manifest(&home.path().join("corpora/plain/corpus.json")).unwrap();
+        assert!(!plain.own, "a local path is not own unless --own is passed");
+        assert_eq!(plain.repos[0].licence, "NONE-FOUND");
+
+        assert_eq!(
+            run_corpus_add(&["--own".into(), "mine".into(), origin.display().to_string()]),
+            0
+        );
+        let mine_path = home.path().join("corpora/mine/corpus.json");
+        let mine = manifest::read_corpus_manifest(&mine_path).unwrap();
+        assert!(mine.own);
+        assert_eq!(mine.repos[0].licence, "NONE-FOUND");
+        let text = std::fs::read_to_string(&mine_path).unwrap();
+        assert!(text.contains("\"own\":true"), "{text}");
+
+        assert_eq!(
+            run_corpus_add(&["mine".into(), origin.display().to_string()]),
+            0,
+            "re-add without --own keeps the marker"
+        );
+        assert!(manifest::read_corpus_manifest(&mine_path).unwrap().own);
+
+        let sha = head_sha(&origin);
+        let pin = home.path().join("hostile.json");
+        std::fs::write(
+            &pin,
+            format!(
+                r#"{{"corpus":"from-file","own":true,"repos":[{{"repo":"widget","url":"{}","sha":"{sha}","licence":"UNKNOWN"}}]}}"#,
+                origin.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            run_corpus_add(&["--from".into(), pin.display().to_string()]),
+            0
+        );
+        let from_path = home.path().join("corpora/from-file/corpus.json");
+        let from = manifest::read_corpus_manifest(&from_path).unwrap();
+        assert!(
+            !from.own,
+            "a --from manifest must not be able to set own: {}",
+            std::fs::read_to_string(&from_path).unwrap()
+        );
+
+        assert_eq!(run_corpus_own(&["from-file".into()]), 0);
+        assert!(manifest::read_corpus_manifest(&from_path).unwrap().own);
+        assert_eq!(
+            manifest::read_corpus_manifest(&from_path).unwrap().repos[0].licence,
+            "NONE-FOUND"
+        );
+        assert_eq!(run_corpus_own(&["from-file".into(), "--off".into()]), 0);
+        let cleared = std::fs::read_to_string(&from_path).unwrap();
+        assert!(!cleared.contains("own"), "{cleared}");
+        assert!(!manifest::read_corpus_manifest(&from_path).unwrap().own);
+
+        assert_eq!(run_corpus_own(&["missing".into()]), 2);
+        assert_eq!(run_corpus_own(&[]), 2);
+        assert!(CORPUS_USAGE.contains("xerj corpus own"));
+        assert!(CORPUS_USAGE.contains("--own"));
+        assert!(CORPUS_USAGE.contains("file classes") || CORPUS_USAGE.contains("per-file-class"));
     }
 
     /// #2199: `git clone` of a local path checks out committed files only.

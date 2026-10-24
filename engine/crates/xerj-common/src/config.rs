@@ -1671,11 +1671,32 @@ pub struct EmbeddingConfig {
     #[serde(skip)]
     pub runtime_onnx_assets:
         std::sync::Arc<std::sync::OnceLock<Result<EmbeddingAssetSnapshot, String>>>,
+    /// Vector width last confirmed for this proxy endpoint and model (#2306).
+    ///
+    /// Filled by the engine, not by configuration. Cloned configs share the
+    /// cell. Empty until a probe (or the on-disk fallback) succeeds; identity
+    /// reporting then treats the proxy as resumable and publishes the width.
+    /// Serde skips it: it is not a setting and must not round-trip through a
+    /// config file.
+    #[serde(skip)]
+    pub runtime_proxy_width: std::sync::Arc<std::sync::RwLock<Option<ConfirmedProxyWidth>>>,
     /// Neural ingest probe, shared by cloned configs (the server preloads
     /// from a clone). `None` inside the cell means the probe ran and did not
     /// produce a rate; an empty cell means it has not run. Not a setting.
     #[serde(skip)]
     pub neural_ingest_probe: std::sync::Arc<std::sync::OnceLock<Option<NeuralIngestProbe>>>,
+}
+
+/// Vector width a proxy embedder confirmed for one endpoint and model.
+///
+/// The digest of a proxy identity stays the configured model and endpoint
+/// (#533). This width is the other half of that identity: autoindex compares
+/// it on resume and refuses to mix a different width into an existing corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedProxyWidth {
+    pub endpoint: String,
+    pub model: String,
+    pub dimensions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1710,6 +1731,7 @@ impl Default for EmbeddingConfig {
             onnx_max_input_bytes_per_call: 8 * 1024 * 1024,
             onnx_max_inflight_input_bytes: 32 * 1024 * 1024,
             runtime_onnx_assets: std::sync::Arc::new(std::sync::OnceLock::new()),
+            runtime_proxy_width: std::sync::Arc::new(std::sync::RwLock::new(None)),
             neural_ingest_probe: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -1718,9 +1740,10 @@ impl Default for EmbeddingConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sentinel value of [`LimitsConfig::max_process_memory_mb`] meaning **AUTO**:
-/// pick the process-memory cap from the machine size in binary-GiB steps
-/// (8 / 16 / 32 GiB) rather than a flat number. It is the serde default, so an
-/// omitted field resolves to AUTO; the governor intercepts it before any budget
+/// pick the process-memory cap from the machine size (half of RAM under
+/// 16 GiB, then 8 / 16 / 32 GiB) rather than a flat number. It is the serde
+/// default, so an omitted field resolves to AUTO; the governor intercepts it
+/// before any budget
 /// math, so this literal never reaches a budget as a byte count. `u64::MAX` is
 /// used because no operator sets a 16-EiB cap — it is a reserved, unmistakable
 /// "not a real MiB value" marker, distinct from `0` (uncapped, the whole
@@ -1844,14 +1867,19 @@ pub struct LimitsConfig {
     /// Ceiling on the machine size every other memory budget is derived FROM,
     /// in MiB. **Omitted / default = AUTO** ([`AUTO_PROCESS_MEMORY_MB`]): XERJ
     /// picks the cap from the effective (cgroup-aware) memory it can actually
-    /// see, in binary-GiB steps —
+    /// see —
     ///
-    ///   effective < 64 GiB             → 8 GiB cap
+    ///   effective < 16 GiB             → half of that RAM
+    ///   16 GiB ≤ effective < 64 GiB    → 8 GiB cap
     ///   64 GiB ≤ effective < 128 GiB   → 16 GiB cap
     ///   effective ≥ 128 GiB            → 32 GiB cap
     ///
     /// so a laptop is never sized for ~20 GiB of memtables and a big server is
-    /// no longer starved by a flat 8 GiB. Every budget in `ResourceGovernor`
+    /// no longer starved by a flat 8 GiB. A host under 16 GiB used to take the
+    /// 8 GiB step and then the machine, so an 8 GiB box's budget was all of
+    /// its RAM; half of RAM leaves room for the OS during a merge (#1122).
+    /// At 16 GiB the half-RAM step and the 8 GiB step are the same number.
+    /// Every budget in `ResourceGovernor`
     /// derives from `effective_memory_limit_bytes()` = min(cgroup limit, total
     /// system RAM); capping that ONE base is what makes every dependent budget
     /// shrink coherently instead of each growing its own ceiling.
@@ -1896,7 +1924,7 @@ impl Default for LimitsConfig {
             max_segment_hydration_cache_mb: 0, // 0 = 20% effective memory, no floor
             memory_watermark_percent: 95,
             disk_flood_stage_percent: 95,
-            // AUTO: tier the cap (8/16/32 GiB) off the machine at governor
+            // AUTO: half of RAM under 16 GiB, then 8/16/32 GiB, at governor
             // build time. 0 = uncapped (whole machine); N = a fixed MiB cap.
             max_process_memory_mb: AUTO_PROCESS_MEMORY_MB,
         }

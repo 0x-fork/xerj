@@ -2,13 +2,13 @@
 ---
 title: "Elasticsearch-compatible engine that isn't Elasticsearch"
 canonical: "https://xerj.org/compare/xerj-vs-elasticsearch-local"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/compare/xerj-vs-elasticsearch-local.md"
 ---
 
 # Is there an Elasticsearch-compatible engine that isn't Elasticsearch?
 
-**Short answer** (updated 2026-10-19): Is there an Elasticsearch-compatible engine that isn't Elasticsearch? XERJ speaks the Elasticsearch REST API from one binary. One published board measured both on one host: 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4 at 100,000 documents. XERJ is single-node only.
+**Short answer** (updated 2026-10-23): Is there an Elasticsearch-compatible engine that isn't Elasticsearch? XERJ speaks the Elasticsearch REST API from one binary. One published board measured both on one host: 55 wins, 26 ties, 4 losses and 3 not-applicable across 88 cells against Elasticsearch 8.13.4 at 100,000 documents. XERJ is single-node only.
 
 **Key number:** Elasticsearch has 78,319 GitHub stars and its latest release is v9.5.5 (2026-10-06); the board was measured against 8.13.4. (as of 2026-10-19; source: [github.com/elastic/elasticsearch](https://github.com/elastic/elasticsearch))
 
@@ -79,7 +79,7 @@ Before that fix (2026-09), one lexical-mode node was observed resident at 20.2 G
 
 `GET /` advertises version 8.13.0, and the query DSL an agent already writes lands without a translation layer. XERJ is a from-scratch Rust engine that shares no code and no architecture with Elasticsearch or Lucene.
 
-The conformance figure is 1,366 of 1,369 ES-YAML assertions, and it carries a mandatory caveat: it is a curated 200-file subset, and `catch:` assertions in it are unverified. Some request shapes still differ on both sides. In the same capture Elasticsearch answered `match_phrase_prefix`, `combined_fields` and `_count` with a 400, and other shapes will differ the other way.
+The conformance figure is 1,444 of 1,454 ES-YAML cases, with 0 failed and 10 skipped, and it carries a mandatory caveat: it is a curated 229-file subset. Expected-error (`catch:`) checks are enforced except for the cases listed in catch-lenient.txt. Some request shapes still differ on both sides. In the same capture Elasticsearch answered `match_phrase_prefix`, `combined_fields` and `_count` with a 400, and other shapes will differ the other way.
 
 Plan a bridge, not parity. Send your real queries at a XERJ node and read the responses before you move anything.
 

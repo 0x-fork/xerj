@@ -2,7 +2,7 @@
 ---
 title: "Local code search MCP that uses fewer tokens than grep"
 canonical: "https://xerj.org/answers/local-code-search-mcp-fewer-tokens-than-grep"
-updated: "2026-10-20"
+updated: "2026-10-23"
 source: "content/answers/local-code-search-mcp-fewer-tokens-than-grep.md"
 ---
 
@@ -149,7 +149,7 @@ The ratio is 19 times fewer bytes for the search, measured once on one repositor
 
 | Tool | Runs locally | Ranked results | file:line | MCP server | Setup |
 | --- | --- | --- | --- | --- | --- |
-| xerj | yes | yes, BM25 | yes | yes, 17 tools | install, start node, index once |
+| xerj | yes | yes, BM25 | yes | yes, 22 tools | install, start node, index once |
 | ripgrep | yes | no, every match | yes | no | none |
 | Zoekt | yes | yes | yes | no | index server |
 | GitHub code search | no | yes | yes | no | repo on GitHub, API limits |

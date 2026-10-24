@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/vector-database-vs-full-text-search"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What's the actual difference between a vector database and full-text search?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Full-text search matches tokens and ranks with BM25. Vector search compares one embedding against stored dense vectors. XERJ serves both from one index."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need a vector database for this, or am I overcomplicating it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "For one folder on one host it is usually more parts than the job needs. XERJ keeps the dense vector beside the inverted index, and one _search request can query either or fuse both."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I even need embeddings for search, or is full-text enough?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Full-text is enough when people type words that appear in the files. On our 8 judged queries BM25 scored 0.375 precision at 3 and kNN 0.4167, both on the lexical default embedder."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When should I combine keyword search and vector search?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "When both are partly right. Weighted linear fusion scored 0.4583 precision at 3 on the same judged set, the best of the 4 modes, and it was still wrong on more than half the judged documents at k of 3."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When does BM25 beat vectors?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "When the query token is present in the document. For quokka BM25 returned exactly the one judged document and nothing else."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When does kNN beat BM25?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "When no token matches. On our restart question BM25 ranked an irrelevant document first and kNN ranked a judged-relevant document first."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ use approximate kNN?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Only when seven conditions hold, including cosine similarity, no filter and at least 1,024 vectors. Everything else runs exact brute force."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

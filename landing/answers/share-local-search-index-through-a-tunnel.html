@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-18",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/answers/share-local-search-index-through-a-tunnel"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How can I give a remote person temporary search access to files on my laptop without port forwarding or a VPN?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj share on the indexed folder with --tunnel. XERJ starts your own cloudflared, prints a public HTTPS link, and revokes the share when you stop the command."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens when I press Ctrl-C?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The tunnel is closed and the share is revoked, which invalidates every guest key it minted. Add --keep to leave the share active. The link still stops working, because the hostname is gone."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need a Cloudflare account?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not for a quick tunnel. You do need the cloudflared binary. If it is missing, xerj share prints the install steps for your platform and the local link, and does not fail."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can Cloudflare read what my guest searches for?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It terminates the HTTPS connection, so in principle yes. The folder is not uploaded there, but everything between the guest's browser and your node crosses its network: the passcode, the guest key, the searches and the documents the guest opens. The command prints this with the link, and the guest page shows it. Use your own hostname and certificate with --public-url when that matters."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does the guest get a passcode and not a passkey?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A passkey is bound to a hostname, and a quick tunnel gets a new random hostname on every start. A passkey made through one tunnel would not work through the next."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Every guest arrives from 127.0.0.1 through a tunnel. Does that break the passcode lockout?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The lockout is charged to the share, not to the address: 30 attempts an hour from anywhere. Junk ids are charged to the source address, where one shared bucket only makes the bound tighter."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

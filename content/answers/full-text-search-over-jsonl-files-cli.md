@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 og_image: "og/answers-full-text-search-over-jsonl-files-cli.png"
 og_image_alt: "Cover: a field of 1,000 dots for the CSV rows, 79 ink BM25 hits for 'bm25 jsonl folder' in 1 ms and row id 480 ringed in yellow; an exact rg phrase search found 0"
 queries:

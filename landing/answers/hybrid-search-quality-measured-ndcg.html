@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-18",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/answers/hybrid-search-quality-measured-ndcg"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How much better is hybrid search than BM25?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On two public BEIR datasets XERJ's hybrid RRF scored nDCG@10 0.6993 against 0.6572 for BM25 on SciFact, and 0.3448 against 0.3016 on NFCorpus. Both runs used --embed-mode neural."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do these numbers apply to a default XERJ node?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Only the BM25 row does. The vector and hybrid rows need --embed-mode neural. The default embedder is lexical feature hashing, which has no model in it."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is reranking a BM25 shortlist with the same embedding model a good idea?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not in this run. Reordering the BM25 top 30 by MiniLM scored 0.6855 on SciFact, below 0.6993 for fusing with the same model. Fusion beat reordering on both datasets."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How does XERJ hybrid compare to hosted rerankers?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XERJ did not run them. Figures published elsewhere put Jev at 0.768 on SciFact and XERJ hybrid at 0.6993, but they use a different first stage, so it is not a controlled comparison."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does hybrid search cost in latency?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "In this run hybrid queries cost about 220 to 370 ms at p50 against about 18 ms for BM25, on a 5,000-document index on CPU. The machine was also compiling, so read those as upper bounds."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How fast is neural indexing?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "About 3 to 7 documents per second on CPU in this run. SciFact's 5,183 short abstracts took about 25 minutes to index."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a security-reviewing coding agent on a large PHP repository. Read https://xerj.org/llms.txt, compile the invariant you care about into indexed facts with an AST extractor, index those facts into XERJ, query for the violating shape, and read only the survivors — then report the clean surfaces as findings rather than dropping them."
 answer: "How do you search a large PHP repo for dangerous sinks without reading every file? Index it as queryable facts, ask for the bug shape, and read only what comes back. The published WordPress core audit spent about 26,000 tokens against an estimated 5,200,000 to read the code once, and found core hardened."
 key_fact: "The WordPress core audit covered 1,492 PHP files and about 619k lines, indexed as 11,990 functions."

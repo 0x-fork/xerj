@@ -15,7 +15,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai — Local search for AI agents</title>
-<meta name="description" content="Local search for AI agents in one Apache-2.0 Rust binary: the xerj CLI and xerj ask, 20 MCP tools on rc.98, signed Corpus Hub packs, and published benchmarks.">
+<meta name="description" content="XERJ, the search engine for AI agents: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -45,7 +45,7 @@
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="website">
 <meta property="og:title" content="XERJ.ai — Local search for AI agents">
-<meta property="og:description" content="Local search for AI agents in one Apache-2.0 Rust binary: the xerj CLI and xerj ask, 20 MCP tools on rc.98, signed Corpus Hub packs, and published benchmarks.">
+<meta property="og:description" content="XERJ, the search engine for AI agents: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.">
 <meta property="og:url" content="https://xerj.org/product">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
 <meta property="og:image:width" content="1200">
@@ -54,7 +54,7 @@
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="XERJ.ai — Local search for AI agents">
-<meta name="twitter:description" content="Local search for AI agents in one Apache-2.0 Rust binary: the xerj CLI and xerj ask, 20 MCP tools on rc.98, signed Corpus Hub packs, and published benchmarks.">
+<meta name="twitter:description" content="XERJ, the search engine for AI agents: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
 {
@@ -65,8 +65,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -93,7 +95,7 @@
   "applicationSubCategory": "Search engine",
   "operatingSystem": "Linux, macOS, Windows",
   "url": "https://xerj.org/product",
-  "description": "Local search for AI agents in one Apache-2.0 Rust binary: the xerj CLI and xerj ask, 20 MCP tools on rc.98, signed Corpus Hub packs, and published benchmarks.",
+  "description": "XERJ, the search engine for AI agents: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "image": "https://xerj.org/og/xerj-card.png",
   "license": "https://www.apache.org/licenses/LICENSE-2.0",
   "isAccessibleForFree": true,
@@ -170,9 +172,8 @@
   <h1 class="hero">SEARCH FOR<br><span class="accent">AI AGENTS.</span></h1>
 
   <p class="lead" id="what-is-xerj">
-    <strong>XERJ is a local search engine for AI agents, shipped as one
-    Apache-2.0 Rust binary.</strong> It indexes code, documents and data files,
-    answers with file:line citations, and serves them through a CLI, an
+    <strong>A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.</strong> The binary is Apache-2.0. It
+    answers with file:line citations and serves them through a CLI, an
     MCP server and the Elasticsearch API, so an agent reads a passage instead of
     a whole file.
   </p>
@@ -203,7 +204,7 @@
   </div>
   <div class="row">
     <div class="k">Elasticsearch clients</div>
-    <div class="v">The node speaks the Elasticsearch REST API on <span class="mono">:9200</span>. The conformance suite passes 1,366 / 1,369 cases (<a href="https://github.com/xerj-org/xerj/blob/main/README.md" rel="external">README.md</a>).</div>
+    <div class="v">The node speaks the Elasticsearch REST API on <span class="mono">:9200</span>. The conformance suite passes 1,444 / 1,454 cases (0 failed, 10 skipped) (<a href="https://github.com/xerj-org/xerj/blob/main/README.md" rel="external">README.md</a>).</div>
   </div>
 
   <p class="loss"><strong>Not a fit, today:</strong> neural semantic search with no extra flag (the default embedder is lexical feature hashing; <code class="inline">--embed-mode neural</code> loads an all-MiniLM-L6-v2 model, about 90 MB, at startup), regex search over source (the benchmarks page marks it “not offered”), or a machine where an idle daemon must cost nothing (8% CPU and 8.3 GB on a 15-repo corpus, a published loss).</p>
@@ -255,7 +256,7 @@ LZ4_FORCE_INLINE int LZ4_compress_generic_validated(
       <tr><td><code class="inline">xerj "&lt;question&gt;"</code> · <code class="inline">xerj ask</code></td><td>Answers from a hub corpus. <code class="inline">--def SYMBOL</code>, <code class="inline">--how</code>, <code class="inline">--files</code>, <code class="inline">--offline</code>, <code class="inline">--json</code>, <code class="inline">--hosted on|off|auto</code>. Exit 1 when nothing matches.</td></tr>
       <tr><td><code class="inline">xerj code</code> · <code class="inline">xerj corpus</code></td><td><code class="inline">corpus add|index|list</code> pins and builds corpora you choose. <code class="inline">code &lt;corpus&gt; "&lt;query&gt;"</code> retrieves a definition and warns on the licence.</td></tr>
       <tr><td><code class="inline">xerj hub</code></td><td><code class="inline">sync</code>, <code class="inline">pull</code>, <code class="inline">feedback</code>, <code class="inline">status</code>, <code class="inline">stop</code>, and <code class="inline">config hosted on|off|auto</code>. Packs are verified, then restored. They are not cloned or indexed on your machine.</td></tr>
-      <tr><td><code class="inline">xerj mcp</code></td><td><code class="inline">xerj mcp --help</code> on this binary says it proxies 20 tools, and <code class="inline">tools/list</code> returned those 20. The hub three are <code class="inline">xerj_hub_find</code>, <code class="inline">xerj_hub_def</code>, <code class="inline">xerj_hub_ask</code>. It does not start a node.</td></tr>
+      <tr><td><code class="inline">xerj mcp</code></td><td><code class="inline">xerj mcp --help</code> on this binary says it proxies 20 tools, and <code class="inline">tools/list</code> returned those 20. Main adds <code class="inline">xerj_def</code> and <code class="inline">xerj_batch_search</code>, for 22 (<a href="/docs/agents/schemas/mcp-tools.json">mcp-tools.json</a>). The hub three are <code class="inline">xerj_hub_find</code>, <code class="inline">xerj_hub_def</code>, <code class="inline">xerj_hub_ask</code>. It does not start a node.</td></tr>
       <tr><td><code class="inline">xerj init</code></td><td>Writes <code class="inline">.mcp.json</code>, and, when the directory exists, <code class="inline">.cursor/mcp.json</code>, <code class="inline">.codex/config.toml</code>, the skill and rule files, and an <code class="inline">AGENTS.md</code> section.</td></tr>
       <tr><td><code class="inline">xerj brain</code> · <code class="inline">xerj share</code> · <code class="inline">xerj gain</code> · <code class="inline">xerj feedback</code></td><td>A browsable second brain, a read-only link with a passcode and an expiry, usage counted from the audit log, and the field report in section 07.</td></tr>
     </tbody>

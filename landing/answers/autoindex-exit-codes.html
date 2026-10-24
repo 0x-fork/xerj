@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-22",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/autoindex-exit-codes"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What does indexer exit code 3 mean?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It means the run completed and recorded junk. xerj autoindex --help states it as 3 completed-with-junk (junk recorded, never fatal). Treat it as a success with a refusal list to read."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "The indexer exited 3 (or 4). Did it fail?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "3 did not fail. 4 did not fail either, and it did not index anything: it is a decision request waiting for --approve. Only 1 and 2 are failures."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why did folder indexing stop and ask me to approve?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The measured phase-A estimate for the indexing phase was longer than --max-minutes (default 10). With no --approve or --yes, nothing is indexed, a JSON decision request goes to stdout and the process exits 4."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I tell a failed index from a completed one with junk files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Read the exit code, not the log volume. 0 and 3 are both finished runs; 3 additionally refused at least one file, or a whole dataset whose mapping the server answered HTTP 400 to, in which case the xerj-done line carries datasets_refused and files_refused. 1 is an endpoint or journal failure and nothing about it is a junk report."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is exit 1 the code for any error?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No, and that shorthand is wrong. --help scopes 1 to an endpoint or journal failure, a refused corpus removal, or a refused unsafe state transition. A bad command line is 2. On the --no-graph path, an exit 1 whose terminal line reads reason=server-backpressure means the node rejected every write for the whole 600 s a bulk waits; the line carries ops_applied and ops_remaining."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does exit 0 always mean the folder was indexed?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Answering the decision gate with --approve cancel also exits 0, and that run indexes nothing on purpose. Read the terminal line or the journal before you report a corpus as searchable."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why did my run print no terminal line at all?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Either --quiet or --progress none was in force, which prints no terminal line, or the process was killed by a signal. A missing terminal line after the process is gone means it died, not that it finished."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which codes should an agent retry?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Retry nothing on 0 or 3. Re-run with --approve on 4. Fix the command line on 2. Investigate the endpoint and the journal on 1, because a blind retry repeats the same refusal. The one exit 1 to rerun unchanged is reason=server-backpressure, once the node accepts writes again: it resumes with the operations that remain."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

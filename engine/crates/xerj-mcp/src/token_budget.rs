@@ -952,6 +952,7 @@ mod tests {
                 rrf_scores: false,
                 age_days: None,
                 strict_licence: false,
+                own: false,
                 lexical_lines: true,
                 checkout: None,
             },

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj autoindex with --progress plain, and keep reading the stream when a line says server is shedding load or server pushed back (HTTP 429): the run is re-sending the rejected items and is not hung. Parse the xerj-done line; bulk_retries=N means the run fought back-pressure and still landed every record. Report exit 1 with 'kept rejecting' in the error line as a server condition that did not clear, and rerun the same command to resume."
 answer: "Why did xerj autoindex say the server pushed back with HTTP 429? The node shed load for a moment through its memory circuit breaker. autoindex lowers bulk concurrency, re-sends only the rejected items, and reports bulk_retries on the terminal line. It exits 1 only after 600 seconds of re-sends the node never accepts, and the same command resumes."
 key_fact: "One bulk request carries at most 10,000 actions (`BULK_MAX_ACTIONS`), a fifth of the engine's default limit."

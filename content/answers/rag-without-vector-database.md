@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start one single-node XERJ, create an index with a semantic_text field, bulk-load the corpus, then run one hybrid request with fusion rrf and report the returned ids and scores before you write any retrieval code."
 answer: "How do I build RAG without a vector database? Keep the inverted index and the dense vectors in one XERJ index and retrieve with one hybrid request, which fuses a BM25 sub-query and a kNN sub-query with Reciprocal Rank Fusion. No second service runs. Our 20-document capture returned d08, d04 and d10."
 key_fact: "On BEIR SciFact, hybrid RRF with the opt-in neural embedder scored nDCG@10 0.6993, above both BM25 (0.6572) and vectors alone (0.6764)."

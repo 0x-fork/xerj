@@ -234,3 +234,114 @@ async fn an_empty_member_installs_the_leader_log_and_keeps_it_across_restart() {
         "the caught-up log must restore metadata with the peers stopped from helping"
     );
 }
+
+#[tokio::test]
+async fn a_compacted_prefix_installs_on_an_empty_member_and_survives_restart() {
+    let ids = ["n1", "n2", "n3"];
+    let held = fresh_dirs(3);
+    let paths: Vec<PathBuf> = held.iter().map(|(_, path)| path.clone()).collect();
+    let bus = InMemoryBus::new();
+    let mut nodes = vec![
+        open_node("n1", &ids, &bus, &paths[0]).await,
+        open_node("n2", &ids, &bus, &paths[1]).await,
+    ];
+    pump_until(&mut nodes, |nodes| {
+        nodes.iter().filter(|n| n.is_leader()).count() == 1
+    })
+    .await;
+    let leader = nodes.iter().position(|n| n.is_leader()).expect("leader");
+    nodes[leader]
+        .propose(ClusterCommand::CreateIndex {
+            name: "orders".into(),
+            schema_json: "{}".into(),
+        })
+        .expect("propose create");
+    nodes[leader]
+        .propose(ClusterCommand::SetShardInSync {
+            index: "orders".into(),
+            shard: 0,
+            nodes: vec!["n2".into()],
+        })
+        .expect("propose in-sync");
+    pump_until(&mut nodes, |nodes| nodes.iter().all(has_orders)).await;
+
+    for node in &mut nodes {
+        assert!(node.compact_applied(), "{} did not compact", node.raft.id);
+        assert_eq!(
+            node.raft.log_len(),
+            0,
+            "{} still has log entries after compacting the prefix",
+            node.raft.id
+        );
+        assert!(
+            node.snapshot_index() >= 2,
+            "{} snapshot does not cover both entries",
+            node.raft.id
+        );
+    }
+    let leader_id = nodes[leader].raft.id.clone();
+    let leader_path = if leader_id == "n1" {
+        paths[0].clone()
+    } else {
+        paths[1].clone()
+    };
+    let flog = xerj_cluster::raft_log::FileRaftLog::open(&leader_path).expect("reopen log");
+    assert_eq!(flog.len(), 0, "raft.log must not keep the compacted prefix");
+    assert!(
+        flog.snapshot_bytes().is_some(),
+        "the prefix has to be in snapshot.meta"
+    );
+    drop(flog);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut late = open_node("n3", &ids, &bus, &paths[2]).await;
+    late.set_applier(Arc::new(RecordingApplier {
+        events: Arc::clone(&events),
+    }));
+    nodes.push(late);
+    pump_until(&mut nodes, |nodes| nodes.iter().all(has_orders)).await;
+    let late = nodes.last().expect("n3");
+    assert_eq!(late.raft.id, "n3");
+    assert!(
+        late.snapshot_index() >= 2,
+        "n3 must install the snapshot; copying the log cannot work, it was compacted"
+    );
+    let caught_up = events.lock().expect("events").clone();
+    assert!(
+        caught_up.iter().any(|e| e == "create:orders"),
+        "applying the snapshot must run the create applier: {caught_up:?}"
+    );
+    assert!(
+        caught_up.iter().any(|e| e == "insync:orders:0"),
+        "applying the snapshot must run the in-sync applier: {caught_up:?}"
+    );
+
+    let leader = nodes.iter().position(|n| n.is_leader()).expect("leader");
+    nodes[leader]
+        .propose(ClusterCommand::UpdateConfig {
+            key: "after".into(),
+            value: "1".into(),
+        })
+        .expect("propose after the snapshot");
+    pump_until(&mut nodes, |nodes| {
+        nodes
+            .iter()
+            .all(|node| node.metadata.config.get("after").map(String::as_str) == Some("1"))
+    })
+    .await;
+
+    let late = nodes.pop().expect("n3");
+    assert_eq!(late.raft.id, "n3");
+    drop(late);
+    let mut restarted = open_node("n3", &ids, &bus, &paths[2]).await;
+    restarted.replay_committed().await;
+    assert!(
+        has_orders(&restarted),
+        "restart must restore the compacted prefix from snapshot.meta"
+    );
+    assert_eq!(
+        restarted.metadata.config.get("after").map(String::as_str),
+        Some("1"),
+        "restart must also replay the entry that landed after the snapshot"
+    );
+}

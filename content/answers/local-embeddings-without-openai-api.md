@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start one XERJ node with --embed-mode neural and a run-local HF_HOME, index 20 documents twice, and report both wall-clock times together with the output of GET /v1/embedding/identity."
 answer: "What are my options for local search that works offline with no cloud embeddings? XERJ embeds locally two ways. The default embedder is lexical feature hashing inside the binary, needs no model, and made 0 outbound connections in our capture. The opt-in --embed-mode neural loads all-MiniLM-L6-v2 from a local cache and runs on the CPU."
 key_fact: "The opt-in neural embedder downloads about 90 MB of model files once; the default lexical embedder downloads nothing."

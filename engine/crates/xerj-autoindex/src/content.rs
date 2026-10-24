@@ -212,23 +212,52 @@ fn resolve_with_digests(files: Vec<FileEntry>, digests: Vec<String>) -> Result<I
     })
 }
 
+/// A source file moved under the run after it was hashed (#1031, #1911, #2314).
+///
+/// The display text is the operator message. `path` is the live source, so a
+/// seal that noticed the change on the staged copy can still name the file
+/// the caller has to skip.
+#[derive(Debug, Clone)]
+pub struct SourceChanged {
+    pub path: std::path::PathBuf,
+    pub detail: String,
+}
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SourceChanged {}
+
 pub fn verify(path: &Path, expected_size: u64, expected_digest: &str) -> Result<()> {
     let actual_size = std::fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
         .len();
-    anyhow::ensure!(
-        actual_size == expected_size,
-        "{} changed size during autoindex (expected {}, now {}); retry the run",
-        path.display(),
-        expected_size,
-        actual_size
-    );
+    if actual_size != expected_size {
+        return Err(SourceChanged {
+            path: path.to_path_buf(),
+            detail: format!(
+                "{} changed size during autoindex (expected {}, now {}); retry the run",
+                path.display(),
+                expected_size,
+                actual_size
+            ),
+        }
+        .into());
+    }
     let actual = full_digest(path, actual_size)?;
-    anyhow::ensure!(
-        actual == expected_digest,
-        "{} changed content during autoindex; retry the run",
-        path.display()
-    );
+    if actual != expected_digest {
+        return Err(SourceChanged {
+            path: path.to_path_buf(),
+            detail: format!(
+                "{} changed content during autoindex; retry the run",
+                path.display()
+            ),
+        }
+        .into());
+    }
     Ok(())
 }
 

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index the user's labelled examples into one XERJ index with the label in a keyword field, classify each held-out item by a rank-weighted vote over its 10 nearest neighbours, and report accuracy, the share of items decided at confidence 0.8 or higher, and the accuracy on that share."
 answer: "Can I classify text from labelled history without calling an LLM? Yes, if you already have labelled examples. Index them in XERJ, fetch the 10 nearest for each new item, and vote. Measured: 0.933 accuracy on 77-way intent routing with the opt-in neural embedder, and 0.983 on SMS spam with plain BM25."
 key_fact: "SMS spam detection scored 0.983 accuracy with BM25 over 4,000 labelled examples and 1,000 held-out items, k = 10."

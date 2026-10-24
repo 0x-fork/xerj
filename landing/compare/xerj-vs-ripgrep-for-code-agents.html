@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-20",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/compare/xerj-vs-ripgrep-for-code-agents"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Should a code agent use ripgrep or an indexed search?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Use ripgrep for one-off literals and substrings on a tree that changes constantly. Use an index when the same tree is queried hundreds of times."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How often did the two tools agree?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On 18 of 30 tasks the file sets matched exactly. The other 12 disagreements are published in both directions in the capture."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When should I choose ripgrep instead?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Choose ripgrep for substrings inside identifiers, for regular expressions over raw bytes, for tiny trees, and for files that changed 1 second ago."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which task did ripgrep win most clearly?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "T25. Searching for ompat_por, a substring inside es_compat_port, ripgrep named 7 files and the index named 0."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why can an index not find a substring inside an identifier?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Because an index matches tokens. The analyzer splits text into whole terms, so a run of characters that starts mid-token is not a term and cannot match."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Where did the index win?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Symbol definitions and analyzed phrases. On T22 one defs query found 2 files where a Rust-specific regular expression found 1."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Are the timings in this comparison a benchmark?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The binary is a ci-test build, ripgrep's number includes process start, and XERJ's excludes the cost of running a node. Do not quote either as a benchmark."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How many queries before the index pays for itself?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Order of magnitude, several hundred on this tree. The derived figure was about 713 queries, and it ignores index memory, disk and staleness."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

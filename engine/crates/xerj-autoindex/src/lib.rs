@@ -481,6 +481,30 @@ fn dataset_create_body(dataset: &PlanDataset) -> Value {
     dataset_mapping_body(dataset, &[])
 }
 
+/// Mapping upgrade for an index the graph path already created.
+///
+/// `ensure_index` does not resend the body once the index exists, and a full
+/// properties PUT can 400 when an older dynamic type disagrees. The upgrade
+/// sends `ax_paths` plus scalar fields an incremental absorb added after the
+/// schema was frozen (#2176, #2314) — names the frozen mapping does not have.
+fn graph_mapping_upgrade(plan: &Plan, dataset: &PlanDataset) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert("ax_paths".into(), json!({"type": "keyword"}));
+    for spec in extra_fields(plan, &dataset.slug) {
+        if properties.contains_key(&spec.name) {
+            continue;
+        }
+        let property = match spec.es_type.as_str() {
+            "date" => {
+                json!({"type": "date", "format": "strict_date_optional_time||epoch_millis"})
+            }
+            es_type => json!({"type": es_type}),
+        };
+        properties.insert(spec.name.clone(), property);
+    }
+    json!({"properties": properties})
+}
+
 fn extra_fields<'a>(plan: &'a Plan, slug: &str) -> &'a [infer::FieldSpec] {
     plan.incremental_fields
         .get(slug)
@@ -1078,6 +1102,7 @@ fn project_reconcile_plan(
             })
             .collect()
     });
+    note_worker_address_space_cap(pr);
     let rebuild = incremental_schema_rebuild_command(cfg, state_dir);
     reconcile_plan::reconcile_plan(inventory, base_plan, scans, cfg.sample, &rebuild)
 }
@@ -1415,11 +1440,21 @@ const ALIAS_SWEEP_FAILED_REASON: &str = "catalog-alias-sweep-failed";
 ///
 /// Distinct from `completed-with-junk`. Those files are content the plan
 /// predates, not unusable input, and counting them as junk made a resume look
-/// like an ordinary successful-with-junk run. The graph path does not
-/// re-cluster a frozen plan (dataset identity and graph anchors stay put);
-/// `--no-graph` is the route that reconciles additions. `--fresh` rebuilds
-/// this plan in place and includes the files.
+/// like an ordinary successful-with-junk run. A file that fits a frozen
+/// dataset is absorbed in place (#2314). A file that needs a new dataset is
+/// not: dataset identity and graph anchors stay put, and `--fresh` rebuilds
+/// the plan in place to include it. `--no-graph` reconciles both.
 const STALE_RESUME_PLAN_REASON: &str = "stale-resume-plan";
+
+/// `xerj-done` reason when a graph-path rerun removed documents for files
+/// that left the folder (#2314).
+///
+/// Exit 3, not 0: a removal used to look like a no-op resume while the
+/// documents stayed live, and exit 0 is what that bug printed. The index
+/// matches the folder afterwards — this is success, the same way junk is —
+/// and the next unchanged rerun is exit 0. Distinct from
+/// `completed-with-junk`: the files were usable, they are gone.
+const FILES_REMOVED_REASON: &str = "files-removed";
 
 /// Catalog / plan status for a file the frozen resume plan does not cover.
 const STALE_RESUME_PLAN_STATUS: &str = "stale-plan";
@@ -1504,6 +1539,11 @@ fn alias_sweep_notes(paths: &[&str], error: &str) -> Vec<String> {
 /// that still contains junk reports 3 again instead of flapping to 0.
 fn generated_exit_code(summary: &Value) -> i32 {
     let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+    // #2336: every PDF failed because the worker process could not start.
+    // Exit 3 would call that success. The field is absent on every other run.
+    if count("pdf_worker_unavailable") > 0 {
+        return 1;
+    }
     if count("junk_records_total") > 0 || count("files_junk") > 0 {
         3
     } else {
@@ -1517,16 +1557,26 @@ fn generated_exit_code(summary: &Value) -> i32 {
 /// unless something it reads first says otherwise. The `xerj-done` line on
 /// stderr already carries `ok=true`, yet it is the LAST line of a long progress
 /// stream and the summary on stdout opened with a timing line that never
-/// mentioned the exit code at all. So every finished run now leads with one
-/// line that starts `ok:` and names the exit code in words; exit 3 also says
-/// what was recorded and where to look, so junk stays visible.
+/// mentioned the exit code at all. A finished run leads with one line that
+/// starts `ok:` and names the exit code in words; exit 3 also says what was
+/// recorded and where to look, so junk stays visible. A family-wide PDF
+/// worker startup failure (#2336) leads with `not ok:` and exit 1.
 pub(crate) fn outcome_headline(
     code: i32,
     junk_files: u64,
     junk_records: u64,
     alias_sweep_failed: bool,
     stale_plan_files: u64,
+    pdf_worker_unavailable: Option<u64>,
+    files_removed: u64,
 ) -> String {
+    if let Some(n) = pdf_worker_unavailable.filter(|n| *n > 0) {
+        return format!(
+            "not ok: the isolated PDF parser could not start for {}, so no PDF text was indexed. \
+             Other files in this run were still indexed. Exit 1 ({PDF_WORKER_UNAVAILABLE_REASON})",
+            estimate::count_phrase(n, "PDF file", "PDF files")
+        );
+    }
     if code != 3 {
         return format!("ok: indexed and searchable (exit {code}, completed)");
     }
@@ -1565,6 +1615,27 @@ pub(crate) fn outcome_headline(
              duplicate-alias cleanup could not run, so rerun the same command once the server \
              condition clears"
         );
+    }
+    if files_removed > 0 {
+        let files = estimate::count_phrase(files_removed, "file", "files");
+        let mut line = format!(
+            "ok: indexed and searchable — exit 3 ({FILES_REMOVED_REASON}) is SUCCESS, not an \
+             error: removed documents for {files} that no longer exist in the folder"
+        );
+        if junk_files > 0 || junk_records > 0 {
+            let mut recorded = Vec::new();
+            if junk_files > 0 {
+                recorded.push(estimate::count_phrase(junk_files, "file", "files"));
+            }
+            if junk_records > 0 {
+                recorded.push(estimate::count_phrase(junk_records, "record", "records"));
+            }
+            line.push_str(&format!(
+                ". Also recorded as junk: {}",
+                recorded.join(" and ")
+            ));
+        }
+        return line;
     }
     let mut recorded = Vec::new();
     if junk_files > 0 {
@@ -1637,6 +1708,14 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_
         extra.push(("skipped_dataless", skipped_dataless));
     }
     extra.extend(coverage.fields());
+    note_worker_address_space_cap(pr);
+    let pdf_down = count("pdf_worker_unavailable");
+    if pdf_down > 0 {
+        pr.note(&pdf_worker_unavailable_note(pdf_down));
+        extra.push(("pdf_worker_unavailable", pdf_down));
+        pr.finish(false, 1, PDF_WORKER_UNAVAILABLE_REASON, &extra);
+        return;
+    }
     pr.finish(
         true,
         code,
@@ -1648,6 +1727,31 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_
         &extra,
     );
 }
+
+/// `xerj-done` reason when every PDF failed because the isolated parser
+/// process could not start (#2336). Exit 1, `ok=false`. Other files in the
+/// same run may already be indexed; a corrupt PDF that the worker did parse
+/// stays exit 3.
+const PDF_WORKER_UNAVAILABLE_REASON: &str = "pdf-worker-unavailable";
+
+fn pdf_worker_unavailable_note(count: u64) -> String {
+    format!(
+        "warning: the isolated PDF parser could not start for {}, so no PDF text was indexed. \
+         Other files in this run were still indexed. This is a worker startup failure (process \
+         or resource limits). Exit 1 ({PDF_WORKER_UNAVAILABLE_REASON}).",
+        estimate::count_phrase(count, "PDF file", "PDF files")
+    )
+}
+
+#[cfg(unix)]
+fn note_worker_address_space_cap(progress: &Progress) {
+    if let Some(warning) = extract::rlimit::take_address_space_cap_warning() {
+        progress.note(warning);
+    }
+}
+
+#[cfg(not(unix))]
+fn note_worker_address_space_cap(_progress: &Progress) {}
 
 fn inventory_size_map(inventory: &content::Inventory) -> HashMap<&str, u64> {
     inventory
@@ -1686,6 +1790,148 @@ fn note_neural_ingest_cost(
     }
 }
 
+fn recount_plan_file_counts(plan: &mut Plan) {
+    for dataset in &mut plan.datasets {
+        dataset.file_count = plan
+            .files
+            .values()
+            .filter(|assignment| {
+                assignment
+                    .assignments
+                    .iter()
+                    .any(|(_, slug)| *slug == dataset.slug)
+            })
+            .count();
+    }
+}
+
+/// A schema refusal from [`reconcile_plan`], which tells the operator to
+/// rebuild. On the graph path that rebuild is `--fresh` (a new dataset), not
+/// a permanent junk row, so these files stay unplanned and the stale-plan
+/// note names `--fresh`.
+fn schema_evolution_junk(junk: &JunkFile) -> bool {
+    junk.reason.contains("Stop the watcher and rebuild")
+        || junk.reason.contains("no frozen dataset accepts")
+        || junk.reason.contains("refusing ambiguous assignment")
+        || junk.reason.contains("unsupported dataset/schema evolution")
+}
+
+/// Fold files that appeared after a graph plan was frozen into that plan
+/// when they fit a dataset it already has (#2314).
+///
+/// A no-op resume (every key already planned or junk) does not call
+/// [`project_reconcile_plan`], so the durable plan is not rewritten just
+/// because the projection would re-order junk. Files that need a new dataset
+/// are left unplanned: the stale-plan note still names `--fresh`.
+fn absorb_compatible_additions(
+    plan: &mut Plan,
+    inventory: &content::Inventory,
+    cfg: &IndexCfg,
+    state_dir: &Path,
+    pr: &Progress,
+    meter: &estimate::Meter,
+    tally: &ScanTally,
+) -> Result<bool> {
+    let unplanned = inventory.keys.iter().any(|key| {
+        !key.is_empty()
+            && !plan.files.contains_key(key)
+            && !plan.junk_files.iter().any(|junk| &junk.file_key == key)
+    });
+    if !unplanned {
+        return Ok(false);
+    }
+    let projected = match project_reconcile_plan(inventory, plan, cfg, state_dir, pr, meter, tally)
+    {
+        Ok(projected) => projected,
+        Err(error) => {
+            pr.note(&format!(
+                "autoindex: files added after the resume plan was frozen could not be absorbed \
+                 ({error:#}); re-run with --fresh to rebuild the plan in place"
+            ));
+            return Ok(false);
+        }
+    };
+    let inventory_keys: HashSet<&str> = inventory.keys.iter().map(String::as_str).collect();
+    let mut changed = false;
+    for (key, assignment) in projected.files {
+        if !inventory_keys.contains(key.as_str())
+            || plan.files.contains_key(&key)
+            || plan.junk_files.iter().any(|junk| junk.file_key == key)
+        {
+            continue;
+        }
+        plan.files.insert(key, assignment);
+        changed = true;
+    }
+    for junk in projected.junk_files {
+        if !inventory_keys.contains(junk.file_key.as_str())
+            || plan.files.contains_key(&junk.file_key)
+            || plan
+                .junk_files
+                .iter()
+                .any(|existing| existing.file_key == junk.file_key)
+            || schema_evolution_junk(&junk)
+        {
+            continue;
+        }
+        plan.junk_files.push(junk);
+        changed = true;
+    }
+    for (slug, specs) in projected.incremental_fields {
+        let dest = plan.incremental_fields.entry(slug).or_default();
+        for spec in specs {
+            if dest.iter().any(|existing| existing.name == spec.name) {
+                continue;
+            }
+            dest.push(spec);
+            changed = true;
+        }
+    }
+    if changed {
+        recount_plan_file_counts(plan);
+    }
+    Ok(changed)
+}
+
+/// Drop one live source out of a generation that is about to seal (#2314).
+///
+/// Returns false when `path` is not a canonical inventory file, so the caller
+/// does not retry a failure it cannot attribute.
+fn quarantine_changed_source(
+    plan: &mut Plan,
+    inventory: &mut content::Inventory,
+    path: &Path,
+    detail: &str,
+) -> bool {
+    let Some(index) = inventory.files.iter().position(|file| file.path == path) else {
+        return false;
+    };
+    let key = inventory.keys[index].clone();
+    let format = plan
+        .files
+        .get(&key)
+        .map(|assignment| {
+            if assignment.gzip {
+                format!("{}(gzip)", assignment.family)
+            } else {
+                assignment.family.clone()
+            }
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let file = inventory.files.remove(index);
+    inventory.keys.remove(index);
+    inventory.digests.remove(index);
+    plan.files.remove(&key);
+    plan.duplicate_files
+        .retain(|alias| alias.file_key != key && plan.files.contains_key(&alias.file_key));
+    let error = anyhow::anyhow!("{detail}");
+    plan.junk_files.push(changed_during_run_junk(
+        &key, &file.rel, &format, file.size, &error,
+    ));
+    recount_plan_file_counts(plan);
+    true
+}
+
 #[allow(clippy::too_many_arguments)] // cutover threads the whole run context
 fn begin_non_graph_generation(
     es: &Es,
@@ -1720,23 +1966,15 @@ fn begin_non_graph_generation(
         .context("generation cutover has no committed base")?
         .clone();
     let tx_id = format!("{}-g{}", journal.run_id, base.generation + 1);
-    // #1723: derive the content groups and check the plan's projection onto
-    // them BEFORE sealing. Both depend only on the plan, the inventory and the
-    // base; only the counts need the snapshot (`bind_prepared_counts` below).
-    // A plan that cannot be accepted used to be refused only after the whole
-    // corpus was sealed — ~25 minutes per attempt on the report's corpus.
-    let mut groups = desired_content_groups(&base.groups, &plan, inventory)?;
-    sync::preflight_plan_projection(&plan, &groups).with_context(|| {
-        format!(
-            "autoindex refused generation {} before sealing any file: the plan built from this \
-             walk does not project onto its own content groups, so every run over this input \
-             fails the same way, --fresh included. No snapshot was written and no remote data \
-             was changed. This is an autoindex defect for this corpus; please report it with \
-             this message",
-            base.generation + 1
-        )
-    })?;
-    let preparation_contract = preparation_contract_digest(cfg, &plan)?;
+    let mut plan = plan;
+    // #2314: a file that changes between the hash and the seal is dropped and
+    // the seal is retried. The owned copy is what the generation publishes.
+    let mut sealed = content::Inventory {
+        files: inventory.files.clone(),
+        keys: inventory.keys.clone(),
+        digests: inventory.digests.clone(),
+        duplicates: inventory.duplicates.clone(),
+    };
     // #971: the prior committed generation's snapshot is the reuse source for
     // sealing. A file whose content digest and preparation identity match its
     // entry there is hardlinked instead of re-copied and re-extracted, so the
@@ -1748,18 +1986,91 @@ fn begin_non_graph_generation(
         .map(|_| sync_executor::open_committed_snapshot(state_dir, &base))
         .transpose()?;
     let chunker_identity = prepared_records_identity(cfg)?;
-    let snapshot = sync_executor::create_prepared_snapshot_reporting(
-        state_dir,
-        &tx_id,
-        inventory,
-        &plan,
-        &preparation_contract,
-        cfg.snapshot_max_bytes,
-        pr,
-        prior_snapshot.as_ref(),
-        &chunker_identity,
-        labeler,
-    )?;
+    let (snapshot, mut groups) = {
+        let mut prepared = None;
+        let mut groups_out = None;
+        // One file leaves per attempt, plus the successful seal.
+        let max_attempts = sealed.files.len().saturating_add(2).max(1);
+        for _attempt in 0..max_attempts {
+            let failing: Vec<(std::path::PathBuf, String)> = sealed
+                .files
+                .iter()
+                .zip(sealed.digests.iter())
+                .filter_map(|(file, digest)| {
+                    content::verify(&file.path, file.size, digest)
+                        .err()
+                        .map(|error| (file.path.clone(), format!("{error:#}")))
+                })
+                .collect();
+            let mut quarantined = false;
+            for (path, detail) in failing {
+                if quarantine_changed_source(&mut plan, &mut sealed, &path, &detail) {
+                    quarantined = true;
+                    pr.note(&format!(
+                        "warning: {} changed while this run was reading it, so it was skipped \
+                         ({detail})",
+                        path.display()
+                    ));
+                }
+            }
+            if quarantined {
+                continue;
+            }
+            // #1723: derive the content groups and check the plan's projection
+            // onto them BEFORE sealing. A plan that cannot be accepted used to
+            // be refused only after the whole corpus was sealed.
+            let groups = desired_content_groups(&base.groups, &plan, &sealed)?;
+            sync::preflight_plan_projection(&plan, &groups).with_context(|| {
+                format!(
+                    "autoindex refused generation {} before sealing any file: the plan built \
+                     from this walk does not project onto its own content groups, so every run \
+                     over this input fails the same way, --fresh included. No snapshot was \
+                     written and no remote data was changed. This is an autoindex defect for \
+                     this corpus; please report it with this message",
+                    base.generation + 1
+                )
+            })?;
+            let preparation_contract = preparation_contract_digest(cfg, &plan)?;
+            match sync_executor::create_prepared_snapshot_reporting(
+                state_dir,
+                &tx_id,
+                &sealed,
+                &plan,
+                &preparation_contract,
+                cfg.snapshot_max_bytes,
+                pr,
+                prior_snapshot.as_ref(),
+                &chunker_identity,
+                labeler,
+            ) {
+                Ok(snapshot) => {
+                    prepared = Some(snapshot);
+                    groups_out = Some(groups);
+                    break;
+                }
+                Err(error) => {
+                    let Some(changed) = error.downcast_ref::<content::SourceChanged>() else {
+                        return Err(error);
+                    };
+                    let path = changed.path.clone();
+                    let detail = changed.detail.clone();
+                    if !quarantine_changed_source(&mut plan, &mut sealed, &path, &detail) {
+                        return Err(error);
+                    }
+                    pr.note(&format!(
+                        "warning: {} changed while this run was sealing it, so it was skipped \
+                         ({detail})",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        let snapshot = prepared.context(
+            "autoindex could not seal a snapshot after skipping files that changed during the \
+             run",
+        )?;
+        (snapshot, groups_out.expect("a sealed snapshot has groups"))
+    };
     // #1062: every vote the generated route makes happens during sealing, so
     // the Labeler's counters are final here — the same accounting the legacy
     // path prints after its walk, stated where this route's cost was paid.
@@ -1798,6 +2109,7 @@ fn begin_non_graph_generation(
         journal.pin_embedding_identity(
             &identity.identity_sha256,
             identity.resumable,
+            identity.dimensions,
             identity.non_resumable_reason.as_deref(),
         )?;
         identity
@@ -1819,7 +2131,7 @@ fn begin_non_graph_generation(
         }
     };
 
-    sync_executor::bind_prepared_counts(&mut groups, &snapshot, &inventory.keys)?;
+    sync_executor::bind_prepared_counts(&mut groups, &snapshot, &sealed.keys)?;
     let (schema_identity, index_identity) = generation_contract_identities(&plan)?;
     let desired = sync::GenerationManifest {
         generation: base.generation + 1,
@@ -2084,6 +2396,99 @@ fn without_corpus_data_files(files: Vec<walk::FileEntry>) -> (Vec<walk::FileEntr
     (kept, dropped, skipped_bytes)
 }
 
+/// Per-extension accounting printed at the end of `xerj corpus index`
+/// (#2339, the summary half of #1985).
+///
+/// `indexed` is what the walk admits after ignore rules, minus the corpus
+/// manifest and — unless `include_data` — the data-file families.
+/// `ignored data` is those families. A pruned directory is not expanded
+/// into extensions; the ignore-rules line names the prune instead. A walk
+/// that cannot run yields no lines, and the index verdict still prints.
+pub(crate) fn corpus_file_class_summary(root: &Path, include_data: bool) -> Vec<String> {
+    let Ok((files, ignore)) =
+        walk::walk_reporting(root, false, ignore_rules::IgnoreOptions::default())
+    else {
+        return Vec::new();
+    };
+    let files: Vec<walk::FileEntry> = files
+        .into_iter()
+        .filter(|file| file.rel != CORPUS_MANIFEST_REL)
+        .collect();
+    let (kept, skipped): (Vec<walk::FileEntry>, Vec<walk::FileEntry>) = if include_data {
+        (files, Vec::new())
+    } else {
+        let mut kept = Vec::new();
+        let mut skipped = Vec::new();
+        for file in files {
+            if is_corpus_data_file(&file) {
+                skipped.push(file);
+            } else {
+                kept.push(file);
+            }
+        }
+        (kept, skipped)
+    };
+    let mut lines = vec![format!(
+        "file classes: indexed {} ({} file{})",
+        format_class_counts(&class_counts(&kept)),
+        kept.len(),
+        if kept.len() == 1 { "" } else { "s" },
+    )];
+    if !skipped.is_empty() {
+        lines.push(format!(
+            "file classes: ignored data {} ({} file{}) — pass --include-data to index them",
+            format_class_counts(&class_counts(&skipped)),
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" },
+        ));
+    }
+    if ignore.files_skipped > 0 || ignore.dirs_pruned > 0 {
+        lines.push(format!(
+            "file classes: ignore rules skipped {} file{} and pruned {} director{}",
+            ignore.files_skipped,
+            if ignore.files_skipped == 1 { "" } else { "s" },
+            ignore.dirs_pruned,
+            if ignore.dirs_pruned == 1 { "y" } else { "ies" },
+        ));
+    }
+    lines
+}
+
+fn class_of(file: &walk::FileEntry) -> String {
+    file.path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "noext".to_string())
+}
+
+fn class_counts(files: &[walk::FileEntry]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for file in files {
+        *counts.entry(class_of(file)).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn format_class_counts(counts: &BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    let mut ranked: Vec<(&String, &u64)> = counts.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    const SHOW: usize = 12;
+    let mut parts: Vec<String> = ranked
+        .iter()
+        .take(SHOW)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect();
+    if ranked.len() > SHOW {
+        parts.push(format!("+{}", ranked.len() - SHOW));
+    }
+    parts.join(" ")
+}
+
 #[cfg(test)]
 mod generation_preflight_tests {
     use super::*;
@@ -2270,6 +2675,52 @@ mod corpus_data_skip_tests {
     fn a_file_without_an_extension_is_kept() {
         let (kept, count, bytes) = without_corpus_data_files(vec![entry("Makefile", 1)]);
         assert_eq!((kept.len(), count, bytes), (1, 0, 0));
+    }
+
+    /// #2339: the corpus-index tail names indexed extensions and the data
+    /// families the gate left out. `corpus.json` is bookkeeping. A pruned
+    /// `node_modules` is the ignore-rules line, not an indexed class.
+    #[test]
+    fn corpus_index_summary_splits_indexed_extensions_from_ignored_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "docs\n").unwrap();
+        std::fs::write(root.join("Makefile"), "all:\n").unwrap();
+        std::fs::write(root.join("data/rows.csv"), "a,b\n").unwrap();
+        std::fs::write(root.join("data/ROWS.CSV"), "c,d\n").unwrap();
+        std::fs::write(root.join("sim.h5"), "not-really\n").unwrap();
+        std::fs::write(root.join("corpus.json"), "{}\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+
+        let lines = corpus_file_class_summary(root, false);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("file classes: indexed md=1 noext=1 rs=1 (3 files)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "file classes: ignored data csv=2 h5=1 (3 files) — pass --include-data to index them"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("pruned"), "{text}");
+        assert!(!text.contains("corpus.json"), "{text}");
+        assert!(!text.contains("js="), "{text}");
+
+        let included = corpus_file_class_summary(root, true).join("\n");
+        assert!(
+            included.contains("csv=2") && included.contains("h5=1") && included.contains("rs=1"),
+            "{included}"
+        );
+        assert!(
+            !included.contains("ignored data"),
+            "include-data indexes the data families: {included}"
+        );
     }
 }
 
@@ -3619,6 +4070,43 @@ mod clustering_key_tests {
         assert_eq!(clusters.len(), 1, "{clusters:#?}");
     }
 
+    /// #2337: a hand-written DDL file, including a routine whose body
+    /// inserts a row, is code. `scan_file` must not record it as junk.
+    #[test]
+    fn a_handwritten_sql_schema_is_code_not_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "-- rule engine\n\
+             CREATE TABLE rules (\n\
+             id integer primary key,\n\
+             code text not null\n\
+             );\n\
+             CREATE OR REPLACE FUNCTION apply_slope(percent numeric)\n\
+             RETURNS text LANGUAGE plpgsql AS $$\n\
+             BEGIN\n\
+               INSERT INTO audit(note) VALUES ('slope');\n\
+               RETURN 'low';\n\
+             END;\n\
+             $$;\n";
+        let scanned = scan(dir.path(), "30_rule_engine.sql", body);
+        assert!(scanned.junk.is_none(), "DDL was junked: {:?}", scanned.junk);
+        assert_eq!(
+            scanned.sniffed.as_ref().map(|s| s.family),
+            Some(Family::Code)
+        );
+        let defs: Vec<String> = scanned
+            .sketches
+            .iter()
+            .filter_map(|s| s.fields.get("defs"))
+            .flat_map(|v| v.examples.iter().chain(v.raw_values.iter()).cloned())
+            .collect();
+        assert!(
+            defs.iter()
+                .any(|d| d.contains("table rules") && d.contains("function apply_slope")),
+            "defs={defs:?} junk={:?}",
+            scanned.junk
+        );
+    }
+
     /// The other half: a data file's own column names ARE the key, so real
     /// schemas still drive clustering.
     #[test]
@@ -4504,6 +4992,7 @@ fn build_phase_a(
     });
 
     report_pdf_spool_fallbacks(files, &scans, ctx);
+    note_worker_address_space_cap(pr);
 
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
@@ -5080,13 +5569,15 @@ fn pending_for_phase_b(
         .collect()
 }
 
-/// #487: an unchanged re-index on a `neural`/`proxy` backend must not fail with
-/// a false "embedding execution identity changed" message. The identity CHANGED
-/// only if a comparable field differs from what the journal pinned; `resumable`
-/// is a standing property of the backend (false by construction for backends
-/// whose identity hashes the model NAME, not its bytes), so it is checked
-/// SEPARATELY with an accurate message — restoring the identity cannot fix a
-/// backend that simply cannot resume.
+/// An unchanged re-index must not fail with a false "embedding execution
+/// identity changed" message (#487). The identity changed only when a
+/// comparable field differs from what the journal pinned. `resumable` is
+/// checked on its own.
+///
+/// A proxy whose vector width is not confirmed reports `dimensions: None` and
+/// `resumable: false` (#2306). That missing width is the resume limit, not a
+/// different embedder. A confirmed width that disagrees with the pinned width
+/// is a real change and must not be mixed into the corpus.
 fn ensure_embedding_execution_unchanged_and_resumable(
     current: &crate::esclient::EmbeddingExecutionIdentity,
     expected_sha: &str,
@@ -5094,11 +5585,22 @@ fn ensure_embedding_execution_unchanged_and_resumable(
     expected_dimension: Option<usize>,
     expected_semantic_contract: &str,
 ) -> anyhow::Result<()> {
+    let same_embedder = current.identity_sha256 == expected_sha
+        && current.backend == expected_backend
+        && current.semantic_contract == expected_semantic_contract;
+    let same_width = current.dimensions == expected_dimension;
+    if same_embedder && !same_width && !(current.dimensions.is_none() && !current.resumable) {
+        anyhow::bail!(
+            "embedding execution identity changed since this autoindex journal was created \
+             (vector width {} vs {}); refusing to mix vector spaces. No remote mutation was \
+             attempted. Restore the original identity, or rebuild with a new --state-dir and a \
+             new --prefix",
+            dimension_label(expected_dimension),
+            dimension_label(current.dimensions),
+        );
+    }
     anyhow::ensure!(
-        current.identity_sha256 == expected_sha
-            && current.backend == expected_backend
-            && current.dimensions == expected_dimension
-            && current.semantic_contract == expected_semantic_contract,
+        same_embedder && (same_width || (current.dimensions.is_none() && !current.resumable)),
         "embedding execution identity changed since this autoindex journal was created; \
          refusing to mix vector spaces. No remote mutation was attempted. Restore the \
          original identity, or rebuild with a new --state-dir and a new --prefix"
@@ -5107,8 +5609,10 @@ fn ensure_embedding_execution_unchanged_and_resumable(
         current.resumable,
         "the `{}` embedding backend cannot resume semantic indexing{}. The pinned identity is \
          UNCHANGED — this is a backend limitation, not a change, so restoring the identity will \
-         not help. Rebuild with a new --state-dir and a new --prefix, or content-address the \
-         model identity so this backend can resume (#367).",
+         not help. Follow the reason above. Documents already indexed were kept. If the vector \
+         width was not confirmed, make the embedding endpoint reachable and rerun — \
+         already-embedded documents are reused once the same width is confirmed. Rebuild with a \
+         new --state-dir and a new --prefix only to discard this corpus and start over.",
         current.backend,
         current
             .non_resumable_reason
@@ -5117,6 +5621,13 @@ fn ensure_embedding_execution_unchanged_and_resumable(
             .unwrap_or_default()
     );
     Ok(())
+}
+
+fn dimension_label(width: Option<usize>) -> String {
+    match width {
+        Some(width) => width.to_string(),
+        None => "unreported".to_string(),
+    }
 }
 
 fn select_resume_plan_keys(
@@ -5317,6 +5828,10 @@ struct RefusalTargets {
 }
 
 impl RefusalTargets {
+    /// The destination a removal refusal would name. The run sweeps deletions
+    /// instead of returning that error (#2314); the constructor stays so the
+    /// typed message can still be built from a plan.
+    #[allow(dead_code)]
     fn describe(cfg: &IndexCfg, state_dir: &Path, plan: &Plan) -> Self {
         let mut data_indices: Vec<String> = plan.datasets.iter().map(|d| d.index.clone()).collect();
         data_indices.sort();
@@ -5562,6 +6077,21 @@ impl std::fmt::Display for UnsupportedInventoryDeltaError {
 
 impl std::error::Error for UnsupportedInventoryDeltaError {}
 
+/// Paths of swept content groups, capped the same way a refusal lists them.
+fn deleted_group_list(entries: &[InventoryDeltaEntry]) -> String {
+    let mut rendered = entries
+        .iter()
+        .take(REFUSAL_LIST_CAP)
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = entries.len().saturating_sub(REFUSAL_LIST_CAP);
+    if remaining > 0 {
+        rendered.push_str(&format!(", … and {remaining} more"));
+    }
+    rendered
+}
+
 /// Whether a plan file that vanished from the walk is still on disk (#439).
 ///
 /// The disk probe uses the file's reversible raw-bytes identity (`path_id`:
@@ -5718,23 +6248,20 @@ impl UnsupportedInventoryDelta {
         }
     }
 
-    /// A rerun is refused only when a content group the plan published has
-    /// vanished from the folder: those documents stay live and searchable with
-    /// no source file behind them, and nothing in this pipeline removes them.
-    /// Additions are not refused — they are skipped by the frozen plan exactly
-    /// as before and `--fresh` rebuilds the plan in place to include them.
+    /// Whether the classifier sees a genuine deletion.
+    ///
+    /// The run does not return [`Self::into_error`] for that anymore (#2314):
+    /// both gates sweep `deleted_content_groups` with `sweep_excluded_groups`,
+    /// including `--fresh`, which used to be refused because discarding the
+    /// journal does not delete published documents. This method stays so the
+    /// classifier tests can tell a deletion from an exclusion or an addition.
+    /// An exclusion is swept the same way and is not a refusal (#589).
+    #[cfg(test)]
     fn refuses(&self) -> bool {
-        // #589: only a GENUINE deletion (source file gone from disk) refuses the
-        // rerun — its published documents would be left live with no file behind
-        // them and nothing else removes them. An EXCLUSION (file still on disk,
-        // newly matched by a widened ignore/hidden/`.xerjignore` rule) is data
-        // the exclusion must REMOVE, so it is SWEPT by `sweep_excluded_groups`
-        // and the run continues (#439's data-exposure headline). When a genuine
-        // deletion co-occurs the whole rerun is refused, and `into_error` still
-        // reports the excluded set too because it also stays live in that case.
         !self.deleted_content_groups.is_empty()
     }
 
+    #[cfg(test)]
     fn into_error(self, targets: RefusalTargets) -> anyhow::Error {
         UnsupportedInventoryDeltaError {
             delta: self,
@@ -5967,6 +6494,7 @@ fn pin_pending_embedding_identity(
     journal.pin_embedding_identity(
         &current.identity_sha256,
         current.resumable,
+        current.dimensions,
         current.non_resumable_reason.as_deref(),
     )
 }
@@ -6060,6 +6588,12 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
     if let Some(skipped) = skip_doc {
         summary["skipped"] = skipped;
     }
+    // Recomputed from the committed plan, not only copied from the catalog
+    // document: a no-op re-run reads the previous run document, which may
+    // predate this field, and a family-wide worker failure must still exit 1.
+    if let Some(n) = committed.plan.pdf_worker_unavailable_count() {
+        summary["pdf_worker_unavailable"] = json!(n);
+    }
     journal.finish(&summary)?;
     if cfg.json {
         println!("{summary}");
@@ -6072,6 +6606,13 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
                 count("files_junk"),
                 count("junk_records_total"),
                 false,
+                0,
+                summary
+                    .get("pdf_worker_unavailable")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 0),
+                // File removal is reported on the graph path. This printer
+                // is the generated route, which does not sweep membership.
                 0,
             )
         );
@@ -8214,6 +8755,12 @@ fn run_index_report_inner(
             );
         }
     }
+    // #2314: deletions are swept before the journal opens, so `--fresh` (which
+    // deletes `journal.ndjson` inside `open_after_preflight`) still has the
+    // frozen plan to name the indices and keys. `deleted_file_keys` is then
+    // dropped from the resumed plan so the second gate does not see them.
+    let mut swept_membership = false;
+    let mut deleted_file_keys: HashSet<String> = HashSet::new();
     if let Some(prior_plan) = preflight.plan.as_ref() {
         let comparison_keys = if cfg.fresh {
             inventory.keys.clone()
@@ -8231,9 +8778,11 @@ fn run_index_report_inner(
             .map(|(planned, current)| planned.unwrap_or_else(|| current.clone()))
             .collect()
         };
-        // `--fresh` is checked here too: discarding the plan does not delete
-        // the documents already published for a file that is now gone, so a
-        // removal is unsafe in place whether or not the plan is kept.
+        // #2314: a file that left the folder used to refuse the rerun, and
+        // `--fresh` with it, because discarding the journal does not delete
+        // documents already published. Sweep them here, with the frozen plan
+        // still in hand, the same way an exclusion is swept. `--dry-run`
+        // names them and does not mutate.
         let delta = inventory_delta(
             &cfg.root,
             &inventory.files,
@@ -8241,13 +8790,42 @@ fn run_index_report_inner(
             prior_plan,
             &dataless_skipped_files,
         );
-        if delta.refuses() {
-            return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, prior_plan)));
+        if !delta.deleted_content_groups.is_empty() {
+            deleted_file_keys.extend(
+                delta
+                    .deleted_content_groups
+                    .iter()
+                    .map(|entry| entry.file_key.clone()),
+            );
+            let count = delta.deleted_content_groups.len();
+            let paths = deleted_group_list(&delta.deleted_content_groups);
+            if cfg.dry_run {
+                pr.note(&format!(
+                    "autoindex: {count} file(s) indexed under this resume plan no longer exist in \
+                     the folder ({paths}); a real run removes their documents"
+                ));
+            } else {
+                let edges_index = graph_edges_index(&cfg);
+                sweep_excluded_groups(
+                    &es,
+                    &cfg.prefix,
+                    prior_plan,
+                    &delta.deleted_content_groups,
+                    edges_index.as_deref(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .context("sweep deleted content groups")?;
+                swept_membership = true;
+                pr.note(&format!(
+                    "autoindex: removed documents for {count} file(s) that no longer exist in the \
+                     folder ({paths})"
+                ));
+            }
         }
         // #589: a widened exclusion (file still on disk, newly ignored) is data
         // the exclusion must remove — sweep the excluded group's documents and
-        // continue, rather than leaving them live in the destination. Genuine
-        // deletions above still refuse; never mutate under --dry-run.
+        // continue, rather than leaving them live in the destination. Never
+        // mutate under --dry-run.
         if !delta.excluded_content_groups.is_empty() && !cfg.dry_run {
             let edges_index = graph_edges_index(&cfg);
             sweep_excluded_groups(
@@ -8329,9 +8907,33 @@ fn run_index_report_inner(
     // `inventory.duplicates` after this block.
     let mut own_unprefixed_alias_ids: HashSet<String> = HashSet::new();
     let mut plan_changed = journal.plan.is_none();
+    // #2314: drop completions for files swept before the journal opened, so
+    // the catalog write below does not advertise them again.
+    if journal.plan.is_some() {
+        let forgotten: Vec<String> = deleted_file_keys
+            .iter()
+            .filter(|key| journal.done.contains_key(key.as_str()))
+            .cloned()
+            .collect();
+        for key in forgotten {
+            journal.file_removed(&key)?;
+        }
+    }
     // Preserve legacy document IDs while upgrading old plans with full digests.
     // A later same-size/tail mutation is then detected and reindexed.
     if let Some(plan) = &mut journal.plan {
+        if !deleted_file_keys.is_empty() {
+            let before = plan.files.len();
+            plan.files.retain(|key, _| !deleted_file_keys.contains(key));
+            plan.duplicate_files.retain(|alias| {
+                !deleted_file_keys.contains(&alias.file_key)
+                    && plan.files.contains_key(&alias.file_key)
+            });
+            if plan.files.len() != before {
+                recount_plan_file_counts(plan);
+                plan_changed = true;
+            }
+        }
         let needs_alias_path_migration = !plan.alias_paths_indexed;
         let previous_aliases = plan.duplicate_files.clone();
         alias_paths_to_replace.extend(previous_aliases.iter().map(|alias| alias.rel.clone()));
@@ -8448,6 +9050,10 @@ fn run_index_report_inner(
             plan_changed = true;
         }
         plan.duplicate_files = inventory.duplicates.clone();
+        if absorb_compatible_additions(plan, &inventory, &cfg, &state_dir, &pr, &scan_meter, tally)?
+        {
+            plan_changed = true;
+        }
     }
     alias_paths_to_replace.extend(inventory.duplicates.iter().map(|alias| alias.rel.clone()));
     own_unprefixed_alias_ids.extend(inventory.duplicates.iter().flat_map(|alias| {
@@ -8546,27 +9152,62 @@ fn run_index_report_inner(
         plan
     };
 
-    // Second gate, after key selection has settled: fail before index
-    // creation/mapping, replacement intent, graph invalidation,
-    // delete-by-query, bulk publication, refresh, or catalog writes when a
-    // canonical content group the plan published is gone from the folder.
-    // Continuing would leave those documents searchable with no source file.
-    // Additions, same-path replacement and crash repair remain supported.
-    //
-    // It runs before the #238 junk sweep below on purpose: a refused rerun
-    // must compute nothing and mutate nothing.
-    // An exclusion sweep removes a file's documents without this run re-reading
-    // anything; a reply edge from a surviving mailbox into the swept one would
-    // stay live. The corpus-wide mail pass below re-derives those edges when
-    // this is set (see `carry_over_unread_mail`).
+    // Second gate, after key selection has settled. Deletions the first gate
+    // already swept are gone from the plan. Anything still classified as a
+    // deletion here (a key the first comparison missed) is swept the same way
+    // rather than refusing the run (#2314). An exclusion sweep removes a
+    // file's documents without this run re-reading anything; a reply edge from
+    // a surviving mailbox into the swept one would stay live. The corpus-wide
+    // mail pass below re-derives those edges when this is set (see
+    // `carry_over_unread_mail`).
     let mut swept_excluded = false;
     if resumed_with_plan {
         let delta = inventory_delta(&cfg.root, &files, &keys, &plan, &dataless_skipped_files);
-        if delta.refuses() {
-            return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, &plan)));
+        if !delta.deleted_content_groups.is_empty() {
+            let gone: HashSet<String> = delta
+                .deleted_content_groups
+                .iter()
+                .map(|entry| entry.file_key.clone())
+                .collect();
+            let count = delta.deleted_content_groups.len();
+            let paths = deleted_group_list(&delta.deleted_content_groups);
+            if cfg.dry_run {
+                pr.note(&format!(
+                    "autoindex: {count} file(s) indexed under this resume plan no longer exist in \
+                     the folder ({paths}); a real run removes their documents"
+                ));
+            } else {
+                swept_membership = true;
+                let edges_index = graph_edges_index(&cfg);
+                sweep_excluded_groups(
+                    &es,
+                    &cfg.prefix,
+                    &plan,
+                    &delta.deleted_content_groups,
+                    edges_index.as_deref(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .context("sweep deleted content groups")?;
+                pr.note(&format!(
+                    "autoindex: removed documents for {count} file(s) that no longer exist in the \
+                     folder ({paths})"
+                ));
+            }
+            plan.files.retain(|key, _| !gone.contains(key));
+            plan.duplicate_files.retain(|alias| {
+                !gone.contains(&alias.file_key) && plan.files.contains_key(&alias.file_key)
+            });
+            recount_plan_file_counts(&mut plan);
+            plan_changed = true;
+            for key in &gone {
+                deleted_file_keys.insert(key.clone());
+                if journal.done.contains_key(key) {
+                    journal.file_removed(key)?;
+                }
+            }
         }
         // #589: sweep documents left behind by a widened exclusion (see gate
-        // above). Genuine deletions still refuse; never mutate under --dry-run.
+        // above). Never mutate under --dry-run.
         if !delta.excluded_content_groups.is_empty() && !cfg.dry_run {
             swept_excluded = true;
             let edges_index = graph_edges_index(&cfg);
@@ -8883,6 +9524,7 @@ fn run_index_report_inner(
         journal.pin_embedding_identity(
             &identity.identity_sha256,
             identity.resumable,
+            identity.dimensions,
             identity.non_resumable_reason.as_deref(),
         )?;
         // #1189: name the live backend in the run output. A server started
@@ -8893,6 +9535,15 @@ fn run_index_report_inner(
             identity.backend,
             if identity.resumable { "" } else { "non-" }
         ));
+        if !identity.resumable {
+            pr.note(&format!(
+                "semantic autoindex cannot resume this embedding backend: {}",
+                identity
+                    .non_resumable_reason
+                    .as_deref()
+                    .unwrap_or("the server did not provide an immutable embedding identity")
+            ));
+        }
     }
 
     // ── create indices with explicit mappings ────────────────────────────
@@ -8915,11 +9566,8 @@ fn run_index_report_inner(
             .ensure_index(&d.index, &dataset_create_body(d))
             .with_context(|| format!("create index {}", d.index))
             .and_then(|()| {
-                es.update_mapping(
-                    &d.index,
-                    &json!({"properties": {"ax_paths": {"type": "keyword"}}}),
-                )
-                .with_context(|| format!("upgrade alias-path mapping for {}", d.index))
+                es.update_mapping(&d.index, &graph_mapping_upgrade(&plan, d))
+                    .with_context(|| format!("upgrade alias-path mapping for {}", d.index))
             });
         match installed {
             Ok(()) => {}
@@ -9857,6 +10505,20 @@ fn run_index_report_inner(
                         }
                     }
                     Err(e) => {
+                        // #2314: extract fails when the file shrinks or vanishes
+                        // after the pre-extract verify. That is one skipped
+                        // file. A genuine extract error, with the bytes still
+                        // what phase A hashed, still aborts the run.
+                        if let Err(changed) = content::verify(&f.path, f.size, expected_digest) {
+                            extra_junk.lock().unwrap().push(changed_during_run_junk(
+                                key,
+                                &f.rel,
+                                &format_str(Some(&sn)),
+                                f.size,
+                                &changed,
+                            ));
+                            continue;
+                        }
                         send_err = Some(format!("extract {}: {e}", f.rel));
                         extra_junk.lock().unwrap().push(JunkFile {
                             file_key: key.clone(),
@@ -10167,19 +10829,17 @@ fn run_index_report_inner(
             files_done.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // #1122: `Scope::spawn` panics when a thread cannot be created (thread
-    // limit, memory exhaustion), and release builds are panic=abort, so one
-    // failed spawn used to abort the whole run. Spawn through the fallible
-    // builder instead: workers that did start share the queue between them,
-    // the pipe stops counting the ones that never did, and if none started
-    // this thread works the queue itself. Slower, never wrong.
-    std::thread::scope(|scope| {
+    // #1122: `Builder::spawn_scoped` returns `Ok`, then the child panics
+    // if it cannot map an alternate signal stack. Release builds are
+    // panic=abort, so that panic takes the process down. `thread_spawn::scope`
+    // uses `pthread_create` and does not install that stack. A refusal is
+    // an error: workers that did start share the queue, the pipe stops
+    // counting the ones that never did, and if none started this thread
+    // works the queue itself. The failed closure is dropped unrun.
+    xerj_common::thread_spawn::scope(|scope| {
         let mut started = 0usize;
         for _ in 0..worker_count {
-            match std::thread::Builder::new()
-                .name("autoindex-worker".into())
-                .spawn_scoped(scope, worker)
-            {
+            match scope.spawn("autoindex-worker", worker) {
                 Ok(_) => started += 1,
                 Err(error) => {
                     pr.note(&format!(
@@ -10235,7 +10895,7 @@ fn run_index_report_inner(
                 gr,
                 &index_of_slug,
                 &reread,
-                journal_interrupted || swept_excluded,
+                journal_interrupted || swept_excluded || swept_membership,
             ) {
                 Ok(carried) => carried,
                 Err(e) => {
@@ -10458,10 +11118,19 @@ fn run_index_report_inner(
     // classification does not recognise.
     let (files_done_journaled, journal_records) = {
         let journal = journal_mx.lock().unwrap();
-        (
-            journal.done.len(),
-            journal.done.values().map(|fd| fd.records).sum::<u64>(),
-        )
+        // #2314: a file swept because it left the folder is still in
+        // `journal.done` until the next plan write forgets to republish it.
+        // Those records are supposed to be gone. Counting them made a folder
+        // that had just been emptied look like a write that never landed.
+        let mut files_done_journaled = 0usize;
+        let mut journal_records = 0u64;
+        for (key, done) in &journal.done {
+            if plan.files.contains_key(key) {
+                files_done_journaled += 1;
+                journal_records += done.records;
+            }
+        }
+        (files_done_journaled, journal_records)
     };
     let live_records: u64 = ds_counts.values().sum();
     if !count_unknown.is_empty() {
@@ -10721,6 +11390,11 @@ fn run_index_report_inner(
     {
         let j = journal_mx.lock().unwrap();
         for fd in j.done.values() {
+            // A swept deletion stays in an older file_done until
+            // `file_removed` replays. Do not advertise it (#2314).
+            if deleted_file_keys.contains(&fd.file_key) {
+                continue;
+            }
             completed_keys.insert(fd.file_key.clone());
             let current_path = plan
                 .files
@@ -11033,11 +11707,28 @@ fn run_index_report_inner(
     if skipped_appeared > 0 {
         run_doc["skipped_appeared"] = json!(skipped_appeared);
     }
+    // #2314: present only when this run deleted documents for files that left
+    // the folder. A later unchanged rerun does not set it, so exit 0 there is
+    // a real no-op and not another removal.
+    let files_removed = if swept_membership {
+        deleted_file_keys.len() as u64
+    } else {
+        0
+    };
+    if files_removed > 0 {
+        run_doc["files_removed"] = json!(files_removed);
+    }
     // #2056: the exit-3 headline stays one line. The paths themselves are a
     // separate list, capped, with the reason. Present only when something
     // was skipped, so a clean run document is unchanged.
     if let Some(skipped) = skipped_json(&all_junk) {
         run_doc["skipped"] = skipped;
+    }
+    // #2336: present only when every PDF failed to start the isolated parser.
+    // A single corrupt PDF stays ordinary junk and does not set the field.
+    let pdf_worker_unavailable = plan.pdf_worker_unavailable_count();
+    if let Some(n) = pdf_worker_unavailable {
+        run_doc["pdf_worker_unavailable"] = json!(n);
     }
     // Owned lines: the resume-plan update below mutates `plan.junk_files`,
     // which `all_junk` borrows. The summary prints these after that update.
@@ -11120,21 +11811,26 @@ fn run_index_report_inner(
 
     // ── summary ──────────────────────────────────────────────────────────
     let junk_total_records = junk_records.load(Ordering::Relaxed);
-    // Exit 3 means "completed, some input was unusable". Backend rejections
-    // are not consulted and must not be: a rejected item aborts the run with
-    // an error long before this line, so `rejected_records` is provably 0
-    // here. Splitting them out of `junk_total_records` therefore changes no
-    // exit code.
+    // Exit 3 means "completed, and something about this run is recorded
+    // rather than fatal" (`cli.rs` EXIT CODES). Junk is the everyday case.
+    // Backend rejections are not consulted and must not be: a rejected item
+    // aborts the run with an error long before this line, so
+    // `rejected_records` is provably 0 here. Splitting them out of
+    // `junk_total_records` therefore changes no exit code.
     //
-    // A failed alias sweep lands here too, and on 3 rather than on a code of
-    // its own: 3 already means "completed, and something about this run is
-    // recorded rather than fatal" (`cli.rs` EXIT CODES), and inventing a fourth
-    // success code would break every caller that already branches on 0/3. The
-    // `reason` is what tells the two apart.
-    let code = if junk_total_records > 0
+    // A failed alias sweep and a swept deletion land here too, on 3 rather
+    // than on a code of their own: inventing another success code would break
+    // every caller that already branches on 0/3. The `reason` is what tells
+    // them apart. A removal is not exit 0: that is what the run printed when
+    // the documents stayed live (#2314). A PDF worker that could not start is
+    // exit 1: exit 3 would call a missing PDF family success (#2336).
+    let code = if pdf_worker_unavailable.is_some() {
+        1
+    } else if junk_total_records > 0
         || junk_file_count > 0
         || alias_sweep_error.is_some()
         || skipped_appeared > 0
+        || files_removed > 0
     {
         3
     } else {
@@ -11151,6 +11847,8 @@ fn run_index_report_inner(
                 junk_total_records,
                 alias_sweep_error.is_some(),
                 skipped_appeared as u64,
+                pdf_worker_unavailable,
+                files_removed,
             )
         );
         for line in &skip_lines {
@@ -11296,20 +11994,33 @@ fn run_index_report_inner(
     if skipped_appeared > 0 {
         done_fields.push(("skipped_appeared", skipped_appeared as u64));
     }
+    if files_removed > 0 {
+        done_fields.push(("files_removed", files_removed));
+    }
     if dataless_skipped > 0 {
         done_fields.push(("skipped_dataless", dataless_skipped));
     }
+    if let Some(n) = pdf_worker_unavailable {
+        done_fields.push(("pdf_worker_unavailable", n));
+        pr.note(&pdf_worker_unavailable_note(n));
+    }
+    note_worker_address_space_cap(&pr);
     pr.finish(
-        true,
+        pdf_worker_unavailable.is_none(),
         code,
-        // A stale plan wins the `reason` when files on disk were not indexed:
-        // junk is the everyday state, and `completed-with-junk` is what hid
-        // those files (#2076). The alias-sweep failure is next: it needs an
-        // operator, and junk does not.
-        if skipped_appeared > 0 {
+        // A worker that cannot start wins the `reason`: exit 3 would call a
+        // missing PDF family success (#2336). A stale plan is next, because
+        // junk is the everyday state and `completed-with-junk` is what hid
+        // those files (#2076). The alias-sweep failure needs an operator,
+        // and ordinary junk does not.
+        if pdf_worker_unavailable.is_some() {
+            PDF_WORKER_UNAVAILABLE_REASON
+        } else if skipped_appeared > 0 {
             STALE_RESUME_PLAN_REASON
         } else if alias_sweep_error.is_some() {
             ALIAS_SWEEP_FAILED_REASON
+        } else if files_removed > 0 {
+            FILES_REMOVED_REASON
         } else if code == 3 {
             "completed-with-junk"
         } else {
@@ -11427,6 +12138,7 @@ fn run_remove(cfg: cli::RemoveCfg) -> Result<i32> {
         root: cfg.root,
         yes: cfg.yes,
         prompt,
+        state_dir: cfg.state_dir,
     })?;
     println!(
         "{}",
@@ -12782,6 +13494,47 @@ mod duplicate_integration_tests {
             err2.contains("identity changed"),
             "a real identity change must still report it: {err2}"
         );
+        // A confirmed width that disagrees with the pinned width is a real
+        // change. An unconfirmed width on a non-resumable backend is not.
+        let wider = crate::esclient::EmbeddingExecutionIdentity {
+            dimensions: Some(768),
+            resumable: true,
+            non_resumable_reason: None,
+            ..current.clone()
+        };
+        let err3 = ensure_embedding_execution_unchanged_and_resumable(
+            &wider,
+            "6e51e5ce3e46",
+            "neural",
+            None,
+            "semantic_text-derived-vector.v1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err3.contains("identity changed") && err3.contains("768"),
+            "a different vector width must be reported as a change: {err3}"
+        );
+        let unconfirmed = crate::esclient::EmbeddingExecutionIdentity {
+            dimensions: None,
+            resumable: false,
+            non_resumable_reason: Some("vector width was not confirmed".into()),
+            ..current
+        };
+        let err4 = ensure_embedding_execution_unchanged_and_resumable(
+            &unconfirmed,
+            "6e51e5ce3e46",
+            "neural",
+            Some(384),
+            "semantic_text-derived-vector.v1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err4.contains("cannot resume") && !err4.contains("identity changed"),
+            "an unconfirmed width is a resume limit, not a changed identity: {err4}"
+        );
+        assert!(err4.contains("vector width was not confirmed"), "{err4}");
     }
 
     #[test]
@@ -13282,11 +14035,11 @@ mod generation_contract_identity_tests {
     /// what was recorded instead of hiding it.
     #[test]
     fn a_finished_run_leads_with_an_ok_line_that_spells_out_exit_3() {
-        let clean = outcome_headline(0, 0, 0, false, 0);
+        let clean = outcome_headline(0, 0, 0, false, 0, None, 0);
         assert!(clean.starts_with("ok: indexed and searchable"), "{clean}");
         assert!(clean.contains("exit 0"), "{clean}");
 
-        let junk = outcome_headline(3, 1, 0, false, 0);
+        let junk = outcome_headline(3, 1, 0, false, 0, None, 0);
         assert!(junk.starts_with("ok: indexed and searchable"), "{junk}");
         assert!(
             junk.contains("exit 3 (completed-with-junk) is SUCCESS, not an error"),
@@ -13296,10 +14049,30 @@ mod generation_contract_identity_tests {
         assert!(junk.contains("xerj autoindex"), "{junk}");
         assert!(!junk.contains('\n'), "one line: {junk}");
 
-        let both = outcome_headline(3, 2, 5, false, 0);
+        let both = outcome_headline(3, 2, 5, false, 0, None, 0);
         assert!(both.contains("2 files and 5 records"), "{both}");
 
-        let stale = outcome_headline(3, 0, 0, false, 2);
+        let removed = outcome_headline(3, 0, 0, false, 0, None, 1);
+        assert!(
+            removed.contains("exit 3 (files-removed) is SUCCESS, not an error"),
+            "{removed}"
+        );
+        assert!(
+            removed.contains("no longer exist in the folder"),
+            "{removed}"
+        );
+        assert!(
+            !removed.contains("recorded as junk"),
+            "a removal is not junk: {removed}"
+        );
+        assert!(!removed.contains('\n'), "one line: {removed}");
+        let removed_and_junk = outcome_headline(3, 1, 0, false, 0, None, 2);
+        assert!(
+            removed_and_junk.contains("Also recorded as junk: 1 file"),
+            "{removed_and_junk}"
+        );
+
+        let stale = outcome_headline(3, 0, 0, false, 2, None, 0);
         assert!(stale.contains("exit 3 (stale-resume-plan)"), "{stale}");
         assert!(
             stale.contains("2 files skipped because the resumed plan is stale"),
@@ -13311,13 +14084,18 @@ mod generation_contract_identity_tests {
             "a stale plan is not junk: {stale}"
         );
         assert!(!stale.contains('\n'), "one line: {stale}");
-        let stale_and_junk = outcome_headline(3, 1, 0, false, 2);
+        let stale_and_junk = outcome_headline(3, 1, 0, false, 2, None, 0);
         assert!(
             stale_and_junk.contains("Also recorded as junk: 1 file"),
             "{stale_and_junk}"
         );
 
-        let sweep = outcome_headline(3, 4, 0, true, 0);
+        let sweep = outcome_headline(3, 4, 0, true, 0, None, 0);
+        let pdfs = outcome_headline(1, 4, 0, false, 0, Some(4), 0);
+        assert!(pdfs.starts_with("not ok:"), "{pdfs}");
+        assert!(pdfs.contains("4 PDF files"), "{pdfs}");
+        assert!(pdfs.contains(PDF_WORKER_UNAVAILABLE_REASON), "{pdfs}");
+        assert!(!pdfs.contains("is SUCCESS"), "{pdfs}");
         assert!(sweep.starts_with("ok: indexed and searchable"), "{sweep}");
         assert!(sweep.contains(ALIAS_SWEEP_FAILED_REASON), "{sweep}");
         assert!(sweep.contains("rerun the same command"), "{sweep}");
@@ -13673,6 +14451,50 @@ mod code_coverage_tests {
             "a run that skipped nothing keeps the terminal line it had: {text}"
         );
         assert!(!text.contains("warning:"), "{text}");
+    }
+
+    #[test]
+    fn every_pdf_failing_to_start_ends_the_run_as_a_worker_outage() {
+        let (pr, buffer) = progress::Progress::capture(
+            progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        finish_generated_progress(
+            &pr,
+            3,
+            &json!({
+                "files_indexed": 2,
+                "records_total": 4,
+                "generation": 1,
+                "code_files": 0,
+                "code_files_indexed": 0,
+                "code_files_junked": 0,
+                "pdf_worker_unavailable": 2,
+            }),
+            0,
+        );
+        let text = captured(&buffer);
+        let done = text
+            .lines()
+            .find(|line| line.starts_with("xerj-done "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(done.contains("ok=false"), "{done}");
+        assert!(done.contains("exit=1"), "{done}");
+        assert!(done.contains("reason=pdf-worker-unavailable"), "{done}");
+        assert!(done.contains("pdf_worker_unavailable=2"), "{done}");
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("warning:") && line.contains("isolated PDF parser")),
+            "{text}"
+        );
+        assert!(
+            text.trim_end()
+                .lines()
+                .next_back()
+                .unwrap()
+                .starts_with("xerj-done "),
+            "the warning precedes the terminal line: {text}"
+        );
     }
 
     #[test]

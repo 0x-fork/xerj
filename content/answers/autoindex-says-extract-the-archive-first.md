@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt. If a run prints 'not indexed — archives are never opened' under its summary (or its --json summary has a non-empty unextracted_archives list), run the command each line names (unzip, tar -xzf, 7z x, unrar x, xz -dk) on that file, then run xerj autoindex again on the extracted folder. Exit code 3 with those lines is a completed run, not a failure, but if the archive was the only thing in the folder nothing was indexed: tell the user."
 answer: "Why does xerj autoindex say to extract a zip first? Because autoindex never opens archives. A .zip, .tgz, .7z, .rar or .xz is marked as junk with a reason that quotes the extraction command, the rest of the folder is indexed, and the run exits 3. Extract the archive and run the same command again."
 key_fact: "autoindex classifies a file from its first 8,192 bytes (`PREFIX` in the sniffer), which is how an archive is recognised by magic bytes rather than by its extension."

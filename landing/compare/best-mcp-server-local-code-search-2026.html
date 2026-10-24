@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/compare-best-mcp-server-local-code-search-2026.png",
   "inLanguage": "en",
   "datePublished": "2026-10-19",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,68 @@
     "@id": "https://xerj.org/compare/best-mcp-server-local-code-search-2026"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Which MCP server for local code search needs no API key?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Serena, Semble, cocoindex-code with its full install, ast-grep MCP and XERJ all run without an API key. Claude Context's documented setup needs a vector database and an OpenAI key for embeddings, and codedb's default hybrid retrieval uses hosted embeddings unless you choose semantic=local."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which one is best for finding references and renaming symbols?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Serena. It drives real language servers, so it can find references and perform symbol-level edits. XERJ extracts definitions only and rewrites nothing, and the embedding-based servers return passages, not reference graphs."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which one searches by meaning offline?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Semble and cocoindex-code ship local embedding models. XERJ's default embedder is lexical feature hashing; embedding-based retrieval needs the opt-in --embed-mode neural, which downloads a small model once."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When does XERJ beat the code-only servers?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "When the agent's questions span code and the files around it: docs, JSONL, CSV, logs, PDFs and SQLite. XERJ indexes all of them into one Elasticsearch-compatible node behind one MCP server, and the same node stores agent memory."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Were these servers benchmarked against each other?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. This page compares documented capabilities and GitHub data checked on 2026-10-19. No head-to-head retrieval benchmark was run, and vendor token-saving claims are quoted as vendor claims."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How were stars and releases collected?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "From the GitHub REST API on 2026-10-19: stargazers_count from the repository endpoint and the latest release from the releases/latest endpoint. A server with no GitHub release shows none."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -252,9 +316,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>THE BEST MCP SERVERS FOR SEARCHING A LOCAL CODEBASE IN 2026</div>
   <div class="kicker"><span>COMPARE · COMPARISON: CODE RETRIEVAL</span></div>
   <h1>The best MCP servers for searching a local codebase in 2026</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-10-19 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-10-19 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>What is the best MCP server to search a local codebase in 2026? It depends on the job. Serena wins symbol navigation and refactoring through language servers. Semble and cocoindex-code give embedding-based search with no API key. ast-grep MCP matches syntax patterns. XERJ indexes code plus docs and data files behind one server.</p>
     <p class="key-fact"><strong>Key number:</strong> Serena has 30,404 GitHub stars and shipped v2.1.0 on 2026-10-19, the most-starred server on this list; XERJ has 10,569. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/oraios/serena">github.com/oraios/serena</a>)</span></p>
     <p class="mute">Last checked: 2026-10-19. Every third-party fact on this page was re-read from the tool's own docs or repository on that date.</p>
@@ -302,7 +366,7 @@
   <p>The ast-grep MCP server is experimental and exposes four tools, including one that dumps a syntax tree so the agent can write a working pattern. It builds no index, so it never goes stale, and it needs ast-grep and uv installed.</p>
   <p>Use it beside an index, not instead of one. Choose ast-grep when the question is a pattern rather than a topic. The <a href="/compare/xerj-vs-ast-grep">XERJ vs ast-grep</a> page splits those jobs in detail.</p>
   <h2>XERJ: one index over the whole folder</h2>
-  <p>XERJ is a search engine first. <code class="inline">xerj autoindex</code> reads a repository plus the docs, logs, JSONL, CSV, PDFs and SQLite files around it, writes a <code class="inline">defs</code> field and a <code class="inline">symbols</code> array for 36 tree-sitter languages, and <code class="inline">xerj mcp</code> serves 17 tools over that node, memory included.</p>
+  <p>XERJ is a search engine first. <code class="inline">xerj autoindex</code> reads a repository plus the docs, logs, JSONL, CSV, PDFs and SQLite files around it, writes a <code class="inline">defs</code> field and a <code class="inline">symbols</code> array for 36 tree-sitter languages, and <code class="inline">xerj mcp</code> serves 22 tools over that node, memory included.</p>
   <p>What it gives up: no references, no edits, a lexical default embedder, single-node only, and heavy memory while indexing. Our own <a href="/compare/best-local-full-text-search-jsonl-csv-2026">JSONL benchmark</a> measured the node peaking at about 9.1 GiB resident while indexing a 9.7 MB file. For code-only questions, compare it with ripgrep first: on 30 disclosed tasks ripgrep won 5 outright (<a href="/compare/xerj-vs-ripgrep-for-code-agents">XERJ vs ripgrep</a>). Choose ripgrep when the agent searches a tree once.</p>
   <h2>How this page was checked</h2>
   <p>Every licence, install line and capability above was read from the project's own README or docs on 2026-10-19. Stars and latest releases came from the GitHub REST API the same day. Nothing was benchmarked head to head, and every vendor performance number is labelled as the vendor's.</p>

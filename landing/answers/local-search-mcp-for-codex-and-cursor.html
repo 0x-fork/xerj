@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-10-20",
   "dateModified": "2026-10-20",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,60 @@
     "@id": "https://xerj.org/answers/local-search-mcp-for-codex-and-cursor"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Search tool for a Codex agent?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj init in a project that already has .codex/. It appends [mcp_servers.xerj]. Codex reads that file in trusted projects only."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Plug search into Cursor?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "If .cursor/ exists, init writes .cursor/mcp.json with the same mcpServers.xerj entry. Restart Cursor."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does init configure Windsurf and Cline?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It prints the entry and tells you to copy it. It does not write their config files."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How many tools does xerj mcp serve?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "17 on this binary, from a live tools/list. The count includes the hub tools. Do not copy an old list of 13."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does xerj mcp start the node?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Start the node, then run xerj mcp. The handshake can succeed and every tool call can still fail if nothing is listening."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

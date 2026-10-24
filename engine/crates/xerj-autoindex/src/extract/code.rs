@@ -350,6 +350,13 @@ pub fn extract(path: &Path, sn: &crate::sniff::Sniffed, sink: Sink) -> Result<Ex
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    // #2337: SQL source is code, but `.sql` is not a registry extension.
+    // A registry row would claim dumps in the sniffer before content is
+    // read. The DDL scanner runs only after sniff has ruled a dump out
+    // (or the dump extractor emitted nothing and the caller fell through).
+    if crate::sniff::is_sql_filename(named) {
+        return super::sqlsrc::extract(path, named, sn.gzip, sink);
+    }
     let claimants: Vec<&LangDef> = registry()
         .iter()
         .filter(|d| d.exts.contains(&ext.as_str()))
@@ -3009,9 +3016,12 @@ mod tests {
         }
         // Deliberately NOT claimed, each for a stated reason: fixed-form
         // Fortran would mis-parse under the free-form grammar; nim/crystal
-        // have no usable published grammar; sql routing is deferred; `.sls`
-        // is an R6RS library but also a SaltStack state file (YAML), and a
-        // single-claimant extension is never content-probed; `.edn` is data.
+        // have no usable published grammar; `.sql` is indexed as code by
+        // the DDL scanner in `sqlsrc` only after the dump sniff (#2337) —
+        // a registry row would claim INSERT/COPY dumps before that sniff;
+        // `.sls` is an R6RS library but also a SaltStack state file (YAML),
+        // and a single-claimant extension is never content-probed; `.edn`
+        // is data.
         for ext in ["f", "nim", "cr", "sql", "sls", "edn"] {
             assert!(!is_code_ext(ext), "{ext} must stay unclaimed (see #295)");
         }

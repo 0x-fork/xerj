@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 og_image: "og/answers-retrieval-that-says-not-found-with-file-line-citations.png"
 og_image_alt: "Cover: three dot discs for three outcomes: answered at zstd.h:134 with exit 0, no match with exit 1, and an off-topic question that still returned passages with exit 0 (issue #1786)"
 queries:

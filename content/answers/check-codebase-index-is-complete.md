@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, count the files under the target folder, run xerj autoindex with --dry-run, run it for real, then reconcile the dry-run file count with xerj autoindex status and with a _cat/indices count before you report the codebase as indexed."
 answer: "My codebase indexer says indexed but I don't see my code: how do I check it actually finished? Reconcile four numbers: files on disk, the --dry-run plan, xerj autoindex status, and the document count in _cat/indices. A captured run turned 64 non-hidden files into a 3-file plan, naming an ignore rule for every gap."
 key_fact: "Source files above 2 MiB are not parsed for symbols (`CODE_CAP`), one of the documented reasons a file can be missing from the code fields."

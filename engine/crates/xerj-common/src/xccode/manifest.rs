@@ -61,6 +61,24 @@ pub struct CorpusManifest {
     /// Validation happens in [`query_text_weight`] / [`read_hub_manifest`].
     #[serde(default)]
     pub query: Option<Value>,
+    /// First-party marker (#2339). `true` only when the operator passed
+    /// `xerj corpus add --own` or `xerj corpus own`. Absent on every
+    /// historical manifest, and never taken from a `--from` document: that
+    /// file is untrusted input and must not be able to silence the
+    /// do-not-copy banner. A non-bool value is read as false so a corrupt
+    /// key cannot blank the licence map.
+    #[serde(default, deserialize_with = "deserialize_own")]
+    pub own: bool,
+}
+
+/// Only JSON `true` counts. Anything else — including a string an untrusted
+/// file might carry — is not the operator's marker.
+fn deserialize_own<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_bool() == Some(true))
 }
 
 /// `corpus.json`'s optional `"query"` block (#1254). The corpus AUTHOR knows
@@ -105,6 +123,45 @@ pub fn read_corpus_manifest(path: &Path) -> Result<CorpusManifest, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
     serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+}
+
+/// Whether this corpus was marked first-party (#2339). Missing manifest,
+/// a missing key, or any value other than JSON `true` is false — the
+/// do-not-copy banner stays on.
+pub fn corpus_is_own(root: &Path, corpus: &str) -> bool {
+    let path = root.join("corpora").join(corpus).join("corpus.json");
+    read_corpus_manifest(&path).is_ok_and(|m| m.own)
+}
+
+/// Set or clear the first-party marker on an existing `corpus.json`.
+///
+/// Rewrites through the pinned writer. `own: false` omits the key, which is
+/// what every historical manifest looks like. The recorded licences are not
+/// touched. A malformed `query` block is refused rather than dropped.
+pub fn set_corpus_own(path: &Path, corpus: &str, own: bool) -> Result<(), String> {
+    let m = read_corpus_manifest(path)?;
+    let query = match m.query {
+        None => None,
+        Some(q) => Some(
+            serde_json::from_value::<QueryHints>(q)
+                .map_err(|e| format!("{}: query block is malformed: {e}", path.display()))?,
+        ),
+    };
+    let cloned_at = m.cloned_at.unwrap_or_default();
+    write_corpus_manifest_kind(
+        path,
+        corpus,
+        m.kind.as_deref(),
+        &cloned_at,
+        &m.repos,
+        query.as_ref(),
+        own,
+    );
+    let back = read_corpus_manifest(path)?;
+    if back.own != own {
+        return Err(format!("could not record own={own} in {}", path.display()));
+    }
+    Ok(())
 }
 
 /// repo -> recorded licence for a corpus. ALWAYS the recorded data, never
@@ -168,17 +225,20 @@ fn entry_json(repo: &ManifestRepo) -> String {
 /// Atomic (tmp + rename): a half-written manifest describes a checkout that
 /// does not exist, and `xerj corpus list` reads these.
 pub fn write_corpus_manifest(path: &Path, corpus: &str, cloned_at: &str, repos: &[ManifestRepo]) {
-    write_corpus_manifest_kind(path, corpus, None, cloned_at, repos, None)
+    write_corpus_manifest_kind(path, corpus, None, cloned_at, repos, None, false)
 }
 
-/// [`write_corpus_manifest`] with an optional `kind` and query-hint block.
-/// `None` for either emits byte-for-byte what the pinned format has always
-/// been — a git corpus's manifest must not churn because a second kind of
-/// corpus now exists. `Some("harvested")` inserts `"kind":"harvested"`
-/// directly after `"corpus"`; only packs' corpora carry it, and `add` refuses
-/// to mix the two kinds under one name. A `query` block (#1254) is appended
-/// after `repos` verbatim — the corpus author's declaration must survive a
-/// re-clone from a hub pin that carries it.
+/// [`write_corpus_manifest`] with an optional `kind`, query-hint block, and
+/// first-party marker. `None` / `false` for those emits byte-for-byte what
+/// the pinned format has always been — a git corpus's manifest must not
+/// churn because a second kind of corpus, or an own-code marker, now exists.
+/// `Some("harvested")` inserts `"kind":"harvested"` directly after
+/// `"corpus"`; only packs' corpora carry it, and `add` refuses to mix the
+/// two kinds under one name. `own: true` inserts `"own":true` after
+/// `cloned_at` (#2339). A `query` block (#1254) is appended after `repos`
+/// verbatim — the corpus author's declaration must survive a re-clone from
+/// a hub pin that carries it.
+#[allow(clippy::too_many_arguments)]
 pub fn write_corpus_manifest_kind(
     path: &Path,
     corpus: &str,
@@ -186,11 +246,13 @@ pub fn write_corpus_manifest_kind(
     cloned_at: &str,
     repos: &[ManifestRepo],
     query: Option<&QueryHints>,
+    own: bool,
 ) {
     let kind_json = match kind {
         Some(k) => format!(",\"kind\":{}", Value::String(k.to_string())),
         None => String::new(),
     };
+    let own_json = if own { ",\"own\":true" } else { "" };
     let query_json = match query {
         Some(q) => match q.text_weight {
             Some(w) => format!(",\"query\":{{\"text_weight\":{w}}}"),
@@ -199,7 +261,7 @@ pub fn write_corpus_manifest_kind(
         None => String::new(),
     };
     let mut body = format!(
-        "{{\"corpus\":{}{kind_json},\"cloned_at\":{},\"repos\":[\n",
+        "{{\"corpus\":{}{kind_json},\"cloned_at\":{}{own_json},\"repos\":[\n",
         Value::String(corpus.to_string()),
         Value::String(cloned_at.to_string())
     );
@@ -407,7 +469,15 @@ mod tests {
             review: None,
             paths: Vec::new(),
         }];
-        write_corpus_manifest_kind(&path, "rust-vulns", Some("harvested"), "t", &repos, None);
+        write_corpus_manifest_kind(
+            &path,
+            "rust-vulns",
+            Some("harvested"),
+            "t",
+            &repos,
+            None,
+            false,
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.starts_with("{\"corpus\":\"rust-vulns\",\"kind\":\"harvested\",\"cloned_at\":"),
@@ -495,9 +565,73 @@ mod tests {
                 paths: Vec::new(),
             }],
             None,
+            false,
         );
         let m = licence_map(&dir, "18f-content-guide");
         assert_eq!(m.get("content-guide").map(String::as_str), Some("CC0-1.0"));
+    }
+
+    /// #2339: `own` is absent on the historical byte format, round-trips when
+    /// set, and a non-bool value does not fail the manifest (that would blank
+    /// the licence map).
+    #[test]
+    fn own_is_omitted_unless_set_and_only_json_true_counts() {
+        let dir = tmp();
+        let path = dir.join("corpus.json");
+        let repos = vec![ManifestRepo {
+            repo: "mine".into(),
+            url: "/src".into(),
+            licence: "NONE-FOUND".into(),
+            sha: "abc".into(),
+            files: Some(1),
+            bytes: Some(2),
+            review: None,
+            paths: Vec::new(),
+        }];
+        write_corpus_manifest(&path, "mine", "t", &repos);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("own"), "{text}");
+        assert!(!read_corpus_manifest(&path).unwrap().own);
+
+        write_corpus_manifest_kind(&path, "mine", None, "t", &repos, None, true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"cloned_at\":\"t\",\"own\":true,\"repos\":"),
+            "{text}"
+        );
+        assert!(read_corpus_manifest(&path).unwrap().own);
+        assert_eq!(
+            read_corpus_manifest(&path).unwrap().repos[0].licence,
+            "NONE-FOUND"
+        );
+
+        std::fs::write(
+            &path,
+            "{\"corpus\":\"mine\",\"own\":\"yes\",\"repos\":[{\"repo\":\"mine\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let parsed = read_corpus_manifest(&path).unwrap();
+        assert!(!parsed.own, "a string is not the operator's marker");
+        assert_eq!(parsed.repos[0].licence, "UNKNOWN");
+
+        let root = tmp();
+        let corpora = root.join("corpora").join("mine");
+        std::fs::create_dir_all(&corpora).unwrap();
+        let manifest = corpora.join("corpus.json");
+        std::fs::copy(&path, &manifest).unwrap();
+        assert!(!corpus_is_own(&root, "mine"));
+        set_corpus_own(&manifest, "mine", true).unwrap();
+        assert!(corpus_is_own(&root, "mine"));
+        assert_eq!(
+            read_corpus_manifest(&manifest).unwrap().repos[0].licence,
+            "UNKNOWN",
+            "setting own does not rewrite the recorded licence"
+        );
+        set_corpus_own(&manifest, "mine", false).unwrap();
+        let cleared = std::fs::read_to_string(&manifest).unwrap();
+        assert!(!cleared.contains("own"), "{cleared}");
+        assert!(!corpus_is_own(&root, "mine"));
+        assert!(!corpus_is_own(&root, "missing"));
     }
 
     #[test]
@@ -586,7 +720,7 @@ mod tests {
         let hints = QueryHints {
             text_weight: Some(1.0),
         };
-        write_corpus_manifest_kind(&path, "otel-proto", None, "t", &repos, Some(&hints));
+        write_corpus_manifest_kind(&path, "otel-proto", None, "t", &repos, Some(&hints), false);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.ends_with("],\"query\":{\"text_weight\":1}}\n"),

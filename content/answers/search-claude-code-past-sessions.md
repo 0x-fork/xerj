@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node and run xerj autoindex on the session JSONL folder, then read xerj autoindex map for the message field. Search that field with a match query and cite ax_path. If xerj search returns no match, say so. This is BM25 over files you point at, not a session-memory feature."
 answer: "Search Claude Code past sessions by indexing the session JSONL and querying the message field. On 2026-10-20 a three-file fixture, not a live chat folder, indexed 8 records in 0.6 s. Searching zstd on message_content returned 2 hits. xerj search on the same words returned no match."
 key_fact: "A match on message_content for zstd returned 2 hits and took 0 ms."

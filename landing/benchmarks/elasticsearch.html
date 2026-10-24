@@ -192,8 +192,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -391,21 +393,21 @@
     <div class="kicker"><span class="accent">COMPATIBILITY &amp; LIMITS</span><span class="dash">·</span><span>WHAT THIS BOARD IS NOT EVIDENCE FOR</span></div>
     <div class="cov-row">
       <span class="cov-label">ES-YAML wire conformance</span>
-      <span class="cov-bar" style="width:99.8%"></span>
-      <span class="cov-meta">1,366 / 1,369 <b>99.8%</b></span>
+      <span class="cov-bar" style="width:99.3%"></span>
+      <span class="cov-meta">1,444 / 1,454 <b>99.3%</b></span>
     </div>
     <p class="sb-note">
       That figure is <em>wire compatibility</em>, not performance, and it is sourced from the
-      ES-YAML conformance job on main's CI (<span class="mono">1366 passed &middot; 0 failed &middot; 3 skipped &middot; 1369 total</span>)
+      ES-YAML conformance job on main's CI (<span class="mono">1444 passed &middot; 0 failed &middot; 10 skipped &middot; 1454 total</span>, run 40058513341)
       — <span class="mono">SCORECARD.md</span>
-      does not record it. Three of 1,369 conformance cases are still unmet and we do not round that
+      does not record it. Ten of 1,454 conformance cases are skipped, and the expected-error cases listed in <span class="mono">catch-lenient.txt</span> are not yet met, so we do not round that
       to 100% or to "full ES compatibility." It is also not the product: XERJ is a from-scratch Rust
       engine that speaks the ES 8.x wire protocol as an <strong>adoption bridge</strong>, the way modern
       databases speak the Postgres protocol without being Postgres — compatibility is a feature here,
       not an identity.
     </p>
     <p class="sb-note">
-      <strong>Passing the REST YAML suite is not feature parity</strong>, and 99.8% should not be read as
+      <strong>Passing the REST YAML suite is not feature parity</strong>, and 99.3% should not be read as
       "essentially feature-complete" — a suite only tests what it asserts. A separate stub audit
       (<span class="mono">demo/playbooks/STUB_AUDIT.md</span>, 2026-07-07) records <strong>68 real
       implementation gaps</strong> against surfaces XERJ exposes, <strong>34 of them intersecting a public
@@ -1213,7 +1215,7 @@
   <div class="row"><div class="k">The tie band</div><div class="v"><strong>26 of 88 cells</strong> land inside <span class="mono">|Δ| ≤ max(0.30&nbsp;ms, 20%)</span> and score TIE. Some of them point at ES (<span class="mono">random_sampler</span> 0.82×, <span class="mono">deep from+size</span> 0.85×, <span class="mono">match_all</span> 0.93×, <span class="mono">exists</span> 0.98×, <span class="mono">constant_score</span> 0.99×); most point at XERJ. Both kinds are ties. Earlier boards had no band and forced every one of these into a win or a loss, which is why their totals wandered — the band replaced an argument with a threshold.</div></div>
   <div class="row"><div class="k">Hardening along the way</div><div class="v">Durable mappings across restarts, a merge-race segment lease validated under sustained merge churn with zero result mismatches, WAL and segment garbage collection, a merge data-loss fix, a dedicated deprioritised ingest pool, and cooperative query timeouts. None of these are scored cells; they are the reason the scored cells are trustworthy.</div></div>
   <div class="row"><div class="k">Not measured here</div><div class="v">Skipped, not hidden — each needs a purpose-built index the flat corpus lacks: <span class="mono">geo_*</span> queries and aggregations, <span class="mono">ip_range / ip_prefix</span>, <span class="mono">nested / has_child / has_parent</span>, <span class="mono">span_*</span>, <span class="mono">significant_text</span>, <span class="mono">semantic / hybrid</span> retrieval, top-level <span class="mono">knn</span> (covered separately by the kNN family), and <span class="mono">percolate</span> — a real reverse-search doc-scan in the engine, with no percolator corpus here to run it against. Purpose-built corpora are planned follow-ups.</div></div>
-  <div class="row"><div class="k">The standing guardrail</div><div class="v">Every performance change must hold ES-YAML REST conformance at <strong>1,366 passed / 0 failed / 3 skipped</strong> (1,366 of 1,369) — the pass count grows as cases are added; <strong>0 failed</strong> is the part that never moves. Speed bought with correctness is not a win, and it does not merge.</div></div>
+  <div class="row"><div class="k">The standing guardrail</div><div class="v">Every performance change must hold ES-YAML REST conformance at <strong>1,444 passed / 0 failed / 10 skipped</strong> (1,444 of 1,454) — the pass count grows as cases are added; <strong>0 failed</strong> is the part that never moves. Speed bought with correctness is not a win, and it does not merge.</div></div>
 </section>
 
 <!-- 06 — CHANGELOG -------------------------------------------->

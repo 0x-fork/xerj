@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index a small folder of plain-text logs with xerj autoindex, then run a term filter on level and a terms aggregation on service, and record the node's peak resident memory from /proc before you plan a larger corpus."
 answer: "Is there a free or cheap alternative for low-volume log management and searching? XERJ indexes plain-text logs on one node with no ELK stack, returns exact error counts, and answered a level=ERROR filter at p50 0.488 ms on a 16 MB corpus. Memory is the limit: peak resident memory grew to about 200 times the corpus."
 key_fact: "The page's measured ladder stopped at a 16 MB log corpus, where peak resident memory was about 200 times the corpus size."
