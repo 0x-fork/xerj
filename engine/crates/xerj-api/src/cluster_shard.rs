@@ -4,6 +4,8 @@
 //! in the same Raft entry as the create. [`dispatch_index`] forwards a
 //! document to the owner [`Engine::route_write`] names. [`dispatch_update`]
 //! and [`bulk_on_primaries`] send `_update` and `_bulk` to that same owner.
+//! [`update_by_query_on_primaries`] runs `_update_by_query` on every primary
+//! and each primary copies the documents it changed.
 //! The primary copies an index, delete, or the document an update stored
 //! onto the in-sync replicas and acknowledges the caller when a quorum of
 //! the copies has confirmed. A replica that does not
@@ -30,7 +32,8 @@ use serde_json::{json, Value};
 use xerj_cluster::{ApplyEffect, ClusterCommand, ShardOp, ShardResult};
 
 use crate::es_compat::{
-    apply_get_doc_source_filter, apply_local_update, search_shard_local, EsSearchBody,
+    aggregate_by_query_results, apply_get_doc_source_filter, apply_local_update,
+    pipeline_rejected_body, search_shard_local, unrunnable_pipeline_reason, EsSearchBody,
     EsSearchJson, EsSearchQueryParams, EsUpdateBody, GetDocParams, UpdateDocParams,
 };
 use crate::responses::{EsDeleteDocResponse, EsDocResponse, EsGetResponse};
@@ -666,6 +669,29 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                     require_alias,
                     default_pipeline,
                     default_source_req_json,
+                )
+                .await
+            }
+            ShardOp::UpdateByQuery {
+                index,
+                query_json,
+                script_source,
+                script_params_json,
+                pipeline,
+                max_docs,
+                scroll_size,
+                check_only,
+            } => {
+                handle_update_by_query(
+                    &self.state,
+                    &index,
+                    &query_json,
+                    script_source,
+                    script_params_json,
+                    pipeline,
+                    max_docs,
+                    scroll_size,
+                    check_only,
                 )
                 .await
             }
@@ -2560,4 +2586,442 @@ pub(crate) async fn bulk_on_primaries(
         },
         wire,
     )
+}
+
+// ── `_update_by_query` on every primary ─────────────────────────────────────
+
+/// One `_update_by_query` after the accepting node has validated the query.
+///
+/// [`update_by_query_on_primaries`] borrows this. `max_docs` is the caller's
+/// cap for the whole index; the fan-out spends it across primaries.
+#[derive(Clone)]
+pub(crate) struct UpdateByQueryParts {
+    pub query: Value,
+    pub script: Option<(String, Value)>,
+    pub pipeline: Option<String>,
+    pub max_docs: Option<u64>,
+    pub scroll_size: usize,
+}
+
+/// Box the per-index fan-out so it is not inlined into `update_by_query`.
+///
+/// See `begin_cluster_update_by_query` for why the future has to live on
+/// the heap: a debug worker stack overflows when the handler and the runner
+/// are both built on it.
+pub(crate) fn pin_update_by_query_on_primaries(
+    state: AppState,
+    index: String,
+    parts: UpdateByQueryParts,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    Box::pin(async move { update_by_query_on_primaries(&state, &index, &parts).await })
+}
+
+fn update_by_query_op(
+    index: &str,
+    parts: &UpdateByQueryParts,
+    max_docs: Option<u64>,
+    check_only: bool,
+) -> ShardOp {
+    ShardOp::UpdateByQuery {
+        index: index.to_string(),
+        query_json: parts.query.to_string(),
+        script_source: parts.script.as_ref().map(|(source, _)| source.clone()),
+        script_params_json: parts.script.as_ref().map(|(_, params)| params.to_string()),
+        pipeline: parts.pipeline.clone(),
+        max_docs,
+        scroll_size: parts.scroll_size as u64,
+        check_only,
+    }
+}
+
+fn update_by_query_unavailable(index: &str, detail: &str) -> Value {
+    json!({
+        "error": {
+            "type": "shard_not_ready",
+            "reason": format!("update_by_query on [{index}] failed: {detail}")
+        },
+        "status": 503
+    })
+}
+
+fn empty_update_by_query() -> Value {
+    json!({
+        "took": 0,
+        "timed_out": false,
+        "total": 0,
+        "updated": 0,
+        "deleted": 0,
+        "batches": 0,
+        "version_conflicts": 0,
+        "noops": 0,
+        "failures": [],
+        "throttled_millis": 0,
+        "requests_per_second": -1,
+        "throttled_until_millis": 0,
+    })
+}
+
+fn value_from_shard(result: &ShardResult) -> Value {
+    serde_json::from_str(&result.body).unwrap_or_else(|_| {
+        json!({
+            "error": {
+                "type": "shard_not_ready",
+                "reason": result.body,
+            },
+            "status": result.status
+        })
+    })
+}
+
+fn is_not_ready_value(value: &Value) -> bool {
+    value.get("status").and_then(Value::as_u64) == Some(503)
+        && value.pointer("/error/type").and_then(Value::as_str) == Some("shard_not_ready")
+}
+
+fn ensure_error_status(mut value: Value) -> Value {
+    if value.get("status").is_some() {
+        return value;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("status".to_string(), json!(503));
+    }
+    value
+}
+
+fn has_replica_nack(body: &Value) -> bool {
+    body.get("failures")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.pointer("/cause/type").and_then(Value::as_str)
+                    == Some("replica_not_acknowledged")
+            })
+        })
+}
+
+fn stamp_replica_nack(mut body: Value) -> Value {
+    if !has_replica_nack(&body) {
+        return body;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("status".to_string(), json!(503));
+        obj.insert(
+            "error".to_string(),
+            json!({
+                "type": "replica_not_acknowledged",
+                "reason": "primary applied the update but a replica copy missed quorum. The primary has the update; retry the update so an in-sync replica can take the copy"
+            }),
+        );
+    }
+    body
+}
+
+/// Index open, this node is a primary (when a plan exists), pipeline runnable.
+///
+/// `Err` is a body the HTTP layer can return. Nothing has been written.
+fn prepare_update_by_query(
+    state: &AppState,
+    index: &str,
+    pipeline: Option<&str>,
+) -> Result<(), Value> {
+    if state.engine.get_index(index).is_err() {
+        return Err(serde_json::from_str(&shard_not_ready_body(index))
+            .unwrap_or_else(|_| update_by_query_unavailable(index, "index is not open")));
+    }
+    let me = state.engine.routing_node_id();
+    let targets = state.engine.shard_search_targets(index);
+    if !targets.is_empty() && !targets.iter().any(|id| id == &me) {
+        let owner = targets.first().map(String::as_str).unwrap_or("unknown");
+        let body = not_this_primary(index, owner);
+        return Err(value_from_shard(&body));
+    }
+    if let Some(name) = pipeline {
+        if let Some(reason) = unrunnable_pipeline_reason(&state.engine, name) {
+            return Err(pipeline_rejected_body(&reason));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_update_by_query_wait(
+    state: &AppState,
+    index: &str,
+    pipeline: Option<&str>,
+) -> Result<(), Value> {
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        match prepare_update_by_query(state, index, pipeline) {
+            Err(body) if is_not_ready_value(&body) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn forward_update_by_query(state: &AppState, index: &str, owner: &str, op: ShardOp) -> Value {
+    let deadline = Instant::now() + OWNER_READY_WAIT;
+    loop {
+        match state.engine.forward_shard(owner, op.clone()).await {
+            Ok(result) if is_shard_not_ready(&result) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(result) => return value_from_shard(&result),
+            Err(err) => return update_by_query_unavailable(index, &err.to_string()),
+        }
+    }
+}
+
+async fn copy_updated_document(state: &AppState, index: &str, id: &str) -> Result<(), String> {
+    if state.engine.primary_of(index, id).is_none() {
+        return Ok(());
+    }
+    if !state.engine.owns_shard(index, id) {
+        return Err(format!(
+            "primary applied the update on [{index}] but document [{id}] is not owned by this node"
+        ));
+    }
+    let op = match state.engine.get_index(index) {
+        Ok(idx) => match idx.get_document(id).await {
+            Ok(Some(doc)) => match serde_json::to_string(&doc) {
+                Ok(source_json) => ShardOp::IndexDoc {
+                    index: index.to_string(),
+                    id: id.to_string(),
+                    source_json,
+                    op: "index".to_string(),
+                    if_seq_no: None,
+                    if_primary_term: None,
+                    version: None,
+                    version_type: None,
+                    replica: false,
+                    shard: 0,
+                },
+                Err(err) => {
+                    return Err(format!(
+                        "primary applied the update on [{index}] but document [{id}] is not JSON: {err}"
+                    ));
+                }
+            },
+            Ok(None) => ShardOp::DeleteDoc {
+                index: index.to_string(),
+                id: id.to_string(),
+                if_seq_no: None,
+                if_primary_term: None,
+                replica: false,
+                shard: 0,
+            },
+            Err(err) => {
+                return Err(format!(
+                    "primary applied the update on [{index}] but document [{id}] could not be read: {err}"
+                ));
+            }
+        },
+        Err(err) => {
+            return Err(format!(
+                "primary applied the update but [{index}] is not open: {err}"
+            ));
+        }
+    };
+    replicate_write(state, index, id, op)
+        .await
+        .map_err(|nack| nack_reason(&nack))
+}
+
+async fn apply_update_by_query_here(
+    state: &AppState,
+    index: &str,
+    parts: &UpdateByQueryParts,
+    max_docs: Option<u64>,
+) -> Value {
+    let idx = match state.engine.get_index(index) {
+        Ok(idx) => idx,
+        Err(err) => return update_by_query_unavailable(index, &err.to_string()),
+    };
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pipeline = parts
+        .pipeline
+        .as_ref()
+        .map(|name| (std::sync::Arc::clone(&state.engine), name.clone()));
+    let mut body = crate::es_compat::run_update_by_query_recorded_boxed(
+        idx,
+        parts.query.clone(),
+        max_docs,
+        parts.scroll_size,
+        parts.script.clone(),
+        pipeline,
+        Some(std::sync::Arc::clone(&recorded)),
+    )
+    .await;
+    let ids = recorded
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    // A failed run may already have updated some documents. Copy those before
+    // returning the error so a replica does not keep the pre-update source.
+    let mut nacks = Vec::new();
+    for id in ids {
+        if let Err(reason) = copy_updated_document(state, index, &id).await {
+            nacks.push((id, reason));
+        }
+    }
+    if body.get("status").is_some() {
+        return body;
+    }
+    if nacks.is_empty() {
+        return body;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return body;
+    };
+    let failures = obj
+        .entry("failures".to_string())
+        .or_insert_with(|| json!([]));
+    if let Some(failures) = failures.as_array_mut() {
+        for (id, reason) in nacks {
+            failures.push(json!({
+                "id": id,
+                "cause": {
+                    "type": "replica_not_acknowledged",
+                    "reason": reason,
+                }
+            }));
+        }
+    }
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_update_by_query(
+    state: &AppState,
+    index: &str,
+    query_json: &str,
+    script_source: Option<String>,
+    script_params_json: Option<String>,
+    pipeline: Option<String>,
+    max_docs: Option<u64>,
+    scroll_size: u64,
+    check_only: bool,
+) -> ShardResult {
+    if let Err(body) = prepare_update_by_query_wait(state, index, pipeline.as_deref()).await {
+        let status = body
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+            .unwrap_or(503);
+        return ShardResult::http(status, body.to_string());
+    }
+    if check_only {
+        return ShardResult::http(200, json!({ "ok": true }).to_string());
+    }
+    let query = match serde_json::from_str::<Value>(query_json) {
+        Ok(query) => query,
+        Err(err) => {
+            return ShardResult::http(
+                400,
+                json!({
+                    "error": {
+                        "type": "parsing_exception",
+                        "reason": format!("update_by_query query is not JSON: {err}")
+                    },
+                    "status": 400
+                })
+                .to_string(),
+            );
+        }
+    };
+    let script = script_source.map(|source| {
+        let params = script_params_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        (source, params)
+    });
+    let parts = UpdateByQueryParts {
+        query,
+        script,
+        pipeline,
+        max_docs,
+        scroll_size: scroll_size.max(1) as usize,
+    };
+    let value = apply_update_by_query_here(state, index, &parts, max_docs).await;
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or(200);
+    ShardResult::http(status, value.to_string())
+}
+
+/// Run `_update_by_query` on every primary of `index` and copy the updates.
+///
+/// Primaries are visited in node-id order so `max_docs` is one budget for the
+/// index. A primary that fails the preflight (missing pipeline, or not
+/// answering) stops the call before any document is written. A later primary
+/// that fails after an earlier one has already applied is returned as that
+/// error; the earlier updates stay. `[cluster] enabled = false` does not call
+/// this.
+pub(crate) async fn update_by_query_on_primaries(
+    state: &AppState,
+    index: &str,
+    parts: &UpdateByQueryParts,
+) -> Value {
+    let targets = state.engine.shard_search_targets(index);
+    if targets.is_empty() {
+        // No plan: this node holds the whole index. There is no primary to
+        // call, so the run stays here. `replicate_write` does nothing when
+        // `primary_of` is `None`.
+        return apply_update_by_query_here(state, index, parts, parts.max_docs).await;
+    }
+    // Every primary, including this node, is a shard call. The runner builds
+    // `search_inner` on the caller's stack, and that overflows a debug worker
+    // (2 MiB) once the fan-out is above it. `MemoryShardRpc` already runs a
+    // handler on an 8 MiB thread — the same thread a remote primary uses — so
+    // this node's own shard takes that path too. A primary that is not
+    // answering fails here, before any document is written.
+    for target in &targets {
+        let value = forward_update_by_query(
+            state,
+            index,
+            target,
+            update_by_query_op(index, parts, parts.max_docs, true),
+        )
+        .await;
+        if value.get("ok").and_then(Value::as_bool) != Some(true) {
+            return ensure_error_status(value);
+        }
+    }
+    if parts.max_docs == Some(0) {
+        return empty_update_by_query();
+    }
+
+    let mut remaining = parts.max_docs;
+    let mut parts_out = Vec::with_capacity(targets.len());
+    for target in &targets {
+        if remaining == Some(0) {
+            break;
+        }
+        let cap = remaining;
+        let value = forward_update_by_query(
+            state,
+            index,
+            target,
+            update_by_query_op(index, parts, cap, false),
+        )
+        .await;
+        // A shard that failed its own run (flush, script limit, or a primary
+        // that stopped answering) has no `updated` count. Replica nacks keep
+        // `updated` and sit in `failures` until the aggregate below.
+        if value.get("updated").is_none() {
+            return ensure_error_status(value);
+        }
+        if let Some(left) = remaining.as_mut() {
+            let used = value.get("total").and_then(Value::as_u64).unwrap_or(0);
+            *left = left.saturating_sub(used);
+        }
+        parts_out.push(value);
+    }
+    if parts_out.is_empty() {
+        return empty_update_by_query();
+    }
+    stamp_replica_nack(aggregate_by_query_results(parts_out, "updated"))
 }

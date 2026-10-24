@@ -252,6 +252,32 @@ pub enum ShardOp {
         /// JSON value of the URL-level `_source` filter, when one was set.
         default_source_req_json: Option<String>,
     },
+    /// Run `_update_by_query` on this primary's shard only.
+    ///
+    /// The coordinating node sends one of these to every primary. This node
+    /// updates documents in its user index and copies each updated document
+    /// onto the in-sync replicas. `check_only` confirms the index is open and
+    /// the pipeline can run, and writes nothing.
+    UpdateByQuery {
+        index: String,
+        /// JSON query object. Already combined with any alias filter.
+        query_json: String,
+        /// Painless source. Absent when the request has no script.
+        #[serde(default)]
+        script_source: Option<String>,
+        /// JSON script params. Absent when there is no script.
+        #[serde(default)]
+        script_params_json: Option<String>,
+        /// Ingest pipeline name. The primary runs it; pipelines are not
+        /// replicated with the index.
+        #[serde(default)]
+        pipeline: Option<String>,
+        #[serde(default)]
+        max_docs: Option<u64>,
+        scroll_size: u64,
+        #[serde(default)]
+        check_only: bool,
+    },
     /// Search this member's local shard only. The caller merges hits.
     Search {
         index: String,

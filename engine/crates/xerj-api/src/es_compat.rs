@@ -31459,7 +31459,10 @@ async fn resolve_by_query_targets(
     state: &AppState,
     spec: &str,
     user_query: Value,
-) -> std::result::Result<(Vec<std::sync::Arc<xerj_engine::Index>>, Value), xerj_common::XerjError> {
+) -> std::result::Result<
+    (Vec<std::sync::Arc<xerj_engine::Index>>, Vec<String>, Value),
+    xerj_common::XerjError,
+> {
     let member_names = resolve_index_selector(state, spec).await;
 
     // Alias filters are keyed on the name AS WRITTEN (the alias, not its
@@ -31491,7 +31494,7 @@ async fn resolve_by_query_targets(
                 .map_err(xerj_common::XerjError::from)?,
         );
     }
-    Ok((indices, effective_query))
+    Ok((indices, member_names, effective_query))
 }
 
 /// Combine the per-member results of a fanned-out by-query into one response.
@@ -31502,7 +31505,7 @@ async fn resolve_by_query_targets(
 /// concatenated; if any member produced an error body (it carries a `status`),
 /// that error is surfaced rather than a clean aggregate — a destructive
 /// by-query that partially failed must not report success.
-fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
+pub(crate) fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
     if results.len() == 1 {
         return results.pop().unwrap();
     }
@@ -31562,7 +31565,7 @@ pub async fn delete_by_query(
 ) -> impl IntoResponse {
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
-    let (indices, effective_query) =
+    let (indices, _index_names, effective_query) =
         match resolve_by_query_targets(&state, &index, body.query.clone()).await {
             Ok(t) => t,
             Err(e) => return ApiError::new(e).into_response(),
@@ -31973,6 +31976,137 @@ pub struct UpdateByQueryBody {
     pub scroll_size: Option<u64>,
 }
 
+/// Why `pipeline` cannot run on this engine, in the same words the
+/// `_update_by_query?pipeline=` handler has always used.
+pub(crate) fn unrunnable_pipeline_reason(
+    engine: &xerj_engine::Engine,
+    pipeline: &str,
+) -> Option<String> {
+    if !engine.pipelines.contains_key(pipeline) {
+        Some(format!("pipeline with id [{pipeline}] does not exist"))
+    } else {
+        engine.unrunnable_pipelines.get(pipeline).map(|reason| {
+            format!(
+                "pipeline with id [{pipeline}] cannot be run: {}",
+                reason.value()
+            )
+        })
+    }
+}
+
+pub(crate) fn pipeline_rejected_body(reason: &str) -> Value {
+    json!({
+        "error": {
+            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+            "type": "illegal_argument_exception",
+            "reason": reason,
+        },
+        "status": 400,
+    })
+}
+
+/// Build the cluster fan-out off this handler's state machine.
+///
+/// `update_by_query` is already large enough that a debug build's worker
+/// stack (2 MiB, the `#[tokio::test]` default) overflows once a second copy
+/// of the runner is inlined into the same future. `[cluster] enabled = false`
+/// never polls the fan-out, so the future is allocated here and only the
+/// pointer is stored on the handler. The server runtime is 4 MiB; this keeps
+/// the single-node path the size it was before the fan-out existed.
+fn begin_cluster_update_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::UpdateByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    Box::pin(cluster_update_by_query(
+        state,
+        index_names,
+        parts,
+        wait_for_completion,
+        handle,
+    ))
+}
+
+async fn cluster_update_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::UpdateByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> Response {
+    if !wait_for_completion {
+        let task_key = handle.key().to_string();
+        let spawned_key = task_key.clone();
+        let tasks = state.tasks.clone();
+        let names = index_names.clone();
+        // The fan-out calls `Engine::get_index` on the detached task, so
+        // the request's visibility rule has to come with it. See
+        // `xerj_engine::index_guard`.
+        let rule = xerj_engine::index_guard::current();
+        tokio::spawn(xerj_engine::index_guard::scoped_opt(rule, async move {
+            let mut results = Vec::with_capacity(names.len());
+            for name in &names {
+                results.push(
+                    crate::cluster_shard::pin_update_by_query_on_primaries(
+                        state.clone(),
+                        name.clone(),
+                        parts.clone(),
+                    )
+                    .await,
+                );
+            }
+            tasks.complete(&spawned_key, aggregate_by_query_results(results, "updated"));
+            drop(handle);
+        }));
+        return Json(json!({ "task": task_key })).into_response();
+    }
+    let mut results = Vec::with_capacity(index_names.len());
+    for name in &index_names {
+        results.push(
+            crate::cluster_shard::pin_update_by_query_on_primaries(
+                state.clone(),
+                name.clone(),
+                parts.clone(),
+            )
+            .await,
+        );
+    }
+    drop(handle);
+    by_query_response(aggregate_by_query_results(results, "updated"))
+}
+
+/// Own the runner's arguments, then box it.
+///
+/// A primary's `_update_by_query` runs on the coordinator's task when this
+/// node is that primary. Inlining the runner into the fan-out future puts
+/// two copies of it on the stack under `search_inner` and overflows a debug
+/// worker. The box is the same split `MemoryShardRpc` uses for a remote
+/// primary: the heavy future is not built on the caller's state machine.
+pub(crate) fn run_update_by_query_recorded_boxed(
+    idx: std::sync::Arc<xerj_engine::Index>,
+    query: Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+    updated_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    Box::pin(async move {
+        run_update_by_query_recorded(
+            &idx,
+            &query,
+            max_docs,
+            scroll_size,
+            script,
+            pipeline,
+            updated_ids,
+        )
+        .await
+    })
+}
+
 pub async fn update_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -31982,11 +32116,11 @@ pub async fn update_by_query(
     let query_val = body.query.clone().unwrap_or(json!({ "match_all": {} }));
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
-    let (indices, effective_query) = match resolve_by_query_targets(&state, &index, query_val).await
-    {
-        Ok(t) => t,
-        Err(e) => return ApiError::new(e).into_response(),
-    };
+    let (indices, index_names, effective_query) =
+        match resolve_by_query_targets(&state, &index, query_val).await {
+            Ok(t) => t,
+            Err(e) => return ApiError::new(e).into_response(),
+        };
 
     // Validate the (alias-filter-ANDed) query once, up front, so a malformed
     // body is an immediate 400 before a task is registered or any member is
@@ -32017,34 +32151,27 @@ pub async fn update_by_query(
     // rewritten every document EXACTLY as it was. Resolved and validated
     // before any document is touched: an unknown or unrunnable name fails the
     // whole request rather than half of it.
-    let pipeline = match params.get("pipeline").map(String::as_str) {
+    //
+    // With a cluster handle the pipeline runs on each primary, which is where
+    // the current source is. The check is that primary's, before it writes.
+    // Single-node mode still refuses here, on the node that accepted the call.
+    let pipeline_name = match params.get("pipeline").map(String::as_str) {
         None | Some("_none") => None,
-        Some(p) => {
-            let reason = if !state.engine.pipelines.contains_key(p) {
-                Some(format!("pipeline with id [{p}] does not exist"))
-            } else {
-                state
-                    .engine
-                    .unrunnable_pipelines
-                    .get(p)
-                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
-            };
-            if let Some(reason) = reason {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
-                            "type": "illegal_argument_exception",
-                            "reason": reason,
-                        },
-                        "status": 400,
-                    })),
-                )
-                    .into_response();
-            }
-            Some((state.engine.clone(), p.to_string()))
+        Some(p) => Some(p.to_string()),
+    };
+    let pipeline = if state.engine.has_cluster() {
+        None
+    } else if let Some(p) = pipeline_name.as_deref() {
+        if let Some(reason) = unrunnable_pipeline_reason(&state.engine, p) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(pipeline_rejected_body(&reason)),
+            )
+                .into_response();
         }
+        Some((state.engine.clone(), p.to_string()))
+    } else {
+        None
     };
 
     // ES defaults `wait_for_completion` to true (synchronous); only an
@@ -32054,6 +32181,24 @@ pub async fn update_by_query(
         .map(|v| v != "false")
         .unwrap_or(true);
     let handle = state.tasks.register("indices:data/write/update/byquery");
+
+    if state.engine.has_cluster() {
+        let parts = crate::cluster_shard::UpdateByQueryParts {
+            query: effective_query,
+            script,
+            pipeline: pipeline_name,
+            max_docs: body.max_docs,
+            scroll_size,
+        };
+        return begin_cluster_update_by_query(
+            state,
+            index_names,
+            parts,
+            wait_for_completion,
+            handle,
+        )
+        .await;
+    }
 
     if !wait_for_completion {
         let task_key = handle.key().to_string();
@@ -32183,6 +32328,15 @@ fn apply_pipeline_or_fail(
 /// no-script write is blind — XERJ cannot produce a version conflict);
 /// `noops` stays 0 (the mini-painless tolerates `ctx.*` statements without
 /// skipping the write).
+fn record_updated(updated_ids: &Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>, id: &str) {
+    let Some(ids) = updated_ids else {
+        return;
+    };
+    ids.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(id.to_string());
+}
+
 async fn run_update_by_query(
     idx: &std::sync::Arc<xerj_engine::Index>,
     query: &Value,
@@ -32190,6 +32344,18 @@ async fn run_update_by_query(
     scroll_size: usize,
     script: Option<(String, Value)>,
     pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+) -> Value {
+    run_update_by_query_recorded(idx, query, max_docs, scroll_size, script, pipeline, None).await
+}
+
+pub(crate) async fn run_update_by_query_recorded(
+    idx: &std::sync::Arc<xerj_engine::Index>,
+    query: &Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+    updated_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> Value {
     let started = Instant::now();
 
@@ -32300,7 +32466,10 @@ async fn run_update_by_query(
                                 processed += 1;
                                 if let Some(f) = transform_one(idx, id, &script, &pipeline).await {
                                     match f {
-                                        Ok(()) => updated += 1,
+                                        Ok(()) => {
+                                            updated += 1;
+                                            record_updated(&updated_ids, id);
+                                        }
                                         Err(reason) => failures.push(json!({
                                             "id": id,
                                             "cause": { "reason": reason },
@@ -32432,6 +32601,7 @@ async fn run_update_by_query(
                                     Ok(()) => {
                                         updated += 1;
                                         mutated_in_batch += 1;
+                                        record_updated(&updated_ids, &hit.id);
                                     }
                                     Err(reason) => failures.push(json!({
                                         "id": hit.id,
@@ -32466,6 +32636,7 @@ async fn run_update_by_query(
                                 Ok(_) => {
                                     updated += 1;
                                     mutated_in_batch += 1;
+                                    record_updated(&updated_ids, &hit.id);
                                 }
                                 Err(e) => {
                                     failures.push(json!({
