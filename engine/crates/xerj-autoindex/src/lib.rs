@@ -1798,6 +1798,7 @@ fn begin_non_graph_generation(
         journal.pin_embedding_identity(
             &identity.identity_sha256,
             identity.resumable,
+            identity.dimensions,
             identity.non_resumable_reason.as_deref(),
         )?;
         identity
@@ -5080,13 +5081,15 @@ fn pending_for_phase_b(
         .collect()
 }
 
-/// #487: an unchanged re-index on a `neural`/`proxy` backend must not fail with
-/// a false "embedding execution identity changed" message. The identity CHANGED
-/// only if a comparable field differs from what the journal pinned; `resumable`
-/// is a standing property of the backend (false by construction for backends
-/// whose identity hashes the model NAME, not its bytes), so it is checked
-/// SEPARATELY with an accurate message — restoring the identity cannot fix a
-/// backend that simply cannot resume.
+/// An unchanged re-index must not fail with a false "embedding execution
+/// identity changed" message (#487). The identity changed only when a
+/// comparable field differs from what the journal pinned. `resumable` is
+/// checked on its own.
+///
+/// A proxy whose vector width is not confirmed reports `dimensions: None` and
+/// `resumable: false` (#2306). That missing width is the resume limit, not a
+/// different embedder. A confirmed width that disagrees with the pinned width
+/// is a real change and must not be mixed into the corpus.
 fn ensure_embedding_execution_unchanged_and_resumable(
     current: &crate::esclient::EmbeddingExecutionIdentity,
     expected_sha: &str,
@@ -5094,11 +5097,22 @@ fn ensure_embedding_execution_unchanged_and_resumable(
     expected_dimension: Option<usize>,
     expected_semantic_contract: &str,
 ) -> anyhow::Result<()> {
+    let same_embedder = current.identity_sha256 == expected_sha
+        && current.backend == expected_backend
+        && current.semantic_contract == expected_semantic_contract;
+    let same_width = current.dimensions == expected_dimension;
+    if same_embedder && !same_width && !(current.dimensions.is_none() && !current.resumable) {
+        anyhow::bail!(
+            "embedding execution identity changed since this autoindex journal was created \
+             (vector width {} vs {}); refusing to mix vector spaces. No remote mutation was \
+             attempted. Restore the original identity, or rebuild with a new --state-dir and a \
+             new --prefix",
+            dimension_label(expected_dimension),
+            dimension_label(current.dimensions),
+        );
+    }
     anyhow::ensure!(
-        current.identity_sha256 == expected_sha
-            && current.backend == expected_backend
-            && current.dimensions == expected_dimension
-            && current.semantic_contract == expected_semantic_contract,
+        same_embedder && (same_width || (current.dimensions.is_none() && !current.resumable)),
         "embedding execution identity changed since this autoindex journal was created; \
          refusing to mix vector spaces. No remote mutation was attempted. Restore the \
          original identity, or rebuild with a new --state-dir and a new --prefix"
@@ -5107,8 +5121,10 @@ fn ensure_embedding_execution_unchanged_and_resumable(
         current.resumable,
         "the `{}` embedding backend cannot resume semantic indexing{}. The pinned identity is \
          UNCHANGED — this is a backend limitation, not a change, so restoring the identity will \
-         not help. Rebuild with a new --state-dir and a new --prefix, or content-address the \
-         model identity so this backend can resume (#367).",
+         not help. Follow the reason above. Documents already indexed were kept. If the vector \
+         width was not confirmed, make the embedding endpoint reachable and rerun — \
+         already-embedded documents are reused once the same width is confirmed. Rebuild with a \
+         new --state-dir and a new --prefix only to discard this corpus and start over.",
         current.backend,
         current
             .non_resumable_reason
@@ -5117,6 +5133,13 @@ fn ensure_embedding_execution_unchanged_and_resumable(
             .unwrap_or_default()
     );
     Ok(())
+}
+
+fn dimension_label(width: Option<usize>) -> String {
+    match width {
+        Some(width) => width.to_string(),
+        None => "unreported".to_string(),
+    }
 }
 
 fn select_resume_plan_keys(
@@ -5967,6 +5990,7 @@ fn pin_pending_embedding_identity(
     journal.pin_embedding_identity(
         &current.identity_sha256,
         current.resumable,
+        current.dimensions,
         current.non_resumable_reason.as_deref(),
     )
 }
@@ -8883,6 +8907,7 @@ fn run_index_report_inner(
         journal.pin_embedding_identity(
             &identity.identity_sha256,
             identity.resumable,
+            identity.dimensions,
             identity.non_resumable_reason.as_deref(),
         )?;
         // #1189: name the live backend in the run output. A server started
@@ -8893,6 +8918,15 @@ fn run_index_report_inner(
             identity.backend,
             if identity.resumable { "" } else { "non-" }
         ));
+        if !identity.resumable {
+            pr.note(&format!(
+                "semantic autoindex cannot resume this embedding backend: {}",
+                identity
+                    .non_resumable_reason
+                    .as_deref()
+                    .unwrap_or("the server did not provide an immutable embedding identity")
+            ));
+        }
     }
 
     // ── create indices with explicit mappings ────────────────────────────
@@ -12782,6 +12816,47 @@ mod duplicate_integration_tests {
             err2.contains("identity changed"),
             "a real identity change must still report it: {err2}"
         );
+        // A confirmed width that disagrees with the pinned width is a real
+        // change. An unconfirmed width on a non-resumable backend is not.
+        let wider = crate::esclient::EmbeddingExecutionIdentity {
+            dimensions: Some(768),
+            resumable: true,
+            non_resumable_reason: None,
+            ..current.clone()
+        };
+        let err3 = ensure_embedding_execution_unchanged_and_resumable(
+            &wider,
+            "6e51e5ce3e46",
+            "neural",
+            None,
+            "semantic_text-derived-vector.v1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err3.contains("identity changed") && err3.contains("768"),
+            "a different vector width must be reported as a change: {err3}"
+        );
+        let unconfirmed = crate::esclient::EmbeddingExecutionIdentity {
+            dimensions: None,
+            resumable: false,
+            non_resumable_reason: Some("vector width was not confirmed".into()),
+            ..current
+        };
+        let err4 = ensure_embedding_execution_unchanged_and_resumable(
+            &unconfirmed,
+            "6e51e5ce3e46",
+            "neural",
+            Some(384),
+            "semantic_text-derived-vector.v1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err4.contains("cannot resume") && !err4.contains("identity changed"),
+            "an unconfirmed width is a resume limit, not a changed identity: {err4}"
+        );
+        assert!(err4.contains("vector width was not confirmed"), "{err4}");
     }
 
     #[test]

@@ -176,8 +176,9 @@ pub struct EmbeddingExecutionIdentity {
     /// while content-addressing it (#487) — the same number
     /// `NeuralEmbedder::dims` reports, so it is known without loading the
     /// model. It stays `None` for a `neural` node whose assets cannot be
-    /// resolved at all, and for `proxy`, whose width is whatever the remote
-    /// returns. A reader must not treat an absent width as 384.
+    /// resolved at all, and for a `proxy` whose endpoint has not confirmed a
+    /// width yet (#2306). A confirmed proxy reports the probed width. A reader
+    /// must not treat an absent width as 384.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
     pub semantic_contract: String,
@@ -938,6 +939,9 @@ impl Engine {
         // clone lineage. This ensures a later Engine re-reads same-path ONNX
         // assets while all Index config clones within one Engine share bytes.
         config.embedding.runtime_onnx_assets = Arc::new(std::sync::OnceLock::new());
+        // Same ownership rule for the proxy width cache: this engine probes
+        // into its own cell, and every index cloned from `config` shares it.
+        config.embedding.runtime_proxy_width = Arc::new(std::sync::RwLock::new(None));
         let data_dir = PathBuf::from(&config.server.data_dir);
         std::fs::create_dir_all(&data_dir)?;
 
@@ -4233,6 +4237,11 @@ impl Engine {
     /// Return the effective embedding identity without exposing configuration
     /// secrets or local asset paths.
     pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {
+        // #2306: a proxy resume needs a confirmed vector width. The probe runs
+        // here, on the identity request autoindex makes before it writes, and
+        // not on index open — open compares the model+endpoint digest, which
+        // does not wait on the endpoint.
+        crate::index::confirm_proxy_embedding_width(&self.config.embedding, &self.data_dir);
         crate::index::embedding_execution_identity(&self.config.embedding)
     }
 

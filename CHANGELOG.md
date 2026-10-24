@@ -59,6 +59,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Semantic `xerj autoindex` against `--embed-mode proxy` resumes after a
+  mid-run failure and does not re-embed documents already indexed, when the
+  backend, configured model, endpoint, and confirmed vector width are
+  unchanged. The proxy digest is still the model and endpoint (#533); the
+  width is learned with one probe (and remembered under the data directory)
+  and compared on resume, so a successful probe does not change the hash an
+  existing index was recorded under. A proxy whose endpoint has not confirmed
+  a width stays non-resumable, and the refusal says to make the endpoint
+  reachable and rerun — already-indexed documents are kept — or to rebuild
+  with a new `--state-dir` and `--prefix` only to discard the corpus. A
+  provider that swaps weights without changing the name, endpoint, or width
+  is still not detectable
+  ([#2306](https://github.com/xerj-org/xerj/issues/2306)).
+
 - An existing index's persisted `index.default_pipeline` runs again after a
   clean restart. `GET /_settings` still reported the binding, and the
   pipeline definition was still there, but an ordinary document write no

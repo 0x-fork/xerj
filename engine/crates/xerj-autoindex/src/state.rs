@@ -283,16 +283,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut first = Journal::open(dir.path(), "root", "url", "prefix", 300, true).unwrap();
         first
-            .pin_embedding_identity(&"a".repeat(64), true, None)
+            .pin_embedding_identity(&"a".repeat(64), true, None, None)
             .unwrap();
         drop(first);
 
         let mut resumed = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
         resumed
-            .pin_embedding_identity(&"a".repeat(64), true, None)
+            .pin_embedding_identity(&"a".repeat(64), true, None, None)
             .unwrap();
         let error = resumed
-            .pin_embedding_identity(&"b".repeat(64), true, None)
+            .pin_embedding_identity(&"b".repeat(64), true, None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("refusing to mix vector spaces"), "{error}");
@@ -307,18 +307,74 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), "root", "url", "prefix", 300, true).unwrap();
         journal
-            .pin_embedding_identity(&"a".repeat(64), false, Some("remote alias can drift"))
+            .pin_embedding_identity(&"a".repeat(64), false, None, Some("remote alias can drift"))
             .unwrap();
         drop(journal);
         let mut resumed = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
         let error = resumed
-            .pin_embedding_identity(&"a".repeat(64), false, Some("remote alias can drift"))
+            .pin_embedding_identity(&"a".repeat(64), false, None, Some("remote alias can drift"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("remote alias can drift"), "{error}");
         assert!(error.contains("--fresh"), "{error}");
         assert!(error.contains("--prefix"), "{error}");
         assert!(error.contains("delete and recreate"), "{error}");
+    }
+
+    /// #2306: a journal pinned while the proxy width was still unconfirmed
+    /// (`resumable: false`, no width) resumes once the same digest is reported
+    /// as resumable. A later width that disagrees with a pinned width does not.
+    #[test]
+    fn confirmed_width_resumes_a_journal_pinned_before_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        let mut journal = Journal::open(dir.path(), "root", "url", "prefix", 300, true).unwrap();
+        journal
+            .pin_embedding_identity(&digest, false, None, Some("width was not confirmed"))
+            .unwrap();
+        drop(journal);
+
+        let mut resumed = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
+        resumed
+            .pin_embedding_identity(&digest, true, Some(384), None)
+            .expect("same digest becomes resumable once the width is confirmed");
+        // The pre-confirmation record did not carry a width, and resume does
+        // not append a second identity line (a flipped resumable flag would
+        // fail replay). A width is therefore not yet pinned on this journal.
+        assert_eq!(resumed.embedding_identity_dimensions, None);
+    }
+
+    #[test]
+    fn a_pinned_width_is_durable_and_a_missing_width_is_not_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = "c".repeat(64);
+        let mut first = Journal::open(dir.path(), "root", "url", "prefix", 300, true).unwrap();
+        first
+            .pin_embedding_identity(&digest, true, Some(384), None)
+            .unwrap();
+        drop(first);
+        let text = std::fs::read_to_string(dir.path().join("journal.ndjson")).unwrap();
+        assert!(text.contains("\"dimensions\":384"), "{text}");
+
+        let mut resumed = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
+        assert_eq!(resumed.embedding_identity_dimensions, Some(384));
+        let lost = resumed
+            .pin_embedding_identity(&digest, true, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(lost.contains("no longer reported"), "{lost}");
+        assert!(lost.contains("--fresh"), "{lost}");
+        let drifted = resumed
+            .pin_embedding_identity(&digest, true, Some(768), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            drifted.contains("refusing to mix vector spaces"),
+            "{drifted}"
+        );
+        assert!(drifted.contains("384"), "{drifted}");
+        assert!(drifted.contains("768"), "{drifted}");
+        assert!(drifted.contains("--prefix"), "{drifted}");
     }
 
     #[test]
@@ -336,7 +392,7 @@ mod tests {
         .unwrap();
         let mut journal = Journal::open(dir.path(), "root", "url", "prefix", 300, false).unwrap();
         let error = journal
-            .pin_embedding_identity(&"a".repeat(64), true, None)
+            .pin_embedding_identity(&"a".repeat(64), true, None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -352,6 +408,11 @@ mod tests {
     fn malformed_or_conflicting_identity_records_fail_during_replay() {
         for tail in [
             "{\"v\":1,\"kind\":\"embedding_identity\",\"identity_sha256\":\"bad\",\"resumable\":true}\n",
+            concat!(
+                "{\"v\":1,\"kind\":\"embedding_identity\",\"identity_sha256\":\"",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "\",\"resumable\":true,\"dimensions\":0}\n"
+            ),
             concat!(
                 "{\"v\":1,\"kind\":\"embedding_identity\",\"identity_sha256\":\"",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -688,6 +749,11 @@ pub struct Journal {
     pub plan: Option<Plan>,
     pub embedding_identity_sha256: Option<String>,
     pub embedding_identity_resumable: Option<bool>,
+    /// Vector width pinned with the identity, when the record carried one.
+    ///
+    /// Older journals omit it. A resume that now reports a width is not drift
+    /// for that reason alone (#2306); two recorded widths that disagree are.
+    pub embedding_identity_dimensions: Option<usize>,
     /// Newest corpus reconciliation transaction without a durable
     /// `sync_commit`. Its desired plan is deliberately not authoritative yet.
     pub committed_manifest: Option<crate::sync::CommittedManifest>,
@@ -1081,6 +1147,19 @@ pub struct JournalPreflight {
     pub no_graph_genesis: bool,
 }
 
+fn embedding_resume_refused(reason: &str) -> String {
+    format!(
+        "server embedding backend cannot safely resume semantic indexing: {reason}. \
+         No remote mutation was attempted. Documents already indexed were kept. \
+         If the vector width was not confirmed, make the embedding endpoint reachable \
+         and rerun the same command — already-embedded documents are reused once the \
+         same width is confirmed. Restore the exact original embedding identity, or \
+         rebuild all vectors with --fresh and a new --prefix only when the backend, \
+         model, endpoint, or vector width changed. Before reusing the old prefix, \
+         delete and recreate its prior autoindex indices"
+    )
+}
+
 impl Journal {
     /// `fresh` is not a formality here. `open_after_preflight` removes the
     /// journal before replaying it when `--fresh` is set, so nothing inside a
@@ -1216,6 +1295,10 @@ impl Journal {
         let mut plan = None;
         let mut embedding_identity_sha256 = None;
         let mut embedding_identity_resumable = None;
+        // `None` = no identity record yet. `Some(None)` = a record that omitted
+        // the width. `Some(Some(n))` = a recorded width. Absence and a width
+        // in the same journal disagree; two different widths disagree.
+        let mut embedding_identity_dimensions_seen: Option<Option<usize>> = None;
         let mut committed_manifest: Option<crate::sync::CommittedManifest> = None;
         let mut pending_sync: Option<crate::sync::PendingSync> = None;
         let mut legacy_migration_reasons = Vec::new();
@@ -1307,15 +1390,42 @@ impl Journal {
                                             })
                                     });
                                 let resumable = v.get("resumable").and_then(Value::as_bool);
+                                let has_dimensions = v
+                                    .as_object()
+                                    .is_some_and(|object| object.contains_key("dimensions"));
+                                let keys_ok = v.as_object().is_some_and(|object| {
+                                    let base = ["v", "kind", "identity_sha256", "resumable"]
+                                        .iter()
+                                        .all(|key| object.contains_key(*key));
+                                    if has_dimensions {
+                                        object.len() == 5 && base
+                                    } else {
+                                        object.len() == 4 && base
+                                    }
+                                });
+                                let recorded_width = if has_dimensions {
+                                    match v.get("dimensions").and_then(Value::as_u64) {
+                                        Some(width)
+                                            if width > 0 && usize::try_from(width).is_ok() =>
+                                        {
+                                            Some(width as usize)
+                                        }
+                                        _ => {
+                                            anyhow::bail!(
+                                                "journal at {} contains a malformed embedding \
+                                                 identity; restore it from backup or re-run with \
+                                                 --fresh",
+                                                jpath.display()
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 if v.get("v").and_then(Value::as_u64) != Some(1)
                                     || digest.is_none()
                                     || resumable.is_none()
-                                    || v.as_object().is_none_or(|object| {
-                                        object.len() != 4
-                                            || !["v", "kind", "identity_sha256", "resumable"]
-                                                .iter()
-                                                .all(|key| object.contains_key(*key))
-                                    })
+                                    || !keys_ok
                                 {
                                     anyhow::bail!(
                                         "journal at {} contains a malformed embedding identity; \
@@ -1328,6 +1438,8 @@ impl Journal {
                                     .is_some_and(|existing| existing != digest.unwrap())
                                     || embedding_identity_resumable
                                         .is_some_and(|existing| existing != resumable.unwrap())
+                                    || embedding_identity_dimensions_seen
+                                        .is_some_and(|existing| existing != recorded_width)
                                 {
                                     anyhow::bail!(
                                         "journal at {} contains conflicting embedding identities; \
@@ -1337,6 +1449,7 @@ impl Journal {
                                 }
                                 embedding_identity_sha256 = digest.map(str::to_owned);
                                 embedding_identity_resumable = resumable;
+                                embedding_identity_dimensions_seen = Some(recorded_width);
                             }
                             Some(kind) if crate::sync::is_sync_record_kind(kind) => {
                                 // A durable record that no longer re-validates
@@ -1450,6 +1563,7 @@ impl Journal {
             plan,
             embedding_identity_sha256,
             embedding_identity_resumable,
+            embedding_identity_dimensions: embedding_identity_dimensions_seen.flatten(),
             committed_manifest,
             pending_sync,
             legacy_migration_reasons,
@@ -1477,10 +1591,15 @@ impl Journal {
     }
 
     /// Pin the server-side vector-space identity before any semantic write.
+    ///
+    /// `dimensions` is the confirmed vector width when the server has one.
+    /// The key is omitted from the journal record when it is absent, so a
+    /// journal written before widths were pinned still replays.
     pub fn pin_embedding_identity(
         &mut self,
         identity_sha256: &str,
         resumable: bool,
+        dimensions: Option<usize>,
         non_resumable_reason: Option<&str>,
     ) -> Result<()> {
         if identity_sha256.len() != 64
@@ -1489,15 +1608,6 @@ impl Journal {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
             anyhow::bail!("server returned an invalid embedding identity digest");
-        }
-        if self.resumed && (!resumable || self.embedding_identity_resumable == Some(false)) {
-            anyhow::bail!(
-                "server embedding backend cannot safely resume semantic indexing: {}. \
-                 Restore the exact original embedding identity, or rebuild all vectors with \
-                 --fresh and a new --prefix. Before reusing the old prefix, delete and recreate \
-                 its prior autoindex indices",
-                non_resumable_reason.unwrap_or("embedding identity is not immutable")
-            );
         }
         if let Some(existing) = &self.embedding_identity_sha256 {
             if existing != identity_sha256 {
@@ -1508,7 +1618,52 @@ impl Journal {
                      reusing the old prefix, delete and recreate its prior autoindex indices"
                 );
             }
+            match (self.embedding_identity_dimensions, dimensions) {
+                (Some(stored), Some(current)) if stored != current => {
+                    anyhow::bail!(
+                        "embedding execution identity changed since this autoindex journal was \
+                         created (vector width {stored} vs {current}); refusing to mix vector \
+                         spaces. Restore the original embedding identity, or rebuild all vectors \
+                         with --fresh and a new --prefix. Before reusing the old prefix, delete \
+                         and recreate its prior autoindex indices"
+                    );
+                }
+                (Some(stored), None) => {
+                    anyhow::bail!(
+                        "embedding execution identity changed since this autoindex journal was \
+                         created (vector width {stored} is no longer reported); refusing to mix \
+                         vector spaces. Restore the original embedding identity, or rebuild all \
+                         vectors with --fresh and a new --prefix. Before reusing the old prefix, \
+                         delete and recreate its prior autoindex indices"
+                    );
+                }
+                _ => {}
+            }
+            if !resumable {
+                // Same digest, still not safe to reuse vectors. A proxy whose
+                // width was never confirmed lands here; the server's reason
+                // says how to get a resume instead of a rebuild.
+                anyhow::bail!(
+                    "{}",
+                    embedding_resume_refused(
+                        non_resumable_reason.unwrap_or("embedding identity is not immutable")
+                    )
+                );
+            }
+            // Same digest, and the server can resume. Do not append another
+            // identity record: replay treats a flipped `resumable` flag as
+            // corruption. That is what lets a journal pinned before a proxy
+            // width could be confirmed (#2306) continue once this process
+            // confirms the same model and endpoint.
             return Ok(());
+        }
+        if self.resumed && !resumable {
+            anyhow::bail!(
+                "{}",
+                embedding_resume_refused(
+                    non_resumable_reason.unwrap_or("embedding identity is not immutable")
+                )
+            );
         }
         if self.resumed && !self.done.is_empty() {
             anyhow::bail!(
@@ -1517,17 +1672,19 @@ impl Journal {
                  reusing the old prefix, delete and recreate its prior autoindex indices"
             );
         }
-        self.append_transaction(
-            &serde_json::json!({
-                "v": 1,
-                "kind": "embedding_identity",
-                "identity_sha256": identity_sha256,
-                "resumable": resumable,
-            }),
-            "embedding_identity",
-        )?;
+        let mut record = serde_json::json!({
+            "v": 1,
+            "kind": "embedding_identity",
+            "identity_sha256": identity_sha256,
+            "resumable": resumable,
+        });
+        if let Some(width) = dimensions {
+            record["dimensions"] = serde_json::json!(width);
+        }
+        self.append_transaction(&record, "embedding_identity")?;
         self.embedding_identity_sha256 = Some(identity_sha256.to_owned());
         self.embedding_identity_resumable = Some(resumable);
+        self.embedding_identity_dimensions = dimensions;
         Ok(())
     }
 

@@ -1671,11 +1671,32 @@ pub struct EmbeddingConfig {
     #[serde(skip)]
     pub runtime_onnx_assets:
         std::sync::Arc<std::sync::OnceLock<Result<EmbeddingAssetSnapshot, String>>>,
+    /// Vector width last confirmed for this proxy endpoint and model (#2306).
+    ///
+    /// Filled by the engine, not by configuration. Cloned configs share the
+    /// cell. Empty until a probe (or the on-disk fallback) succeeds; identity
+    /// reporting then treats the proxy as resumable and publishes the width.
+    /// Serde skips it: it is not a setting and must not round-trip through a
+    /// config file.
+    #[serde(skip)]
+    pub runtime_proxy_width: std::sync::Arc<std::sync::RwLock<Option<ConfirmedProxyWidth>>>,
     /// Neural ingest probe, shared by cloned configs (the server preloads
     /// from a clone). `None` inside the cell means the probe ran and did not
     /// produce a rate; an empty cell means it has not run. Not a setting.
     #[serde(skip)]
     pub neural_ingest_probe: std::sync::Arc<std::sync::OnceLock<Option<NeuralIngestProbe>>>,
+}
+
+/// Vector width a proxy embedder confirmed for one endpoint and model.
+///
+/// The digest of a proxy identity stays the configured model and endpoint
+/// (#533). This width is the other half of that identity: autoindex compares
+/// it on resume and refuses to mix a different width into an existing corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedProxyWidth {
+    pub endpoint: String,
+    pub model: String,
+    pub dimensions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1710,6 +1731,7 @@ impl Default for EmbeddingConfig {
             onnx_max_input_bytes_per_call: 8 * 1024 * 1024,
             onnx_max_inflight_input_bytes: 32 * 1024 * 1024,
             runtime_onnx_assets: std::sync::Arc::new(std::sync::OnceLock::new()),
+            runtime_proxy_width: std::sync::Arc::new(std::sync::RwLock::new(None)),
             neural_ingest_probe: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
