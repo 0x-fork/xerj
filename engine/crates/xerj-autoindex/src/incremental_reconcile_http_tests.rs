@@ -116,6 +116,11 @@ struct HttpState {
     /// a serial index phase.
     in_flight_data_bulks: usize,
     max_concurrent_data_bulks: usize,
+    /// #2314: the next N catalog searches that filter on `file_key` omit the
+    /// last hit and report that shorter total. The visibility race four
+    /// identical files hit. The counter, not refresh, clears it, so the
+    /// recount after refresh sees the full set.
+    short_catalog_file_key_pages: usize,
 }
 
 struct HttpEndpoint {
@@ -294,8 +299,21 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<HttpState>>) {
         }
     } else if method == "POST" && path == "/_bulk" {
         let locked = state.lock().unwrap();
+        let writes_data = body.split(|byte| *byte == b'\n').any(|line| {
+            serde_json::from_slice::<Value>(line)
+                .ok()
+                .and_then(|action| {
+                    action
+                        .pointer("/index/_index")
+                        .or_else(|| action.pointer("/update/_index"))
+                        .and_then(Value::as_str)
+                        .map(|index| index != catalog::CATALOG_INDEX)
+                })
+                .unwrap_or(false)
+        });
         assert!(
-            locked.saw_dataset_mapping_update && locked.saw_catalog_mapping_update,
+            locked.saw_catalog_mapping_update
+                && (!writes_data || locked.saw_dataset_mapping_update),
             "bulk publication preceded exact generation mapping updates"
         );
         drop(locked);
@@ -906,7 +924,7 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
                 .map(str::to_owned)
                 .collect()
         });
-    let locked = state.lock().unwrap();
+    let mut locked = state.lock().unwrap();
     // #890: a catalog field an older build left as `text` is ANALYZED, so a
     // `term` on it matches tokens, not the raw value. `legacy` is empty for
     // every other index, which keeps every other search byte-exact.
@@ -1011,6 +1029,18 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
         Some((field, _)) => matching.sort_by(|(_, a), (_, b)| cmp_docs_by_field(a, b, field)),
         None => matching.sort_by_key(|(key, _)| *key),
     }
+    // #2314: one short catalog page, internally consistent (total matches the
+    // hits actually returned). The per-group equality then falls short and
+    // the retry after refresh must see the document that was held back.
+    let catalog_file_key_page = indices.contains(&catalog::CATALOG_INDEX)
+        && filters
+            .iter()
+            .any(|filter| filter.pointer("/terms/file_key").is_some());
+    let mut shorten = false;
+    if catalog_file_key_page && locked.short_catalog_file_key_pages > 0 && matching.len() > 1 {
+        matching.pop();
+        shorten = true;
+    }
     let total = matching.len();
     let from = query
         .get("from")
@@ -1063,6 +1093,10 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
             Value::Object(body)
         })
         .unwrap_or_else(|| json!({}));
+    drop(matching);
+    if shorten {
+        locked.short_catalog_file_key_pages -= 1;
+    }
     json!({
         "hits": {
             "total": {"value": total, "relation": "eq"},
@@ -7214,4 +7248,129 @@ mod delete_gate {
             execution: None,
         }
     }
+}
+
+/// #2314: four identical empty files must not abort on the catalog
+/// canonical/alias count. They are junk (no rows), recorded, and a rerun
+/// confirms instead of failing the equality that a one-shot read used to
+/// trip.
+#[test]
+fn four_identical_empty_files_do_not_fail_the_catalog_count() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        fs::write(corpus.path().join(name), "").unwrap();
+    }
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    let result = run_index_report(config.clone());
+    let message = match &result {
+        Ok((code, summary)) => format!("code={code} summary={summary:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        !message.contains("catalog canonical/alias count disagrees"),
+        "{message}"
+    );
+    let (code, _) = result.expect("four identical empty files must not abort the run");
+    assert_eq!(code, 3, "empty files are recorded junk, not a failure");
+    assert_eq!(run_index(config).unwrap(), 3);
+}
+
+/// #2314: the catalog canonical/alias read can come back one document
+/// short, the race a folder of identical files hit. The check refreshes
+/// and recounts; the run completes and the alias documents stay.
+#[test]
+fn a_short_catalog_alias_page_is_recounted_instead_of_aborting() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let body = "id,value\n1,same\n";
+    for name in ["a.csv", "b.csv", "c.csv", "d.csv"] {
+        fs::write(corpus.path().join(name), body).unwrap();
+    }
+    let endpoint = HttpEndpoint::start();
+    endpoint.state.lock().unwrap().short_catalog_file_key_pages = 1;
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    let (code, summary) = run_index_report(config)
+        .expect("a one-document-short catalog page must be recounted, not abort the generation");
+    assert_eq!(code, 0, "{summary:?}");
+    let summary = summary.expect("the generation commits");
+    assert_eq!(summary["duplicate_files"], 3, "{summary}");
+    assert_eq!(
+        endpoint.state.lock().unwrap().short_catalog_file_key_pages,
+        0,
+        "the short page must have been consumed by the first count"
+    );
+    let refreshes = endpoint
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(method, path)| {
+            method == "POST" && path.contains("/_refresh") && path.contains(catalog::CATALOG_INDEX)
+        })
+        .count();
+    assert!(
+        refreshes >= 1,
+        "the short count refreshes the catalog before recounting"
+    );
+}
+
+/// #2314: a file that changes size between the hash and the snapshot seal
+/// is skipped. The rest of the folder is indexed, the run exits 3, and
+/// the next run indexes the file's current bytes.
+#[test]
+fn a_file_that_changes_size_during_snapshot_seal_is_skipped() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("stable.csv"), "id,value\n1,stable\n").unwrap();
+    let changing = corpus.path().join("live.csv");
+    fs::write(&changing, "id,value\n1,before\n").unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    let grow = changing.clone();
+    sync_executor::arm_snapshot_source_hook(state_dir.path(), move || {
+        let mut file = fs::OpenOptions::new().append(true).open(&grow).unwrap();
+        file.write_all(b"2,after\n").unwrap();
+    });
+    let (code, summary) = run_index_report(config.clone())
+        .expect("one file changing size during the seal must not abort the run");
+    assert_eq!(
+        code, 3,
+        "the changing file is junk, not a failure: {summary:?}"
+    );
+    let indexed = paths(&endpoint.data_docs());
+    assert!(
+        indexed.iter().any(|path| path == "stable.csv"),
+        "{indexed:?}"
+    );
+    assert!(
+        indexed.iter().all(|path| path != "live.csv"),
+        "the changing file must not be published from a torn read: {indexed:?}"
+    );
+
+    let (again, _) = run_index_report(config).expect("the settled file indexes on the rerun");
+    assert_eq!(again, 0);
+    let indexed = paths(&endpoint.data_docs());
+    assert!(indexed.iter().any(|path| path == "live.csv"), "{indexed:?}");
+    assert!(
+        endpoint
+            .data_docs()
+            .iter()
+            .any(|doc| doc.get("value").and_then(Value::as_str) == Some("after")),
+        "the rerun indexes the bytes the file settled on"
+    );
 }

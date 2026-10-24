@@ -2201,7 +2201,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         // record counts above, only changed groups ask — a kept group's
         // canonical/alias documents intentionally keep the run_id of the
         // generation that last wrote them.
-        let catalog_counts = if catalog_wanted.is_empty() {
+        let mut catalog_counts = if catalog_wanted.is_empty() {
             HashMap::new()
         } else {
             let _reading = self.pr.watch_file(crate::catalog::CATALOG_INDEX, 0);
@@ -2244,9 +2244,30 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
                 group.expected_vectors,
                 group.dataset_slugs
             );
+            // #2314: the equality used to be one shot. A folder of identical
+            // empty files published the canonical doc and its aliases, then
+            // lost the race with catalog visibility and aborted; the same
+            // command retried clean. Recount after a refresh, the same bound
+            // as the short read-back walk, before calling it a disagreement.
+            let expected = 1 + group.aliases.len() as u64;
+            let mut observed = catalog_counts.get(&group.content_id).copied().unwrap_or(0);
+            let mut attempt = 1usize;
+            while observed != expected && attempt < Self::READBACK_WALK_ATTEMPTS {
+                self.pr.note(&format!(
+                    "autoindex: catalog canonical/alias count for {} saw {observed} of \
+                     {expected} document(s) — refreshing and recounting (attempt {attempt} of {})",
+                    group.group_id,
+                    Self::READBACK_WALK_ATTEMPTS
+                ));
+                self.es.refresh_once(crate::catalog::CATALOG_INDEX)?;
+                catalog_counts = self.windowed_catalog_counts(&catalog_wanted, &snapshot.tx_id)?;
+                observed = catalog_counts.get(&group.content_id).copied().unwrap_or(0);
+                attempt += 1;
+            }
             anyhow::ensure!(
-                catalog_counts[&group.content_id] == 1 + group.aliases.len() as u64,
-                "catalog canonical/alias count disagrees with desired group {}",
+                observed == expected,
+                "catalog canonical/alias count disagrees with desired group {}: \
+                 observed {observed}, expected {expected}",
                 group.group_id
             );
         }
@@ -3145,6 +3166,9 @@ fn create_snapshot_inner(
     // Entered only when there is work to report: a retry that reuses a verified
     // final snapshot returned above and never claims a phase it did not run.
     pr.phase("snapshot", inventory.files.len() as u64, source_bytes);
+    // #2314: a test grows one source in the window after the hash and before
+    // this seal. Production runs leave the hook empty.
+    snapshot_source_hook(state_dir);
     for (ordinal, ((source, content_id), content_digest)) in inventory
         .files
         .iter()
@@ -3254,9 +3278,24 @@ fn create_snapshot_inner(
                 });
             }
             None => {
-                crate::content::verify(&source.path, source.size, content_digest)?;
-                copy_synced(&source.path, &destination, &mut budget)?;
-                crate::content::verify(&destination, source.size, content_digest)?;
+                // #2314: a file that changes size (or disappears) between the
+                // hash and this copy used to abort the generation on the `?`.
+                // The error names the live source so the caller can drop that
+                // one file and seal the rest.
+                verify_live_source(source, content_digest)?;
+                if let Err(error) = copy_synced(&source.path, &destination, &mut budget) {
+                    if verify_live_source(source, content_digest).is_err() {
+                        return Err(source_changed(
+                            &source.path,
+                            format!(
+                                "{} changed while it was being copied into the snapshot ({error:#})",
+                                source.path.display()
+                            ),
+                        ));
+                    }
+                    return Err(error);
+                }
+                verify_sealed_blob(source, &destination, content_digest)?;
                 #[cfg(test)]
                 apply_post_seal_source_replacement(&source.path)?;
                 let prepared = match assignment {
@@ -3816,6 +3855,76 @@ fn apply_post_seal_source_replacement(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// A live source no longer matches the bytes this generation hashed.
+///
+/// Stat failures are included: a file deleted between the hash and the seal
+/// is the same skip, not a reason to abort every other file.
+fn verify_live_source(source: &crate::walk::FileEntry, digest: &str) -> Result<()> {
+    match crate::content::verify(&source.path, source.size, digest) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(source_changed(&source.path, format!("{error:#}"))),
+    }
+}
+
+/// The staged blob does not match the hashed source. A size or content miss
+/// is reported against the live path, which is the file the caller can drop.
+fn verify_sealed_blob(source: &crate::walk::FileEntry, sealed: &Path, digest: &str) -> Result<()> {
+    match crate::content::verify(sealed, source.size, digest) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<crate::content::SourceChanged>()
+                .is_some() =>
+        {
+            Err(source_changed(&source.path, format!("{error:#}")))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn source_changed(path: &Path, detail: String) -> anyhow::Error {
+    crate::content::SourceChanged {
+        path: path.to_path_buf(),
+        detail,
+    }
+    .into()
+}
+
+/// Test-only: run once at the start of a snapshot seal, keyed by state dir
+/// so a parallel test cannot grow another run's files (#2314).
+#[cfg(test)]
+type SnapshotSourceHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static SNAPSHOT_SOURCE_HOOK: std::sync::Mutex<Option<SnapshotSourceHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_snapshot_source_hook(state_dir: &Path, action: impl FnOnce() + Send + 'static) {
+    *SNAPSHOT_SOURCE_HOOK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) =
+        Some((state_dir.to_path_buf(), Box::new(action)));
+}
+
+#[cfg(test)]
+fn snapshot_source_hook(state_dir: &Path) {
+    let action = {
+        let mut armed = SNAPSHOT_SOURCE_HOOK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match armed.as_ref() {
+            Some((dir, _)) if dir == state_dir => armed.take().map(|(_, action)| action),
+            _ => None,
+        }
+    };
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(not(test))]
+fn snapshot_source_hook(_state_dir: &Path) {}
 
 #[cfg(test)]
 fn fail_next_snapshot(boundary: u8) {

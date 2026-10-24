@@ -77,7 +77,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-19",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-24",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -156,9 +156,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I KEEP A SEARCH INDEX UP TO DATE AS FILES CHANGE, WITHOUT RE-INDEXING EVERYTHING?</div>
   <div class="kicker"><span>ANSWERS · OPERATIONS: FRESHNESS</span></div>
   <h1 class="h1-long">How do I keep a search index up to date as files change, without re-indexing everything?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-19 · UPDATED · 2026-10-24</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-24</span>
     <p>How do I keep a search index up to date as files change, without re-indexing everything? Run xerj autoindex ./folder --watch --no-graph. It indexes once, then reindexes only what the filesystem reports changed. Measured idle cost was 0.00 CPU-seconds per minute, against 1.7 s and a full corpus re-read for every timed re-run.</p>
     <p class="key-fact"><strong>Key number:</strong> The --debounce quiet period accepts at most 60,000 ms (<code class="inline">MAX_DEBOUNCE_MS</code>); longer than a minute is a timer, not a debounce. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-autoindex/src/cli.rs">engine/crates/xerj-autoindex/src/cli.rs</a>)</span></p>
   </div>
@@ -225,8 +225,8 @@ xerj autoindex ./notes --url http://127.0.0.1:9200 \
   <ul>
     <li>On the default graph path, a run resumes a <em>frozen</em> plan. A file whose content</li>
   </ul>
-  <p>changed <strong>is</strong> reconciled there (measured: 3.07 s, <code class="inline">files=1</code>, the new text searchable). A file that was <strong>added</strong> is not. The run reports <code class="inline">1 file(s) appeared after the resume plan was frozen and were NOT indexed</code>, exits 3, and tells you to rebuild with <code class="inline">--fresh</code>. A file that was <strong>deleted</strong> is worse. The run aborts in 0.24 s with "removing files from an indexed folder is not reconciled yet". Its documents stay live, and every later re-run aborts the same way.</p>
-  <p>A watcher on the graph path would therefore go stale on the first new file and stop reindexing on the first deletion. The price of <code class="inline">--no-graph</code> is relationship detection: no wikilink, local-link, section-order or directory-chain edges.</p>
+  <p>changed <strong>is</strong> reconciled there (measured on 2026-09-19: 3.07 s, <code class="inline">files=1</code>, the new text searchable). A deleted file is swept (exit 3, <code class="inline">reason=files-removed</code>; the next unchanged rerun is exit 0), and an added file that fits a frozen dataset is indexed on the rerun. A file that needs a new dataset is not: the run exits 3 with <code class="inline">reason=stale-resume-plan</code> and names <code class="inline">--fresh</code>. Before that reconcile, the same 2026-09-19 capture recorded a deletion aborting in 0.24 s and leaving its documents live. Those timings were not re-measured here.</p>
+  <p>The watcher stays on <code class="inline">--no-graph</code> because that route also reconciles a file that would be a new dataset, and the watcher is not built on the graph path. The price of <code class="inline">--no-graph</code> is relationship detection: no wikilink, local-link, section-order or directory-chain edges.</p>
   <h2>Which directories the watcher covers</h2>
   <p>The watch set is the directories the indexing walk <strong>admits</strong>. Same traversal, same hidden-name rule, same <code class="inline">.gitignore</code> and <code class="inline">.xerjignore</code> stack. An ignored <code class="inline">target/</code> therefore costs no watch and cannot wake the watcher at all. A watched run and a plain re-run also agree about what is indexed, because they read the same rules from the same code. Editing <code class="inline">.gitignore</code> or <code class="inline">.xerjignore</code> invalidates the directory it governs. The rule you change takes effect on the next pass.</p>
   <p>Events on hidden names such as <code class="inline">.file.swp</code> or <code class="inline">.git/index.lock</code> are dropped without a pass, because no run indexes those either.</p>
@@ -247,7 +247,7 @@ xerj autoindex ./notes --url http://127.0.0.1:9200 \
   <h3>How do I keep a search index up to date as files change, without re-indexing everything?</h3>
   <p>Run xerj autoindex with --watch --no-graph. It indexes the folder once, then stays resident and reindexes only what the filesystem reports as changed, using one OS watch per indexed directory and no polling.</p>
   <h3>Why does --watch require --no-graph?</h3>
-  <p>Reconciling an added or deleted file exists only on the --no-graph route. On the default graph path a re-run resumes a frozen plan: a file added after that plan was frozen is reported as appeared after the resume plan was frozen and is not indexed until a --fresh rebuild, and a deleted file aborts the run and every re-run after it. A file whose content changed is reconciled there, so the limitation is additions and deletions, not edits.</p>
+  <p>The watcher re-runs the generated route, which reconciles added, changed, renamed and deleted files, including a file that would be a new dataset. On the default graph path a deleted file is swept and an added file that fits a frozen dataset is indexed, but a file that needs a new dataset still stops with reason=stale-resume-plan until --fresh, and the watcher is not built on that route.</p>
   <h3>Is a file watcher cheaper than re-running the indexer on a timer?</h3>
   <p>At idle, yes, and measurably. On a 10,000-file tree a re-run with nothing changed took 1.7 s and re-read all 4,576,300 bytes, while an idle watcher used 0.00 CPU-seconds over 60 s and read nothing. It does hold about 157 MiB resident between passes.</p>
   <h3>Does --watch use less CPU per change than a re-run?</h3>

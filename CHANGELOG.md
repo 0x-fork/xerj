@@ -128,6 +128,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `keep_archived`) is marked on the `xerj code` header and on `xerj search`
   (#2327).
 
+- Graph-mode `xerj autoindex` re-indexes a folder after files are added or
+  deleted. An added file that fits a frozen dataset is indexed on the rerun;
+  a file that needs a new dataset stays unindexed until `--fresh`. Documents,
+  catalog rows, and graph edges for a file that left the folder are removed,
+  and the run names that file, including when `--fresh` rebuilds the plan.
+  `xerj autoindex remove` deletes that folder's resume journal (and
+  `sync-snapshots`), and an explicit
+  `--state-dir` on `remove` deletes the journal there too. A file whose size
+  changes while a run is reading it is skipped with a warning instead of
+  aborting the run, on the graph path and on `--no-graph` snapshot sealing.
+  The catalog canonical/alias count refreshes and recounts before it aborts
+  a generation. A rerun that removes documents for files that left the folder
+  finishes exit 3 (`reason=files-removed`); the next unchanged rerun is exit 0
+  ([#2314](https://github.com/xerj-org/xerj/issues/2314)).
+
 - Scoped autoindex threads and `POST /{index}/_update/{id}` no longer abort
   the process when a thread stack or a large body cannot be allocated
   (#1122). Indexing workers, sync replay, object-watch fetches, and mailbox

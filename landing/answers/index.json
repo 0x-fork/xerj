@@ -1096,7 +1096,7 @@
       "canonical_url": "https://xerj.org/answers/keep-index-current-as-files-change",
       "markdown_url": "https://xerj.org/answers/keep-index-current-as-files-change.md",
       "cluster": "Operations: freshness",
-      "updated": "2026-10-19",
+      "updated": "2026-10-24",
       "summary": "Run xerj autoindex --watch --no-graph. It indexes once, then reindexes what the filesystem reports. Measured: 0.00 CPU-seconds per idle minute against 1.7 s and a full corpus re-read for every poll.",
       "intent_group": "operating autoindex",
       "answer": "How do I keep a search index up to date as files change, without re-indexing everything? Run xerj autoindex ./folder --watch --no-graph. It indexes once, then reindexes only what the filesystem reports changed. Measured idle cost was 0.00 CPU-seconds per minute, against 1.7 s and a full corpus re-read for every timed re-run.",
