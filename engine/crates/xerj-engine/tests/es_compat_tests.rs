@@ -814,6 +814,9 @@ async fn test_es_bulk_index_multiple() {
 /// One JSON document over [`MAX_INDEXED_DOCUMENT_BYTES`] must not be parsed
 /// or tokenized. Its neighbour in the same bulk still indexes, and a later
 /// single-document write of the same shape is refused the same way (#1122).
+/// A 50 MiB file is the same gate: anything past 8 MiB, including the
+/// single JSON files that killed a Windows node, is refused on its length
+/// before `serde_json`.
 #[tokio::test]
 async fn oversized_json_document_is_refused_and_its_neighbour_is_indexed() {
     use xerj_common::document_limit::{indexed_document_too_large, MAX_INDEXED_DOCUMENT_BYTES};
@@ -823,6 +826,7 @@ async fn oversized_json_document_is_refused_and_its_neighbour_is_indexed() {
         .create_index("bulk_oversize", Schema::empty())
         .unwrap();
 
+    assert!(indexed_document_too_large(50 * 1024 * 1024));
     let big = "x".repeat(MAX_INDEXED_DOCUMENT_BYTES + 1);
     let big_line = format!(r#"{{"blob":"{big}"}}"#);
     assert!(indexed_document_too_large(big_line.len()));

@@ -159,6 +159,22 @@ mod tests {
     }
 
     #[test]
+    fn a_fifty_mebibyte_document_is_refused_before_it_is_indexed() {
+        // Field report on #1122: a single JSON file over 50 MB killed the
+        // node. The ceiling is 8 MiB, so that file is the same refusal as
+        // one byte over the ceiling — checked on the length, before parse.
+        let len = 50 * 1024 * 1024;
+        assert!(indexed_document_too_large(len));
+        let text = indexed_document_refusal(len);
+        assert!(text.contains("52428800"), "{text}");
+        assert!(
+            text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("not indexed"), "{text}");
+    }
+
+    #[test]
     fn refusal_names_the_size_and_the_limit() {
         let text = indexed_document_refusal(50 * 1024 * 1024);
         assert!(text.contains("52428800"));

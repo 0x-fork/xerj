@@ -476,8 +476,9 @@ timeout_ms = 5000
 
 # Process-wide memory ceiling (MiB) that bounds every internal budget — segment
 # hydration, query working sets, and the ingest circuit breaker. OMIT it (the
-# default) to AUTO-size the cap from the machine in binary-GiB tiers
-# (8 / 16 / 32 GiB): a laptop stays bounded, a large box climbs. Set an explicit
+# default) to AUTO-size the cap from the machine: half of RAM under 16 GiB,
+# then 8 / 16 / 32 GiB. An 8 GiB host gets 4 GiB, so a merge has room; a
+# 16 GiB host stays at 8 GiB and a large box climbs. Set an explicit
 # MiB ceiling to raise headroom on a big host — e.g. when a large `xerj autoindex`
 # trips `429 circuit_breaking_exception`. Set 0 to uncap to the whole machine
 # (not recommended). Env override: XERJ_MAX_PROCESS_MEMORY_MB=auto|off|<MiB>.

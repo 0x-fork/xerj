@@ -130,6 +130,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded only on a catalog dataset document
   ([#2321](https://github.com/xerj-org/xerj/issues/2321)).
 
+- The default process memory cap on a host under 16 GiB is half of that
+  RAM, and segment merges follow it (#1122). An 8 GiB machine used to
+  take the 8 GiB step, so the budget was the whole machine; a merge
+  storm on Windows 10 stayed up only after
+  `XERJ_MAX_PROCESS_MEMORY_MB=4096`. That host now gets a 4 GiB cap.
+  A merge batch on a budget that cannot hold the historical 512 MiB
+  input (8× working set plus the 2 GiB memtable floor) is sized to
+  `budget / 64` (64 MiB at 4 GiB) and concurrent merges share a quarter
+  of the budget. A batch that would still cross the RSS watermark waits
+  for the next check; one batch still runs, because a merge is what
+  retires per-segment caches. Hosts at 16 GiB and above keep the 8 / 16 /
+  32 GiB steps, the 512 MiB batch, and the configured merge parallelism.
+  A single JSON document over 50 MiB is still refused at the 8 MiB
+  ceiling, before it is parsed, and the rest of the bulk is indexed.
+
 - A multi-term question no longer ranks a one-word symbol definition
   (`type Token`) above a hit that covers more of the question. `xerj search`,
   `xerj def`, `xerj code`, and the plain-string `xerj_search` tool add a

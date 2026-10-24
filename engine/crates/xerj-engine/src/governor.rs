@@ -413,6 +413,25 @@ impl ResourceGovernor {
         ))
     }
 
+    /// Resolved process-memory ceiling in bytes. `0` is not used: an
+    /// uncapped config stores the machine size here. Merge planning reads
+    /// this so a small host's batches follow the AUTO cap instead of a
+    /// fixed 512 MiB.
+    pub fn process_memory_limit_bytes(&self) -> u64 {
+        self.memory_limit_bytes
+    }
+
+    /// RSS admission watermark in bytes. `0` means the check is off.
+    pub fn memory_watermark_bytes(&self) -> u64 {
+        self.memory_watermark_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Larger of the last RSS sample and a live read. `0` when this
+    /// platform cannot read process memory.
+    pub fn observed_rss_bytes(&self) -> u64 {
+        self.observed_process_memory()
+    }
+
     /// Whether the parent RSS memory breaker is currently engaged (issue
     /// #948). Admission (429) is only half of the contract: the resource
     /// sampler uses this flag, together with [`Self::memtable_breaker_engaged`],
@@ -1033,9 +1052,10 @@ fn windows_override_ceiling(
 }
 
 /// The AUTO process-memory cap, in MiB, chosen from the effective memory the
-/// process can actually see, in binary-GiB steps:
+/// process can actually see:
 ///
-///   effective < 64 GiB             → 8 GiB
+///   effective < 16 GiB             → half of that RAM
+///   16 GiB ≤ effective < 64 GiB    → 8 GiB
 ///   64 GiB ≤ effective < 128 GiB   → 16 GiB
 ///   effective ≥ 128 GiB            → 32 GiB
 ///
@@ -1043,11 +1063,21 @@ fn windows_override_ceiling(
 /// `effective_memory_limit_bytes` — not raw host RAM, so a container smaller
 /// than its host is sized for the container. This only *chooses* a ceiling;
 /// `cap_memory_limit` still mins it with the machine, so the cap only ever
-/// LOWERS a budget: on a 40 GiB box the 8 GiB tier yields min(40, 8) = 8, and
-/// on a 6 GiB box it yields min(6, 8) = 6. It never invents headroom.
+/// LOWERS a budget: on a 40 GiB box the 8 GiB tier yields min(40, 8) = 8.
+///
+/// Hosts under 16 GiB used to take the 8 GiB step and then `min` with the
+/// machine, so an 8 GiB box's process budget was all of its RAM. A merge
+/// storm on that budget died; the same box stayed up at a 4 GiB cap
+/// (#1122). Half of RAM is that cap. At 16 GiB, half is 8 GiB, so the
+/// steps above 16 GiB — and the memtable budget they derive — do not move.
+/// A sub-mebibyte reading rounds up to 1 MiB and is still min'd with the
+/// machine, so the floor does not invent RAM.
 fn tiered_cap_mb(effective_bytes: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
-    if effective_bytes < 64 * GIB {
+    const MIB: u64 = 1024 * 1024;
+    if effective_bytes < 16 * GIB {
+        (effective_bytes / 2 / MIB).max(1)
+    } else if effective_bytes < 64 * GIB {
         8 * 1024
     } else if effective_bytes < 128 * GIB {
         16 * 1024
@@ -1295,7 +1325,8 @@ fn build(config: &Config) -> ResourceGovernor {
     //
     // Capped by `limits.max_process_memory_mb`, resolved through
     // `resolve_process_memory_cap`: the AUTO default tiers the cap off the
-    // machine (8/16/32 GiB), `0` means uncapped (whole machine), an explicit
+    // machine (half of RAM under 16 GiB, then 8/16/32 GiB), `0` means uncapped
+    // (whole machine), an explicit
     // `N` forces a fixed MiB ceiling, and `XERJ_MAX_PROCESS_MEMORY_MB` can
     // override any of it. Every budget below derives from this one number, so
     // capping HERE is what makes the ceiling coherent — capping each dependent
@@ -2138,14 +2169,33 @@ mod tests {
         assert_eq!(cap_memory_limit(40 * GIB, laptop.cap_mb), 8 * GIB);
         assert_eq!(auto_memtable_budget(8 * GIB), 2 * GIB);
 
-        // 6 GiB box → 8 GiB tier, but the machine only has 6, so min = 6.
+        // 8 GiB host → half of RAM, 4 GiB. The old tier was min(8, 8) = 8,
+        // the whole machine; a merge storm on that budget is #1122.
+        let small = resolve_process_memory_cap(8 * GIB, AUTO, None);
+        assert_eq!(small.cap_mb, 4 * 1024);
+        assert_eq!(cap_memory_limit(8 * GIB, small.cap_mb), 4 * GIB);
+        // The memtable floor stays 2 GiB, the same budget the old 8 GiB
+        // tier handed this host, so ingest is not given a smaller buffer.
+        assert_eq!(auto_memtable_budget(4 * GIB), 2 * GIB);
+
+        // 6 GiB box → half of RAM, 3 GiB, not min(6, 8) = 6.
         let tiny = resolve_process_memory_cap(6 * GIB, AUTO, None);
-        assert_eq!(tiny.cap_mb, 8 * 1024, "the tier is chosen before the min");
-        assert_eq!(
-            cap_memory_limit(6 * GIB, tiny.cap_mb),
-            6 * GIB,
-            "cap only lowers"
-        );
+        assert_eq!(tiny.cap_mb, 3 * 1024);
+        assert_eq!(cap_memory_limit(6 * GIB, tiny.cap_mb), 3 * GIB);
+    }
+
+    /// Under 16 GiB the cap is half of RAM. 16 GiB is the old 8 GiB step.
+    #[test]
+    fn a_host_under_sixteen_gib_is_capped_at_half_its_ram() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(tiered_cap_mb(4 * GIB), 2 * 1024);
+        assert_eq!(tiered_cap_mb(8 * GIB), 4 * 1024);
+        assert_eq!(tiered_cap_mb(12 * GIB), 6 * 1024);
+        // One byte under 16 GiB is still the half-RAM step, in whole MiB.
+        assert_eq!(tiered_cap_mb(16 * GIB - 1), 8191);
+        assert_eq!(tiered_cap_mb(16 * GIB), 8 * 1024);
+        // And the 64 GiB step is unchanged.
+        assert_eq!(tiered_cap_mb(64 * GIB - 1), 8 * 1024);
     }
 
     /// The tier steps exactly on the 64 GiB and 128 GiB binary boundaries.
