@@ -34,6 +34,15 @@ ORG_ID = f"{urlmap.SITE_ORIGIN}/#organization"
 SITE_ID = f"{urlmap.SITE_ORIGIN}/#website"
 ORG_LOGO = f"{urlmap.SITE_ORIGIN}/brandbook/xerj-mark.svg"
 GITHUB = "https://github.com/xerj-org/xerj"
+X_PROFILE = "https://x.com/xerj_org"
+# One Organization node for xerj.org and hub.xerj.org: same @id, same sameAs
+# (tools/corpus-hub-site/gen.py on the corpus-hub branch mirrors these).
+ORG_SAME_AS = [GITHUB, X_PROFILE]
+# The canonical one-line description, shared with llms.txt, README.md and the
+# hub. Change it everywhere at once or not at all.
+ORG_DESCRIPTION = ("A new way for AI to search for data: one local Rust binary "
+                   "that indexes your code, docs, specs and logs, plus Corpus "
+                   "Hub packs, and returns cited answers.")
 LICENSE = "https://www.apache.org/licenses/LICENSE-2.0"
 
 
@@ -85,7 +94,8 @@ def organization() -> dict[str, Any]:
         "alternateName": urlmap.SITE_NAME,
         "url": urlmap.SITE_ORIGIN + "/",
         "logo": ORG_LOGO,
-        "sameAs": [GITHUB],
+        "description": ORG_DESCRIPTION,
+        "sameAs": ORG_SAME_AS,
     }
 
 
@@ -101,10 +111,17 @@ def website() -> dict[str, Any]:
     }
 
 
+def _team(name: str) -> dict[str, Any]:
+    """A named XERJ team (author or reviewer line). Teams are not people, so
+    they are typed Organization and tied to the one site Organization node."""
+    return {"@type": "Organization", "name": name,
+            "parentOrganization": {"@id": ORG_ID}}
+
+
 def _person_or_org(meta: dict[str, Any]) -> dict[str, Any]:
     name = meta.get("author")
     if name:
-        return {"@type": "Person", "name": name}
+        return _team(name)
     return {"@id": ORG_ID}
 
 
@@ -162,7 +179,7 @@ def page_body(rel: str, meta: dict[str, Any], url: str, title: str,
         }
         reviewer = meta.get("reviewer")
         if reviewer:
-            body["reviewedBy"] = {"@type": "Person", "name": reviewer}
+            body["reviewedBy"] = _team(reviewer)
         return body
 
     return {
@@ -226,7 +243,8 @@ def _plain(text: str) -> str:
 def extra_structured_data(url: str, desc: str, meta: dict[str, Any]) -> list[dict[str, Any]]:
     """Opt-in JSON-LD for an article whose source lists `structured_data:`.
 
-    No page opts in yet. See README trap 6 and seo_lint rule 46 for the
+    Answers and compare articles opt in to `faq` where every question and
+    answer is visible on the page. See README trap 6 and seo_lint rule 46 for the
     policy and the visible-content check.
     """
     kinds = meta.get("structured_data") or ()

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, ask the operator whether a rerank provider key is set on the XERJ node and whether document text may leave the machine, then run one search without the rerank block and one with it, and report the _rerank block of the second response, including whether applied is true."
 answer: "How do I rerank search results with a relevance judge? Add a rerank block to a XERJ _search body. The top 30 hits go to an external judge, which returns a 0 to 1 relevance probability that replaces _score. Order by it, but never threshold it with min_score: measured calibration error was 0.10 to 0.31."
 key_fact: "The rerank stage defaults to a 30-hit window and allows at most 300."

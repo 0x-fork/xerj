@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt. On a throwaway XERJ node with authentication on, create a share with POST /_share, claim it with POST /_share/claim and a JSON body of {id, passcode}, then use the returned api_key to call /_cat/indices, /_cluster/health, a search on another index, a write to the shared index and a search with ?scroll=1m, and report the status code of each call."
 answer: "If I give someone a read-only share link to one search index, can they see my other indices? No. A share-link guest key carries read on the shared index only, and a guest route allow-list closes _cat, _cluster, every other index, all writes, and scroll and point-in-time contexts. A live test checked each refusal."
 key_fact: "The live share-link test ran 237 checks on 2026-09-19 with 0 failures."

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, index a judged corpus into one XERJ index, then run the same query three times as a match query, as a knn query and as a hybrid query with fusion rrf. Report the returned ids for all three and say which judged documents each one missed."
 answer: "What's the actual difference between a vector database and full-text search? Full-text search matches tokens and ranks with BM25; a kNN query compares one embedding against stored dense vectors. XERJ holds both in one index, so the choice is which clause to send. On our 8 judged queries the three modes disagreed on the top hit once."
 key_fact: "On BEIR SciFact, BM25 scored nDCG@10 0.6572, vectors alone 0.6764, and hybrid RRF 0.6993."

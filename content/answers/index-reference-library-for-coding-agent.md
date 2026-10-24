@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent about to write against an unfamiliar library. Read https://xerj.org/llms.txt, clone the library into ./ref, start a XERJ node with --insecure, run xerj autoindex ./ref --prefix ref, read xerj autoindex map, then answer with a defs query and quote the retrieved passage with its ax_path before you write any code."
 answer: "How do I set up reference coding so the agent retrieves a mechanism before writing code? Clone the library you are about to write against, index it with xerj autoindex, and have the agent retrieve the passage before it writes. A published study measured a gain on code the model cannot recall, and a loss on code it knows."
 key_fact: "Across 16 runs in four languages, the xerj arm solved 16/16 with 9,982 output tokens at $1.58."

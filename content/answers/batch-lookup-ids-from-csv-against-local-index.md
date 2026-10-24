@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node, index the dataset, and read the id field type from xerj autoindex map. Send one terms query with every id from the CSV. Print found or not found for each id from the hits. A wildcard index name on _msearch is not a pattern."
 answer: "Look up 1,000 IDs against a local index with one `terms` query, then mark each ID found or not found. On 2026-10-20 the query sent 1,000 numbers over 532 issues. The response `took` was 0. 532 IDs were in the index and 468 were not."
 key_fact: "A terms query of 1,000 IDs against 532 issues returned 532 hits and took 0 ms."

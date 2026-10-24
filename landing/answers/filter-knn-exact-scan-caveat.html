@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-22",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/filter-knn-exact-scan-caveat"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why is filtered kNN slower than unfiltered?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Because the filter takes the query off the HNSW graph. A filtered kNN runs the exact scan, and the cost of an exact scan scales with the number of vectors it has to scan."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does a metadata filter on vector search use HNSW?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The graph serves the unfiltered case. Adding a filter to a knn clause moves the query onto the exact path."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "When is exact scan used instead of HNSW?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On a filtered or nested kNN, a non-cosine similarity, an SQ8-quantized field, an index holding fewer than 1,024 documents, a stale graph, and on semantic and _memory recall."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why did my filtered vector search get slower when I added a filter?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The filter changed the retrieval path, not just the result set. The unfiltered query was a beam search over a graph; the filtered one is a scan whose work grows with the corpus."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How much slower is a filtered kNN query?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "This page does not say, because no latency was measured for it. Measure it on your own index and your own filter, because the answer scales with the vectors scanned."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does a kNN query with aggregations use the graph?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. An aggregation-bearing kNN always runs the exact scan, and there is no published performance claim for that path."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does a small index behave differently from a big one?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "An index holding fewer than 1,024 documents always uses the exact scan. A test corpus that crosses that line will change path even if the query text never changed."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is the exact scan less accurate?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No, the opposite. The exact scan has recall 1.00 by construction. The graph path is approximate, and its recall is measured rather than guaranteed."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

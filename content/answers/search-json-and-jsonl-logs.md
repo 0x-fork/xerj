@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./json-logs --url http://127.0.0.1:9200 --prefix jlog --progress plain`, GET /jlog-*/_mapping to find which field XERJ inferred as a date, then POST a filtered search for level=ERROR and a terms aggregation on service, and report the hit total and the bucket counts."
 answer: "What's the easiest way to search JSON logs plus some old gzip text logs in the same folder? Run xerj autoindex on it. It detects JSON-array and JSONL files by content and gives each its own index. In a captured 2-file run it inferred timestamp and ts as date fields, and level=ERROR returned exactly 386 hits."
 key_fact: "One JSONL file yields at most 4,096 records per extraction window (`MAX_RECORDS_PER_FILE`)."

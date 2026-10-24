@@ -7,10 +7,11 @@ cluster: "Comparison: desktop search"
 question: "What is the best local desktop search for a folder of PDFs and docs?"
 intent: "comparison"
 published: "2026-08-22"
-updated: "2026-10-19"
+updated: "2026-10-23"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent with a folder of PDFs and Word documents. Read https://xerj.org/llms.txt, start a local XERJ node, run xerj autoindex on the folder, read the data map, then answer the user question with a match_phrase query and cite the ax_path of every file you used."
 answer: "What is the best local desktop search for a folder of PDFs and docs? For a person at a desk, Recoll: a GUI, email folders and attachments, OCR hooks and open-at-page. For an agent, XERJ, a search engine called over HTTP or MCP. No head-to-head benchmark was run; this page compares documented capabilities."
 key_fact: "XERJ reads at most 100,000 pages per PDF and runs no OCR; Recoll's OCR goes through tesseract or ABBYY FineReader."
@@ -60,7 +61,7 @@ faq:
   - q: "Is Recoll enough for AI agents or do I need an API?"
     a: "Recoll is enough if you write the wrapper. It answers on the command line through recollq and through a Python API, so an agent can call it through a subprocess you maintain. XERJ answers HTTP and MCP with no wrapper."
   - q: "How do I search my documents folder from Claude or ChatGPT?"
-    a: "Index the folder with `xerj autoindex`, then attach the folder to the agent through `xerj mcp`, a stdio MCP server that serves 17 tools against a running node."
+    a: "Index the folder with `xerj autoindex`, then attach the folder to the agent through `xerj mcp`, a stdio MCP server that serves 21 tools against a running node."
   - q: "Did you run a head-to-head benchmark between XERJ and Recoll?"
     a: "No. No shared corpus was frozen and no recall or timing numbers were measured, so this page publishes documented capabilities and no win counts."
   - q: "Which tool indexes email, mbox and attachments?"
@@ -101,7 +102,7 @@ The node answers the Elasticsearch REST API. A `match_phrase` query and a filter
 
 An agent reads that map first. It then names a real index and a real field in the query.
 
-`xerj mcp` is a stdio MCP server in the same binary. It serves 17 tools against a node you already started. Agent memory lives in the engine under `/_memory/{namespace}`.
+`xerj mcp` is a stdio MCP server in the same binary. It serves 21 tools against a node you already started. Agent memory lives in the engine under `/_memory/{namespace}`.
 
 XERJ is single-node. There is no replication and no failover. The index is as durable as the one host it lives on.
 
@@ -122,7 +123,7 @@ Every row is a documented capability of each tool. No row is a measured result.
 | format detection | file name and MIME configuration | content sniffing per family |
 | helper programs on the host | many handlers are external | none, the binary parses in process |
 | HTTP query API | not in the core application | yes, Elasticsearch REST API |
-| MCP server for an agent | not in the core application | yes, `xerj mcp`, 17 tools |
+| MCP server for an agent | not in the core application | yes, `xerj mcp`, 21 tools |
 | catalog of refused files | index failures are reported | `autoindex-catalog`, one reason per file |
 | agent memory in the engine | no | yes, `/_memory/{namespace}` |
 
@@ -156,7 +157,7 @@ Choose Elasticsearch instead when the documents must live on more than one host.
 
 Choose XERJ when the caller is a program. An agent that speaks HTTP or MCP needs no wrapper and no subprocess protocol.
 
-`xerj mcp` serves 17 tools. A coding agent can start the node itself.
+`xerj mcp` serves 21 tools. A coding agent can start the node itself.
 
 Choose XERJ when the folder is mixed. Format detection reads content, not the file extension. A CSV file with the wrong file extension still lands in a typed dataset.
 

@@ -925,7 +925,8 @@ section.section-split p.wide { max-width: none; }
   color: var(--z-accent);
   margin-bottom: var(--sp-3);
 }
-.uc-hero h1 {
+.uc-hero h1,
+.uc-hero .uc-display {
   font-family: var(--font-display);
   font-weight: 900;
   font-size: 80px;
@@ -933,6 +934,24 @@ section.section-split p.wide { max-width: none; }
   text-transform: uppercase;
   color: var(--z-ink);
   margin-bottom: var(--sp-4);
+}
+.uc-hero .uc-display {
+  /* matches the browser's default h1 top margin and lifts the p measure,
+     so the former <h1> keeps its exact spacing and width */
+  margin-top: 0.67em;
+  max-width: none;
+}
+/* Use-case pages carry a plain-text H1 in the eyebrow style, and the big
+   display headline is a <p class="uc-display">, so the look is unchanged. */
+.uc-hero h1.uc-eyebrow {
+  font-family: var(--font-data);
+  font-weight: 400;
+  font-size: var(--fs-11);
+  line-height: inherit;
+  letter-spacing: var(--track-ui);
+  text-transform: uppercase;
+  color: var(--z-accent);
+  margin: 0 0 var(--sp-3);
 }
 .uc-hero .uc-lead {
   font-size: var(--fs-20);

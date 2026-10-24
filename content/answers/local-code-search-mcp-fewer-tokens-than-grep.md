@@ -7,10 +7,11 @@ cluster: "Answers for coding agents"
 question: "Is there a local code search MCP for Claude Code that uses fewer tokens than grep?"
 intent: "tool-selection"
 published: "2026-10-19"
-updated: "2026-10-20"
+updated: "2026-10-23"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 og_image: "og/answers-local-code-search-mcp-fewer-tokens-than-grep.png"
 og_image_alt: "Cover: dot-bars of the bytes an agent reads for one question on psf/requests: rg 25,150 B, xerj search 1,303 B (sessions.py:309), xerj def 949 B (sessions.py:154)"
 agent_prompt: "Read https://xerj.org/llms.txt. Install xerj, start a node with xerj --insecure --data-dir ~/xerj-data, run xerj autoindex on this repository, run xerj init so the xerj MCP server is registered, then answer my next code question with one xerj search or xerj def call and cite path:line instead of opening whole files."
@@ -154,7 +155,7 @@ The ratio is 19 times fewer bytes for the search, measured once on one repositor
 
 | Tool | Runs locally | Ranked results | file:line | MCP server | Setup |
 | --- | --- | --- | --- | --- | --- |
-| xerj | yes | yes, BM25 | yes | yes, 17 tools | install, start node, index once |
+| xerj | yes | yes, BM25 | yes | yes, 21 tools | install, start node, index once |
 | ripgrep | yes | no, every match | yes | no | none |
 | Zoekt | yes | yes | yes | no | index server |
 | GitHub code search | no | yes | yes | no | repo on GitHub, API limits |

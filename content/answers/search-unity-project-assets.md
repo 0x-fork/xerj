@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, install the latest XERJ and start a node, run xerj autoindex on a Unity project folder with --prefix unity, list the indices it created, then find one GameObject by m_Name and join one asset to its .meta record with a bool should query on asset_path and ax_path."
 answer: "How do I search a Unity project's assets? Run xerj autoindex on the project folder. XERJ detects the unity and unity-meta families and extracts m_Name, unity_class and guid, splitting a scene into one index per Unity class. One bool query joined an asset to its .meta record and returned 3 documents across 2 families."
 key_fact: "One `bool` query joined an asset to its `.meta` record by path and returned 3 documents across 2 families."

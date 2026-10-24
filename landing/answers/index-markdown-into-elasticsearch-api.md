@@ -2,15 +2,15 @@
 ---
 title: "How do I index Markdown into Elasticsearch?"
 canonical: "https://xerj.org/answers/index-markdown-into-elasticsearch-api"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/answers/index-markdown-into-elasticsearch-api.md"
 ---
 
 # How do I index Markdown into the Elasticsearch API?
 
-**Short answer** (updated 2026-10-19): What is the best way to index Markdown documents into Elasticsearch? XERJ indexes a Markdown folder with xerj autoindex and serves it on the Elasticsearch REST API. Markdown lands in the txt-prose family; in our capture XERJ mapped 9 fields, kept the title as the literal '# Runbook', and produced no headings array.
+**Short answer** (updated 2026-10-23): What is the best way to index Markdown documents into Elasticsearch? XERJ indexes a Markdown folder with xerj autoindex and serves it on the Elasticsearch REST API. Markdown lands in the txt-prose family; in our capture XERJ mapped 9 fields, kept the title as the literal '# Runbook', and produced no headings array.
 
-**Key number:** XERJ passes 1366 of 1369 Elasticsearch YAML conformance cases, so ES clients query the Markdown index unchanged. (as of 2026-10-19; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
+**Key number:** XERJ passes 1444 of 1454 Elasticsearch YAML conformance cases, so ES clients query the Markdown index unchanged. (as of 2026-10-23; source: [README.md](https://github.com/xerj-org/xerj/blob/main/README.md))
 
 **TL;DR** — XERJ indexes a Markdown folder with `xerj autoindex` and serves it on the Elasticsearch REST API. Markdown lands in the `txt-prose` family, not in a Markdown family. In our capture XERJ mapped 9 fields, extracted the title as the literal `# Runbook`, and produced no `headings` array.
 

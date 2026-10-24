@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj autoindex with --dry-run to read the measured extraction floor, then re-run with --max-minutes and --quiet so the decision gate returns exit 4 and a machine-readable decision JSON on stdout before any document is written."
 answer: "How long will it take to index a folder for search? Run xerj autoindex --dry-run first: it measures an extraction floor on your own machine and writes nothing. Add --max-minutes and the decision gate exits 4 with a JSON decision request. On 2,500 PDFs the floor was 2.2 minutes and the finished run took 157.7 seconds."
 key_fact: "Without --max-minutes, the gate asks before any run estimated at more than 10 minutes (`DEFAULT_MAX_MINUTES`)."

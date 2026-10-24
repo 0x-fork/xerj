@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/reindex-taking-forever"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Reindexing my files is taking forever. What usually causes that?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Corpus size, document size, host load and mapping complexity set the wall time. A _reindex call blocks and answers only at the end, so read a _count of the destination before you call it stuck."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why is my local search index rebuild so slow?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Corpus size, document size, host load and mapping complexity all change the time. The measured run used a fixed 100,000-document corpus at 1-minute load average 2.63."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What should I measure when folder reindex never finishes?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "For a _reindex, read took, batches, created, version_conflicts, retries and failures, and count the destination while the call runs. For a folder re-run, read xerj autoindex status, which reports files done, records and the journal state."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is PDF extraction the thing that makes reindex hang?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not measured here. This page captures a _reindex of a fixed document corpus, not a per-format split, so it cannot blame PDF extraction. A folder run does bound each PDF with a size cap, a page cap and a worker timeout, and refuses a file past a cap instead of hanging on it."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How long does a XERJ reindex take?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "One measured run copied 100,000 documents in 20,836 ms on a single node. That is one run on one shared host, not a rate you can extrapolate."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ reindex across nodes?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ is single-node, so _reindex is a local copy. There is no cross-node parallelism to add and no failover if the node stops."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does reindexing use more memory as it runs?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. XERJ has an open defect that retains heap per indexed document, so a large reindex grows resident memory. Do not plan corpora beyond a few million documents."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

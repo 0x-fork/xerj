@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-19",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/search-files-in-an-s3-bucket"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I search files that live in an S3 bucket?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex s3://bucket/prefix against a running node. It lists the prefix, streams each object into a local mirror under the state dir, and indexes the documents. Credentials come from the environment."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does it download the whole bucket every time I run it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Each object's ETag and size are recorded in the state dir, and a re-run downloads only what changed. Measured against MinIO, an unchanged prefix costs 1 LIST request and zero GETs."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Will this blow through my R2 or S3 free tier?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A run makes no writes, so its only class-A cost is listing: one request per 1,000 keys, plus any attempt the store throttled and made the client retry. The printed counts are billed wire attempts, not logical calls, so what a run reports is what the store bills. Daily or hourly over a normal corpus is a fraction of a percent, and every run prints what a schedule would cost."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I use MinIO, Ceph or Cloudflare R2?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Pass --endpoint-url, or set AWS_ENDPOINT_URL_S3. R2 needs the account host because there is no default for it. The bucket is then addressed in the path rather than as a subdomain."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does the index live in the bucket?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No, and that matters for sizing. The objects are mirrored to local disk under the state dir and the index is written to the XERJ node's own disk. Keeping the index in object storage is not implemented."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens to search results when someone deletes an object?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run with --no-graph. The next run removes the object from the local mirror and the generated journal's incremental reconcile deletes its documents. On the default graph-enabled journal a deletion is refused instead, exactly as it is for a folder, and the run tells you how to rebuild."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is a multipart-uploaded object handled correctly?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. A multipart ETag is a digest of digests with a -N suffix, so it is not an MD5 of the body. XERJ never treats it as one: it stores the string and asks only whether it changed."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "My bucket has 40,000 objects. What does one run cost?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "40 LIST requests, plus one GET per changed object, plus disk for the bytes. Hourly that is 28,800 class-A requests a month, under 3% of a 1,000,000 free allowance for that prefix."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

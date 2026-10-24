@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.xerj-org/xerj",
   "title": "XERJ",
-  "description": "Local-first BM25, vector and hybrid search, code search and agent memory over your indexed files.",
-  "version": "1.0.0-rc.97",
+  "description": "The search engine for AI agents: cited answers from your local code, docs, specs and logs.",
+  "version": "1.0.0-rc.98",
   "websiteUrl": "https://xerj.org",
   "repository": {
     "url": "https://github.com/xerj-org/xerj",
@@ -12,8 +12,8 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/xerj-org/xerj/releases/download/v1.0.0-rc.97/xerj-mcp-1.0.0-rc.97.mcpb",
-      "fileSha256": "45731b9b0bb53fc471a15d3c5720f222a8a5c2de6f939fab870c95de4cede32a",
+      "identifier": "https://github.com/xerj-org/xerj/releases/download/v1.0.0-rc.98/xerj-mcp-1.0.0-rc.98.mcpb",
+      "fileSha256": "1aa7ce0d9474c1150e0ea583c438cae74cc2b0eef25d7f369d11be30abc70702",
       "transport": {
         "type": "stdio"
       },
@@ -30,7 +30,8 @@
           "isRequired": false,
           "isSecret": true
         }
-      ]
+      ],
+      "version": "1.0.0-rc.98"
     }
   ]
 }

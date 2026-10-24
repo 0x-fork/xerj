@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./papers --url http://127.0.0.1:9200 --prefix pdfx --progress plain`, POST a match_phrase query for a sentence you know is in one paper to /pdfx-docs/_search, then query /autoindex-catalog/_search for doc_kind=file and status=junk and report every PDF that produced no text."
 answer: "I downloaded a bunch of papers as PDFs; how do I search across them? Run xerj autoindex on the folder, then send one match_phrase query. In a captured run, 3 born-digital PDFs produced 9 documents and one phrase hit all 3 files. The fourth, an image-only scan, produced 0 documents, because XERJ runs no OCR."
 key_fact: "XERJ reads at most 100,000 pages per PDF (`MAX_PAGES`) in an isolated worker process."

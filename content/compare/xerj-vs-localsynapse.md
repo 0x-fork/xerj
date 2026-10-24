@@ -7,10 +7,11 @@ cluster: "Comparison: local MCP search"
 question: "What's a local MCP search engine for Claude?"
 intent: "comparison"
 published: "2026-08-22"
-updated: "2026-10-19"
+updated: "2026-10-23"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local node with `xerj --insecure --data-dir ./xerj-data`, run `xerj autoindex ./work --prefix work --state-dir ./state-work` on one chosen folder rather than a whole drive, attach it with `xerj mcp --url http://127.0.0.1:9200`, then answer the user question with an Elasticsearch DSL query and report every file the run refused together with the reason it gave."
 answer: "What's a local MCP search engine for Claude? Two candidates: LocalSynapse wins the desktop experience, whole-drive indexing and mail shapes beyond mbox and eml. XERJ wins data files, Excel sheets read as typed tables, and the Elasticsearch query surface. No head-to-head was run for this comparison."
 key_fact: "LocalSynapse released v2.21.0 on 2026-10-16; its GitHub repository hosts release artifacts and had 10 stars."
@@ -26,7 +27,7 @@ commands:
   - cmd: "xerj autoindex ./work --prefix work --state-dir ./state-work"
     note: "One folder at a time, chosen by you, rather than a whole drive."
   - cmd: "xerj mcp --url http://127.0.0.1:9200"
-    note: "Attach the running node over stdio MCP. Same binary, 17 tools, no desktop window."
+    note: "Attach the running node over stdio MCP. Same binary, 21 tools, no desktop window."
 links_out:
   - "give-chatgpt-claude-local-file-access"
   - "code-search-mcp-for-claude-code"
@@ -96,7 +97,7 @@ LocalSynapse documents an MCP server over stdio that opens no network port, with
 
 XERJ answers over the Elasticsearch REST API. An agent writes the query DSL it already knows: `match_phrase`, `terms`, `range`, aggregations and `_source` narrowing.
 
-`xerj mcp` serves 17 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
+`xerj mcp` serves 21 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
 
 Pick the surface that matches your caller. A small tool list is easier for a simple agent, and a query language is more useful for one that asks precise questions.
 

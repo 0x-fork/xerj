@@ -2,13 +2,13 @@
 ---
 title: "XERJ vs LocalSynapse for MCP local file search"
 canonical: "https://xerj.org/compare/xerj-vs-localsynapse"
-updated: "2026-10-19"
+updated: "2026-10-23"
 source: "content/compare/xerj-vs-localsynapse.md"
 ---
 
 # What's a local MCP search engine for Claude?
 
-**Short answer** (updated 2026-10-19): What's a local MCP search engine for Claude? Two candidates: LocalSynapse wins the desktop experience, whole-drive indexing and mail shapes beyond mbox and eml. XERJ wins data files, Excel sheets read as typed tables, and the Elasticsearch query surface. No head-to-head was run for this comparison.
+**Short answer** (updated 2026-10-23): What's a local MCP search engine for Claude? Two candidates: LocalSynapse wins the desktop experience, whole-drive indexing and mail shapes beyond mbox and eml. XERJ wins data files, Excel sheets read as typed tables, and the Elasticsearch query surface. No head-to-head was run for this comparison.
 
 **Key number:** LocalSynapse released v2.21.0 on 2026-10-16; its GitHub repository hosts release artifacts and had 10 stars. (as of 2026-10-19; source: [github.com/LocalSynapse/LocalSynapse](https://github.com/LocalSynapse/LocalSynapse))
 
@@ -40,7 +40,7 @@ xerj autoindex ./work --prefix work --state-dir ./state-work
 
 ### Command 3
 
-Note: Attach the running node over stdio MCP. Same binary, 17 tools, no desktop window.
+Note: Attach the running node over stdio MCP. Same binary, 21 tools, no desktop window.
 
 ```sh
 xerj mcp --url http://127.0.0.1:9200
@@ -76,7 +76,7 @@ LocalSynapse documents an MCP server over stdio that opens no network port, with
 
 XERJ answers over the Elasticsearch REST API. An agent writes the query DSL it already knows: `match_phrase`, `terms`, `range`, aggregations and `_source` narrowing.
 
-`xerj mcp` serves 17 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
+`xerj mcp` serves 21 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
 
 Pick the surface that matches your caller. A small tool list is easier for a simple agent, and a query language is more useful for one that asks precise questions.
 

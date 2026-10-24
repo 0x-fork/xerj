@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/why-autoindex-skipped-files"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why would a folder search miss files that I can see on disk?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "An ignore rule pruned them or an extractor refused them. XERJ prints one line per ignore rule and stores a refusal reason for every file it opened."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "My search tool skipped files that are sitting right there. Why?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Either the path was pruned before it was opened, or the file was opened and refused. Ignore rules print to stderr during the run; refusals land in autoindex-catalog with a reason field."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does folder search honour gitignore?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Your .gitignore is read as an ignore file, and every rule that fires is printed with the count of files behind it, for example .gitignore:*.tmp — 1 file."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I force the indexer to include .env and .ssh files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not through any flag this capture found. The built-in hidden:dotfile rule prunes hidden dotfiles and dot-directories. Copy the file to a non-hidden path you index deliberately instead."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which directories does autoindex prune by default?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Built-in rules prune build trees such as target/ and node_modules/, and hidden dotfiles and dot-directories. Your .gitignore adds more, and each rule is printed with its file count."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does autoindex index my .env file?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not in this capture. Hidden dotfiles were pruned, and a query across _all for the fixture secrets returned 0 hits. Ignore rules are a filter, not an access control."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does exit code 3 from autoindex mean?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The run finished but refused at least one file. The terminal line reads reason=completed-with-junk, and junk_files counts the refusals."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

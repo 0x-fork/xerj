@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run `xerj brain ./casefile --no-open` on a folder of .eml and .pdf files, search the index it reports for a word from one email subject, then give the person the console link `/_xerj-console/#/reader?index=INDEX&id=ID` for the best hit instead of pasting the whole document into the chat."
 answer: "I indexed a folder of email and PDFs; how do I actually read what it found? Run xerj brain on the folder and open the console it prints. The Corpus page lists what was indexed, and the Reader opens an email with headers, body and attachments, or one PDF page. It shows extracted text only."
 key_fact: "In the recorded run, xerj brain turned 10 files into 81 records in one dataset and wrote 33 links into the brain."

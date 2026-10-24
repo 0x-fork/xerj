@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, unzip a Confluence HTML space export to a folder, run `xerj autoindex ./confluence-export --url http://127.0.0.1:9200 --prefix cf --progress plain`, then POST a match_phrase on body for text inside a nested page, POST an exists query on title sorted by ax_path, and report every distinct title and the attachment paths that matched."
 answer: "How do I search my Confluence export? Unzip the Confluence HTML space export to local disk and run xerj autoindex on the folder. A captured run kept page titles, nested page bodies and the attachment tree: body text on a nested page returned 1 hit, titled as Confluence writes it, PLAT : Recovery procedure."
 key_fact: "One body-text query on a nested page returned 1 hit at `Recovery-procedure_262146.html` in the captured run."

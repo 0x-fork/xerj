@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/cheap-low-volume-log-search"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Can XERJ replace a hosted log service?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "For low volume on one node, yes. A measured 16 MB corpus indexed in 22.237 s and answered exact error counts in under a millisecond. Large volumes are a different question."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How much memory does log indexing use?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "About 200x the corpus size. The measured ladder reached 2,755.9 MB peak resident memory after 28 MB of cumulative log data on one node."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How large a log corpus can XERJ handle?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "This capture measured up to 16 MB per step and stopped there for memory headroom. Plan for corpora up to a few million documents, and measure your own host."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Are XERJ log counts exact or estimated?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Exact. At every ladder step the level=ERROR document count matched the generator's own count exactly: 424, 848 and 1,696."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How fast are queries over an indexed log corpus?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On the 16 MB corpus, p50 was 0.488 ms for an error filter, 0.536 ms for a terms aggregation and 0.676 ms for a date range with an aggregation."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does a match query on the text field find log lines?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The logs family writes ts, level and message fields with no generic text field, and message is a keyword. Query message or level instead."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How much disk does an indexed log corpus need?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The 3 measured steps stored 1.045, 1.319 and 1.039 bytes per source byte. The ratio is not stable, so do not publish a single storage multiplier."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

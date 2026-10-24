@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-22",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/search-gzipped-csv-or-json"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I search gzipped CSV exports?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Point xerj autoindex at the folder. Gzip is treated as a wrapper, so the inner CSV is sniffed and typed and you query columns rather than a blob."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I index .json.gz files as structured data?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. JSON and JSONL are parsed families and gzip is a wrapper over them, so a .json.gz file lands as records with fields, not as one compressed document."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I grep a compressed CSV?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "You can, with zgrep or ripgrep-all, and for a single one-off question that is the smaller tool. Indexing wins when you are going to ask the folder more than one question."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search a .csv.gz or .json.gz without unzipping it first?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "You never unzip it yourself. xerj autoindex decompresses each .gz once during the run and indexes what it reads, so no query ever expands the archive again."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does the CSV dialect survive the gzip wrapper?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "That is the design: the wrapper is stripped and the inner bytes go through the same CSV dialect sniff that handles semicolons, decimal commas, a BOM and quoted multiline fields. No capture on this page measures it."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can XERJ read a .tar.gz?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ has no archive handler, so a tar inside a gzip is not unpacked. ripgrep-all does walk nested archives, and it is the right tool for that folder."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I tell a gzip-sourced document from a plain one?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Read ax_format. The captured gzip log index recorded logs(gzip) where the plain copy recorded logs, and ax_path keeps the .gz file name."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Did you measure a .csv.gz run for this page?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The measured gzip capture on this site is the log family. The CSV and JSON wrapper behaviour here is documented capability, and it is written as such."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

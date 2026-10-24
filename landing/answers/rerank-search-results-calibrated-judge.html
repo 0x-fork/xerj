@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-18",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/rerank-search-results-calibrated-judge"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I rerank search results in XERJ?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Add a rerank object to the body of POST /{index}/_search. An empty object uses every default: the top 30 hits are judged and reordered by relevance probability."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does reranking send my documents to a third party?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. It is the only search-time feature that sends document text off the node. Proxy embeddings and the WAL tap also send text off the node when an operator configures them, and all three are off by default. The question and the text of up to window hits go to the provider. Only fields the response returns are sent."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens when the rerank provider is slow?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The search still answers with HTTP 200. You get the engine's order and scores, and the _rerank block says applied: false with the reason. A slow provider degrades; it does not fail the search."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens when the provider key is wrong or missing?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The search fails loudly. A missing key is HTTP 503, a provider 401 is HTTP 502, both with type rerank_exception and no hits. XERJ does not hand back lexical order as if it had been reranked."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is the ranking quality of the rerank model verified?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes, since PR #975 (merged 2026-09-20). The real Jev reranker judged 1,271 BEIR queries ranking off a XERJ node: median nDCG@10 of 0.7410 on SciFact, 0.3312 on NFCorpus and 0.3638 on FiQA. The stage's own HTTP tests still use a test double; the benchmark runs carry the quality claim."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I combine rerank with sort or aggregations?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Aggregations work and still describe the full match set. sort, search_after, collapse, scroll and size: 0 are refused with an HTTP 400 that names the conflict."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can an AI agent ask for reranking through MCP?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. The xerj_search and xerj_hybrid_search tools take an optional rerank argument. It only works when the operator has set a provider key on the node."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

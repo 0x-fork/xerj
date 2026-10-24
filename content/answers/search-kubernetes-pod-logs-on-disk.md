@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, copy or stream the pod logs you care about into a local folder that keeps the var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log layout, start a local XERJ node, run `xerj autoindex ./pod-logs --url http://127.0.0.1:9200 --prefix pl --progress plain`, POST a match_phrase on body with size 100, and report the per-file hit counts read from the returned hits rather than from an aggregation."
 answer: "How do I grep for specific text across logs from multiple Kubernetes pods? Collect the pod logs to local disk first, then run xerj autoindex on the folder. In a captured run, one match_phrase request returned 18 hits, 6 from each of 3 pod log files. XERJ is not a collector, and the CRI format reads as prose."
 key_fact: "One `match_phrase` request returned 18 hits, 6 per pod, across 3 collected pod logs."

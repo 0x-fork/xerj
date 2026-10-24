@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/compare/xerj-vs-pagefind"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What is Pagefind for?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Search on a built static website, running in the visitor's browser with no server component and a chunked index that keeps the download small."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can Pagefind index a PDF?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Only if you extract the text yourself and pass it through addCustomRecord. The command-line tool discovers HTML files by default."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "I saved a bunch of docs pages as HTML. How do I search that?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the folder where it sits. XERJ reads the HTML files and any PDF, DOCX, CSV or SQLite files beside them, then answers an agent over the Elasticsearch REST API."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can XERJ put a search field on my website?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. XERJ is not a static-site plugin and ships no browser bundle. Pagefind is the right tool for that job."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is there a measured comparison here?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. No head-to-head was run. Every Pagefind fact on this page comes from Pagefind's own documentation."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need a running process?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "For Pagefind, no. For XERJ, yes: one single-node process serves the queries."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What license is Pagefind under?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Pagefind is MIT and XERJ is Apache-2.0. Both are permissive, so neither one constrains what you build on top of it."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search a saved website or HTML export?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It depends who is asking. Pagefind serves your readers in the browser on a built site, XERJ answers your agent about the same files on disk, and both can run against one folder."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,9 +236,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>PAGEFIND VS INDEXING A LOCAL HTML DUMP FOR AN AGENT?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: SITE AND EXPORT SEARCH</span></div>
   <h1>Pagefind vs indexing a local HTML dump for an agent?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>Pagefind or a local index for a folder of saved HTML? Pagefind wins search on a built static website: no server, a chunked index and a small download for the visitor. XERJ wins when an agent must query a saved HTML export on disk beside the PDFs next to it. No head-to-head was run.</p>
     <p class="key-fact"><strong>Key number:</strong> Pagefind has 5,519 GitHub stars, is MIT-licensed, and released v1.5.2 on 2026-04-12. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/Pagefind/pagefind">github.com/Pagefind/pagefind</a>)</span></p>
   </div>
@@ -200,7 +280,7 @@
 </code></pre>
   <p>The command reads a content signature rather than the file extension. It infers field types, writes explicit mappings, and files what it learned in a catalog index.</p>
   <p>Thirteen families are covered. The list holds HTML, plain text, PDF, DOCX and CSV. It also holds JSON and JSONL, structured logs, SQL exports, SQLite, XML, YAML, code and gzip variants.</p>
-  <p>The result is queryable over the Elasticsearch REST API, and <code class="inline">xerj mcp</code> serves 17 tools to an agent over stdio. A <code class="inline">match_phrase</code> query returns the file path and the matching passage rather than the whole page.</p>
+  <p>The result is queryable over the Elasticsearch REST API, and <code class="inline">xerj mcp</code> serves 21 tools to an agent over stdio. A <code class="inline">match_phrase</code> query returns the file path and the matching passage rather than the whole page.</p>
   <h2>What XERJ is not</h2>
   <p>XERJ is not a static-site plugin. It ships no browser bundle, no client-side index and no ready-made search field for a website.</p>
   <p>Putting XERJ behind a public site would mean running a single-node process and exposing it, which is the opposite of what Pagefind was built to avoid. Do not read this page as a suggestion to do that.</p>

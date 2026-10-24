@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, load an existing chunk store into one XERJ index with a semantic_text content field, then run retrieval as a hybrid clause nested inside query with fusion rrf. Report the exact 400 body for any request shape that fails."
 answer: "How can I improve a basic FAISS RAG pipeline? Load the chunk store into one XERJ index with a semantic_text field and retrieve with the hybrid clause, which fuses BM25 and kNN, instead of vectors alone. Our 20-chunk migration indexed cleanly, and the two request shapes FAISS users write first both returned HTTP 400."
 key_fact: "With the neural embedder, hybrid RRF beat vectors alone on BEIR SciFact: nDCG@10 0.6993 against 0.6764."

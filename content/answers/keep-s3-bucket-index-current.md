@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent planning a bucket-backed search index. Read https://xerj.org/llms.txt first. Before you choose a poll interval, compute the cost: ListObjectsV2 is a Class A operation at one call per 1,000 keys per cycle, and Cloudflare R2's free tier is 1,000,000 Class A operations a month. A 5-second poll on an empty bucket costs 518,400 a month, which is half the tier for no change detection at all. Tell the human the monthly operation count your interval implies before you write any code, and do not use `xerj autoindex --watch` as an indexer: it emits a change feed and does not write to a node."
 answer: "My documents live in an S3 or R2 bucket; how do I keep a XERJ index current as objects change? Poll the prefix with xerj autoindex s3://bucket/prefix --watch, and pick the interval from the operation count. ListObjectsV2 is a Class A operation, one call per 1,000 keys, on every cycle, even for an empty bucket."
 key_fact: "The default poll interval is 300 seconds and the default budget is 200,000 Class A operations a month."

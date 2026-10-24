@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent with a folder holding .csv.gz and .json.gz exports. Read https://xerj.org/llms.txt, run xerj autoindex on the folder, then run xerj autoindex map --json and confirm from the map that the compressed files produced typed columns before you write a query against them."
 answer: "How do I search gzipped CSV exports without unzipping them? Point xerj autoindex at the folder. Gzip is a wrapper, not a family: autoindex strips it during the run and sniffs the bytes underneath, so a .csv.gz becomes typed columns and a .json.gz becomes documents with fields. No query re-reads the archive."
 key_fact: "The sniffer classifies the decompressed stream from its first 8,192 bytes (`PREFIX`), the same window it uses for a plain file."

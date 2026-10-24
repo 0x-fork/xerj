@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/improve-basic-faiss-rag-pipeline"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why is my FAISS RAG pipeline missing obvious answers?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A vector-only pipeline has no term signal. On our judged set BM25 found literal tokens that the vector clause missed, and fusion recovered both."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I migrate a chunk store into XERJ?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Create one index with a semantic_text content field, then _bulk the chunks in. Our 20-chunk migration reported \"errors\": false and 20 created items."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does my kNN request return 400?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XERJ rejects query_vector_builder and needs a literal embedding in query_vector. Index the query text first, then read the companion vector out of _source."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does my hybrid request return 400?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The hybrid clause must be nested inside query. A top-level hybrid key returns Unknown key for a START_OBJECT in [hybrid]."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ chunk long documents for me?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes, for semantic_text fields: 512 characters with a 64-character overlap, split at sentence breaks first. The field must be top-level, not nested."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I highlight results from a hybrid query?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The hybrid sub-request zeroes highlight, sort, collapse, rescore, min_score, explain and profile, and the result carries no aggregations."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Will fusion fix a weak embedder?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Partly. Weighted linear fusion reached 0.4583 precision at 3 on the lexical default, against 0.6667 for every vector-backed mode under --embed-mode neural."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/search-word-documents-in-a-folder"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I search through a folder of contracts in .docx?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the folder, then send a match_phrase query for the clause wording. XERJ reads the paragraph text of each DOCX file, so a clause is found wherever it sits."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search a folder of Word documents?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the folder, then send a match_phrase query to the _search endpoint. XERJ reads the paragraph text of each DOCX file."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I find a clause across a directory of Word contracts?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Send the clause wording as a match_phrase against the index the run created. Each hit carries ax_path and the extracted title, so you know which contract it came from."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ extract the title of a Word document?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. In the captured run the title field held 'Change management policy', the first paragraph of the file, and the body field held the rest."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ index .doc files as well as .docx?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The extractor reads the zipped OpenXML format that .docx uses. Convert a legacy .doc file to .docx before you index the folder."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What stops a malicious Word document?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A decompression guard set at 72 MiB and 20,000 paragraphs. A file past either limit produces 0 documents and lands in the catalog as junk."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why did a small DOCX produce no documents?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A small DOCX can expand to hundreds of megabytes when unzipped. The captured 245,109-byte file expands to about 96 MiB and the guard refused it."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

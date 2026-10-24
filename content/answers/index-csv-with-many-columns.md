@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./csv-wide --url http://127.0.0.1:9200 --prefix wide --progress plain`, GET /wide-csv/_mapping to read the inferred field types, then POST a terms aggregation on an inferred keyword field and report the bucket counts with doc_count_error_upper_bound."
 answer: "How do you index CSV files with a big number of columns or fields? Point xerj autoindex at the file; it infers the mapping with no schema work. In a captured run a 120-column CSV became 128 mapped fields across 501 documents, and a terms aggregation on an inferred keyword column returned 4 exact buckets."
 key_fact: "Type inference keeps up to 512 fields per dataset (`MAX_FIELDS_PER_DATASET`), the ceiling for a very wide CSV."

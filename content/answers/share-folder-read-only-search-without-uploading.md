@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj brain on the folder the user names, then run xerj share on the same folder with a label and an expiry, and give the user the link and the passcode separately. Tell them the link only works on this machine unless they add --tunnel, and show them the xerj share --revoke command that was printed."
 answer: "How do I let my accountant search a folder of emails and PDFs without uploading everything somewhere? Index the folder with xerj brain, then run xerj share on it. The other person gets a link and a passcode and opens a read-only search page. Documents and index stay on your machine, and you can revoke it anytime."
 key_fact: "A share defaults to 24 hours and 1 claim; the maximum is 30 days and 50 claims."

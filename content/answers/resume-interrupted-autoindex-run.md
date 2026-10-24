@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, run xerj autoindex against a folder with an explicit --state-dir, interrupt it, then re-run the identical command with the same --state-dir and compare the final _count and the first 20 document ids with a clean control run into a fresh prefix."
 answer: "The indexer died overnight; do I have to start over? No. XERJ writes a resume journal into the --state-dir, so re-running the identical autoindex command is idempotent. In a capture the interrupted run, the resumed run and a clean control run all ended at 82,231 documents, and the first 20 document ids matched exactly."
 key_fact: "A resumed full-corpus generation with all 47,444 operations already applied finished on a restarted node without re-sending them."

@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/read-autoindex-progress"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I know autoindex is still working?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Read the xerj-progress line on stderr. The elapsed_s and since_progress_s fields advance even when the percentage does not, and waiting_on names the current file."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does autoindex progress stay at 0%?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The percentage counts items, and one large file is one item. The captured 16 MB run held 0.0% with items=0/1 for 15 seconds while it indexed normally."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which phases does autoindex report?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The default capture recorded 12 in order: walk, hash, scan, prepare, graph, index, graph-corpus, finalize-refresh, finalize-count, finalize-correlate, finalize-histogram and finalize-catalog. With --no-graph a capture recorded 9: walk, hash, scan, prepare, snapshot, index, finalize-catalog, finalize-refresh and finalize-verify."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "The progress says scan 100% and stalled. Is autoindex hung?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On a current build, scan at 100% means scan, so read since_progress_s and waiting_on. On v1.0.0-rc.74 and earlier, a --no-graph run printed that line for the whole indexing phase while it worked normally. Check _count on the node before you stop it."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I parse autoindex progress in a script?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Pass --progress plain and read the xerj-progress lines from stderr. Each line is a flat set of key=value pairs with no colors and no cursor control."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does the final autoindex line say?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The xerj-done line carries ok, exit, reason, wall, files, records, datasets and junk_files. The captured run ended ok=true exit=0 reason=completed."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does a server is shedding load line mean?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The node answered some bulk items with HTTP 429 and the run is re-sending only those after a backoff. since_progress_s climbs while it waits; the line names how long the wait has run and when the run gives up. The terminal line then carries bulk_retries=N."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I combine --quiet with --progress plain?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. --quiet means no progress output, so the decision-JSON recipe and the progress-parsing recipe are separate invocations of autoindex."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

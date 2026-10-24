@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Read https://xerj.org/llms.txt. Start one local node, index the saved source files, and run one match_phrase query per claim on the prose field from xerj autoindex map. Mark a claim found only when a hit comes back, and name ax_path. A miss means the words were not in that field."
 answer: "Verify claims in a report against the saved sources. Index those files, then run one `match_phrase` per claim. A claim with no hit is unverified. On 2026-10-20, 3 of 5 phrases were in the docs index and 2 were not. The first check took 490 ms."
 key_fact: "3 of 5 body phrases were found in the docs index; the first check took 490 ms."

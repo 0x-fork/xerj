@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, install the latest XERJ and start a node, run xerj autoindex on a folder of .bvh files with --prefix bvh, read GET /bvh-*/_mapping, then find a clip by joint name with a terms query on joints and report frames, frame_time_s and duration_s for every hit."
 answer: "How do I search motion-capture data in BVH files? Run xerj autoindex on the folder. XERJ detects the bvh family and writes frames, frame_time_s, duration_s, joint_count and a joints keyword array, with no body field. Our test clip reported 60 frames over 1.999998 seconds, and a terms query on joints returned it."
 key_fact: "The captured BVH clip reported 60 frames over a duration_s of 1.999998."

@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/private-agent-memory-namespaces"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I keep one agent's memory from leaking into another agent's?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Give each agent its own namespace and its own scoped API key. A scoped key is confined to its named indices, and authorization runs before the existence check."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can two local agents share a search engine but not memory?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Both can query the same document indices on one node, while each scoped key reaches only its own reserved .xerj-memory-* namespace."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I point an MCP memory server at a folder I choose?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Point the node's data directory there. XERJ has no separate memory path: memory lives in the data directory as .xerj-memory-{namespace}, and the MCP server stores nothing itself."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ enforce roles?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The node itself answers \"enforced\": false and warns that every authenticated caller has full superuser access. Full role enforcement is deferred."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What authorization does exist?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Scoped API keys. XERJ confines a scoped key to its named indices and reserves the .xerj-memory-* namespace, which is principal scoping rather than roles."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can an attacker enumerate my namespaces?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not through status codes on a secured node. Authorization runs before the existence check, so an absent brain and an unauthorized brain both answer 403."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does --insecure turn off?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "TLS and API-key authentication. Any client that reaches the port can then read and delete every index, so use it on a development machine only."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

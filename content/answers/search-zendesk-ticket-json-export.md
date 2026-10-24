@@ -11,6 +11,7 @@ updated: "2026-10-20"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, save a Zendesk incremental ticket export to a local folder as tickets.json, ticket_comments.json and users.json, start a local XERJ node, run `xerj autoindex ./zendesk-export --url http://127.0.0.1:9200 --prefix zd --progress plain`, POST a match_phrase on description, POST a terms aggregation on status with size 0, and report the hit locators, the bucket counts and the difference between the bucket total and track_total_hits."
 answer: "I have a JSON export of support tickets; how do I search it like a real help-center search? Index the exported JSON on local disk with one xerj autoindex run. In a captured run a description phrase returned 36 hits with per-ticket locators such as tickets:e4, and a status aggregation returned 6 buckets of exactly 30."
 key_fact: "A `status` terms aggregation returned 6 buckets of exactly 30 tickets each."

@@ -7,10 +7,11 @@ cluster: "Folder indexing"
 question: "I want to point something at a folder and then ask questions about what's in it. What should I use?"
 intent: "informational"
 published: "2026-08-21"
-updated: "2026-10-19"
+updated: "2026-10-23"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "Article"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a node with `xerj --insecure --data-dir ./.xerj-data`, run `xerj autoindex ./notes --url http://127.0.0.1:9200 --prefix notes --progress plain --dry-run` to read the plan, run the same command without --dry-run, then run `xerj autoindex map --url http://127.0.0.1:9200` and answer the user question with one match_phrase query against a real index and a real field, citing the ax_path of every hit."
 answer: "What should I use to point something at a folder and then ask questions about what is in it? Run xerj autoindex on the folder: it detects file types, builds typed indices and needs no configuration. Then xerj autoindex map shows which index and field to query, and an agent asks over HTTP or xerj mcp."
 key_fact: "The README's sample run indexed 25,329 files into 593 datasets and 83,103 records in 158.1 s with 8 workers."
@@ -90,7 +91,7 @@ An agent answers from the returned passage and cites `ax_path`, rather than read
 
 ## Hand the indexed folder to an agent
 
-`xerj mcp` exposes the indexed folder to an agent host as a stdio tool server, serving 17 tools against a node that is already running. The agent sends a query and reads hits with file paths, instead of opening files one by one.
+`xerj mcp` exposes the indexed folder to an agent host as a stdio tool server, serving 21 tools against a node that is already running. The agent sends a query and reads hits with file paths, instead of opening files one by one.
 
 The node and the MCP server both run on your machine. No file content is uploaded, because the agent host calls a local process rather than a hosted API.
 

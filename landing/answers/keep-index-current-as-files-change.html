@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-09-19",
   "dateModified": "2026-10-24",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/answers/keep-index-current-as-files-change"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I keep a search index up to date as files change, without re-indexing everything?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex with --watch --no-graph. It indexes the folder once, then stays resident and reindexes only what the filesystem reports as changed, using one OS watch per indexed directory and no polling."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does --watch require --no-graph?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The watcher re-runs the generated route, which reconciles added, changed, renamed and deleted files, including a file that would be a new dataset. On the default graph path a deleted file is swept and an added file that fits a frozen dataset is indexed, but a file that needs a new dataset still stops with reason=stale-resume-plan until --fresh, and the watcher is not built on that route."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is a file watcher cheaper than re-running the indexer on a timer?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "At idle, yes, and measurably. On a 10,000-file tree a re-run with nothing changed took 1.7 s and re-read all 4,576,300 bytes, while an idle watcher used 0.00 CPU-seconds over 60 s and read nothing. It does hold about 157 MiB resident between passes."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does --watch use less CPU per change than a re-run?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not measurably. It skips the corpus re-hash, but that saving is inside the run-to-run noise: on a 10,000-file tree, modifying one file cost 7.6 CPU-seconds by re-running against 6.6 under --watch in one measurement and 5.6 against 7.2 in another, and the wall clock was no better (44.3 s against 47.6 s), because each pass still seals a snapshot over the whole corpus and rewrites one catalog document per file. Against re-indexing the folder from scratch, which took 293.8 s and 127.9 CPU-seconds, both incremental routes win by an order of magnitude."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Will a watched index match a full re-index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Two tests assert it. After any sequence of changes a plain re-run that re-hashes every byte must change nothing, and that is asserted after a randomised create, modify, rename, delete and recreate sequence. A watched index also equals an independently built full index, except that an incremental run keeps the dataset name it was built with."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens when the index hits the inotify watch limit?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The run stops with a message naming fs.inotify.max_user_watches, its current value, how many directories the tree needs, the sysctl that raises it, and the ways out that need no root. A half-watched tree would look live and silently miss changes, so it is refused."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does a watcher notice a file that was deleted?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. The pass reconciles the folder against the committed generation, so a deleted file's documents stop appearing in search."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What can --watch miss?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A write that produces no filesystem event and leaves size, mtime and inode identical, which touch -r and a same-size rewrite with a restored timestamp can do. A plain xerj autoindex re-run hashes every byte and repairs it."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

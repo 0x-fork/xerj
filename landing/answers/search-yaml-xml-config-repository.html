@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/search-yaml-xml-config-repository"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "How do I find every place a config key is set across YAML and XML in a repo?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the tree, then search the key name inside body. Every hit carries ax_path and ax_format, so the answer is the list of files that mention the key."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search YAML and XML config across a big repo?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the repo and send one bool query over the index pattern. In our capture that returned 2 hits, 1 xml document and 1 yaml document."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I find a Helm value that is overridden in three files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Search the key name and read ax_path on each hit; the hits name every file that carries it. XERJ does not merge or resolve overrides, so ranking the files by precedence is your job."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ create one field per YAML key?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The captured cfg-docs mapping held body, title and 7 provenance fields, and no key-derived field. Search the key name inside body instead."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which fields can I query on a config index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Query body for the file text, title for its name, and the 7 ax_* provenance fields for path, format, dataset and run. The captured cfg-docs mapping held exactly those 9 fields."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does XERJ read TOML and INI files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "TOML and INI have no dedicated extractor. Both fall through to the text path, so the text stays searchable but no key becomes a field."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How large a config file can XERJ index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The whole-file cap is 64 MiB and the longest line is 16 MiB. One document holds at most 512 fields, and one dataset holds at most 512 fields."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

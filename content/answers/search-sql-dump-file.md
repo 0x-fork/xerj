@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./sqldump --url http://127.0.0.1:9200 --prefix dump --progress plain`, GET /_cat/indices/dump-*?format=json to see one index per table, then POST a match_phrase query to /dump-*/_search for a string you expect inside an INSERT value and report the hit with its ax_locator."
 answer: "I have a 2 GB SQL dump; how do I find rows mentioning a customer without loading it into Postgres? Run xerj autoindex on the .sql file; it parses MySQL-style dumps with no database server. In a captured run one file produced dump-articles with 301 documents and dump-authors with 20, and match_phrase found text inside an INSERT."
 key_fact: "The captured dump produced 2 indices holding 301 and 20 documents, 321 in total."

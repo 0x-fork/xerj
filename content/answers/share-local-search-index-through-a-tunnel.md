@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt. Confirm cloudflared is installed, then run xerj share on the user's indexed folder with --tunnel in the background, wait for the line that says the tunnel is up, and give the user the https link and the passcode separately. Tell them the link stops working when the command stops, and that stopping it revokes the share."
 answer: "How can I give a remote person temporary search access to files on my laptop without port forwarding or a VPN? Run xerj share with --tunnel: it starts your own cloudflared, prints a public HTTPS guest link, and runs until Ctrl-C, which closes the tunnel and revokes the share. Cloudflare terminates the TLS."
 key_fact: "A known share accepts at most 30 passcode attempts an hour, from any address."

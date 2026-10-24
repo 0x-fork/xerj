@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a throwaway XERJ node with --embed-mode neural, load the BEIR SciFact corpus with benchmarks/beir-hybrid/load.py, run benchmarks/beir-hybrid/eval.py, and report nDCG@10 for the BM25, vector-only, reorder and hybrid RRF arms next to the published figures."
 answer: "How much better is hybrid search than BM25 alone? On two public BEIR datasets XERJ's hybrid RRF beat both BM25 and vectors: nDCG@10 0.6993 against 0.6572 on SciFact and 0.3448 against 0.3016 on NFCorpus. Those runs used --embed-mode neural with all-MiniLM-L6-v2; the default lexical embedder is not covered."
 key_fact: "On BEIR NFCorpus (323 test queries, 3,633 documents), hybrid RRF scored nDCG@10 0.3448 against 0.3016 for BM25."

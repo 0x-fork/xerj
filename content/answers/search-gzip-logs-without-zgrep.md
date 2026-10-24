@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a XERJ node with --insecure, run xerj autoindex on a folder of .gz logs with --prefix gzz, then GET /gzz-*/_count and POST a bool filter on level to /gzz-*/_search, and report that ax_format is logs(gzip) and that ts is a date field you can range over."
 answer: "How do I search gzipped logs without decompressing the whole file? Let XERJ decompress each .gz log once at index time, so no query reads the compressed file again. In our capture the plain copy and the gzip copy of one log both returned 5001 from _count, and both returned 1250 hits for level=ERROR."
 key_fact: "The plain and gzip copies of one log both returned a `_count` of 5001 and 1250 `level=ERROR` hits."

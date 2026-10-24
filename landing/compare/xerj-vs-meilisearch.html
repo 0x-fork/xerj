@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -77,10 +79,13 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-22",
-  "dateModified": "2026-10-19",
+  "dateModified": "2026-10-23",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,84 @@
     "@id": "https://xerj.org/compare/xerj-vs-meilisearch"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Which tool handles a typo better?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Meilisearch. Typo tolerance is on by default there: one typo at five characters, two at nine. XERJ needs an explicit fuzzy query."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is Meilisearch the right thing to point Claude at a folder?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not on its own. Its document endpoint accepts JSON, NDJSON and CSV, so you extract the text and build the documents yourself before an agent can query them."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does XERJ do that Meilisearch does not?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It reads a folder of mixed files directly, including PDF, DOCX, SQLite and SQL exports, and writes typed mappings without a schema step."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does Meilisearch have an MCP server?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Meilisearch publishes a first-party MCP server, so this is not a point where XERJ stands alone."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is there a measured comparison on this page?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. No head-to-head was run. Every vendor fact here comes from Meilisearch's own documentation."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How does each side do hybrid search?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Meilisearch interpolates the two result sets with a semanticRatio that defaults to 0.5. XERJ fuses with Reciprocal Rank Fusion or a weighted linear sum."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which license applies?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XERJ is Apache-2.0. Meilisearch is MIT with an Enterprise Edition under the Business Source License 1.1, which holds sharding."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Meilisearch vs a local search engine for an agent?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Call Meilisearch when a person types into a search field. Call XERJ when an agent must query files that are already on disk."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">
@@ -156,9 +236,9 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/compare/">COMPARISONS</a><span class="sep">·</span>WHAT'S A LOCAL ALTERNATIVE TO MEILISEARCH THAT INDEXES A FOLDER BY ITSELF?</div>
   <div class="kicker"><span>COMPARE · COMPARISON: SEARCH ENGINES</span></div>
   <h1>What's a local alternative to Meilisearch that indexes a folder by itself?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-22 · UPDATED · 2026-10-23</div>
   <div class="prompt-card answer-first" id="short-answer">
-    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-19</span>
+    <span class="prompt-label">SHORT ANSWER · UPDATED 2026-10-23</span>
     <p>What's a local alternative to Meilisearch that indexes a folder by itself? XERJ reads a folder of mixed files with one command, where Meilisearch expects you to build and POST the documents. Meilisearch wins typo-tolerant instant search, and its own defaults document that win. No head-to-head was run.</p>
     <p class="key-fact"><strong>Key number:</strong> Meilisearch has 59,612 GitHub stars and released v1.55.0 on 2026-10-12. <span class="mute">(as of 2026-10-19 · source: <a href="https://github.com/meilisearch/meilisearch">github.com/meilisearch/meilisearch</a>)</span></p>
   </div>
@@ -221,7 +301,7 @@
   <p>Choose Meilisearch when you want a managed plan. XERJ has none.</p>
   <h2>When to choose XERJ instead</h2>
   <p>Choose XERJ when the corpus is a folder on a disk and nobody has built a pipeline for it. One command turns mixed formats into typed indices.</p>
-  <p>Choose XERJ when the caller is an agent rather than a person. The same binary also holds namespaced agent memory and an MCP server that serves 17 tools.</p>
+  <p>Choose XERJ when the caller is an agent rather than a person. The same binary also holds namespaced agent memory and an MCP server that serves 21 tools.</p>
   <p>Choose XERJ when the files hold shapes Meilisearch never accepts. A SQLite database, a hostile CSV with a decimal comma and a folder of DOCX contracts all qualify.</p>
   <h2>What was not measured</h2>
   <p>No head-to-head was run for this page. There is no timing here, no recall figure and no typo-query score, because no Meilisearch node was installed to produce one.</p>

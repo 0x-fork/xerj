@@ -49,8 +49,10 @@
   "alternateName": "XERJ.ai",
   "url": "https://xerj.org/",
   "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "description": "A new way for AI to search for data: one local Rust binary that indexes your code, docs, specs and logs, plus Corpus Hub packs, and returns cited answers.",
   "sameAs": [
-    "https://github.com/xerj-org/xerj"
+    "https://github.com/xerj-org/xerj",
+    "https://x.com/xerj_org"
   ]
 }
 </script>
@@ -79,8 +81,11 @@
   "datePublished": "2026-08-21",
   "dateModified": "2026-10-19",
   "author": {
-    "@type": "Person",
-    "name": "XERJ documentation team"
+    "@type": "Organization",
+    "name": "XERJ documentation team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   },
   "publisher": {
     "@id": "https://xerj.org/#organization"
@@ -93,9 +98,76 @@
     "@id": "https://xerj.org/answers/index-multiple-csv-files"
   },
   "reviewedBy": {
-    "@type": "Person",
-    "name": "XERJ engineering team"
+    "@type": "Organization",
+    "name": "XERJ engineering team",
+    "parentOrganization": {
+      "@id": "https://xerj.org/#organization"
+    }
   }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "I have a directory of CSV exports. How do I query them without opening each one in Excel?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Give xerj autoindex the folder, not each file. It reads every CSV in one run, groups the files by header, and each group becomes an index you query over HTTP."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What's a good way to read and search across a bunch of CSV files?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Index the folder once, then query the index pattern. XERJ reads every CSV file in the folder in one run and groups the files by their header."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I search 20 CSV exports like they were one table?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Files that share a header join one dataset, so one query pattern such as /multi-*/_search reads them all. The captured cross-index query returned 171 hits from 2 indices in one request."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I get counts and totals from a folder of CSV exports?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run a terms aggregation on a keyword field such as ax_dataset or ax_file; both are exact bucket counts. This capture measured counts only, so it does not show sums over numeric columns."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do all my CSV files land in one index?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Only if they share a header. Files with the same columns join one dataset, and a file with different columns gets its own index."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I tell which file a hit came from?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Read the ax_file and ax_path fields on the hit. XERJ writes 7 keyword provenance fields on every document it creates."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What happens if I add a fourth CSV file later?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Run xerj autoindex on the folder again. Document ids are content-derived and the run journal converges, so re-runs do not duplicate the earlier files."
+      }
+    }
+  ]
 }
 </script>
 <script type="application/ld+json">

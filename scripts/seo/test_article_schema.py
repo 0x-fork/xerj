@@ -115,7 +115,7 @@ GEO_ANSWER = ("What does the schema test article cover? It covers the GEO fields
 
 def _geo(text: str = FRONTMATTER, **extra: str) -> str:
     lines = [f'answer: "{GEO_ANSWER}"',
-             'key_fact: "The suite passes 1366 of 1369 cases."',
+             'key_fact: "The suite passes 1444 of 1454 cases."',
              'key_fact_source: "https://github.com/xerj-org/xerj"',
              'key_fact_date: "2026-10-19"',
              'intent_group: "code search for agents"',

@@ -11,6 +11,7 @@ updated: "2026-10-19"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
+structured_data: [faq]
 agent_prompt: "Act as a coding agent. Read https://xerj.org/llms.txt, start a local XERJ node, run `xerj autoindex ./csv-exports --url http://127.0.0.1:9200 --prefix multi --progress plain`, GET /_cat/indices/multi-*?format=json to see how many indices the different headers produced, then POST one query_string search across multi-* with a terms aggregation on ax_dataset and report the per-dataset counts."
 answer: "I have a directory of CSV exports; how do I query them without opening each one in Excel? Give xerj autoindex the folder. In a captured run, 3 CSV files with 2 different headers became 2 indices holding 402 and 151 documents, and one query_string request across both returned 171 hits split by dataset."
 key_fact: "One CSV file yields at most 4,096 records per extraction window (`MAX_RECORDS_PER_FILE`) before the next window starts."
