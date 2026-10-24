@@ -136,6 +136,11 @@ landing/resources/xerj-sales-kit.zip
 # documented everywhere and shipped nowhere).
 !tools/**/*.md
 
+# Re-include the DeepSeek Harness bundle readme. The blanket *.md rule
+# above would drop dsh/README.md on `git add`, and the catalog lists the
+# committed file.
+!dsh/**/*.md
+
 # Re-include the public .github community files. The blanket *.md rule above
 # silently swallowed these: no pull-request template has ever existed in this
 # repo's history because `git add` refused it without anyone noticing, while

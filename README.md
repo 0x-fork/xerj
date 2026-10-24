@@ -368,7 +368,7 @@ has been run: v2.1.2 on Windows against `xerj` v1.0.0-rc.97, which answered `ini
 | Kiro | `.kiro/settings/mcp.json` in the workspace, `~/.kiro/settings/mcp.json` user | `mcpServers` | `${VAR}` expansion needs approval | untested |
 | Antigravity | `~/.gemini/config/mcp_config.json`, or `.agents/mcp_config.json` in the workspace | `mcpServers` | remote servers use `serverUrl` | untested |
 | OpenClaw | `~/.openclaw/openclaw.json` (JSON5) | `mcp.servers` | `transport: "stdio"` | untested |
-| DeepSeek Harness (dsh) | `$DSH_HOME/cordis.patch.yml`, or a profile patch | `- insert:` with `@deepseek-ai/dsh-mcp-client` | one plugin instance per server | untested |
+| [DeepSeek Harness (dsh)](dsh/) | `$DSH_HOME/cordis.patch.yml`, or a profile patch | `- insert:` with `@deepseek-ai/dsh-mcp-client` | one plugin instance per server | untested |
 | Warp | Settings > Agents > MCP servers, or `~/.warp/.mcp.json` and `.warp/.mcp.json` in the project | `mcpServers` | `working_directory`, not `cwd` | untested |
 | Augment Code | `~/.augment/settings.json` for the Auggie CLI; the IDE uses its own panel | `mcpServers` | that file does not drive the IDE | untested |
 | Qwen Code | `~/.qwen/settings.json`, or `.qwen/settings.json` in the project | `mcpServers` | `mcp.allowed` can silently hide it | untested |
@@ -434,7 +434,7 @@ context servers, and OpenClaw nests them under `mcp`:
 {mcp: {servers: {xerj: {command: "/abs/path/to/xerj", args: ["mcp"], transport: "stdio"}}}}
 ```
 
-DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.yml`, or in a profile patch at `$DSH_HOME/profiles/<profile>/cordis.patch.yml`. If that file is only `[]`, replace the array with the block below; appending under `[]` is not valid YAML. `env` and `cwd` are optional stdio fields (`args` defaults to `[]`, `env` to `{}`, `cwd` to `""`). When the node is not running `--insecure`, add `XERJ_AUTH: "ApiKey <key>"` under `env`:
+DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.yml`, or in a profile patch at `$DSH_HOME/profiles/<profile>/cordis.patch.yml`. The same block is the profile bundle in [`dsh/`](dsh/), and its `command` is `xerj` on `PATH`. If that file is only `[]`, replace the array with the block below; appending under `[]` is not valid YAML. `env` and `cwd` are optional stdio fields (`args` defaults to `[]`, `env` to `{}`, `cwd` to `""`). When the node is not running `--insecure`, add `XERJ_AUTH: "ApiKey <key>"` under `env`:
 
 ```yaml
 # $DSH_HOME/cordis.patch.yml
@@ -444,7 +444,7 @@ DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.y
       config:
         serverName: xerj
         transport: stdio
-        command: /abs/path/to/xerj
+        command: xerj
         args:
           - mcp
         env:

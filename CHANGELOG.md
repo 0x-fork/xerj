@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0)
+  inserts the README's `mcp-xerj` stdio row via
+  `@deepseek-ai/dsh-mcp-client`. The row is still untested on DSH.
+  `landing/brandbook/xerj-mark-400.png` is a 400×400 PNG of the letter
+  mark for directory submissions.
+
 - MCP `xerj_def` exposes local definition lookup, completing #2080 after the
   `xerj_search` prefix support. It shares `xerj def --json` query construction,
   mapping guards, ranking and location deduplication; accepts `symbol`,

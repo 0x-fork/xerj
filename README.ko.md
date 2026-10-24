@@ -360,7 +360,7 @@ xerj mcp                                # 2. MCP stdio 서버 (클라이언트�
 | Kiro | 워크스페이스의 `.kiro/settings/mcp.json`, 사용자는 `~/.kiro/settings/mcp.json` | `mcpServers` | `${VAR}` 확장은 승인 필요 | untested |
 | Antigravity | `~/.gemini/config/mcp_config.json` 또는 워크스페이스의 `.agents/mcp_config.json` | `mcpServers` | 원격 서버는 `serverUrl` 사용 | untested |
 | OpenClaw | `~/.openclaw/openclaw.json` (JSON5) | `mcp.servers` | `transport: "stdio"` | untested |
-| DeepSeek Harness (dsh) | `$DSH_HOME/cordis.patch.yml` 또는 프로필 패치 | `@deepseek-ai/dsh-mcp-client`가 있는 `- insert:` | 서버당 플러그인 인스턴스 하나 | untested |
+| [DeepSeek Harness (dsh)](dsh/) | `$DSH_HOME/cordis.patch.yml` 또는 프로필 패치 | `@deepseek-ai/dsh-mcp-client`가 있는 `- insert:` | 서버당 플러그인 인스턴스 하나 | untested |
 | Warp | Settings > Agents > MCP servers 또는 `~/.warp/.mcp.json`과 프로젝트의 `.warp/.mcp.json` | `mcpServers` | `cwd`가 아닌 `working_directory` | untested |
 | Augment Code | Auggie CLI는 `~/.augment/settings.json`; IDE는 자체 패널 사용 | `mcpServers` | 그 파일은 IDE를 구동하지 않음 | untested |
 | Qwen Code | `~/.qwen/settings.json` 또는 프로젝트의 `.qwen/settings.json` | `mcpServers` | `mcp.allowed`가 조용히 숨길 수 있음 | untested |
@@ -436,7 +436,7 @@ DeepSeek Harness는 `$DSH_HOME/cordis.patch.yml` 또는 프로필 패치 `$DSH_H
       config:
         serverName: xerj
         transport: stdio
-        command: /abs/path/to/xerj
+        command: xerj
         args:
           - mcp
         env:

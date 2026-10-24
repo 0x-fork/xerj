@@ -257,7 +257,7 @@ xerj mcp                                # 2. MCP stdio server (your client runs 
 | Kiro | 工作区内的 `.kiro/settings/mcp.json`，用户级为 `~/.kiro/settings/mcp.json` | `mcpServers` | `${VAR}` 展开需要批准 | 未测试 |
 | Antigravity | `~/.gemini/config/mcp_config.json`，或工作区内的 `.agents/mcp_config.json` | `mcpServers` | 远程服务用 `serverUrl` | 未测试 |
 | OpenClaw | `~/.openclaw/openclaw.json`（JSON5） | `mcp.servers` | `transport: "stdio"` | 未测试 |
-| DeepSeek Harness (dsh) | `$DSH_HOME/cordis.patch.yml`，或某个 profile 补丁 | 带 `@deepseek-ai/dsh-mcp-client` 的 `- insert:` | 每个服务一个插件实例 | 未测试 |
+| [DeepSeek Harness (dsh)](dsh/) | `$DSH_HOME/cordis.patch.yml`，或某个 profile 补丁 | 带 `@deepseek-ai/dsh-mcp-client` 的 `- insert:` | 每个服务一个插件实例 | 未测试 |
 | Warp | Settings > Agents > MCP servers，或 `~/.warp/.mcp.json` 与项目内的 `.warp/.mcp.json` | `mcpServers` | `working_directory` 而非 `cwd` | 未测试 |
 | Augment Code | Auggie CLI 用 `~/.augment/settings.json`；IDE 有自己的面板 | `mcpServers` | 该文件不控制 IDE | 未测试 |
 | Qwen Code | `~/.qwen/settings.json`，或项目内的 `.qwen/settings.json` | `mcpServers` | `mcp.allowed` 可能悄悄隐藏它 | 未测试 |
@@ -332,7 +332,7 @@ DeepSeek Harness 在 `$DSH_HOME/cordis.patch.yml`（或某个 profile 的 `$DSH_
       config:
         serverName: xerj
         transport: stdio
-        command: /abs/path/to/xerj
+        command: xerj
         args:
           - mcp
         env:
