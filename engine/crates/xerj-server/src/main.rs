@@ -172,6 +172,7 @@ fn is_top_level_command(arg: &str) -> bool {
         arg,
         "index"
             | "search"
+            | "batch-search"
             | "def"
             | "init"
             | "gain"
@@ -446,6 +447,7 @@ fn help_text(feedback: bool) -> String {
          \x20\x20\x20\x20--version,  -V         Print version and exit\n\
          \n\
          SUBCOMMANDS:\n\
+         \x20\x20\x20\x20xerj batch-search --input FILE  ordered batch retrieval, JSON in/out (see xerj batch-search --help)\n\
          \x20\x20\x20\x20xerj index      <opts>          direct NDJSON → engine ingest (see xerj index --help)\n\
          \x20\x20\x20\x20xerj autoindex  <folder> [opts] zero-config folder discovery + indexing (see xerj autoindex --help)\n\
          \x20\x20\x20\x20xerj autoindex  map             print the discovered data map\n\
@@ -2915,6 +2917,14 @@ fn main() -> Result<()> {
         let rt = build_runtime(2)?;
         return rt.block_on(xerj_mcp::run(&args));
     }
+    if matches!(
+        xerj_common::argv::subcommand().as_deref(),
+        Some("batch-search")
+    ) {
+        let args = xerj_common::argv::args_after_subcommand();
+        let rt = build_runtime(2)?;
+        std::process::exit(rt.block_on(xerj_mcp::run_batch_cli(&args)));
+    }
     // Cores from the resource policy, so `XERJ_NUM_CPUS` and a container CPU
     // quota reach the async runtime the same way they reach every pool (#240).
     let cores = xerj_common::resource::cores();
@@ -3491,13 +3501,13 @@ mod decide_flag_tests {
     #[test]
     fn help_counts_the_mcp_tools_actually_served() {
         // The count is `tool_specs()`, the same list `tools/list` returns:
-        // eighteen without a hub key, twenty-one with the three hub tools.
+        // nineteen without a hub key, twenty-two with the three hub tools.
         let served = super::mcp_tool_count();
         if xerj_common::hub::hub_key_configured() {
-            assert_eq!(served, 21, "tool_specs() with a hub key: {served}");
+            assert_eq!(served, 22, "tool_specs() with a hub key: {served}");
         } else {
             assert_eq!(
-                served, 18,
+                served, 19,
                 "a no-key process must not count the hub tools it does not serve"
             );
         }

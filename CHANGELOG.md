@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the documents themselves is the replica backfill entry above (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170)).
 
+- `xerj batch-search --input <file|->` and MCP `xerj_batch_search` retrieve
+  up to 50 IDs or questions in input order through one `_msearch` call.
+  Each item returns cited evidence, an explicit empty-result abstention, or
+  an independent error. Exact IDs require an indexed keyword field. Optional
+  whole-response token budgets preserve outcomes and at least one citation
+  per matched item, or refuse explicitly. This is retrieval, not generated
+  answers or calibrated confidence (#1801, partial implementation).
+
 - With `[cluster] enabled = true`, a single-document index or delete is
   acknowledged when a quorum of the shard's copies has confirmed, not only
   when every placed replica has. Copies are the primary plus the replicas

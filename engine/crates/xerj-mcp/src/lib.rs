@@ -9,10 +9,10 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as twenty-one
-//! tools: eighteen without a hub key, and three Corpus Hub tools
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as twenty-two
+//! tools: nineteen without a hub key, and three Corpus Hub tools
 //! (`xerj_hub_*`) that run the `xerj ask` flow itself. Thirteen of those
-//! eighteen construct exactly the request the running engine already accepts
+//! nineteen construct exactly the request the running engine already accepts
 //! and forward it to a configurable base URL. `xerj_index_budget` counts a
 //! folder and returns the budget plans; it does not index. `xerj_autoindex_remove`
 //! deletes one autoindexed folder after listing what that folder owns, and only
@@ -29,6 +29,7 @@
 //! |------------------------|---------------------------------------|-----------------|
 //! | `xerj_def` | `GET /{index}/_mapping` + `POST /{index}/_search` | local definition lookup with CLI ranking and deduplication |
 //! | `xerj_search`          | `POST /{index}/_search`               | ES query-DSL search (full-text / keyword / structured) |
+//! | `xerj_batch_search` | `GET /{index}/_mapping` + `POST /_msearch` | ordered per-item evidence, abstention or error; shared with `xerj batch-search` |
 //! | `xerj_semantic_search` | `POST /{index}/_search` (`semantic`)  | server-side lexical embedding, no external key |
 //! | `xerj_vector_search`   | `POST /{index}/_search` (`knn`)       | kNN over a `dense_vector` field (HNSW-served unfiltered, exact filtered) |
 //! | `xerj_hybrid_search`   | `POST /{index}/_search` (`hybrid`)    | RRF or linear fusion of sub-queries |
@@ -100,10 +101,14 @@
 //! words), with duplicate passages removed before budgeting and
 //! over-budget hits reduced to locators.
 
+mod batch;
+mod batch_cli;
 mod def;
 mod hub;
 mod map;
 mod token_budget;
+
+pub use batch_cli::run_batch_cli;
 
 use std::time::Duration;
 
@@ -757,6 +762,7 @@ pub fn tool_specs() -> Value {
 pub fn tool_specs_with(include_hub: bool) -> Value {
     let mut specs = json!([
         def::spec(),
+        batch::spec(),
         {
             "name": "xerj_search",
             "description":
@@ -1862,6 +1868,9 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
     let mut demote_page: Option<usize> = None;
     let result = match name {
         "xerj_def" => return def::run(ctx, &args).await,
+        // Keep the batch state machine off the shared dispatcher future's
+        // stack: single-item tools must not inherit its larger frame.
+        "xerj_batch_search" => return Box::pin(batch::run(ctx, &args)).await,
         "xerj_search" => {
             // Resolve before even the mapping GET: conflicting or malformed
             // scope arguments must never silently query a different corpus.
@@ -4335,7 +4344,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_six_search_tools_advertise_max_tokens() {
+    fn search_tools_advertise_their_budget_contracts() {
         let specs = tool_specs();
         let search_tools = [
             "xerj_def",
@@ -4375,6 +4384,15 @@ mod tests {
                         .unwrap_or(false),
                     "{name}: `max_tokens` is optional"
                 );
+            } else if name == "xerj_batch_search" {
+                // Unlike the single-search adapter, a batch must preserve
+                // every item's outcome and refuse an undersized envelope.
+                let d = prop["description"].as_str().expect("described");
+                assert!(d.contains(token_budget::TOKENIZER_NAME), "{d}");
+                assert!(d.contains("NEVER exceeds"), "{d}");
+                assert!(d.contains("ordered item outcomes"), "{d}");
+                assert!(d.contains("Refuses"), "{d}");
+                assert_eq!(prop["minimum"], token_budget::MIN_MAX_TOKENS);
             } else if name == "xerj_hub_ask" {
                 // The hub's own budget (docs/hub-v2-grpc-mcp-notes.md): the
                 // `xerj ask --max-tokens` cap, a SOFT ~4-chars-a-token trim of
@@ -5367,7 +5385,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         for n in [
             "xerj_def",
             "xerj_search",
@@ -5483,23 +5501,23 @@ mod tests {
                 .collect()
         };
         let without = names(false);
-        assert_eq!(without.len(), 18, "{without:?}");
+        assert_eq!(without.len(), 19, "{without:?}");
         assert!(
             without.iter().all(|n| !n.starts_with("xerj_hub_")),
             "{without:?}"
         );
         let with = names(true);
-        assert_eq!(with.len(), 21, "{with:?}");
+        assert_eq!(with.len(), 22, "{with:?}");
         for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
             assert!(with.iter().any(|name| name == n), "missing {n}");
         }
 
         let help = tools_paragraph(false);
-        assert!(help.contains("proxies 18 tools"), "{help}");
+        assert!(help.contains("proxies 19 tools"), "{help}");
         assert!(!help.contains("xerj_hub_"), "{help}");
         assert!(help.contains("~/xerj-data"), "{help}");
         let help = tools_paragraph(true);
-        assert!(help.contains("proxies 21 tools"), "{help}");
+        assert!(help.contains("proxies 22 tools"), "{help}");
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }

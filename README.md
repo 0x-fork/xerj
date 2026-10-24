@@ -58,6 +58,9 @@ xerj def "euler_to_rotationmatrix"               # go-to-definition: file:line +
 xerj gain                                        # what it did for you — counted, not estimated
 ```
 
+For several IDs or questions at once, use `xerj batch-search --input queries.json`
+or MCP `xerj_batch_search`: [ordered results, citations and per-item errors](docs/recipes/batch-search.md).
+
 Keep that data directory outside any folder you will autoindex. `data/` is not in the
 built-in ignore list, so `--data-dir ./data` inside a tree you then index makes the node
 index its own storage.
