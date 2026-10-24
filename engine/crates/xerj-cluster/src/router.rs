@@ -190,6 +190,11 @@ impl ShardRouter {
         shards
     }
 
+    /// Primary node id for one shard, when the plan names one.
+    pub fn primary_node(&self, index: &str, shard: u32) -> Option<String> {
+        self.routing_table.get(&(index.to_string(), shard)).cloned()
+    }
+
     /// Replica node ids a read or a copy uses, excluding the primary.
     ///
     /// This is the in-sync set when one has been published, and otherwise

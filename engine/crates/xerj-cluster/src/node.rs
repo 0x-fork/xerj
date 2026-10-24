@@ -164,6 +164,13 @@ impl ClusterNode {
         self.applier = Some(applier);
     }
 
+    /// Applier installed by [`ClusterNode::set_applier`], if any.
+    ///
+    /// The runner uses this to copy replica documents off the Raft step.
+    pub(crate) fn applier(&self) -> Option<Arc<dyn MetadataApplier>> {
+        self.applier.clone()
+    }
+
     /// See [`crate::raft::RaftNode::set_snapshot_every`].
     pub fn set_snapshot_every(&mut self, every: u64) {
         self.raft.set_snapshot_every(every);

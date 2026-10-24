@@ -6,7 +6,9 @@
 //! copies an index or delete onto the in-sync replicas and acknowledges the
 //! caller when a quorum of the copies has confirmed. A replica that does not
 //! confirm is dropped from the in-sync set when the rest already make a
-//! quorum. [`fanout_search`] asks every
+//! quorum. That replica copies the primary's live documents when it can
+//! answer again, and the primary then publishes it back into the in-sync
+//! set. [`fanout_search`] asks every
 //! primary and merges hits. If a primary does not answer, a GET or a search
 //! of that shard reads a replica copy. Single-node mode (`has_cluster`
 //! false) returns before any of this.
@@ -15,6 +17,7 @@
 //! a primary search does not count them twice. The owner's handler does not
 //! route a `replica` apply again.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -581,6 +584,14 @@ impl xerj_cluster::ShardHandler for ApiShardHandler {
                 body_json,
                 params_json,
             } => local_search(&self.state, &index, &body_json, &params_json).await,
+            ShardOp::BackfillReplica {
+                index,
+                shard,
+                replica_id,
+            } => backfill_replica(&self.state, &index, shard, &replica_id).await,
+            ShardOp::RetainReplicaDocs { index, shard, ids } => {
+                retain_replica_docs(&self.state, &index, shard, &ids).await
+            }
         }
     }
 }
@@ -913,10 +924,11 @@ fn replica_nack(index: &str, replica: &str, detail: &str) -> ShardResult {
 ///
 /// Every in-sync replica is asked. When enough confirm and some do not, the
 /// ones that confirmed are published through the Raft log before the caller
-/// is acknowledged, and later reads skip the rest. A replica that fell out
-/// is not added back: nothing in this process replays the writes it missed.
-/// Two writes of the same shard do not publish different sets; the primary
-/// holds `replica_sync_lock` across the copy and the publish.
+/// is acknowledged, and later reads skip the rest until
+/// [`backfill_replica`] copies the primary's live documents and publishes
+/// the replica again. Two writes of the same shard do not publish different
+/// sets; the primary holds `replica_sync_lock` across the copy and the
+/// publish. Backfill takes that same lock.
 async fn replicate_write(
     state: &AppState,
     index: &str,
@@ -1059,6 +1071,256 @@ fn replica_confirmed(op: &ShardOp, result: &ShardResult) -> bool {
         ShardOp::DeleteDoc { .. } => result.status == 200 || result.status == 404,
         _ => (200..300).contains(&result.status),
     }
+}
+
+fn backfill_body(status: u16, type_name: &str, reason: impl Into<String>) -> ShardResult {
+    let reason = reason.into();
+    ShardResult::http(
+        status,
+        json!({
+            "error": { "type": type_name, "reason": reason },
+            "status": status
+        })
+        .to_string(),
+    )
+}
+
+fn already_in_sync() -> ShardResult {
+    ShardResult::http(
+        200,
+        json!({ "already_in_sync": true, "copied": 0 }).to_string(),
+    )
+}
+
+/// Live documents on this primary for `shard`.
+///
+/// The user index on the primary holds the documents it owns. Ids that
+/// route elsewhere are skipped. A tombstone is not in the list. `Err` is
+/// the reason the copy must not publish an in-sync set.
+async fn primary_live_docs(
+    state: &AppState,
+    index: &str,
+    shard: u32,
+) -> Result<Vec<(String, Value)>, String> {
+    let idx = state
+        .engine
+        .get_index(index)
+        .map_err(|err| format!("primary index [{index}] is not open: {err}"))?;
+    let mut docs = Vec::new();
+    for id in idx.live_document_ids() {
+        let Some((doc_shard, _)) = state.engine.primary_of(index, &id) else {
+            continue;
+        };
+        if doc_shard != shard {
+            continue;
+        }
+        match idx.get_document(&id).await {
+            Ok(Some(source)) => docs.push((id, source)),
+            Ok(None) => {}
+            Err(err) => return Err(format!("reading [{index}] document [{id}]: {err}")),
+        }
+    }
+    Ok(docs)
+}
+
+/// Copy this primary's live documents onto `replica_id` and publish it.
+///
+/// The replica lock is held from the snapshot through the in-sync publish.
+/// A document write applies on the primary first and then waits for this
+/// lock before it copies, so a write that missed the snapshot is replicated
+/// to the set that includes `replica_id`. A failed copy leaves the in-sync
+/// set unchanged. The replica retries.
+async fn backfill_replica(
+    state: &AppState,
+    index: &str,
+    shard: u32,
+    replica_id: &str,
+) -> ShardResult {
+    if replica_id.is_empty() {
+        return backfill_body(400, "illegal_argument_exception", "replica id is empty");
+    }
+    let me = state.engine.routing_node_id();
+    if replica_id == me {
+        return backfill_body(
+            400,
+            "illegal_argument_exception",
+            "a primary does not backfill itself",
+        );
+    }
+    let Some(owner) = state.engine.shard_primary(index, shard) else {
+        return backfill_body(
+            409,
+            "shard_not_ready",
+            format!("[{index}] shard {shard} has no primary on this node"),
+        );
+    };
+    if owner != me {
+        return backfill_body(
+            409,
+            "shard_not_primary",
+            format!("[{index}] shard {shard} is owned by [{owner}], not [{me}]"),
+        );
+    }
+    let placed = state.engine.placed_replica_nodes(index, shard);
+    if !placed.iter().any(|id| id == replica_id) {
+        return backfill_body(
+            400,
+            "illegal_argument_exception",
+            format!("[{replica_id}] is not a replica of [{index}] shard {shard}"),
+        );
+    }
+    if state
+        .engine
+        .replica_nodes(index, shard)
+        .iter()
+        .any(|id| id == replica_id)
+    {
+        return already_in_sync();
+    }
+
+    let sync = state.engine.replica_sync_lock(index, shard);
+    let _guard = sync.lock().await;
+    if state
+        .engine
+        .replica_nodes(index, shard)
+        .iter()
+        .any(|id| id == replica_id)
+    {
+        return already_in_sync();
+    }
+
+    let docs = match primary_live_docs(state, index, shard).await {
+        Ok(docs) => docs,
+        Err(reason) => return backfill_body(503, "replica_backfill_failed", reason),
+    };
+    for (id, source) in &docs {
+        let source_json = match serde_json::to_string(source) {
+            Ok(json) => json,
+            Err(err) => {
+                return backfill_body(
+                    503,
+                    "replica_backfill_failed",
+                    format!("document [{id}] is not JSON: {err}"),
+                );
+            }
+        };
+        let op = ShardOp::IndexDoc {
+            index: index.to_string(),
+            id: id.clone(),
+            source_json,
+            op: "index".to_string(),
+            if_seq_no: None,
+            if_primary_term: None,
+            version: None,
+            version_type: None,
+            replica: true,
+            shard,
+        };
+        if let Err(detail) = confirm_replica(state, replica_id, &op).await {
+            return backfill_body(
+                503,
+                "replica_backfill_failed",
+                format!("replica [{replica_id}] did not take document [{id}]: {detail}"),
+            );
+        }
+    }
+    let ids: Vec<String> = docs.iter().map(|(id, _)| id.clone()).collect();
+    let retain = ShardOp::RetainReplicaDocs {
+        index: index.to_string(),
+        shard,
+        ids,
+    };
+    if let Err(detail) = confirm_replica(state, replica_id, &retain).await {
+        return backfill_body(
+            503,
+            "replica_backfill_failed",
+            format!(
+                "replica [{replica_id}] did not drop documents the primary no longer has: {detail}"
+            ),
+        );
+    }
+
+    let mut nodes = state.engine.replica_nodes(index, shard);
+    if !nodes.iter().any(|id| id == replica_id) {
+        nodes.push(replica_id.to_string());
+    }
+    nodes.sort();
+    nodes.dedup();
+    let Some(handle) = state.engine.cluster_handle() else {
+        return backfill_body(
+            503,
+            "replica_backfill_failed",
+            "no cluster handle to publish the in-sync set",
+        );
+    };
+    let copied = docs.len();
+    match handle
+        .propose(ClusterCommand::SetShardInSync {
+            index: index.to_string(),
+            shard,
+            nodes,
+        })
+        .await
+    {
+        Ok(ApplyEffect::Applied) => {
+            let published = state.engine.replica_nodes(index, shard);
+            if !published.iter().any(|id| id == replica_id) {
+                return backfill_body(
+                    503,
+                    "replica_backfill_failed",
+                    "the in-sync set committed without the replica that was filled",
+                );
+            }
+            tracing::info!(
+                index = %index,
+                shard,
+                replica = %replica_id,
+                copied,
+                "copied primary documents onto a replica and published the in-sync set"
+            );
+            ShardResult::http(
+                200,
+                json!({ "already_in_sync": false, "copied": copied }).to_string(),
+            )
+        }
+        Ok(other) => backfill_body(
+            503,
+            "replica_backfill_failed",
+            format!("in-sync update applied as {other:?}"),
+        ),
+        Err(err) => backfill_body(503, "replica_backfill_failed", err.to_string()),
+    }
+}
+
+/// Drop replica-store documents that are not in `ids`.
+async fn retain_replica_docs(
+    state: &AppState,
+    index: &str,
+    shard: u32,
+    ids: &[String],
+) -> ShardResult {
+    let store = match doc_store(index, true, shard) {
+        Ok(store) => store,
+        Err(result) => return result,
+    };
+    let idx = match open_store(state, &store).await {
+        Ok(idx) => idx,
+        Err(_) => return ShardResult::http(503, shard_not_ready_body(index)),
+    };
+    let keep: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    for id in idx.live_document_ids() {
+        if keep.contains(id.as_str()) {
+            continue;
+        }
+        if let Err(err) = idx.delete_document(&id).await {
+            return backfill_body(
+                503,
+                "replica_backfill_failed",
+                format!("dropping [{id}] from [{store}]: {err}"),
+            );
+        }
+    }
+    ShardResult::http(200, json!({ "retained": ids.len() }).to_string())
 }
 
 /// Search the shards `primary` owns by reading one replica copy of each.

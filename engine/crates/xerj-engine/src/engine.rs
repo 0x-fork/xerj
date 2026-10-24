@@ -3770,6 +3770,11 @@ impl Engine {
         owner.map(|owner| (shard, owner.to_string()))
     }
 
+    /// Primary node id for one shard of `index`, when the plan names one.
+    pub fn shard_primary(&self, index: &str, shard: u32) -> Option<String> {
+        self.shard_router.read().primary_node(index, shard)
+    }
+
     /// Replica node ids a read or a copy uses, excluding the primary.
     ///
     /// The create-time list until an in-sync update commits, then the

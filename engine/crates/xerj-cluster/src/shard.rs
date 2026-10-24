@@ -234,6 +234,28 @@ pub enum ShardOp {
         /// JSON [`crate`] search query params. `from` and `size` match the body.
         params_json: String,
     },
+    /// Copy this primary's live documents onto `replica_id` and, once that
+    /// copy matches, publish `replica_id` in the in-sync set.
+    ///
+    /// The caller is a replica that is placed for `shard` and is not in the
+    /// in-sync set. The primary holds the shard's replica lock across the
+    /// copy and the publish, so a document write that lands during the copy
+    /// is replicated to the new set when the lock is released. Documents are
+    /// not part of the Raft snapshot; this is the copy that fills them in.
+    BackfillReplica {
+        index: String,
+        shard: u32,
+        replica_id: String,
+    },
+    /// Delete replica-store documents whose ids are not in `ids`.
+    ///
+    /// Sent by the primary at the end of [`ShardOp::BackfillReplica`], after
+    /// the live documents have been upserted. Does not replicate further.
+    RetainReplicaDocs {
+        index: String,
+        shard: u32,
+        ids: Vec<String>,
+    },
 }
 
 /// What the owner sends back. `status` is an HTTP status; `body` is JSON.

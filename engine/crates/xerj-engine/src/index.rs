@@ -19758,6 +19758,14 @@ impl Index {
         }
     }
 
+    /// Live document ids, sorted by id.
+    ///
+    /// A tombstone is not included. The id is present once the index call
+    /// has returned, including before refresh.
+    pub fn live_document_ids(&self) -> Vec<String> {
+        self.store.version_map.live_ids()
+    }
+
     /// Retrieve a document by its string ID.
     ///
     /// Checks the memtable first, then searches on-disk segments.

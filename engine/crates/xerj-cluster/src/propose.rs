@@ -213,10 +213,18 @@ impl ClusterHandle {
 /// Applies a committed metadata command to the local engine.
 ///
 /// Called on the cluster run loop for every committed entry, on every member.
-/// Implementations must be deterministic: the same command against the same
-/// prior state does the same thing on every node. They must not propose a
-/// new command.
+/// Implementations of [`MetadataApplier::apply_metadata`] must be
+/// deterministic: the same command against the same prior state does the
+/// same thing on every node, and that method must not propose a new command.
 #[async_trait::async_trait]
 pub trait MetadataApplier: Send + Sync {
     async fn apply_metadata(&self, command: &ClusterCommand) -> ApplyEffect;
+
+    /// Copy documents this node is missing as a replica.
+    ///
+    /// The runner calls this off the Raft step. The default does nothing.
+    /// The engine implementation asks each primary to copy that shard's live
+    /// documents and to publish this node into the in-sync set. That call
+    /// may propose. It is not part of applying a log entry.
+    async fn backfill_local_replicas(&self) {}
 }
