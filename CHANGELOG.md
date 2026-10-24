@@ -26,6 +26,125 @@ Harness profile bundle ships in `dsh/`. Contributors in this window:
 Jarvis636431, Tong-bit-art, redwolf2019, ArkNill, pallidev,
 samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
 
+### Upgrade notes
+
+- **No downgrade after a case-distinguished field write** (PR
+  [#2261](https://github.com/xerj-org/xerj/pull/2261)). Opening a data
+  directory does not by itself change its format. The marker moves from
+  2 to 3 only when this binary writes a field whose Windows case-identity
+  is not the name itself: an ASCII name with an uppercase letter
+  (`page_Id`), or `ı`, `ſ`, `K`, or `ß`. rc.98 supports format 2 and
+  refuses a higher marker, so after that write it will not open the
+  directory. Back up the data directory before upgrading if you may need
+  the older binary. A directory that has not taken that write still
+  opens on rc.98. v1 and v2 segments still open on rc.99.
+- **Packed embeddings** (PR
+  [#2240](https://github.com/xerj-org/xerj/pull/2240)). A semantic vector
+  this binary writes is stored as one `xerj:f32:` hex string. That does
+  not advance the data-dir format marker, so an older binary still opens
+  the directory. It does not unpack the string: kNN does not score that
+  vector, and a source read returns the hex instead of a number array.
+  Vectors already stored as number arrays stay that way until rc.99
+  rewrites them.
+- **Hub catalogues** (PR
+  [#2249](https://github.com/xerj-org/xerj/pull/2249)). rc.99 writes
+  catalogue format 2, which adds optional `upstream` (`owner/name`).
+  rc.98 and older clients accept only format 1, so they refuse a
+  catalogue this binary writes. This binary still reads format 1. The
+  published catalogue is still format 1 until a binary with this code
+  rebuilds it, so `upstream` is empty there.
+- **Re-index to pick up new extraction** (PRs
+  [#2278](https://github.com/xerj-org/xerj/pull/2278),
+  [#2342](https://github.com/xerj-org/xerj/pull/2342),
+  [#2247](https://github.com/xerj-org/xerj/pull/2247)). Documents already
+  in an index keep the extraction and settings of the binary that wrote
+  them. An unchanged file is not re-extracted. `xerj autoindex --fresh`
+  rebuilds the index. That is what applies the AND match operator and
+  the asctime date mapping on a logs dataset (#2278), indexes `.sql`
+  schema and routines as code (#2342), and skips catalog phrase text,
+  parses phone and RFC 5424 syslog, and elects the english analyzer for
+  a logs dataset (#2247).
+- **Templates apply at create** (PR
+  [#2283](https://github.com/xerj-org/xerj/pull/2283)). An index that
+  already exists keeps the mapping and `index.default_pipeline` it was
+  created with. A matching template's `semantic_text` and default
+  pipeline are merged in when an index is created, including the first
+  write that auto-creates one. Indices created before this are unchanged.
+- **CPU baseline** (PR
+  [#2253](https://github.com/xerj-org/xerj/pull/2253)). The four x86_64
+  release targets are `x86-64-v2` (SSE4.2). The installers no longer
+  refuse a CPU without AVX2. `XERJ_SKIP_CPU_CHECK`, the installer bypass
+  added in PR [#2178](https://github.com/xerj-org/xerj/pull/2178), is
+  gone. A CPU without SSE4.2 still cannot run the binary.
+- **Defaults that moved:**
+  - A host under 16 GiB gets a process cap of half its RAM. On a budget
+    that cannot hold the old 512 MiB merge input, the merge batch is
+    `budget/64` (64 MiB at a 4 GiB cap) and concurrent merges share a
+    quarter of the budget. Hosts at 16 GiB and above keep the previous
+    steps. This improves
+    [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays open
+    (PR [#2340](https://github.com/xerj-org/xerj/pull/2340)).
+  - On Windows the cap is then lowered to what this process can still
+    commit, not only to physical RAM. Linux and macOS are unchanged.
+    This improves
+    [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays open
+    (PR [#2236](https://github.com/xerj-org/xerj/pull/2236)).
+  - On a logs index that carries
+    `index.query.default_match_operator: and`, an omitted `match`
+    requires every token. An index without that setting, and an
+    explicit `or` or `and`, are unchanged (PR
+    [#2278](https://github.com/xerj-org/xerj/pull/2278)). Existing
+    indices do not gain the setting until they are recreated.
+  - When a request highlights a `semantic_text` field on a semantic
+    query, the default highlighter is the semantic one: chunk fragments,
+    not `<em>` tags. A request that does not ask for highlight is
+    unchanged. An explicit type other than `semantic` stays on the
+    lexical highlighter (PR
+    [#2227](https://github.com/xerj-org/xerj/pull/2227)).
+  - A `semantic` query on a wildcard, `_all`, an alias, or a comma list
+    returns HTTP 200 and records the indices that lack the field under
+    `_shards.failed`, instead of failing the whole request with 400. If
+    every searched index is skipped, the request is still 400. One
+    concrete index that lacks the field is still 400 (PR
+    [#2308](https://github.com/xerj-org/xerj/pull/2308)).
+  - `POST /{index}/_validate/query` reports `valid: false` for a body
+    `_search` rejects: a non-numeric value on a numeric field, or a
+    field that is neither indexed nor has doc values. A selector that
+    resolves to no index stays parse-only (PR
+    [#2263](https://github.com/xerj-org/xerj/pull/2263)).
+  - A question with three or more content tokens ranks a hit that covers
+    more of the question above a one-word symbol. A one-token lookup is
+    unchanged (PR [#2329](https://github.com/xerj-org/xerj/pull/2329)).
+  - Plain-string MCP `xerj_search`, when the caller does not set
+    `_source`, also returns `ax_file` and `ax_locator`. An explicit
+    `_source` list is left alone (PR
+    [#2255](https://github.com/xerj-org/xerj/pull/2255)).
+  - One indexed JSON document is capped at 8 MiB. That ceiling is a
+    constant, not a setting (PR
+    [#2256](https://github.com/xerj-org/xerj/pull/2256)). `PUT
+    /{index}/_doc/{id}` and `PUT /{index}/_create/{id}` refuse a larger
+    body before parsing it (PR
+    [#2315](https://github.com/xerj-org/xerj/pull/2315)). An `_update`
+    body over two 8 MiB documents plus 256 KiB of envelope is refused
+    before `serde_json` (PR
+    [#2322](https://github.com/xerj-org/xerj/pull/2322)). This improves
+    [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays open.
+  - A bulk whose token analysis would cross the memory watermark is
+    HTTP 429 before the documents are parsed (PR
+    [#2302](https://github.com/xerj-org/xerj/pull/2302)). This improves
+    [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays open.
+  - SIGTERM and SIGINT answer new HTTP requests with 503, leave
+    `/health/live` at 200, and keep the ports bound until the final
+    flush finishes. Connection refusal is the signal that the flush is
+    done (PR [#2246](https://github.com/xerj-org/xerj/pull/2246)).
+  - `engine.flush_admit_timeout_secs` (default 120) and
+    `engine.flush_timeout_secs` (default 300) bound how long a flush
+    waits for a permit and how long refresh waits for one index.
+    `XERJ_FLUSH_ADMIT_TIMEOUT_SECS` and `XERJ_FLUSH_TIMEOUT_SECS`
+    override them. A refresh that used to wait now returns when the
+    budget is spent (PR
+    [#2129](https://github.com/xerj-org/xerj/pull/2129)).
+
 ### Security
 
 - **`ctutils` 0.4.5** (RUSTSEC-2026-0385, published 2026-10-23). `Choice`
@@ -758,7 +877,12 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   - An empty corpus ledger names the autoindex prefixes that are actually
     indexed ([#2181](https://github.com/xerj-org/xerj/issues/2181), PR
     [#2230](https://github.com/xerj-org/xerj/pull/2230)).
-  - `xerj hub find` names the upstream repository (PR
+  - `xerj hub find` prints `slug — owner/name — description` when the
+    catalogue has `upstream`. This binary writes catalogue format 2 and
+    still reads format 1, where that field is absent and prints empty.
+    The published catalogue is still format 1, so owner/name is empty
+    until a binary with this code rebuilds it. rc.98 and older clients
+    refuse a format other than 1 (PR
     [#2249](https://github.com/xerj-org/xerj/pull/2249)).
   - A question whose topic no hub corpus covers is `NoCoverage`, not an
     ambiguous tie. `xerj ask` prints that no corpus covers the topic, points
@@ -806,9 +930,14 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   `xerj_hub_*` tools are dropped. The published `mcp-tools.json` already
   lists 22. The v1.0.0-rc.98 figure stays 20 and now names both tools that
   binary lacks (PR [#2350](https://github.com/xerj-org/xerj/pull/2350)).
-  Canonical description, synced figures, FAQPage JSON-LD, robots
-  Content-Signal, `llms.txt`, an IndexNow key, and MCP listing manifests
-  (`server.json`, the mcpb manifest, and a Docker MCP Dockerfile). The
+  Canonical description, synced figures, FAQPage JSON-LD, `llms.txt`,
+  an IndexNow key, and MCP listing manifests (`server.json` and the
+  mcpb manifest). `.claude-plugin/marketplace.json` is a Claude Code
+  plugin marketplace named `xerj` (plugin source `./plugins/xerj`).
+  `packaging/docker-mcp/Dockerfile` builds the Docker MCP image
+  `xerj-mcp` (stdio `xerj mcp`; the file's default `XERJ_VERSION` is
+  `1.0.0-rc.98`). `landing/robots.txt` adds
+  `Content-Signal: search=yes, ai-input=yes, ai-train=yes`. The
   registry manifest names the tagged release v1.0.0-rc.98 (PR
   [#2323](https://github.com/xerj-org/xerj/pull/2323)). The mcpb package
   identifier points at the prerelease asset
@@ -823,8 +952,12 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   PowerShell
   ([#2285](https://github.com/xerj-org/xerj/issues/2285), PR
   [#2289](https://github.com/xerj-org/xerj/pull/2289)).
-- AGENTS.md lists all twenty MCP tools (PR
-  [#2150](https://github.com/xerj-org/xerj/pull/2150), redwolf2019). The
+- AGENTS.md listed twenty MCP tools at the time (PR
+  [#2150](https://github.com/xerj-org/xerj/pull/2150), redwolf2019).
+  After PR [#2166](https://github.com/xerj-org/xerj/pull/2166)
+  (`xerj_def`) and PR [#2333](https://github.com/xerj-org/xerj/pull/2333)
+  (`xerj_batch_search`) the count main registers is 22, or 19 when the
+  three `xerj_hub_*` tools are dropped. The
   Simplified Chinese README matches the English one (PR
   [#2149](https://github.com/xerj-org/xerj/pull/2149), redwolf2019). A Korean
   README translation (PR [#2164](https://github.com/xerj-org/xerj/pull/2164),
@@ -851,9 +984,16 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   not a quality or performance evaluation (PR
   [#2334](https://github.com/xerj-org/xerj/pull/2334), Jarvis636431, written
   with OpenAI Codex).
-- CLA signatures: ArkNill (#2153), pallidev (#2165), samuelmbabhazi (#2168),
-  elewashy (#2173), WYSTAF (#2175), kamwoh (#2264), mgtf (#2275),
-  mariomarcolongo (#2292). Jun516 joined the contributor list (PR
+- CLA signatures: ArkNill (PR
+  [#2153](https://github.com/xerj-org/xerj/pull/2153)), pallidev (PR
+  [#2165](https://github.com/xerj-org/xerj/pull/2165)), samuelmbabhazi (PR
+  [#2168](https://github.com/xerj-org/xerj/pull/2168)), elewashy (PR
+  [#2173](https://github.com/xerj-org/xerj/pull/2173)), WYSTAF (PR
+  [#2175](https://github.com/xerj-org/xerj/pull/2175)), kamwoh (PR
+  [#2264](https://github.com/xerj-org/xerj/pull/2264)), mgtf (PR
+  [#2275](https://github.com/xerj-org/xerj/pull/2275)), mariomarcolongo
+  (PR [#2292](https://github.com/xerj-org/xerj/pull/2292)). Jun516 joined
+  the contributor list (PR
   [#2335](https://github.com/xerj-org/xerj/pull/2335)).
 
 ### Housekeeping
