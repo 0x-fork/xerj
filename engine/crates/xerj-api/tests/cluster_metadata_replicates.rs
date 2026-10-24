@@ -1015,3 +1015,157 @@ async fn restart_reloads_the_shard_plan_and_still_routes_the_document() {
         let _ = member.shutdown.send(true);
     }
 }
+
+async fn open_durable_member(
+    id: &str,
+    ids: &[&str],
+    bus: &InMemoryBus,
+    dir: tempfile::TempDir,
+    snapshot_every: u64,
+) -> Member {
+    let mut config = xerj_common::config::Config::default();
+    config.server.data_dir = dir.path().to_string_lossy().into_owned();
+    let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+    let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+    let state = xerj_api::state::AppState::new(config, engine, metrics);
+    let peers: Vec<String> = ids
+        .iter()
+        .filter(|peer| **peer != id)
+        .map(|peer| (*peer).to_string())
+        .collect();
+    let transport = InMemoryTransport::new(id.to_string(), bus.clone()).await;
+    let raft_dir = xerj_cluster::raft_log::raft_storage_dir(dir.path());
+    let mut node = ClusterNode::with_storage(id.to_string(), peers, Box::new(transport), &raft_dir)
+        .expect("open raft log");
+    node.set_snapshot_every(snapshot_every);
+    node.set_applier(std::sync::Arc::new(EngineMetadataApplier {
+        engine: std::sync::Arc::clone(&state.engine),
+    }));
+    let handle = node.handle();
+    state.engine.attach_cluster(handle.clone());
+    handle.set_shard_handler(std::sync::Arc::new(ApiShardHandler::new(state.clone())));
+    node.replay_committed().await;
+    let engine = std::sync::Arc::clone(&state.engine);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let mut runner = ClusterRunner::new(node, Duration::from_millis(5), shutdown_rx);
+    let task = tokio::spawn(async move {
+        runner.run().await;
+    });
+    let app = xerj_api::router::build_es_compat_router(state.clone());
+    Member {
+        app,
+        state,
+        engine,
+        shutdown,
+        handle,
+        _node: None,
+        runner: Some(task),
+        _dir: dir,
+    }
+}
+
+async fn wait_compacted(member: &Member) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if member.handle.snapshot_index() >= 1 && member.handle.log_len() == 0 {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "leader log was not compacted: snapshot={} log_len={}",
+                member.handle.snapshot_index(),
+                member.handle.log_len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The create is compacted out of the leader's log before the third member
+/// starts. That member still gets the index, and a document written afterwards
+/// is readable from a member that was already up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_member_installs_a_compacted_create_and_routes_a_later_write() {
+    let ids = ["n1", "n2", "n3"];
+    let bus = InMemoryBus::new();
+    let mut members = Vec::new();
+    for id in ["n1", "n2"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        members.push(open_durable_member(id, &ids, &bus, dir, 1).await);
+    }
+    let dead = [false, false];
+    let leader = wait_leader(&members, &dead).await;
+
+    let (status, body) = put_json(
+        &members[0].app,
+        "/orders",
+        json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
+    )
+    .await;
+    assert!(status.is_success(), "create: {status} {body}");
+    wait_compacted(&members[leader]).await;
+    assert_eq!(
+        members[leader].handle.log_len(),
+        0,
+        "the create must not still be an AppendEntries payload"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    members.push(open_durable_member("n3", &ids, &bus, dir, 64).await);
+    let mapping = wait_body_contains(&members[2].app, "/orders/_mapping", "title").await;
+    assert!(
+        mapping.to_string().contains("title"),
+        "n3 must apply the compacted create: {mapping}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if members[2].handle.snapshot_index() >= 1 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "n3 did not install the snapshot: snapshot={} log_len={}",
+                members[2].handle.snapshot_index(),
+                members[2].handle.log_len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (status, body) = put_json(
+        &members[2].app,
+        "/orders/_mapping",
+        json!({ "properties": { "note": { "type": "keyword" } } }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "mapping after snapshot: {status} {body}"
+    );
+    for member in &members {
+        wait_body_contains(&member.app, "/orders/_mapping", "note").await;
+    }
+
+    let (status, body) = put_json(
+        &members[2].app,
+        "/orders/_doc/1",
+        json!({ "title": "after" }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "write from the late member: {status} {body}"
+    );
+    for member in &members {
+        let (status, body) = get(&member.app, "/orders/_doc/1").await;
+        assert!(
+            status.is_success(),
+            "doc readable on {}: {status} {body}",
+            member.handle.node_id()
+        );
+    }
+
+    for member in &members {
+        let _ = member.shutdown.send(true);
+    }
+}

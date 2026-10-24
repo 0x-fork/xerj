@@ -54,6 +54,10 @@ pub struct ClusterView {
     pub node_id: String,
     pub state: RaftState,
     pub leader_id: Option<String>,
+    /// Highest index in this node's snapshot. 0 when it has not compacted.
+    pub snapshot_index: u64,
+    /// Log entries that are not covered by the snapshot.
+    pub log_len: usize,
 }
 
 /// A metadata command waiting to be proposed or forwarded by the run loop.
@@ -153,6 +157,17 @@ impl ClusterHandle {
 
     pub fn leader_id(&self) -> Option<String> {
         self.view().leader_id
+    }
+
+    /// Highest snapshotted index, or 0. Updated by the run loop, so a caller
+    /// can see it only after the next step.
+    pub fn snapshot_index(&self) -> u64 {
+        self.view().snapshot_index
+    }
+
+    /// Entries still in the log, not counting a compacted prefix.
+    pub fn log_len(&self) -> usize {
+        self.view().log_len
     }
 
     fn view(&self) -> ClusterView {

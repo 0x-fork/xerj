@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- With `[cluster] enabled = true`, a member compacts its Raft log once
+  64 metadata entries have been applied since the previous snapshot.
+  The compacted prefix is stored in `{data_dir}/_raft/snapshot.meta` and
+  removed from `raft.log`. A peer whose log does not overlap that prefix
+  receives InstallSnapshot and applies those commands, which installs the
+  same index metadata an AppendEntries catch-up would have. The snapshot
+  is that command prefix, not a smaller folded image and not the
+  documents. A history that does not fit in 8 MiB stays in the log.
+  Restart replays the snapshot and then the entries after it. A node
+  that never stored a document still does not receive it, and a replica
+  removed from the in-sync set stays out (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170)).
+
 - With `[cluster] enabled = true`, a single-document index or delete is
   acknowledged when a quorum of the shard's copies has confirmed, not only
   when every placed replica has. Copies are the primary plus the replicas
@@ -34,9 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts with an empty log copies the leader's log and applies it, which
   installs index metadata (and an empty replica store when this node is
   a replica). It does not copy documents written before it joined. A
-  replica removed from the in-sync set is not filled in. The log is not
-  compacted; there is no InstallSnapshot. Term and vote are stored with
-  the log, so a restarted node does not grant a second vote in the same
+  replica removed from the in-sync set is not filled in. Term and vote are
+  stored with the log, so a restarted node does not grant a second vote in the same
   term. `[cluster] enabled = false` does not open the log (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170)).
 

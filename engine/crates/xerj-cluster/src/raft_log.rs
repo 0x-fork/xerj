@@ -54,7 +54,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use crc32fast::Hasher as Crc32;
 
 /// Magic for the raft log file format.  Distinct from the WAL magic so
@@ -64,10 +64,49 @@ const HARD_MAGIC: u32 = 0x5A52_4853; // "ZRHS"
 const LOG_FILE: &str = "raft.log";
 const COMMIT_FILE: &str = "commit.meta";
 const HARD_FILE: &str = "hard.meta";
+const SNAPSHOT_FILE: &str = "snapshot.meta";
+const SNAPSHOT_MAGIC: u32 = 0x5A52_534E; // "ZRSN"
 
 /// Directory name under the node's data dir. Not a valid index name, so a
 /// user index cannot occupy the same path and take the log with it on delete.
 pub const RAFT_DIR_NAME: &str = "_raft";
+
+/// One on-disk log record. `append` and log compaction both use this so a
+/// rewritten file scans the same way as a file that was only appended to.
+fn encode_entry(term: u64, index: u64, payload: &[u8]) -> Vec<u8> {
+    let payload_len = payload.len() as u64;
+    // Entry length covers everything after the len field up to the CRC,
+    // inclusive — useful for future forward-compatible skipping.
+    let entry_len: u64 = 8 + 8 + 1 + 8 + payload_len + 4;
+    let kind = EntryKind::ClusterCommand as u8;
+    let mut h = Crc32::new();
+    h.update(&MAGIC.to_le_bytes());
+    h.update(&entry_len.to_le_bytes());
+    h.update(&term.to_le_bytes());
+    h.update(&index.to_le_bytes());
+    h.update(&[kind]);
+    h.update(&payload_len.to_le_bytes());
+    h.update(payload);
+    let crc = h.finalize();
+
+    let mut buf = Vec::with_capacity(4 + entry_len as usize);
+    buf.extend_from_slice(&MAGIC.to_le_bytes());
+    buf.extend_from_slice(&entry_len.to_le_bytes());
+    buf.extend_from_slice(&term.to_le_bytes());
+    buf.extend_from_slice(&index.to_le_bytes());
+    buf.push(kind);
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.extend_from_slice(payload);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    let file = File::open(dir).with_context(|| format!("opening {dir:?} to sync"))?;
+    file.sync_all()
+        .with_context(|| format!("syncing raft dir {dir:?}"))?;
+    Ok(())
+}
 
 /// `{data_dir}/_raft`, where the server opens [`FileRaftLog`].
 pub fn raft_storage_dir(data_dir: impl AsRef<Path>) -> PathBuf {
@@ -119,6 +158,10 @@ pub struct FileRaftLog {
     /// Logical end of the log. `None` means `hard.meta` did not record one
     /// and the scan is authoritative. `Some(0)` is an empty log.
     log_end: Option<u64>,
+    /// Raw snapshot payload from `snapshot.meta`, when that file exists.
+    /// The Raft node decodes it. A missing file is a log that has not been
+    /// compacted. A truncated or checksum-mismatched file fails the open.
+    snapshot: Option<Vec<u8>>,
 }
 
 impl FileRaftLog {
@@ -225,6 +268,7 @@ impl FileRaftLog {
             seek_table.retain(|&idx, _| idx <= end);
             last_index = seek_table.keys().next_back().copied().unwrap_or(0);
         }
+        let snapshot = Self::load_snapshot(&dir)?;
 
         Ok(Self {
             dir,
@@ -235,6 +279,7 @@ impl FileRaftLog {
             hard_term,
             hard_vote,
             log_end,
+            snapshot,
         })
     }
 
@@ -253,35 +298,116 @@ impl FileRaftLog {
     /// [`FileRaftLog::fsync`] after a batch to make the entries durable.
     pub fn append(&mut self, term: u64, index: u64, payload: &[u8]) -> Result<()> {
         let header_offset = self.current_offset()?;
-        let payload_len = payload.len() as u64;
-        // Entry length covers everything after the len field up to the CRC,
-        // inclusive — useful for future forward-compatible skipping.
-        let entry_len: u64 = 8 + 8 + 1 + 8 + payload_len + 4;
-
-        let mut h = Crc32::new();
-        h.update(&MAGIC.to_le_bytes());
-        h.update(&entry_len.to_le_bytes());
-        h.update(&term.to_le_bytes());
-        h.update(&index.to_le_bytes());
-        h.update(&[EntryKind::ClusterCommand as u8]);
-        h.update(&payload_len.to_le_bytes());
-        h.update(payload);
-        let crc = h.finalize();
-
-        self.writer.write_u32::<LittleEndian>(MAGIC)?;
-        self.writer.write_u64::<LittleEndian>(entry_len)?;
-        self.writer.write_u64::<LittleEndian>(term)?;
-        self.writer.write_u64::<LittleEndian>(index)?;
-        self.writer.write_u8(EntryKind::ClusterCommand as u8)?;
-        self.writer.write_u64::<LittleEndian>(payload_len)?;
-        self.writer.write_all(payload)?;
-        self.writer.write_u32::<LittleEndian>(crc)?;
+        let record = encode_entry(term, index, payload);
+        self.writer.write_all(&record)?;
 
         self.seek_table
-            .insert(index, (term, header_offset, payload_len));
+            .insert(index, (term, header_offset, payload.len() as u64));
         if index > self.last_index {
             self.last_index = index;
         }
+        Ok(())
+    }
+
+    /// Bytes of `snapshot.meta`, if a snapshot has been saved.
+    pub fn snapshot_bytes(&self) -> Option<&[u8]> {
+        self.snapshot.as_deref()
+    }
+
+    /// Replace `snapshot.meta`. The in-memory copy updates only after the
+    /// rename and directory sync, so a failed write leaves the previous
+    /// snapshot in place.
+    pub fn save_snapshot(&mut self, payload: &[u8]) -> Result<()> {
+        let path = self.dir.join(SNAPSHOT_FILE);
+        let tmp = self.dir.join("snapshot.meta.tmp");
+        let mut buf = Vec::with_capacity(16 + payload.len() + 4);
+        buf.extend_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        let len = u64::try_from(payload.len()).context("raft snapshot longer than u64")?;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(payload);
+        let mut h = Crc32::new();
+        h.update(&buf);
+        buf.extend_from_slice(&h.finalize().to_le_bytes());
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("writing {tmp:?}"))?;
+            file.write_all(&buf)
+                .with_context(|| format!("writing {tmp:?}"))?;
+            file.sync_all()
+                .with_context(|| format!("syncing {tmp:?}"))?;
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {path:?}"))?;
+        sync_dir(&self.dir)?;
+        self.snapshot = Some(payload.to_vec());
+        Ok(())
+    }
+
+    /// Rewrite `raft.log` so it contains only entries with `index > through`.
+    ///
+    /// The new file is synced and renamed over the old one before the seek
+    /// table drops the prefix. A failed write leaves the previous file, and
+    /// its entries, in place.
+    pub fn rewrite_without_prefix(&mut self, through: u64) -> Result<()> {
+        if self.seek_table.keys().all(|idx| *idx > through) {
+            return Ok(());
+        }
+        self.writer
+            .flush()
+            .context("flush raft log before compaction")?;
+        let kept_idx: Vec<u64> = self
+            .seek_table
+            .keys()
+            .copied()
+            .filter(|idx| *idx > through)
+            .collect();
+        let mut kept = Vec::with_capacity(kept_idx.len());
+        for idx in kept_idx {
+            let (term, payload) = self.read(idx)?.ok_or_else(|| {
+                anyhow!("raft entry {idx} disappeared while compacting the log prefix")
+            })?;
+            kept.push((term, idx, payload));
+        }
+
+        let new_path = self.dir.join("raft.log.new");
+        let mut new_table: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&new_path)
+                .with_context(|| format!("writing {new_path:?}"))?;
+            let mut offset = 0u64;
+            for (term, index, payload) in &kept {
+                let record = encode_entry(*term, *index, payload);
+                file.write_all(&record)
+                    .with_context(|| format!("writing {new_path:?}"))?;
+                new_table.insert(*index, (*term, offset, payload.len() as u64));
+                offset += record.len() as u64;
+            }
+            file.sync_all()
+                .with_context(|| format!("syncing {new_path:?}"))?;
+        }
+        let final_path = self.dir.join(LOG_FILE);
+        std::fs::rename(&new_path, &final_path)
+            .with_context(|| format!("replacing {final_path:?}"))?;
+        sync_dir(&self.dir)?;
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(false)
+            .open(&final_path)
+            .with_context(|| format!("reopening {final_path:?} after compaction"))?;
+        self.writer = BufWriter::with_capacity(64 * 1024, file);
+        self.seek_table = new_table;
+        self.last_index = self.seek_table.keys().next_back().copied().unwrap_or(0);
+        self.set_log_end(self.last_index)?;
         Ok(())
     }
 
@@ -438,10 +564,7 @@ impl FileRaftLog {
         std::fs::rename(&tmp, &path).with_context(|| format!("replacing {path:?}"))?;
         // The rename is the publication. Sync the directory so a crash cannot
         // lose the directory entry that names the new file.
-        let dir =
-            File::open(&self.dir).with_context(|| format!("opening {:?} to sync", self.dir))?;
-        dir.sync_all()
-            .with_context(|| format!("syncing raft dir {:?}", self.dir))?;
+        sync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -486,6 +609,43 @@ impl FileRaftLog {
             Some(text.to_string())
         };
         Ok((term, vote, log_end))
+    }
+
+    fn load_snapshot(dir: &Path) -> Result<Option<Vec<u8>>> {
+        let path = dir.join(SNAPSHOT_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {path:?}"))?;
+        if bytes.len() < 4 + 4 + 8 + 4 {
+            return Err(anyhow!("raft snapshot {path:?} is truncated"));
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+        if magic != SNAPSHOT_MAGIC {
+            return Err(anyhow!("raft snapshot {path:?} has a bad magic"));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+        if version != 1 {
+            return Err(anyhow!(
+                "raft snapshot {path:?} has version {version}, want 1"
+            ));
+        }
+        let len = usize::try_from(u64::from_le_bytes(
+            bytes[8..16].try_into().expect("8 bytes"),
+        ))
+        .context("raft snapshot length does not fit usize")?;
+        let header = 16;
+        let crc_at = header + len;
+        if bytes.len() != crc_at + 4 {
+            return Err(anyhow!("raft snapshot {path:?} is truncated"));
+        }
+        let expected = u32::from_le_bytes(bytes[crc_at..crc_at + 4].try_into().expect("4 bytes"));
+        let mut h = Crc32::new();
+        h.update(&bytes[..crc_at]);
+        if h.finalize() != expected {
+            return Err(anyhow!("raft snapshot {path:?} has a bad checksum"));
+        }
+        Ok(Some(bytes[header..crc_at].to_vec()))
     }
 
     /// Highest log index appended so far (0 if the log is empty).
@@ -639,5 +799,56 @@ mod tests {
             ),
             Ok(_) => panic!("corrupt hard state opened"),
         }
+    }
+
+    #[test]
+    fn snapshot_roundtrip_and_a_bad_checksum_refuses_to_open() {
+        let dir = tempdir().unwrap();
+        let mut log = FileRaftLog::open(dir.path()).unwrap();
+        assert!(log.snapshot_bytes().is_none());
+        log.save_snapshot(b"commands").unwrap();
+        assert_eq!(log.snapshot_bytes(), Some(b"commands".as_slice()));
+        drop(log);
+
+        let log2 = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log2.snapshot_bytes(), Some(b"commands".as_slice()));
+
+        let path = dir.path().join(SNAPSHOT_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        match FileRaftLog::open(dir.path()) {
+            Err(err) => assert!(
+                err.to_string().contains("checksum"),
+                "a torn snapshot must not open as an empty one: {err}"
+            ),
+            Ok(_) => panic!("corrupt snapshot opened"),
+        }
+    }
+
+    #[test]
+    fn rewrite_drops_the_prefix_and_keeps_the_suffix() {
+        let dir = tempdir().unwrap();
+        let mut log = FileRaftLog::open(dir.path()).unwrap();
+        for i in 1..=5 {
+            log.append(1, i, format!("{i}").as_bytes()).unwrap();
+        }
+        log.fsync().unwrap();
+        log.save_snapshot(b"snap").unwrap();
+        log.rewrite_without_prefix(3).unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(log.read(1).unwrap().is_none());
+        assert!(log.read(3).unwrap().is_none());
+        assert_eq!(log.read(4).unwrap().unwrap().1, b"4");
+        assert_eq!(log.read(5).unwrap().unwrap().1, b"5");
+        drop(log);
+
+        let mut log2 = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log2.snapshot_bytes(), Some(b"snap".as_slice()));
+        assert_eq!(log2.len(), 2);
+        assert_eq!(log2.last_index(), 5);
+        assert!(log2.read(2).unwrap().is_none());
+        assert_eq!(log2.read(5).unwrap().unwrap().1, b"5");
     }
 }

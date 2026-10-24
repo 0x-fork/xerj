@@ -4272,6 +4272,7 @@ async fn async_main() -> Result<()> {
                     dir = %raft_dir.display(),
                     commit = node.raft.commit_index(),
                     entries = node.raft.log_len(),
+                    snapshot = node.raft.snapshot_index(),
                     "opened on-disk raft log"
                 );
                 cluster_transport_outcome = xerj_api::state::ClusterTransportStatus::Running;
