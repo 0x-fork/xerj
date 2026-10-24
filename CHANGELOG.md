@@ -13,15 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary's live documents copies them and then rejoins the in-sync set.
   That covers a member that starts after the writes (the create entry
   opens an empty replica store) and a replica removed from the in-sync
-  set because it missed an acknowledgement. The primary sends the live
-  documents, drops ids the replica still has that the primary no longer
-  does, and publishes the enlarged in-sync set through the Raft log. The
-  primary holds that shard's replica lock across the copy, so a write
-  that arrives during the copy is replicated to the new set when the
-  lock is released. A later single-document index or delete is copied to
-  that replica with the others. A write still needs the primary. Changing
-  membership does not move copies. `[cluster] enabled = false` does not
-  do this (part of
+  set because it missed an acknowledgement. A process that stops and
+  later opens the same data directory is filled the same way: documents
+  inserted, updated, or deleted while it was down are applied to its
+  replica store before the enlarged set is published. The primary sends
+  the live documents, drops ids the replica still has that the primary
+  no longer does, and publishes the enlarged in-sync set through the
+  Raft log. The primary holds that shard's replica lock across the copy,
+  so a write that arrives during the copy is replicated to the new set
+  when the lock is released. A later single-document index or delete is
+  copied to that replica with the others. A write still needs the
+  primary. Changing membership does not move copies.
+  `[cluster] enabled = false` does not do this (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170)).
 
 - With `[cluster] enabled = true`, a member compacts its Raft log once
@@ -50,10 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named by `index.number_of_replicas` at create. A quorum is
   `copies / 2 + 1`, and the primary already counts, so one replica out of
   two is enough. The replica that did not confirm is removed from the
-  in-sync set through the Raft log and is not used for a later read. Nothing
-  replays the writes it missed, so it stays out. `number_of_replicas` 0 or 1
-  is unchanged: there is no replica to wait for, or that one replica must
-  confirm. Fewer confirmations than the quorum is still HTTP 503
+  in-sync set through the Raft log and is not used for a later read until
+  the backfill entry above has copied the primary's live documents onto
+  it. `number_of_replicas` 0 or 1 is unchanged: there is no replica to
+  wait for, or that one replica must confirm. Fewer confirmations than
+  the quorum is still HTTP 503
   `replica_not_acknowledged` — the primary has the write, and retrying the
   index copies it to the replicas still in sync. There is still no
   `wait_for_active_shards` and no replica promotion. A restarted member
