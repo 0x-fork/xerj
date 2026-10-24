@@ -40,7 +40,7 @@ xerj autoindex ./work --prefix work --state-dir ./state-work
 
 ### Command 3
 
-Note: Attach the running node over stdio MCP. Same binary, 21 tools, no desktop window.
+Note: Attach the running node over stdio MCP. Same binary, 22 tools, no desktop window.
 
 ```sh
 xerj mcp --url http://127.0.0.1:9200
@@ -76,7 +76,7 @@ LocalSynapse documents an MCP server over stdio that opens no network port, with
 
 XERJ answers over the Elasticsearch REST API. An agent writes the query DSL it already knows: `match_phrase`, `terms`, `range`, aggregations and `_source` narrowing.
 
-`xerj mcp` serves 21 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
+`xerj mcp` serves 22 tools over stdio on top of that, and `/_memory/{ns}` gives an agent namespaced memory in the engine.
 
 Pick the surface that matches your caller. A small tool list is easier for a simple agent, and a query language is more useful for one that asks precise questions.
 

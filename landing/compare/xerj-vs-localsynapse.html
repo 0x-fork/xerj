@@ -264,7 +264,7 @@
     <span class="prompt-label">RUN THIS XERJ COMMAND</span>
     <code>xerj mcp --url http://127.0.0.1:9200</code>
     <button type="button" class="prompt-copy" data-copy="xerj mcp --url http://127.0.0.1:9200">COPY COMMAND</button>
-    <span class="hero-proof">Attach the running node over stdio MCP. Same binary, 21 tools, no desktop window.</span>
+    <span class="hero-proof">Attach the running node over stdio MCP. Same binary, 22 tools, no desktop window.</span>
   </div>
   <h2>Concede the desktop</h2>
   <p>LocalSynapse is a product a person installs and opens. The same binary is a search window and an MCP server, and its site states that it runs on Windows and macOS.</p>
@@ -281,7 +281,7 @@
   <h2>Two different answers to "how does the agent ask?"</h2>
   <p>LocalSynapse documents an MCP server over stdio that opens no network port, with four tools: <code class="inline">search_files</code>, <code class="inline">get_file_content</code>, <code class="inline">list_indexed_files</code> and <code class="inline">get_pipeline_status</code>. That is a clean, small surface, and for many agents it is enough.</p>
   <p>XERJ answers over the Elasticsearch REST API. An agent writes the query DSL it already knows: <code class="inline">match_phrase</code>, <code class="inline">terms</code>, <code class="inline">range</code>, aggregations and <code class="inline">_source</code> narrowing.</p>
-  <p><code class="inline">xerj mcp</code> serves 21 tools over stdio on top of that, and <code class="inline">/_memory/{ns}</code> gives an agent namespaced memory in the engine.</p>
+  <p><code class="inline">xerj mcp</code> serves 22 tools over stdio on top of that, and <code class="inline">/_memory/{ns}</code> gives an agent namespaced memory in the engine.</p>
   <p>Pick the surface that matches your caller. A small tool list is easier for a simple agent, and a query language is more useful for one that asks precise questions.</p>
   <h2>Retrieval, stated honestly on both sides</h2>
   <p>LocalSynapse combines full-text BM25 with a local embedder, BGE-M3 running through ONNX Runtime on the CPU. It stores its index in a local SQLite database.</p>

@@ -151,7 +151,7 @@ Use it beside an index, not instead of one. Choose ast-grep when the question is
 
 ## XERJ: one index over the whole folder
 
-XERJ is a search engine first. `xerj autoindex` reads a repository plus the docs, logs, JSONL, CSV, PDFs and SQLite files around it, writes a `defs` field and a `symbols` array for 36 tree-sitter languages, and `xerj mcp` serves 21 tools over that node, memory included.
+XERJ is a search engine first. `xerj autoindex` reads a repository plus the docs, logs, JSONL, CSV, PDFs and SQLite files around it, writes a `defs` field and a `symbols` array for 36 tree-sitter languages, and `xerj mcp` serves 22 tools over that node, memory included.
 
 What it gives up: no references, no edits, a lexical default embedder, single-node only, and heavy memory while indexing. Our own [JSONL benchmark](/compare/best-local-full-text-search-jsonl-csv-2026) measured the node peaking at about 9.1 GiB resident while indexing a 9.7 MB file. For code-only questions, compare it with ripgrep first: on 30 disclosed tasks ripgrep won 5 outright ([XERJ vs ripgrep](/compare/xerj-vs-ripgrep-for-code-agents)). Choose ripgrep when the agent searches a tree once.
 

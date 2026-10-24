@@ -54,7 +54,7 @@ The command does not start a node. Start one first, otherwise every tool call fa
 
 ```text
 Speaks MCP over stdio (newline-delimited JSON-RPC 2.0 on stdin/stdout) and
-proxies 21 tools — xerj_def, xerj_search, ... xerj_hub_ask — to a
+proxies 22 tools — xerj_def, xerj_batch_search, ... xerj_hub_ask — to a
 XERJ node that
 is ALREADY RUNNING. This command does not start a node; start one first with
 `xerj --insecure --data-dir ~/xerj-data`.
@@ -110,7 +110,7 @@ The server also returns an `instructions` string that tells the agent which tool
 
 ## The tools, with their required arguments
 
-A live `tools/list` from v1.0.0-rc.97 (2026-10-19) returned 17 tools, and all 17 carried an `inputSchema`. The first capture for this page, in August 2026, returned 10. On main the list has 21, and `mcp-tools.json` carries every schema.
+A live `tools/list` from v1.0.0-rc.97 (2026-10-19) returned 17 tools, and all 17 carried an `inputSchema`. The first capture for this page, in August 2026, returned 10. On main the list has 22, and `mcp-tools.json` carries every schema.
 
 | tool | required arguments |
 | --- | --- |
@@ -171,7 +171,7 @@ A call against a missing index passes the node's own 404 `index_not_found_except
 
 ## The published tool schemas are stale
 
-On main the binary serves 21 tools. The published `openai-tools.json` and `anthropic-tools.json` still list 6 (checked 2026-10-23), so 15 are missing: `xerj_def`, the 4 `xerj_brain_*` tools, `xerj_map`, `xerj_index_budget`, `xerj_autoindex_remove`, `xerj_code_search`, `xerj_plan`, `xerj_field_report`, `xerj_corpus_feedback` and the 3 `xerj_hub_*` tools. The MCP schema at `/docs/agents/schemas/mcp-tools.json` lists all 21, and a test keeps it in step with the server source.
+On main the binary serves 22 tools. The published `openai-tools.json` and `anthropic-tools.json` still list 6 (checked 2026-10-23), so 16 are missing: `xerj_def`, `xerj_batch_search`, the 4 `xerj_brain_*` tools, `xerj_map`, `xerj_index_budget`, `xerj_autoindex_remove`, `xerj_code_search`, `xerj_plan`, `xerj_field_report`, `xerj_corpus_feedback` and the 3 `xerj_hub_*` tools. The MCP schema at `/docs/agents/schemas/mcp-tools.json` lists all 22, and a test keeps it in step with the server source.
 
 That is a documentation defect, confirmed against the source that generates the tool list. If you wire either vendor schema into an agent by hand, add the missing tools yourself or read `tools/list` from a live server instead.
 
