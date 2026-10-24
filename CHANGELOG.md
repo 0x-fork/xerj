@@ -108,6 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` indexes `.sql` schema, migration, and routine files as
+  code. `CREATE TABLE` / `VIEW` / `FUNCTION` / `PROCEDURE` / `INDEX` /
+  `TRIGGER` / `TYPE` / `SCHEMA` / `SEQUENCE` become symbols, and the source
+  stays searchable. A comment, a quoted literal, a dollar-quoted body,
+  or an `INSERT`/`COPY` nested inside another statement is not a dump.
+  Those files used to be sniffed as an
+  empty SQL dump and skipped (`no records extracted`), which dropped
+  hand-written DDL such as a rule-engine script. A file with a top-level
+  `INSERT … VALUES` is still a row dump. A data-only `COPY … FROM stdin`
+  dump, which the row parser does not read, is skipped with that reason;
+  when the same file also contains schema statements, those statements are
+  indexed as code (#2337).
+
 - A full process memtable budget now flushes instead of leaving `xerj autoindex`
   on HTTP 429 until it gives up. The rejection requests a drain (largest
   memtable first) rather than waiting for the next memory sample, and a

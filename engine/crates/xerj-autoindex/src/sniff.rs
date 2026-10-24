@@ -232,8 +232,12 @@ pub fn sniff_with_name(content_path: &Path, logical_path: &Path) -> Result<Sniff
     // otherwise fall through to text, because the prefix is schema only.
     // One extra read, and only when the prefix already looks like DDL and
     // the file continues. The scan stops at the first row statement.
+    // #2337: a `.sql` schema file is promoted to Code inside `sniff_bytes`.
+    // The same past-the-prefix row scan as #1984 still wins when the rest of
+    // the file is a real dump, so a long CREATE TABLE section followed by
+    // INSERT/COPY does not stay code.
     if prefix.len() == PREFIX
-        && matches!(s.family, Family::TxtLines | Family::TxtProse)
+        && matches!(s.family, Family::TxtLines | Family::TxtProse | Family::Code)
         && prefix_is_schema_ddl(&prefix)
         && file_contains_sql_row_data(content_path, gzip)
     {
@@ -492,7 +496,32 @@ fn sniff_bytes(
             out.family = txt_kind(&nonblank);
         }
     }
+    // #2337: `.sql` is not a tree-sitter extension. Claiming it before this
+    // point would mark every dump as code and the row extractor would never
+    // run. A file that survived the dump test is schema, a migration, or a
+    // routine — source, indexed as code.
+    if is_sql_filename(logical_path) && matches!(out.family, Family::TxtLines | Family::TxtProse) {
+        out.family = Family::Code;
+    }
     Ok(out)
+}
+
+/// `.sql`, or a gzipped `.sql.gz`. Case-insensitive. The dump-vs-source
+/// decision is content; this only says the name is SQL.
+pub(crate) fn is_sql_filename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = name.as_bytes();
+    ends_with_ascii_ignore(name, b".sql") || ends_with_ascii_ignore(name, b".sql.gz")
+}
+
+fn ends_with_ascii_ignore(name: &[u8], suffix: &[u8]) -> bool {
+    name.len() >= suffix.len()
+        && name[name.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
 }
 
 /// The label for the last-resort decode. Every byte maps to *something* in
@@ -1645,15 +1674,16 @@ fn classify_structured(text: &str, nonblank: &[&str]) -> Option<Family> {
         }
     }
 
-    // SQL dump (#1984). A dump carries rows: `INSERT INTO … VALUES (` or
-    // Postgres `COPY … FROM stdin`. Schema migrations are DDL only
-    // (`CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX`) and the dump
-    // extractor emits nothing for them, so `scan_file` junked the file
-    // ("no records extracted") and the migration was unsearchable. DDL
-    // alone returns None: the text fallback indexes it with line numbers,
-    // and the CSV probe below does not read a trailing `;` as a delimiter.
-    // Row data that starts past the sniff prefix is caught in
-    // `sniff_with_name`, which keeps reading when this prefix is schema.
+    // SQL dump (#1984, #2337). A dump carries top-level row data:
+    // `INSERT INTO … VALUES (` or Postgres `COPY … FROM stdin`. Matches
+    // inside comments, quotes, or dollar-quoted routine bodies do not
+    // count — a migration that mentions INSERT, or a function whose body
+    // inserts a row, is source. The dump extractor emits nothing for DDL,
+    // so treating that file as a dump junked it ("no records extracted").
+    // DDL alone returns None. A `.sql` name is then promoted to code in
+    // `sniff_bytes`; the CSV probe below does not read a trailing `;` as
+    // a delimiter. Row data that starts past the sniff prefix is caught
+    // in `sniff_with_name`.
     if sql_dump_has_rows(text.as_bytes()) {
         return Some(Family::SqlDump);
     }
@@ -1714,9 +1744,253 @@ fn scan_sql_row_data(mut reader: impl Read) -> bool {
     }
 }
 
-fn sql_dump_has_rows(bytes: &[u8]) -> bool {
+pub(crate) fn sql_dump_has_rows(bytes: &[u8]) -> bool {
     let mut probe = SqlRowProbe::default();
     probe.push(bytes) || probe.finish()
+}
+
+/// One step of [`SqlLex::feed`]. `n` visible code bytes were written to the
+/// caller buffer. `end_stmt` is a `;` outside strings, comments, dollar
+/// quotes, and parentheses.
+pub(crate) struct SqlLexStep {
+    pub n: u8,
+    pub end_stmt: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqlMode {
+    Code,
+    LineComment,
+    Block,
+    SQuote,
+    SQuoteEsc,
+    SQuoteEnd,
+    DQuote,
+    DQuoteEsc,
+    DQuoteEnd,
+    Tick,
+    TickEsc,
+    TickEnd,
+    DollarOpen,
+    Dollar,
+}
+
+/// Hides comments, quotes, and dollar-quoted bodies from the row-data probe,
+/// and tells a statement scanner where a top-level statement ends.
+///
+/// The probe used to match `INSERT INTO … VALUES (` anywhere in the bytes.
+/// A comment (`-- backfill: INSERT INTO t VALUES (1);`) or a PL/pgSQL body
+/// (`AS $$ … INSERT INTO audit VALUES (1); … $$`) then classified a schema
+/// file as a dump. The dump extractor emits no rows for that file, and
+/// `scan_file` junked it (#2337).
+pub(crate) struct SqlLex {
+    mode: SqlMode,
+    /// MySQL identifier quotes. Off for the row probe: a Markdown fence is
+    /// also backticks, and hiding them would miss `INSERT` inside a README
+    /// code block (#360). The statement scanner keeps them on.
+    mask_ticks: bool,
+    /// `-` or `/` in code, waiting for the second byte of `--` or `/*`.
+    hold: Option<u8>,
+    block_star: bool,
+    dollar_tag: Vec<u8>,
+    dollar_closer: Vec<u8>,
+    dollar_at: usize,
+    paren: i32,
+}
+
+impl Default for SqlLex {
+    fn default() -> Self {
+        Self {
+            mode: SqlMode::Code,
+            mask_ticks: true,
+            hold: None,
+            block_star: false,
+            dollar_tag: Vec::new(),
+            dollar_closer: Vec::new(),
+            dollar_at: 0,
+            paren: 0,
+        }
+    }
+}
+
+impl SqlLex {
+    pub(crate) fn feed(&mut self, b: u8, out: &mut [u8; 2]) -> SqlLexStep {
+        let mut n = 0usize;
+        let mut end_stmt = false;
+        // A held byte or an aborted `$` / quote is replayed by looping, not
+        // by recursion. Four steps covers hold-replay plus one abort.
+        for _ in 0..4 {
+            match self.mode {
+                SqlMode::LineComment => {
+                    if b == b'\n' {
+                        self.mode = SqlMode::Code;
+                    }
+                    break;
+                }
+                SqlMode::Block => {
+                    if self.block_star {
+                        self.block_star = false;
+                        if b == b'/' {
+                            self.mode = SqlMode::Code;
+                        } else if b == b'*' {
+                            self.block_star = true;
+                        }
+                    } else if b == b'*' {
+                        self.block_star = true;
+                    }
+                    break;
+                }
+                SqlMode::SQuoteEsc | SqlMode::DQuoteEsc | SqlMode::TickEsc => {
+                    self.mode = match self.mode {
+                        SqlMode::SQuoteEsc => SqlMode::SQuote,
+                        SqlMode::DQuoteEsc => SqlMode::DQuote,
+                        _ => SqlMode::Tick,
+                    };
+                    break;
+                }
+                SqlMode::SQuote | SqlMode::DQuote | SqlMode::Tick => {
+                    let (q, esc, end) = match self.mode {
+                        SqlMode::DQuote => (b'"', SqlMode::DQuoteEsc, SqlMode::DQuoteEnd),
+                        SqlMode::Tick => (b'`', SqlMode::TickEsc, SqlMode::TickEnd),
+                        _ => (b'\'', SqlMode::SQuoteEsc, SqlMode::SQuoteEnd),
+                    };
+                    if b == b'\\' {
+                        self.mode = esc;
+                    } else if b == q {
+                        self.mode = end;
+                    }
+                    break;
+                }
+                SqlMode::SQuoteEnd | SqlMode::DQuoteEnd | SqlMode::TickEnd => {
+                    let (q, inside) = match self.mode {
+                        SqlMode::DQuoteEnd => (b'"', SqlMode::DQuote),
+                        SqlMode::TickEnd => (b'`', SqlMode::Tick),
+                        _ => (b'\'', SqlMode::SQuote),
+                    };
+                    if b == q {
+                        self.mode = inside;
+                        break;
+                    }
+                    self.mode = SqlMode::Code;
+                    continue;
+                }
+                SqlMode::Dollar => {
+                    if self.dollar_at < self.dollar_closer.len()
+                        && b == self.dollar_closer[self.dollar_at]
+                    {
+                        self.dollar_at += 1;
+                        if self.dollar_at == self.dollar_closer.len() {
+                            self.mode = SqlMode::Code;
+                            self.dollar_at = 0;
+                        }
+                    } else if !self.dollar_closer.is_empty() && b == self.dollar_closer[0] {
+                        self.dollar_at = 1;
+                    } else {
+                        self.dollar_at = 0;
+                    }
+                    break;
+                }
+                SqlMode::DollarOpen => {
+                    if self.dollar_tag.is_empty() && b == b'$' {
+                        self.dollar_closer = b"$$".to_vec();
+                        self.dollar_at = 0;
+                        self.mode = SqlMode::Dollar;
+                        break;
+                    }
+                    if (self.dollar_tag.is_empty() && (b.is_ascii_alphabetic() || b == b'_'))
+                        || (!self.dollar_tag.is_empty()
+                            && self.dollar_tag.len() < 128
+                            && (b.is_ascii_alphanumeric() || b == b'_'))
+                    {
+                        self.dollar_tag.push(b);
+                        break;
+                    }
+                    if b == b'$' && !self.dollar_tag.is_empty() {
+                        let mut closer = Vec::with_capacity(self.dollar_tag.len() + 2);
+                        closer.push(b'$');
+                        closer.append(&mut self.dollar_tag);
+                        closer.push(b'$');
+                        self.dollar_closer = closer;
+                        self.dollar_at = 0;
+                        self.mode = SqlMode::Dollar;
+                        break;
+                    }
+                    // `$1` and other non-quotes. The `$` and the tag are not
+                    // keywords; the current byte is real code.
+                    self.dollar_tag.clear();
+                    self.mode = SqlMode::Code;
+                    continue;
+                }
+                SqlMode::Code => {
+                    if let Some(h) = self.hold.take() {
+                        if h == b'-' && b == b'-' {
+                            self.mode = SqlMode::LineComment;
+                            break;
+                        }
+                        if h == b'/' && b == b'*' {
+                            self.mode = SqlMode::Block;
+                            self.block_star = false;
+                            break;
+                        }
+                        self.emit_visible(h, out, &mut n, &mut end_stmt);
+                        continue;
+                    }
+                    if b == b'-' || b == b'/' {
+                        self.hold = Some(b);
+                        break;
+                    }
+                    if b == b'\'' {
+                        self.mode = SqlMode::SQuote;
+                        break;
+                    }
+                    if b == b'"' {
+                        self.mode = SqlMode::DQuote;
+                        break;
+                    }
+                    if b == b'`' && self.mask_ticks {
+                        self.mode = SqlMode::Tick;
+                        break;
+                    }
+                    if b == b'$' {
+                        self.dollar_tag.clear();
+                        self.mode = SqlMode::DollarOpen;
+                        break;
+                    }
+                    self.emit_visible(b, out, &mut n, &mut end_stmt);
+                    break;
+                }
+            }
+        }
+        SqlLexStep {
+            n: n as u8,
+            end_stmt,
+        }
+    }
+
+    /// A `-` or `/` held at EOF is code, not the start of a comment.
+    pub(crate) fn flush_hold(&mut self) -> Option<u8> {
+        if self.mode == SqlMode::Code {
+            self.hold.take()
+        } else {
+            self.hold = None;
+            None
+        }
+    }
+
+    fn emit_visible(&mut self, b: u8, out: &mut [u8; 2], n: &mut usize, end_stmt: &mut bool) {
+        if *n >= out.len() {
+            return;
+        }
+        if b == b'(' {
+            self.paren = self.paren.saturating_add(1);
+        } else if b == b')' {
+            self.paren = self.paren.saturating_sub(1);
+        } else if b == b';' && self.paren == 0 {
+            *end_stmt = true;
+        }
+        out[*n] = b;
+        *n += 1;
+    }
 }
 
 fn is_sql_ident(b: u8) -> bool {
@@ -1744,6 +2018,14 @@ struct SqlRowProbe {
     stdin_at: u8,
     /// `STDIN` letters are complete; the next byte decides the boundary.
     stdin_done: bool,
+    /// The next identifier is the first word of a statement. `INSERT` /
+    /// `COPY` count only there: a routine body (`BEGIN INSERT … END`) is
+    /// not a dump (#2337).
+    at_stmt: bool,
+    /// The current statement opened with `INSERT`.
+    stmt_insert: bool,
+    /// Comments, quotes, and dollar quotes are not row data (#2337).
+    lex: SqlLex,
 }
 
 const SQL_ROW_WIN: usize = 96;
@@ -1759,18 +2041,45 @@ impl Default for SqlRowProbe {
             from_ws: false,
             stdin_at: 0,
             stdin_done: false,
+            at_stmt: true,
+            stmt_insert: false,
+            // Backticks stay visible. ``` fences in a README are not MySQL
+            // identifier quotes; masking them hides the INSERT the dump
+            // sniff has to see (#360).
+            lex: SqlLex {
+                mask_ticks: false,
+                ..SqlLex::default()
+            },
         }
     }
 }
 
 impl SqlRowProbe {
     fn push(&mut self, chunk: &[u8]) -> bool {
-        chunk.iter().any(|&b| self.push_byte(b))
+        chunk.iter().any(|&b| self.feed(b))
     }
 
     /// EOF is a word boundary, so a statement that ends on `STDIN` still hits.
     fn finish(&mut self) -> bool {
-        self.push_byte(b'\n')
+        let flushed = self.lex.flush_hold().is_some_and(|b| self.push_byte(b));
+        flushed || self.push_byte(b'\n')
+    }
+
+    fn feed(&mut self, b: u8) -> bool {
+        let mut buf = [0u8; 2];
+        let step = self.lex.feed(b, &mut buf);
+        let hit = (0..step.n as usize).any(|i| self.push_byte(buf[i]));
+        if step.end_stmt {
+            self.at_stmt = true;
+            self.stmt_insert = false;
+            self.seen_copy = false;
+            self.seen_insert_into = false;
+            self.values_ws = false;
+            self.from_ws = false;
+            self.stdin_at = 0;
+            self.stdin_done = false;
+        }
+        hit
     }
 
     fn push_byte(&mut self, b: u8) -> bool {
@@ -1812,6 +2121,14 @@ impl SqlRowProbe {
         }
 
         if boundary && self.win.last().is_some_and(|c| is_sql_ident(*c)) {
+            // The first word decides whether this statement can be row data.
+            // `CREATE PROCEDURE … INSERT INTO t VALUES (1)` is still DDL.
+            if self.at_stmt {
+                self.at_stmt = false;
+                self.stmt_insert = self.ends_with_word(b"INSERT");
+                self.seen_copy = self.ends_with_word(b"COPY");
+                self.seen_insert_into = false;
+            }
             if self.seen_insert_into && self.ends_with_word(b"VALUES") {
                 if u == b'(' {
                     return true;
@@ -1823,12 +2140,13 @@ impl SqlRowProbe {
             if self.seen_copy && self.ends_with_word(b"FROM") && u.is_ascii_whitespace() {
                 self.from_ws = true;
             }
-            if self.ends_with_word(b"INTO") && self.win_is_insert_into() {
+            if self.stmt_insert && self.ends_with_word(b"INTO") && self.win_is_insert_into() {
                 self.seen_insert_into = true;
             }
-            if self.ends_with_word(b"COPY") {
-                self.seen_copy = true;
-            }
+        } else if self.at_stmt && boundary && !u.is_ascii_whitespace() {
+            self.at_stmt = false;
+            self.stmt_insert = false;
+            self.seen_copy = false;
         }
 
         self.win.push(u);
@@ -3984,11 +4302,13 @@ mod tests {
         );
     }
 
-    /// #1984: a schema migration is DDL with no row data. The dump extractor
-    /// emits nothing for it, and `scan_file` then junks the file, so the
-    /// column definition never becomes searchable.
+    /// #1984 / #2337: a schema migration is DDL with no row data. The dump
+    /// extractor emits nothing for it, and `scan_file` then junks the file.
+    /// Content classification stays text (so a non-`.sql` name is not forced
+    /// into the code family). A `.sql` name is indexed as code: the table is
+    /// a symbol and the column text is in the body.
     #[test]
-    fn schema_only_sql_migration_is_text_not_an_empty_dump() {
+    fn schema_only_sql_migration_is_code_not_an_empty_dump() {
         let migration = "-- add users\n\
                          CREATE TABLE users (\n\
                          id INTEGER PRIMARY KEY,\n\
@@ -3999,28 +4319,29 @@ mod tests {
                          ALTER TABLE users ADD COLUMN name TEXT;\n\
                          \n\
                          CREATE INDEX idx_users_email ON users (email);\n";
-        assert_eq!(
+        assert_ne!(
             classify(migration),
-            Family::TxtLines,
-            "DDL with no INSERT/COPY is source text, not a dump"
+            Family::SqlDump,
+            "DDL with no INSERT/COPY is not a dump"
         );
 
         // One statement per line, every line ending in `;`. That shape is a
-        // consistent `;`-delimited "CSV"; it must still be text.
+        // consistent `;`-delimited "CSV"; it must still not be a dump.
         let one_liners = "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\n\
                           ALTER TABLE users ADD COLUMN name TEXT;\n\
                           CREATE INDEX idx_users_email ON users (email);\n";
-        let one_line_family = classify(one_liners);
-        assert!(
-            matches!(one_line_family, Family::TxtLines | Family::TxtProse),
-            "semicolon-terminated DDL classified {one_line_family:?}"
+        assert_ne!(
+            classify(one_liners),
+            Family::SqlDump,
+            "semicolon-terminated DDL classified {:?}",
+            classify(one_liners)
         );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("001_users.sql");
         std::fs::write(&path, migration).unwrap();
         let sn = sniff(&path).unwrap();
-        assert_eq!(sn.family, Family::TxtLines);
+        assert_eq!(sn.family, Family::Code);
         let mut recs = Vec::new();
         let stats = crate::extract::extract(&path, &sn, None, &mut |r| {
             recs.push(r);
@@ -4033,13 +4354,78 @@ mod tests {
         );
         assert!(
             recs.iter().any(|r| {
-                r.fields
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| s.contains("email"))
-                    && r.fields.get("start_line").is_some()
+                r.fields.get("language").and_then(|v| v.as_str()) == Some("sql")
+                    && r.fields
+                        .get("defs")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| {
+                            s.contains("table users") && s.contains("index idx_users_email")
+                        })
+                    && r.fields
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.contains("email"))
             }),
-            "the column definition must be searchable with a line number: {recs:?}"
+            "the column definition must be searchable as code: {recs:?}"
+        );
+        assert!(
+            recs.iter().any(|r| {
+                r.fields.get("name").and_then(|v| v.as_str()) == Some("users")
+                    && r.fields.get("kind").and_then(|v| v.as_str()) == Some("table")
+                    && r.fields.get("line").is_some()
+            }),
+            "the table is its own declaration: {recs:?}"
+        );
+    }
+
+    /// #2337: a comment or a routine body that mentions `INSERT`/`COPY` is
+    /// not a dump. The rule-engine file in the field report is this shape.
+    #[test]
+    fn sql_routine_and_comment_inserts_are_code_not_junk() {
+        let rule = "-- backfill: INSERT INTO rules VALUES (1);\n\
+                     CREATE TABLE rules (\n\
+                     id integer primary key,\n\
+                     code text not null\n\
+                     );\n\
+                     CREATE OR REPLACE FUNCTION apply_slope(percent numeric)\n\
+                     RETURNS text LANGUAGE plpgsql AS $$\n\
+                     BEGIN\n\
+                       INSERT INTO audit(note) VALUES ('slope');\n\
+                       RETURN 'low';\n\
+                     END;\n\
+                     $$;\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("30_rule_engine.sql");
+        std::fs::write(&path, rule).unwrap();
+        let sn = sniff(&path).unwrap();
+        assert_eq!(
+            sn.family,
+            Family::Code,
+            "routine DDL classified {:?}",
+            sn.family
+        );
+        let mut recs = Vec::new();
+        let stats = crate::extract::extract(&path, &sn, None, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        assert!(stats.records > 0, "a routine file must not be junked");
+        let defs = recs
+            .iter()
+            .find_map(|r| r.fields.get("defs").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        assert!(
+            defs.contains("table rules") && defs.contains("function apply_slope"),
+            "{defs}"
+        );
+        let body = recs
+            .iter()
+            .find_map(|r| r.fields.get("body").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        assert!(
+            body.contains("apply_slope") && body.contains("'low'"),
+            "{body}"
         );
     }
 
@@ -4113,8 +4499,9 @@ mod tests {
         let schema = dir.path().join("schema.sql");
         std::fs::write(&schema, &body).unwrap();
         let schema_sn = sniff(&schema).unwrap();
-        assert!(
-            matches!(schema_sn.family, Family::TxtLines | Family::TxtProse),
+        assert_eq!(
+            schema_sn.family,
+            Family::Code,
             "schema past the prefix classified {:?}",
             schema_sn.family
         );
@@ -4148,6 +4535,8 @@ mod tests {
             "COPY users (id, name) FROM stdin;",
             "COPY public.users FROM STDIN",
             "INSERT\nINTO\nt\nVALUES\n(1)",
+            // #360: a README fence is backticks, not a MySQL identifier quote.
+            "# doc\n\n```sql\nCREATE TABLE t (id int);\nINSERT INTO t VALUES (1);\n```\n",
         ];
         // The opener and the tuple can be far apart: a wide column list, or
         // pg_dump's schema section before the first COPY.
@@ -4184,12 +4573,32 @@ mod tests {
             "COPYRIGHT notice; FROM stdin;",
             "INSERT INTO t VALUES 1;",
             "REINSERT INTO t VALUES (1);",
+            "-- INSERT INTO t VALUES (1);\nCREATE TABLE t (a int);",
+            "/* COPY t FROM stdin; */\nCREATE TABLE t (a int);",
+            "CREATE FUNCTION f() AS $$\nBEGIN\n  INSERT INTO t VALUES (1);\nEND;\n$$;",
+            "CREATE FUNCTION f() AS $body$\n  INSERT INTO t VALUES (1);\n$body$;",
+            "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); END;",
+            "SELECT 'INSERT INTO t VALUES (1)';",
         ] {
             assert!(
                 !sql_dump_has_rows(sample.as_bytes()),
                 "false hit on {sample:?}"
             );
         }
+        // The same INSERT after the routine is a real dump, even when the
+        // opening `$` of the dollar quote is the last byte of a chunk.
+        let mixed = "CREATE FUNCTION f() AS $$\n  INSERT INTO t VALUES (1);\n$$;\n\
+                     INSERT INTO real_rows VALUES (2);\n";
+        assert!(
+            sql_dump_has_rows(mixed.as_bytes()),
+            "top-level INSERT after a routine must stay a dump"
+        );
+        let bytes = mixed.as_bytes();
+        let dollar = mixed.find('$').unwrap();
+        let mut probe = SqlRowProbe::default();
+        let hit =
+            probe.push(&bytes[..dollar + 1]) || probe.push(&bytes[dollar + 1..]) || probe.finish();
+        assert!(hit, "dollar quote split across a chunk hid a later INSERT");
     }
 
     /// #1142 class 1: markdown opening with an HTML fragment (Hugo front-matter

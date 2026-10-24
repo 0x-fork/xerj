@@ -4022,6 +4022,43 @@ mod clustering_key_tests {
         assert_eq!(clusters.len(), 1, "{clusters:#?}");
     }
 
+    /// #2337: a hand-written DDL file, including a routine whose body
+    /// inserts a row, is code. `scan_file` must not record it as junk.
+    #[test]
+    fn a_handwritten_sql_schema_is_code_not_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "-- rule engine\n\
+             CREATE TABLE rules (\n\
+             id integer primary key,\n\
+             code text not null\n\
+             );\n\
+             CREATE OR REPLACE FUNCTION apply_slope(percent numeric)\n\
+             RETURNS text LANGUAGE plpgsql AS $$\n\
+             BEGIN\n\
+               INSERT INTO audit(note) VALUES ('slope');\n\
+               RETURN 'low';\n\
+             END;\n\
+             $$;\n";
+        let scanned = scan(dir.path(), "30_rule_engine.sql", body);
+        assert!(scanned.junk.is_none(), "DDL was junked: {:?}", scanned.junk);
+        assert_eq!(
+            scanned.sniffed.as_ref().map(|s| s.family),
+            Some(Family::Code)
+        );
+        let defs: Vec<String> = scanned
+            .sketches
+            .iter()
+            .filter_map(|s| s.fields.get("defs"))
+            .flat_map(|v| v.examples.iter().chain(v.raw_values.iter()).cloned())
+            .collect();
+        assert!(
+            defs.iter()
+                .any(|d| d.contains("table rules") && d.contains("function apply_slope")),
+            "defs={defs:?} junk={:?}",
+            scanned.junk
+        );
+    }
+
     /// The other half: a data file's own column names ARE the key, so real
     /// schemas still drive clustering.
     #[test]
