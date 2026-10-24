@@ -12,7 +12,9 @@
 //!     Crossing either rejects writes with HTTP 429
 //!     `circuit_breaking_exception` (so a 429 beats the OOM-killer), and
 //!     wires the hitherto-inert `max_query_memory_mb` into a per-query
-//!     allocation guard.
+//!     allocation guard. An analyze reservation charges in-flight token
+//!     spikes before the next RSS sample, so several bulks cannot all pass
+//!     one sample and allocate together (#1122).
 //!   * **item 2** — a global search-concurrency pool sized from
 //!     `max_concurrent_searches` (previously a hardcoded per-index
 //!     `Semaphore::new(64)`, i.e. no global cap).
@@ -44,6 +46,42 @@ static GOVERNOR: OnceLock<Arc<ResourceGovernor>> = OnceLock::new();
 /// `Engine::spawn_resource_sampler`), so this cadence is honoured even when the
 /// tokio pool is saturated.
 pub const SAMPLE_INTERVAL_MS: u64 = 100;
+
+/// Bytes of analyze-time reservation charged per raw JSON input byte (#1122).
+///
+/// `document_limit` measured about 56 bytes of RSS per token for a
+/// `Vec<String>` of the word `word ` (2026-10-23, 8,388,605 input bytes).
+/// The densest input that still produces one token per two bytes is `"a "`,
+/// so 28 bytes of reservation per input byte covers that spike. One token
+/// per byte is outside this factor; the 8 MiB document ceiling bounds that
+/// input. Eight such bulks are admitted only while the sum of reservations
+/// stays under the watermark.
+pub const ANALYZE_RESERVE_PER_INPUT_BYTE: u64 = 28;
+
+/// Reservation for a raw JSON batch of `raw_json_bytes`.
+pub fn analyze_reserve_bytes(raw_json_bytes: u64) -> u64 {
+    raw_json_bytes.saturating_mul(ANALYZE_RESERVE_PER_INPUT_BYTE)
+}
+
+/// `true` when `request` bytes of analyze reservation still fit.
+///
+/// A watermark of `0` is the disabled breaker: every request fits. Otherwise
+/// the request fails when `observed + already_reserved + request` reaches
+/// the watermark. The comparison is `>=`, matching RSS admission.
+pub fn analyze_reservation_fits(
+    watermark: u64,
+    observed: u64,
+    already_reserved: u64,
+    request: u64,
+) -> bool {
+    if watermark == 0 {
+        return true;
+    }
+    observed
+        .saturating_add(already_reserved)
+        .saturating_add(request)
+        < watermark
+}
 
 /// Process-wide resource governor. See the module docs.
 pub struct ResourceGovernor {
@@ -83,6 +121,10 @@ pub struct ResourceGovernor {
     memory_watermark_bytes: AtomicU64,
     /// Last sampled resident set size of this process.
     rss_bytes: AtomicU64,
+    /// Bytes reserved for in-flight analysis spikes that the RSS sample has
+    /// not observed yet (#1122). Released once those tokens exist, so the
+    /// next admission sees them in live RSS instead of counting them twice.
+    analyze_reserved: Arc<AtomicU64>,
     /// Latched: last sample crossed the RSS watermark.
     memory_tripped: AtomicBool,
     /// The effective watermark in force when the breaker last engaged (#1250).
@@ -206,6 +248,69 @@ impl ResourceGovernor {
             )));
         }
         Ok(())
+    }
+
+    /// Reserve `bytes` of upcoming analysis allocations (#1122).
+    ///
+    /// Callers pass [`analyze_reserve_bytes`] of the raw JSON, before the
+    /// batch is parsed. The check uses the max of the sampled RSS and a live
+    /// probe, plus reservations already held, and rechecks after the atomic
+    /// add so two bulks cannot both pass the same snapshot. A watermark of
+    /// `0`, or a zero request, reserves nothing. The guard releases on drop.
+    pub(crate) fn reserve_analyze(&self, bytes: u64) -> Result<AnalyzeReservation, XerjError> {
+        if bytes == 0 || self.memory_watermark_bytes.load(Ordering::Relaxed) == 0 {
+            return Ok(AnalyzeReservation::none());
+        }
+        if self.memory_tripped.load(Ordering::Relaxed) {
+            return Err(self.analyze_reservation_refused(bytes));
+        }
+        let watermark = self.memory_watermark_bytes.load(Ordering::Relaxed);
+        let observed = self.observed_process_memory();
+        let already = self.analyze_reserved.load(Ordering::Acquire);
+        if !analyze_reservation_fits(watermark, observed, already, bytes) {
+            return Err(self.analyze_reservation_refused(bytes));
+        }
+        let prev = self.analyze_reserved.fetch_add(bytes, Ordering::AcqRel);
+        let watermark = self.memory_watermark_bytes.load(Ordering::Relaxed);
+        if watermark == 0 {
+            self.analyze_reserved.fetch_sub(bytes, Ordering::AcqRel);
+            return Ok(AnalyzeReservation::none());
+        }
+        let observed = self.observed_process_memory();
+        if analyze_reservation_fits(watermark, observed, prev, bytes) {
+            return Ok(AnalyzeReservation {
+                slot: Some(Arc::clone(&self.analyze_reserved)),
+                bytes,
+            });
+        }
+        self.analyze_reserved.fetch_sub(bytes, Ordering::AcqRel);
+        Err(self.analyze_reservation_refused(bytes))
+    }
+
+    fn observed_process_memory(&self) -> u64 {
+        self.rss_bytes
+            .load(Ordering::Relaxed)
+            .max(current_process_memory_bytes())
+    }
+
+    fn analyze_reservation_refused(&self, request: u64) -> XerjError {
+        const MIB: u64 = 1024 * 1024;
+        let observed = self.observed_process_memory();
+        let reserved = self.analyze_reserved.load(Ordering::Relaxed);
+        let watermark = self.memory_watermark_bytes.load(Ordering::Relaxed);
+        XerjError::circuit_breaking(format!(
+            "[parent] real memory circuit breaker tripped: rss={}MB plus {}MB already reserved \
+             for analysis plus {}MB for this batch would reach watermark={}MB ({}% of \
+             limit={}MB); writes rejected to prevent an out-of-memory kill (raise \
+             limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB, or live with \
+             PUT _cluster/settings {{\"persistent\":{{\"indices.breaker.total.limit\":\"<N>gb\"}}}})",
+            observed / MIB,
+            reserved / MIB,
+            request / MIB,
+            watermark / MIB,
+            pct_of(watermark, self.memory_limit_bytes),
+            self.memory_limit_bytes / MIB,
+        ))
     }
 
     /// Whether the parent RSS memory breaker is currently engaged (issue
@@ -1151,6 +1256,7 @@ fn build(config: &Config) -> ResourceGovernor {
         } else {
             0
         }),
+        analyze_reserved: Arc::new(AtomicU64::new(0)),
         memory_tripped: AtomicBool::new(startup_starved),
         memory_trip_watermark: AtomicU64::new(if startup_starved {
             memory_watermark_bytes
@@ -1573,6 +1679,32 @@ fn parse_byte_size(s: &str) -> Option<u64> {
 // Small formatting helpers
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Releases an analyze reservation when the batch's tokens exist (#1122).
+#[derive(Debug)]
+pub(crate) struct AnalyzeReservation {
+    slot: Option<Arc<AtomicU64>>,
+    bytes: u64,
+}
+
+impl AnalyzeReservation {
+    pub(crate) fn none() -> Self {
+        Self {
+            slot: None,
+            bytes: 0,
+        }
+    }
+}
+
+impl Drop for AnalyzeReservation {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            if self.bytes > 0 {
+                slot.fetch_sub(self.bytes, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
 fn pct_of(part: u64, whole: u64) -> u64 {
     if whole == 0 {
         0
@@ -1669,6 +1801,53 @@ fn human_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analyze_reservation_fits_under_the_watermark_and_rejects_at_it() {
+        assert!(analyze_reservation_fits(0, 100, 100, 100));
+        assert!(analyze_reservation_fits(1_000, 100, 100, 799));
+        assert!(!analyze_reservation_fits(1_000, 100, 100, 800));
+        assert!(!analyze_reservation_fits(1_000, 900, 50, 50));
+        assert_eq!(analyze_reserve_bytes(8 << 20), (8 << 20) * 28);
+    }
+
+    /// The guard is a thin wrapper around [`analyze_reservation_fits`]. The
+    /// watermark sits above a live probe so the test does not depend on this
+    /// process's RSS, and a second reserve sees the first until it is dropped.
+    #[test]
+    fn analyze_reservation_releases_and_sees_a_prior_reserve() {
+        let governor = build(&Config::default());
+        let live = governor.observed_process_memory();
+        let slack = 512 * 1024 * 1024;
+        governor
+            .memory_watermark_bytes
+            .store(live.saturating_add(slack), Ordering::Relaxed);
+        governor.rss_bytes.store(live, Ordering::Relaxed);
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+
+        let first = governor.reserve_analyze(32 * 1024 * 1024).unwrap();
+        assert_eq!(
+            governor.analyze_reserved.load(Ordering::Relaxed),
+            32 * 1024 * 1024
+        );
+        let refused = governor.reserve_analyze(480 * 1024 * 1024 + 1).unwrap_err();
+        let text = refused.to_string();
+        assert!(text.contains("circuit breaker"), "{text}");
+        assert!(text.contains("writes rejected"), "{text}");
+        assert!(text.contains("limits.max_process_memory_mb"), "{text}");
+        assert_eq!(refused.http_status(), 429);
+
+        drop(first);
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+        let second = governor.reserve_analyze(400 * 1024 * 1024).unwrap();
+        drop(second);
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+
+        governor.memory_watermark_bytes.store(0, Ordering::Relaxed);
+        let disabled = governor.reserve_analyze(u64::MAX).unwrap();
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+        drop(disabled);
+    }
 
     #[test]
     fn segment_hydration_resolver_is_cgroup_proportional_and_explicit() {

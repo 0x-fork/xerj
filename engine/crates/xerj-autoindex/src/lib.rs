@@ -3266,6 +3266,18 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Scan-time skip for a whole-file family over `--max-file-bytes`.
+///
+/// Names the file's actual size and the flag that raises this cap. It does
+/// not raise the 8 MiB per-document ceiling.
+fn oversized_family_reason(family: &str, size: u64, max_file_bytes: u64) -> String {
+    format!(
+        "oversized for non-streaming family {family} ({} > {}); raise --max-file-mb",
+        human_size(size),
+        human_size(max_file_bytes),
+    )
+}
+
 fn scan_file(
     path: &Path,
     size: u64,
@@ -3327,11 +3339,7 @@ fn scan_file(
     if whole_file && size > max_file_bytes {
         out.junk = Some((
             "skipped".into(),
-            format!(
-                "oversized for non-streaming family {} (> {})",
-                sn.family.as_str(),
-                human_size(max_file_bytes),
-            ),
+            oversized_family_reason(sn.family.as_str(), size, max_file_bytes),
         ));
         out.sniffed = Some(sn);
         return out;
@@ -9766,21 +9774,16 @@ fn run_index_report_inner(
                             truncated_files.lock().unwrap().push(f.rel.clone());
                         }
                         if stats.oversize_values > 0 {
-                            if stats.records > 0 {
-                                pr.note(&format!(
-                                    "{}: {} JSON value(s) were not indexed (over the {}-byte limit for one document). The rest of the file was indexed.",
-                                    f.rel,
-                                    stats.oversize_values,
-                                    xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
-                                ));
+                            let ceiling = xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES;
+                            let tail = if stats.records > 0 {
+                                "The rest of the file was indexed."
                             } else {
-                                pr.note(&format!(
-                                    "{}: {} JSON value(s) were not indexed (over the {}-byte limit for one document).",
-                                    f.rel,
-                                    stats.oversize_values,
-                                    xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
-                                ));
-                            }
+                                "Nothing else in the file was indexed."
+                            };
+                            pr.note(&format!(
+                                "{} ({} bytes): {} JSON value(s) were not indexed (over the {ceiling}-byte limit for one document). {tail} This ceiling is fixed and is not raised by --max-file-mb or limits.max_process_memory_mb; split the value into smaller documents.",
+                                f.rel, f.size, stats.oversize_values,
+                            ));
                         }
                     }
                     Err(e) => {
@@ -14544,6 +14547,14 @@ mod legacy_rebuild_argv_tests {
         assert_eq!(human_size(10 << 20), "10 MB");
         assert_eq!(human_size(4096), "4096 bytes");
         assert_eq!(human_size(0), "0 bytes");
+    }
+
+    #[test]
+    fn an_oversized_family_skip_names_the_file_size_and_the_flag() {
+        assert_eq!(
+            oversized_family_reason("json", 3 << 30, 2 << 30),
+            "oversized for non-streaming family json (3 GB > 2 GB); raise --max-file-mb"
+        );
     }
 
     /// #1233 back-compat: an index built before sub-GB caps existed serialised

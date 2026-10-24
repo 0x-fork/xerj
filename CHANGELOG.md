@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` no longer aborts the node on one large JSON file (#1122).
+  A bulk whose analysis would cross the memory watermark is rejected with
+  HTTP 429 before the documents are parsed, so several in-flight bulks cannot
+  allocate their token strings together. Uncompressed JSON larger than 64 MiB
+  is read one value at a time; a value over the fixed 8 MiB document ceiling
+  is skipped with a note that names the file, its size, and that
+  `--max-file-mb` and `limits.max_process_memory_mb` do not raise that
+  ceiling. A file over the scan cap names its size and `--max-file-mb`.
+
 - `POST /{index}/_refresh` makes recent writes searchable without waiting for
   a background segment merge to finish, and a multi-index or wildcard refresh
   is not serialized behind one busy index. The route used to call the
