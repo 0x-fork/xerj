@@ -245,8 +245,8 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
 
 - The default process memory cap on a host under 16 GiB is half of that
   RAM, and segment merges follow it. This improves
-  [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays
-  open (PR [#2340](https://github.com/xerj-org/xerj/pull/2340)). An 8 GiB
+  [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays open
+  (PR [#2340](https://github.com/xerj-org/xerj/pull/2340)). An 8 GiB
   machine used to take the 8 GiB step, so the budget was the whole machine;
   a merge storm on Windows 10 stayed up only after
   `XERJ_MAX_PROCESS_MEMORY_MB=4096`. That host now gets a 4 GiB cap. A
@@ -334,8 +334,8 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
 
 - The node no longer aborts when a helper thread or a merge buffer cannot
   be allocated. This improves
-  [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays
-  open (PR [#2315](https://github.com/xerj-org/xerj/pull/2315)). An
+  [#1122](https://github.com/xerj-org/xerj/issues/1122); the issue stays open
+  (PR [#2315](https://github.com/xerj-org/xerj/pull/2315)). An
   in-process shard call starts its 8 MiB thread with `pthread_create` and,
   if the OS refuses, returns `could not start the shard call` without
   running the handler. `PUT /{index}/_doc/{id}` and
