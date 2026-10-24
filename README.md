@@ -342,9 +342,15 @@ Twenty-six clients can register `xerj mcp` as a local stdio server. The entry is
 two fields - the absolute path to the binary, and `mcp` as its only argument - but where that entry
 lives and which key wraps it differ per client. `tested` means the server was registered in that
 client and `xerj_search` appeared in its tool list; `untested` means the path and shape are
-transcribed from the client's own documentation and nobody has run it yet. Only the OpenCode row
-has been run: v2.1.2 on Windows against `xerj` v1.0.0-rc.97, which answered `initialize` and
-`tools/list` with its full tool list. Correcting an `untested` row is a welcome first PR.
+transcribed from the client's own documentation and nobody has run it yet. Two rows have been run.
+OpenCode v2.1.2 on Windows against `xerj` v1.0.0-rc.97 answered `initialize` and `tools/list`
+with its full tool list. Cline CLI 3.0.73 on Linux against `xerj` v1.0.0-rc.98 loaded this
+section's `mcpServers` block at `~/.cline/data/settings/cline_mcp_settings.json`. `xerj_search`
+appeared in the tool list Cline handed the model (named `xerj__xerj_search`) among that binary's
+20 tools, and Cline executed one `xerj_search` call. The model turn was a local OpenAI-compatible
+stub, because no provider key was available; the MCP server was the real `xerj mcp` process. The
+IDE's MCP Servers > Configure button was not part of that run. Correcting an `untested` row is a
+welcome first PR.
 
 | Client | Config file | Key | Note | Tested |
 |---|---|---|---|---|
@@ -356,7 +362,7 @@ has been run: v2.1.2 on Windows against `xerj` v1.0.0-rc.97, which answered `ini
 | GitHub Copilot in VS Code | `.vscode/mcp.json` | `servers` | needs `"type": "stdio"`; the portable `.mcp.json` uses `mcpServers` | untested |
 | Windsurf | `%APPDATA%\devin\mcp_config.json`, `~/.config/devin/mcp_config.json` | `mcpServers` | the path is Devin's now, not `~/.codeium/windsurf` | untested |
 | Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json`, `~/Library/Application Support/Claude/claude_desktop_config.json`, `~/.config/Claude/claude_desktop_config.json` | `mcpServers` | quit the app fully, not just the window | untested |
-| Cline | `~/.cline/data/settings/cline_mcp_settings.json` (CLI); the IDE opens it from MCP Servers > Configure | `mcpServers` | `disabled` and `autoApprove` are Cline-specific | untested |
+| Cline | `~/.cline/data/settings/cline_mcp_settings.json` (CLI); the IDE opens it from MCP Servers > Configure | `mcpServers` | `disabled` and `autoApprove` are Cline-specific; the CLI run did not need them | tested |
 | Roo Code | `.roo/mcp.json` in the project, or `<VS Code User>/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json` | `mcpServers` | the project entry wins on name clashes | untested |
 | Kilo Code | `kilo.jsonc` or `.kilo/kilo.jsonc` in the project, `~/.config/kilo/kilo.jsonc` global | `mcp` | one command array, like OpenCode | untested |
 | Continue | `~/.continue/config.yaml`, or any file in `.continue/mcpServers/` | `mcpServers` | a YAML list, not a map; Agent mode only | untested |
@@ -368,7 +374,7 @@ has been run: v2.1.2 on Windows against `xerj` v1.0.0-rc.97, which answered `ini
 | Kiro | `.kiro/settings/mcp.json` in the workspace, `~/.kiro/settings/mcp.json` user | `mcpServers` | `${VAR}` expansion needs approval | untested |
 | Antigravity | `~/.gemini/config/mcp_config.json`, or `.agents/mcp_config.json` in the workspace | `mcpServers` | remote servers use `serverUrl` | untested |
 | OpenClaw | `~/.openclaw/openclaw.json` (JSON5) | `mcp.servers` | `transport: "stdio"` | untested |
-| DeepSeek Harness (dsh) | `$DSH_HOME/cordis.patch.yml`, or a profile patch | `- insert:` with `@deepseek-ai/dsh-mcp-client` | one plugin instance per server | untested |
+| [DeepSeek Harness (dsh)](dsh/) | `$DSH_HOME/cordis.patch.yml`, or a profile patch | `- insert:` with `@deepseek-ai/dsh-mcp-client` | one plugin instance per server | untested |
 | Warp | Settings > Agents > MCP servers, or `~/.warp/.mcp.json` and `.warp/.mcp.json` in the project | `mcpServers` | `working_directory`, not `cwd` | untested |
 | Augment Code | `~/.augment/settings.json` for the Auggie CLI; the IDE uses its own panel | `mcpServers` | that file does not drive the IDE | untested |
 | Qwen Code | `~/.qwen/settings.json`, or `.qwen/settings.json` in the project | `mcpServers` | `mcp.allowed` can silently hide it | untested |
@@ -434,7 +440,7 @@ context servers, and OpenClaw nests them under `mcp`:
 {mcp: {servers: {xerj: {command: "/abs/path/to/xerj", args: ["mcp"], transport: "stdio"}}}}
 ```
 
-DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.yml`, or in a profile patch at `$DSH_HOME/profiles/<profile>/cordis.patch.yml`. If that file is only `[]`, replace the array with the block below; appending under `[]` is not valid YAML. `env` and `cwd` are optional stdio fields (`args` defaults to `[]`, `env` to `{}`, `cwd` to `""`). When the node is not running `--insecure`, add `XERJ_AUTH: "ApiKey <key>"` under `env`:
+DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.yml`, or in a profile patch at `$DSH_HOME/profiles/<profile>/cordis.patch.yml`. The same block is the profile bundle in [`dsh/`](dsh/), and its `command` is `xerj` on `PATH`. If that file is only `[]`, replace the array with the block below; appending under `[]` is not valid YAML. `env` and `cwd` are optional stdio fields (`args` defaults to `[]`, `env` to `{}`, `cwd` to `""`). When the node is not running `--insecure`, add `XERJ_AUTH: "ApiKey <key>"` under `env`:
 
 ```yaml
 # $DSH_HOME/cordis.patch.yml
@@ -444,7 +450,7 @@ DeepSeek Harness loads one MCP server as one plugin in `$DSH_HOME/cordis.patch.y
       config:
         serverName: xerj
         transport: stdio
-        command: /abs/path/to/xerj
+        command: xerj
         args:
           - mcp
         env:

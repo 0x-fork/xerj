@@ -112,6 +112,30 @@ pub fn number_of_replicas_from_settings(settings: &serde_json::Value) -> u32 {
         .unwrap_or(0)
 }
 
+/// Replica acknowledgements a document write needs before the caller is told it landed.
+///
+/// `placed` is how many replicas the create entry named, not how many are
+/// still in sync. Copies are that count plus the primary. A quorum is
+/// `copies / 2 + 1` (a majority of the group). The primary has already
+/// applied the write, so it counts as one and the return value is the
+/// number of replica confirmations still required.
+///
+/// | placed replicas | copies | quorum | replica acks |
+/// | --- | --- | --- | --- |
+/// | 0 | 1 | 1 | 0 |
+/// | 1 | 2 | 2 | 1 |
+/// | 2 | 3 | 2 | 1 |
+/// | 3 | 4 | 3 | 2 |
+///
+/// This is the majority of the replication group. [`crate::replication::ReplicationMode::Quorum`]
+/// is a different helper (a majority of replicas only, not counting the
+/// primary) and is not the document path.
+pub fn replica_quorum_acks(placed: usize) -> usize {
+    let copies = placed.saturating_add(1);
+    let quorum = copies / 2 + 1;
+    quorum.saturating_sub(1)
+}
+
 /// Assignments embedded in a `CreateIndex` schema envelope, if any.
 ///
 /// A schema that is not the replicated envelope — including the `"{}"`
@@ -407,6 +431,11 @@ mod tests {
         let flat = serde_json::json!({"number_of_replicas": 1});
         assert_eq!(number_of_replicas_from_settings(&flat), 1);
         assert_eq!(number_of_replicas_from_settings(&serde_json::json!({})), 0);
+        assert_eq!(replica_quorum_acks(0), 0);
+        assert_eq!(replica_quorum_acks(1), 1);
+        assert_eq!(replica_quorum_acks(2), 1);
+        assert_eq!(replica_quorum_acks(3), 2);
+        assert_eq!(replica_quorum_acks(4), 2);
         assert_eq!(
             replica_index_name("orders", 1).as_deref(),
             Some(".xerj_replica_orders_1")

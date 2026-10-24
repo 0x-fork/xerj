@@ -18,6 +18,11 @@
 //! one element, over that ceiling is skipped and named — it is not indexed
 //! (#1122). Files at or under the ceiling keep the DOM path so existing
 //! locators stay byte-identical.
+//!
+//! An uncompressed file larger than [`MAX_WHOLE_FILE`] is not loaded at all.
+//! A cursor walks it from disk and keeps at most one document-sized value.
+//! Gzip stays on the in-memory cap: the uncompressed length is not known
+//! until the bytes are inflated.
 
 use super::{
     emit_document_with_fields, ensure_text_passage, flatten_object, ExtractStats, FieldOrigin,
@@ -29,8 +34,16 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::Path;
+
+/// Sentence appended to a skip that the 8 MiB document ceiling caused.
+///
+/// `--max-file-mb` is the scan cap (default 2 GiB). `limits.max_process_memory_mb`
+/// is the process watermark. Neither raises this ceiling.
+const FIXED_DOCUMENT_CEILING: &str =
+    "This ceiling is fixed and is not raised by --max-file-mb or limits.max_process_memory_mb";
 
 pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
     extract_limited(
@@ -42,13 +55,33 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
 }
 
 fn extract_limited(path: &Path, gzip: bool, sink: Sink, limit: usize) -> Result<ExtractStats> {
+    extract_with_whole_file_cap(path, gzip, sink, limit, MAX_WHOLE_FILE)
+}
+
+fn extract_with_whole_file_cap(
+    path: &Path,
+    gzip: bool,
+    sink: Sink,
+    limit: usize,
+    whole_file_cap: u64,
+) -> Result<ExtractStats> {
+    // Uncompressed JSON past the in-memory cap is walked from disk. The
+    // 8–64 MiB window stays on `stream_large` so its locators stay the ones
+    // the DOM path produced.
+    if !gzip {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() && meta.len() > whole_file_cap {
+                return stream_uncompressed_over_cap(path, meta.len(), limit, sink);
+            }
+        }
+    }
     let mut stats = ExtractStats::default();
-    let Some(bytes) = super::read_whole(path, gzip, MAX_WHOLE_FILE)? else {
+    let Some(bytes) = super::read_whole(path, gzip, whole_file_cap)? else {
         stats.junk += 1;
         stats.refusal = Some(format!(
-            "{} is larger than {} bytes; a JSON file over that size is not read. Split it into smaller files",
+            "{} is larger than {whole_file_cap} bytes; a JSON file over that size is not read. \
+             Split it into smaller files. {FIXED_DOCUMENT_CEILING}",
             file_label(path),
-            MAX_WHOLE_FILE
         ));
         return Ok(stats);
     };
@@ -477,9 +510,13 @@ fn file_label(path: &Path) -> String {
 }
 
 fn finish_empty_refusal(path: &Path, nbytes: usize, limit: usize, stats: &mut ExtractStats) {
+    finish_empty_refusal_len(path, nbytes as u64, limit, stats);
+}
+
+fn finish_empty_refusal_len(path: &Path, nbytes: u64, limit: usize, stats: &mut ExtractStats) {
     if stats.records == 0 && stats.oversize_values > 0 && stats.refusal.is_none() {
         stats.refusal = Some(format!(
-            "{} is {nbytes} bytes; {} JSON value(s) were not indexed (over the {limit}-byte limit for one document). Split the file into smaller documents",
+            "{} is {nbytes} bytes; {} JSON value(s) were not indexed (over the {limit}-byte limit for one document). Split the file into smaller documents. {FIXED_DOCUMENT_CEILING}",
             file_label(path),
             stats.oversize_values,
         ));
@@ -752,7 +789,7 @@ fn emit_single_object(
     if (skipped > 0 && kept.is_empty()) || sum > limit {
         stats.oversize_values += 1 + skipped;
         stats.refusal = Some(format!(
-            "{} is {} bytes; a JSON document over {limit} bytes is not indexed. Split the file into smaller documents",
+            "{} is {} bytes; a JSON document over {limit} bytes is not indexed. Split the file into smaller documents. {FIXED_DOCUMENT_CEILING}",
             file_label(path),
             bytes.len(),
         ));
@@ -922,6 +959,793 @@ fn emit(v: Value, locator: &str, sink: Sink, stats: &mut ExtractStats) -> bool {
         group: None,
         origin: FieldOrigin::Data,
     })
+}
+
+// Peak bytes retained from one JSON value. Tests assert this stays within the
+// per-document cap while a larger sibling value is skipped.
+#[cfg(test)]
+thread_local! {
+    static JSON_SCAN_STORED_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_stored(capacity: usize) {
+    #[cfg(test)]
+    {
+        JSON_SCAN_STORED_PEAK.with(|peak| {
+            if capacity > peak.get() {
+                peak.set(capacity);
+            }
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = capacity;
+    }
+}
+
+#[derive(Debug)]
+struct ScanError(String);
+
+impl ScanError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScanError {}
+
+impl From<std::io::Error> for ScanError {
+    fn from(error: std::io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+enum ScanOutcome {
+    Fits(Vec<u8>),
+    Oversize,
+}
+
+struct Recorder {
+    cap: usize,
+    stored: Vec<u8>,
+    over: bool,
+}
+
+impl Recorder {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            stored: Vec::new(),
+            over: false,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.over {
+            return;
+        }
+        if self.cap == 0 || self.stored.len() >= self.cap {
+            self.over = true;
+            self.stored = Vec::new();
+            return;
+        }
+        if self.stored.len() == self.stored.capacity() {
+            let room = self.cap - self.stored.len();
+            let grow = room.min(self.stored.capacity().max(64).saturating_mul(2));
+            if grow == 0 {
+                self.over = true;
+                self.stored = Vec::new();
+                return;
+            }
+            self.stored.reserve_exact(grow);
+        }
+        self.stored.push(byte);
+        note_stored(self.stored.len());
+    }
+
+    fn finish(self) -> ScanOutcome {
+        if self.over {
+            ScanOutcome::Oversize
+        } else {
+            ScanOutcome::Fits(self.stored)
+        }
+    }
+}
+
+struct JsonSrc {
+    inner: std::fs::File,
+    buf: Vec<u8>,
+    buf_start: u64,
+    pos: usize,
+    filled: usize,
+}
+
+impl JsonSrc {
+    fn new(inner: std::fs::File) -> Self {
+        Self {
+            inner,
+            buf: vec![0; 64 * 1024],
+            buf_start: 0,
+            pos: 0,
+            filled: 0,
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.buf_start + self.pos as u64
+    }
+
+    fn fill(&mut self) -> Result<(), ScanError> {
+        if self.pos < self.filled {
+            return Ok(());
+        }
+        let at = self.position();
+        self.inner.seek(SeekFrom::Start(at))?;
+        let n = self.inner.read(&mut self.buf)?;
+        self.buf_start = at;
+        self.pos = 0;
+        self.filled = n;
+        Ok(())
+    }
+
+    fn peek(&mut self) -> Result<Option<u8>, ScanError> {
+        self.fill()?;
+        if self.pos >= self.filled {
+            return Ok(None);
+        }
+        Ok(Some(self.buf[self.pos]))
+    }
+
+    fn bump(&mut self) -> Result<Option<u8>, ScanError> {
+        let byte = self.peek()?;
+        if byte.is_some() {
+            self.pos += 1;
+        }
+        Ok(byte)
+    }
+
+    fn skip_ws(&mut self) -> Result<(), ScanError> {
+        while let Some(byte) = self.peek()? {
+            if matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+                self.bump()?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn seek_to(&mut self, at: u64) -> Result<(), ScanError> {
+        if at >= self.buf_start && (at - self.buf_start) < self.filled as u64 {
+            self.pos = (at - self.buf_start) as usize;
+            return Ok(());
+        }
+        self.inner.seek(SeekFrom::Start(at))?;
+        self.buf_start = at;
+        self.pos = 0;
+        self.filled = 0;
+        Ok(())
+    }
+
+    fn read_range(&mut self, start: u64, end: u64) -> Result<Vec<u8>, ScanError> {
+        if end < start {
+            return Err(ScanError::new("invalid JSON span"));
+        }
+        let len = usize::try_from(end - start)
+            .map_err(|_| ScanError::new("JSON value does not fit in memory"))?;
+        let mut out = vec![0; len];
+        self.inner.seek(SeekFrom::Start(start))?;
+        self.inner.read_exact(&mut out)?;
+        self.buf_start = end;
+        self.pos = 0;
+        self.filled = 0;
+        Ok(out)
+    }
+}
+
+fn expect_byte(src: &mut JsonSrc, want: u8) -> Result<(), ScanError> {
+    match src.bump()? {
+        Some(byte) if byte == want => Ok(()),
+        Some(byte) => Err(ScanError::new(format!(
+            "expected '{}', found byte {byte}",
+            want as char
+        ))),
+        None => Err(ScanError::new("truncated JSON")),
+    }
+}
+
+const JSON_NEST_MAX: usize = 128;
+
+fn scan_value(src: &mut JsonSrc, cap: usize) -> Result<ScanOutcome, ScanError> {
+    let mut rec = Recorder::new(cap);
+    let byte = src
+        .bump()?
+        .ok_or_else(|| ScanError::new("truncated JSON value"))?;
+    rec.push(byte);
+    match byte {
+        b'"' => scan_string_body(src, &mut rec)?,
+        b'{' => scan_nest(src, &mut rec, b'}')?,
+        b'[' => scan_nest(src, &mut rec, b']')?,
+        b't' => scan_exact(src, &mut rec, b"rue")?,
+        b'f' => scan_exact(src, &mut rec, b"alse")?,
+        b'n' => scan_exact(src, &mut rec, b"ull")?,
+        b'-' | b'0'..=b'9' => scan_number_rest(src, &mut rec)?,
+        _ => return Err(ScanError::new("invalid JSON value")),
+    }
+    Ok(rec.finish())
+}
+
+fn scan_exact(src: &mut JsonSrc, rec: &mut Recorder, rest: &[u8]) -> Result<(), ScanError> {
+    for &expected in rest {
+        match src.bump()? {
+            Some(byte) if byte == expected => rec.push(byte),
+            _ => return Err(ScanError::new("invalid JSON literal")),
+        }
+    }
+    Ok(())
+}
+
+fn scan_number_rest(src: &mut JsonSrc, rec: &mut Recorder) -> Result<(), ScanError> {
+    loop {
+        match src.peek()? {
+            Some(byte)
+                if byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E') =>
+            {
+                let Some(byte) = src.bump()? else {
+                    return Ok(());
+                };
+                rec.push(byte);
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn scan_string_body(src: &mut JsonSrc, rec: &mut Recorder) -> Result<(), ScanError> {
+    loop {
+        let byte = src
+            .bump()?
+            .ok_or_else(|| ScanError::new("truncated JSON string"))?;
+        rec.push(byte);
+        if byte == b'\\' {
+            let escaped = src
+                .bump()?
+                .ok_or_else(|| ScanError::new("truncated JSON string"))?;
+            rec.push(escaped);
+            if escaped == b'u' {
+                for _ in 0..4 {
+                    let hex = src
+                        .bump()?
+                        .ok_or_else(|| ScanError::new("truncated JSON string"))?;
+                    if !hex.is_ascii_hexdigit() {
+                        return Err(ScanError::new("invalid JSON unicode escape"));
+                    }
+                    rec.push(hex);
+                }
+            }
+            continue;
+        }
+        if byte == b'"' {
+            return Ok(());
+        }
+    }
+}
+
+fn scan_nest(src: &mut JsonSrc, rec: &mut Recorder, closer: u8) -> Result<(), ScanError> {
+    let mut stack = Vec::with_capacity(8);
+    stack.push(closer);
+    let mut in_string = false;
+    let mut escape = false;
+    while !stack.is_empty() {
+        let byte = src
+            .bump()?
+            .ok_or_else(|| ScanError::new("truncated JSON value"))?;
+        rec.push(byte);
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if byte == b'\\' {
+                escape = true;
+                continue;
+            }
+            if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                if stack.len() >= JSON_NEST_MAX {
+                    return Err(ScanError::new("JSON nesting exceeds 128"));
+                }
+                stack.push(if byte == b'{' { b'}' } else { b']' });
+            }
+            b'}' | b']' if stack.pop() != Some(byte) => {
+                return Err(ScanError::new("mismatched JSON bracket"));
+            }
+            b'}' | b']' => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn read_object_key(src: &mut JsonSrc) -> Result<String, ScanError> {
+    let ScanOutcome::Fits(bytes) = scan_value(src, 1 << 20)? else {
+        return Err(ScanError::new("JSON object key is too long"));
+    };
+    serde_json::from_slice(&bytes).map_err(|error| ScanError::new(error.to_string()))
+}
+
+struct DiskField {
+    key: String,
+    start: u64,
+    end: u64,
+    record_len: Option<u64>,
+}
+
+struct ArrayMeasure {
+    end: u64,
+    record_len: Option<u64>,
+}
+
+fn after_value(src: &mut JsonSrc, end: u8) -> Result<(), ScanError> {
+    src.skip_ws()?;
+    match src.peek()? {
+        Some(b',') => {
+            src.bump()?;
+            src.skip_ws()?;
+            if matches!(src.peek()?, Some(byte) if byte == end) || src.peek()?.is_none() {
+                return Err(ScanError::new("trailing comma in JSON"));
+            }
+            Ok(())
+        }
+        Some(byte) if byte == end => Ok(()),
+        _ => Err(ScanError::new("expected comma or end of JSON value")),
+    }
+}
+
+fn measure_array(src: &mut JsonSrc) -> Result<ArrayMeasure, ScanError> {
+    expect_byte(src, b'[')?;
+    let mut objects = 0u64;
+    let mut others = 0u64;
+    loop {
+        src.skip_ws()?;
+        match src.peek()? {
+            None => return Err(ScanError::new("truncated JSON array")),
+            Some(b']') => {
+                src.bump()?;
+                break;
+            }
+            Some(byte) => {
+                if byte == b'{' {
+                    objects += 1;
+                } else {
+                    others += 1;
+                }
+                let _ = scan_value(src, 0)?;
+                after_value(src, b']')?;
+            }
+        }
+    }
+    let record_len = if others == 0 && objects >= 2 {
+        Some(objects)
+    } else {
+        None
+    };
+    Ok(ArrayMeasure {
+        end: src.position(),
+        record_len,
+    })
+}
+
+fn scan_object_fields(src: &mut JsonSrc) -> Result<Vec<DiskField>, ScanError> {
+    expect_byte(src, b'{')?;
+    let mut fields = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    loop {
+        src.skip_ws()?;
+        match src.peek()? {
+            None => return Err(ScanError::new("truncated JSON object")),
+            Some(b'}') => {
+                src.bump()?;
+                break;
+            }
+            Some(b'"') => {
+                let key = read_object_key(src)?;
+                src.skip_ws()?;
+                expect_byte(src, b':')?;
+                src.skip_ws()?;
+                let start = src.position();
+                let (end, record_len) = if src.peek()? == Some(b'[') {
+                    let measured = measure_array(src)?;
+                    (measured.end, measured.record_len)
+                } else {
+                    let _ = scan_value(src, 0)?;
+                    (src.position(), None)
+                };
+                let field = DiskField {
+                    key: key.clone(),
+                    start,
+                    end,
+                    record_len,
+                };
+                if let Some(slot) = at.get(&key).copied() {
+                    fields[slot] = field;
+                } else {
+                    at.insert(key, fields.len());
+                    fields.push(field);
+                }
+                after_value(src, b'}')?;
+            }
+            _ => return Err(ScanError::new("expected object key")),
+        }
+    }
+    Ok(fields)
+}
+
+fn field_raw_len(field: &DiskField) -> Option<usize> {
+    usize::try_from(field.end.saturating_sub(field.start)).ok()
+}
+
+fn read_field_value(
+    src: &mut JsonSrc,
+    field: &DiskField,
+    limit: usize,
+) -> Result<Option<Value>, ScanError> {
+    let Some(len) = field_raw_len(field) else {
+        return Ok(None);
+    };
+    if len > limit {
+        return Ok(None);
+    }
+    let bytes = src.read_range(field.start, field.end)?;
+    let value =
+        serde_json::from_slice(&bytes).map_err(|error| ScanError::new(error.to_string()))?;
+    Ok(Some(value))
+}
+
+type SharedSplit = (Map<String, Value>, Vec<(String, Value)>);
+
+fn shared_from_disk(
+    src: &mut JsonSrc,
+    fields: &[DiskField],
+    skip: &HashSet<&str>,
+    limit: usize,
+    stats: &mut ExtractStats,
+) -> Result<SharedSplit, ScanError> {
+    let mut obj = Map::new();
+    for field in fields {
+        if skip.contains(field.key.as_str()) {
+            continue;
+        }
+        match read_field_value(src, field, limit)? {
+            None => stats.oversize_values += 1,
+            Some(value) => {
+                obj.insert(field.key.clone(), value);
+            }
+        }
+    }
+    Ok(partition_shared(obj))
+}
+
+fn emit_disk_array(
+    src: &mut JsonSrc,
+    field: &DiskField,
+    group: Option<String>,
+    shared: &Map<String, Value>,
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), ScanError> {
+    let key = field.key.as_str();
+    src.seek_to(field.start)?;
+    expect_byte(src, b'[')?;
+    let mut live = true;
+    let mut index = 0u64;
+    loop {
+        src.skip_ws()?;
+        match src.peek()? {
+            None => return Err(ScanError::new("truncated JSON array")),
+            Some(b']') => {
+                src.bump()?;
+                break;
+            }
+            Some(_) => {
+                let cap = if live { limit } else { 0 };
+                let outcome = scan_value(src, cap)?;
+                let i = index;
+                index += 1;
+                if live {
+                    match outcome {
+                        ScanOutcome::Oversize => stats.oversize_values += 1,
+                        ScanOutcome::Fits(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                            Ok(Value::Object(element)) => {
+                                let fields = merge_shared(shared, element);
+                                if !emit_fields(
+                                    fields,
+                                    format!("{key}:e{i}"),
+                                    group.clone(),
+                                    sink,
+                                    stats,
+                                ) {
+                                    live = false;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => stats.junk += 1,
+                        },
+                    }
+                }
+                after_value(src, b']')?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_disk_single_object(
+    src: &mut JsonSrc,
+    path: &Path,
+    file_len: u64,
+    fields: &[DiskField],
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), ScanError> {
+    let mut skipped = 0u64;
+    let mut kept = Vec::new();
+    let mut sum = 2usize;
+    for field in fields {
+        let Some(raw_len) = field_raw_len(field) else {
+            skipped += 1;
+            continue;
+        };
+        if raw_len > limit {
+            skipped += 1;
+            continue;
+        }
+        sum = sum.saturating_add(field.key.len() + raw_len + 4);
+        kept.push(field);
+    }
+    if (skipped > 0 && kept.is_empty()) || sum > limit {
+        stats.oversize_values += 1 + skipped;
+        stats.refusal = Some(format!(
+            "{} is {file_len} bytes; a JSON document over {limit} bytes is not indexed. \
+             Split the file into smaller documents. {FIXED_DOCUMENT_CEILING}",
+            file_label(path),
+        ));
+        return Ok(());
+    }
+    stats.oversize_values += skipped;
+    let mut obj = Map::new();
+    for field in kept {
+        let Some(value) = read_field_value(src, field, limit)? else {
+            return Err(ScanError::new("JSON field exceeded the document limit"));
+        };
+        obj.insert(field.key.clone(), value);
+    }
+    emit(Value::Object(obj), "doc", sink, stats);
+    Ok(())
+}
+
+fn emit_scanned_object(
+    src: &mut JsonSrc,
+    path: &Path,
+    file_len: u64,
+    fields: &[DiskField],
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), ScanError> {
+    let mut arrays: Vec<usize> = (0..fields.len())
+        .filter(|&index| fields[index].record_len.is_some())
+        .collect();
+    arrays.sort_by(|&left, &right| {
+        let left_len = fields[left].record_len.unwrap_or(0);
+        let right_len = fields[right].record_len.unwrap_or(0);
+        right_len
+            .cmp(&left_len)
+            .then_with(|| fields[left].key.cmp(&fields[right].key))
+    });
+    if arrays.len() >= 2
+        && fields[arrays[0]].record_len.unwrap_or(0) >= MULTI_ARRAY_SPLIT_MIN as u64
+    {
+        let skip: HashSet<&str> = arrays
+            .iter()
+            .map(|&index| fields[index].key.as_str())
+            .collect();
+        let (small, sidecars) = shared_from_disk(src, fields, &skip, limit, stats)?;
+        for (idx, field_i) in arrays.iter().copied().enumerate() {
+            let group = if idx == 0 {
+                None
+            } else {
+                Some(fields[field_i].key.clone())
+            };
+            let len = fields[field_i].record_len.unwrap_or(0);
+            stats.populations.push((group.clone(), len));
+            emit_disk_array(src, &fields[field_i], group, &small, limit, sink, stats)?;
+        }
+        emit_sidecars_bounded(sidecars, limit, sink, stats);
+    } else if let Some(field_i) = arrays.into_iter().next() {
+        let key = fields[field_i].key.clone();
+        let len = fields[field_i].record_len.unwrap_or(0);
+        let mut skip = HashSet::new();
+        skip.insert(key.as_str());
+        let (small, sidecars) = shared_from_disk(src, fields, &skip, limit, stats)?;
+        stats.populations.push((None, len));
+        emit_disk_array(src, &fields[field_i], None, &small, limit, sink, stats)?;
+        emit_sidecars_bounded(sidecars, limit, sink, stats);
+    } else {
+        emit_disk_single_object(src, path, file_len, fields, limit, sink, stats)?;
+    }
+    Ok(())
+}
+
+fn stream_disk_top_array(
+    src: &mut JsonSrc,
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), ScanError> {
+    expect_byte(src, b'[')?;
+    let mut count = 0u64;
+    let mut live = true;
+    let result = (|| -> Result<(), ScanError> {
+        loop {
+            src.skip_ws()?;
+            match src.peek()? {
+                None => return Err(ScanError::new("truncated JSON array")),
+                Some(b']') => {
+                    src.bump()?;
+                    break;
+                }
+                Some(_) => {
+                    let cap = if live { limit } else { 0 };
+                    let outcome = scan_value(src, cap)?;
+                    let index = count;
+                    count += 1;
+                    if live {
+                        match outcome {
+                            ScanOutcome::Oversize => stats.oversize_values += 1,
+                            ScanOutcome::Fits(bytes) => {
+                                match serde_json::from_slice::<Value>(&bytes) {
+                                    Ok(value) => {
+                                        if !emit(value, &format!("e{index}"), sink, stats) {
+                                            live = false;
+                                        }
+                                    }
+                                    Err(_) => stats.junk += 1,
+                                }
+                            }
+                        }
+                    }
+                    after_value(src, b']')?;
+                }
+            }
+        }
+        src.skip_ws()?;
+        if src.peek()?.is_some() {
+            return Err(ScanError::new("trailing data after JSON array"));
+        }
+        Ok(())
+    })();
+    if count > 0 {
+        stats.populations.push((None, count));
+    }
+    result
+}
+
+fn stream_disk_top_object(
+    src: &mut JsonSrc,
+    path: &Path,
+    file_len: u64,
+    limit: usize,
+    sink: Sink,
+    stats: &mut ExtractStats,
+) -> Result<(), ScanError> {
+    let fields = scan_object_fields(src)?;
+    src.skip_ws()?;
+    if src.peek()?.is_some() {
+        return Err(ScanError::new("trailing data after JSON object"));
+    }
+    emit_scanned_object(src, path, file_len, &fields, limit, sink, stats)
+}
+
+fn nothing_emitted(stats: &ExtractStats) -> bool {
+    stats.records == 0 && stats.oversize_values == 0 && stats.junk == 0
+}
+
+fn stream_uncompressed_over_cap(
+    path: &Path,
+    file_len: u64,
+    limit: usize,
+    sink: Sink,
+) -> Result<ExtractStats> {
+    let mut stats = ExtractStats::default();
+    let file = std::fs::File::open(path)?;
+    let mut src = JsonSrc::new(file);
+    let kind = src.skip_ws().and_then(|_| src.peek());
+    match kind {
+        Ok(Some(b'[')) => {
+            if let Err(error) = stream_disk_top_array(&mut src, limit, sink, &mut stats) {
+                if nothing_emitted(&stats) {
+                    return jsonl_from_disk(path, file_len, limit, sink);
+                }
+                stats.junk += 1;
+                let _ = error;
+            }
+        }
+        Ok(Some(b'{')) => {
+            if let Err(error) =
+                stream_disk_top_object(&mut src, path, file_len, limit, sink, &mut stats)
+            {
+                if nothing_emitted(&stats) {
+                    return jsonl_from_disk(path, file_len, limit, sink);
+                }
+                stats.junk += 1;
+                let _ = error;
+            }
+        }
+        _ => return jsonl_from_disk(path, file_len, limit, sink),
+    }
+    finish_empty_refusal_len(path, file_len, limit, &mut stats);
+    Ok(stats)
+}
+
+fn jsonl_from_disk(path: &Path, file_len: u64, limit: usize, sink: Sink) -> Result<ExtractStats> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut stats = ExtractStats::default();
+    let mut offset = 0u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = super::jsonl::read_capped_line(&mut reader, &mut line)?;
+        if n == 0 {
+            break;
+        }
+        let start = offset;
+        offset += n as u64;
+        let trimmed = super::jsonl::trim_ws(&line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if line.len() >= MAX_LINE {
+            stats.junk += 1;
+            continue;
+        }
+        if trimmed.len() > limit {
+            stats.oversize_values += 1;
+            continue;
+        }
+        match serde_json::from_slice::<Value>(trimmed) {
+            Ok(Value::Object(map)) => {
+                let mut fields = flatten_object(map);
+                ensure_text_passage(&mut fields);
+                stats.records += 1;
+                if !sink(RawRecord {
+                    fields,
+                    locator: format!("b{start}"),
+                    group: None,
+                    origin: FieldOrigin::Data,
+                }) {
+                    break;
+                }
+            }
+            Ok(_) | Err(_) => stats.junk += 1,
+        }
+    }
+    finish_empty_refusal_len(path, file_len, limit, &mut stats);
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -1587,5 +2411,158 @@ mod tests {
             .populations
             .contains(&(None, MULTI_ARRAY_SPLIT_MIN as u64)));
         assert!(stats.populations.contains(&(Some("runs".into()), 3)));
+    }
+
+    fn run_with_caps(
+        text: &str,
+        limit: usize,
+        whole_file_cap: u64,
+    ) -> (ExtractStats, Vec<RawRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        std::fs::write(&path, text).unwrap();
+        let mut recs = Vec::new();
+        let stats = extract_with_whole_file_cap(
+            &path,
+            false,
+            &mut |record| {
+                recs.push(record);
+                true
+            },
+            limit,
+            whole_file_cap,
+        )
+        .unwrap();
+        (stats, recs)
+    }
+
+    fn run_disk(text: &str, limit: usize) -> (ExtractStats, Vec<RawRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        std::fs::write(&path, text).unwrap();
+        let mut recs = Vec::new();
+        let stats = stream_uncompressed_over_cap(&path, text.len() as u64, limit, &mut |record| {
+            recs.push(record);
+            true
+        })
+        .unwrap();
+        (stats, recs)
+    }
+
+    /// The disk walker is what runs once a file is past 64 MiB. It must emit
+    /// the same records as the DOM path, including a multi-array split and a
+    /// shared value that is too big to copy onto every row.
+    #[test]
+    fn a_file_read_from_disk_matches_the_dom_path() {
+        let mut functions = Vec::new();
+        for i in 0..MULTI_ARRAY_SPLIT_MIN {
+            functions.push(format!(r#"{{"name":"f{i}","addr":{i}}}"#));
+        }
+        let split = format!(
+            r#"{{"generated":"2026-01-01","functions":[{}],"runs":[{{"label":"boot","start":1}},{{"label":"loop","start":9}}]}}"#,
+            functions.join(",")
+        );
+        let blob = "x".repeat(SHARED_REPLICATE_MAX + 8);
+        let sidecar = format!(
+            r#"{{"name":"n","items":[{{"id":1}},{{"id":2,"name":"row"}}],"blob":"{blob}"}}"#
+        );
+        let cases = [
+            split.as_str(),
+            sidecar.as_str(),
+            r#"[{"id":1,"user":{"name":"ann"}},{"id":2}]"#,
+            r#"{"generated":"2026-01-01","count":2,"items":[{"id":1},{"id":2,"generated":"per-item"}],"errors":[{"e":1}]}"#,
+            "[1,2,3]",
+            "[\n  {\"id\": 1}, {\"id\": 2}\n]",
+            r#"{"a":1,"note":"ok"}"#,
+        ];
+        for text in cases {
+            let (dom_stats, dom) = run_limited(text, usize::MAX);
+            let (disk_stats, disk) = run_disk(text, usize::MAX);
+            assert_eq!(dom_stats.records, disk_stats.records, "{text}");
+            assert_eq!(dom_stats.populations, disk_stats.populations, "{text}");
+            assert_eq!(
+                dom_stats.oversize_values, disk_stats.oversize_values,
+                "{text}"
+            );
+            assert_same_records(&dom, &disk);
+        }
+    }
+
+    /// Routing: a file past the whole-file cap is streamed, not refused.
+    #[test]
+    fn a_file_over_the_whole_file_cap_is_streamed_not_refused() {
+        let text = r#"[{"id":1},{"id":2}]"#;
+        let (stats, recs) = run_with_caps(text, usize::MAX, 4);
+        assert!(stats.refusal.is_none(), "{:?}", stats.refusal);
+        assert_eq!(stats.records, 2);
+        assert_eq!(recs[0].locator, "e0");
+        assert_eq!(recs[1].locator, "e1");
+        assert_eq!(recs[1].fields["id"], serde_json::json!(2));
+    }
+
+    /// One element past the document ceiling is skipped. The bytes retained
+    /// for that value stay within the ceiling; its siblings keep their indexes.
+    #[test]
+    fn a_disk_stream_skips_one_oversized_element_within_the_cap() {
+        let blob = "y".repeat(200);
+        let text = format!(r#"[{{"id":1}},{{"blob":"{blob}"}},{{"id":2}}]"#);
+        super::JSON_SCAN_STORED_PEAK.with(|peak| peak.set(0));
+        let (stats, recs) = run_with_caps(&text, 40, 8);
+        let peak = super::JSON_SCAN_STORED_PEAK.with(|peak| peak.get());
+        assert!(
+            peak <= 40,
+            "retained {peak} bytes of a value past the 40-byte cap"
+        );
+        assert_eq!(stats.oversize_values, 1);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].locator, "e0");
+        assert_eq!(recs[1].locator, "e2");
+        assert_eq!(recs[1].fields["id"], serde_json::json!(2));
+        assert!(stats.refusal.is_none(), "the siblings were indexed");
+    }
+
+    #[test]
+    fn a_single_oversized_document_on_disk_names_the_file_and_the_fixed_ceiling() {
+        let blob = "x".repeat(80);
+        let text = format!(r#"{{"blob":"{blob}"}}"#);
+        let (stats, recs) = run_with_caps(&text, 32, 8);
+        assert!(recs.is_empty());
+        let reason = stats.refusal.expect("a refusal");
+        assert!(reason.contains("t.json"), "{reason}");
+        assert!(reason.contains(&text.len().to_string()), "{reason}");
+        assert!(reason.contains("32"), "{reason}");
+        assert!(reason.contains("not indexed"), "{reason}");
+        assert!(reason.contains("--max-file-mb"), "{reason}");
+        assert!(reason.contains("limits.max_process_memory_mb"), "{reason}");
+    }
+
+    /// A `.json` file whose first line is one object and whose next line is
+    /// another is JSONL that sniffed as JSON once the first line outgrew the
+    /// sniff prefix. Past the whole-file cap it must still index every line.
+    #[test]
+    fn a_jsonl_file_over_the_whole_file_cap_streams_every_line() {
+        let text = "{\"id\":1}\n{\"id\":2}\n";
+        let (stats, recs) = run_with_caps(text, usize::MAX, 4);
+        assert_eq!(stats.records, 2, "{:?}", stats.refusal);
+        assert_eq!(recs[0].locator, "b0");
+        assert_eq!(recs[0].fields["id"], serde_json::json!(1));
+        let second = text.find('\n').unwrap() + 1;
+        assert_eq!(recs[1].locator, format!("b{second}"));
+        assert_eq!(recs[1].fields["id"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn gzip_over_the_whole_file_cap_names_the_fixed_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json.gz");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, br#"{"id":1,"name":"ann"}"#).unwrap();
+        std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+        let stats = extract_with_whole_file_cap(&path, true, &mut |_| true, usize::MAX, 4).unwrap();
+        let reason = stats.refusal.expect("gzip is not streamed past the cap");
+        assert!(reason.contains("t.json.gz"), "{reason}");
+        assert!(reason.contains("--max-file-mb"), "{reason}");
+        assert!(reason.contains("limits.max_process_memory_mb"), "{reason}");
+        assert_eq!(stats.records, 0);
     }
 }

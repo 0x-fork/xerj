@@ -311,6 +311,56 @@ impl NeuralEmbedder {
     }
 }
 
+/// Passages in one ingest-rate probe. 32 rows of 512 ASCII characters fit one
+/// length-aware forward pass under [`PADDED_TOKEN_BUDGET`] for prose-like
+/// text, which is the shape `semantic_text` chunks are cut to.
+pub const INGEST_PROBE_PASSAGES: usize = 32;
+
+/// Characters (and bytes — the probe is ASCII) in each probe passage.
+pub const INGEST_PROBE_CHARS: usize = 512;
+
+/// Time one batch of ingest-shaped passages.
+///
+/// One untimed warmup passage runs first, so the timed call is not the
+/// process's first Candle forward. Returns `None` when the call fails or the
+/// clock reports 0 ms — that is "not measured", not a rate of infinity.
+/// The result is not part of [`asset_identity`]: batching and wall time do
+/// not change the vectors.
+pub fn measure_ingest_probe(
+    embedder: &NeuralEmbedder,
+) -> Option<xerj_common::config::NeuralIngestProbe> {
+    let passage = ingest_probe_passage();
+    debug_assert_eq!(passage.len(), INGEST_PROBE_CHARS);
+    let warmup = embedder
+        .embed_blocking(std::slice::from_ref(&passage))
+        .ok()?;
+    if warmup.len() != 1 {
+        return None;
+    }
+    let texts = vec![passage; INGEST_PROBE_PASSAGES];
+    let started = std::time::Instant::now();
+    let vectors = embedder.embed_blocking(&texts).ok()?;
+    let millis = u64::try_from(started.elapsed().as_millis()).ok()?;
+    if millis == 0 || vectors.len() != INGEST_PROBE_PASSAGES {
+        return None;
+    }
+    Some(xerj_common::config::NeuralIngestProbe {
+        bytes: (INGEST_PROBE_CHARS * INGEST_PROBE_PASSAGES) as u64,
+        passages: INGEST_PROBE_PASSAGES as u32,
+        millis,
+    })
+}
+
+fn ingest_probe_passage() -> String {
+    let unit = "fn embed_passage(text: &str) -> Vec<f32> { hash_tokens(text) } ";
+    let mut passage = String::with_capacity(INGEST_PROBE_CHARS);
+    while passage.len() < INGEST_PROBE_CHARS {
+        passage.push_str(unit);
+    }
+    passage.truncate(INGEST_PROBE_CHARS);
+    passage
+}
+
 /// How [`NeuralEmbedder::embed_blocking`] turns per-token hidden states into
 /// one vector. Part of the identity: the same weights pooled differently are a
 /// different embedder.

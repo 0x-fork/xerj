@@ -5507,6 +5507,87 @@ mod merge_publication_transaction_tests {
         .expect("merge did not reach the pre-apply gate");
     }
 
+    /// #2234 — `_refresh` must publish a new write while a merge encode is
+    /// held, on a runtime whose tokio blocking pool has a single thread.
+    ///
+    /// The encode used to run inside `spawn_blocking` for its whole duration.
+    /// Refresh builds a segment on that same pool, so with one blocking thread
+    /// the refresh queued until the merge returned. The encode now runs on the
+    /// merge pool; this test parks it there and requires `refresh` to drain
+    /// the memtable before the park is released.
+    #[test]
+    fn refresh_publishes_while_a_merge_encode_is_held() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let dir = TempDir::new().unwrap();
+            let (_engine, index) = fixture(&dir).await;
+            // Releasing on drop covers an assertion failure: a parked merge
+            // thread must not outlive the test and pin the process-global
+            // merge pool.
+            struct ReleaseHold<'a>(&'a AtomicBool);
+            impl Drop for ReleaseHold<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            index.test_hold_merge_encode.store(true, Ordering::Release);
+            let release = ReleaseHold(&index.test_hold_merge_encode);
+            let merge_index = Arc::clone(&index);
+            let merge = tokio::spawn(async move { merge_index.run_merge_once().await });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !index.test_merge_encode_held.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("merge encode did not reach the hold");
+
+            index
+                .index_document(Some("c".into()), serde_json::json!({"value": "new-c"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                index.memtable.doc_count(),
+                1,
+                "the new document must still be in the memtable"
+            );
+            let refreshed =
+                tokio::time::timeout(std::time::Duration::from_secs(8), index.refresh()).await;
+            assert!(
+                refreshed.is_ok(),
+                "refresh did not return within 8s while the merge encode was held"
+            );
+            refreshed
+                .expect("timeout already checked")
+                .expect("refresh");
+            assert_eq!(
+                index.memtable.doc_count(),
+                0,
+                "refresh must drain the memtable without waiting for the merge"
+            );
+            assert!(
+                index.test_merge_encode_held.load(Ordering::Acquire),
+                "the merge encode must still be parked after refresh returns"
+            );
+            assert_eq!(
+                index.get_document("c").await.unwrap().unwrap()["value"],
+                "new-c"
+            );
+
+            drop(release);
+            let merged = tokio::time::timeout(std::time::Duration::from_secs(30), merge)
+                .await
+                .expect("merge did not finish after the hold was released")
+                .expect("merge task");
+            assert_eq!(merged.expect("merge"), 1);
+        });
+    }
+
     #[tokio::test]
     async fn apply_failure_restores_sources_survives_restart_and_retry() {
         let dir = TempDir::new().unwrap();
@@ -6167,6 +6248,41 @@ mod merge_publication_transaction_tests {
         );
     }
 
+    /// Drive the paused clock past one debounce, and give the merge pool a
+    /// real turn so an encode can finish.
+    ///
+    /// #2234 runs that encode on the merge pool, off this runtime. A paused
+    /// `sleep` auto-advances while the pass is still awaiting the pool, so
+    /// the scheduler never looks idle and a later segment change is only a
+    /// bumped epoch on the in-flight pass — the evaluation counter does not
+    /// move until the encode returns. `std::thread::sleep` does not advance
+    /// the paused clock, so it cannot itself schedule a merge check.
+    async fn settle_merge_scheduler(index: &Index) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let before = index.merge_evaluation_count();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+            let after = index.merge_evaluation_count();
+            if after == before && !index.is_merge_in_progress() {
+                // A second window with no real sleep: a still-armed debounce
+                // is the only thing that can move the counter.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if index.merge_evaluation_count() == after && !index.is_merge_in_progress() {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background merges did not quiesce (evaluations {}, in progress {})",
+                index.merge_evaluation_count(),
+                index.is_merge_in_progress()
+            );
+        }
+    }
+
     /// #871 — merge scheduling must be event-driven: after an index's merge
     /// work settles, ZERO further merge-policy evaluations may run until the
     /// segment set changes again.
@@ -6195,10 +6311,9 @@ mod merge_publication_transaction_tests {
         }
         // Let the scheduled checks and their cascading merges run to
         // quiescence (min/max_merge_count = 2 collapses two at a time).
-        for _ in 0..8 {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            tokio::task::yield_now().await;
-        }
+        // The encode is on the merge pool (#2234); paused sleeps do not
+        // wait for it.
+        settle_merge_scheduler(&index).await;
         let settled = index.merge_evaluation_count();
         assert!(
             settled >= 1,
@@ -6220,14 +6335,19 @@ mod merge_publication_transaction_tests {
             .await
             .unwrap();
         index.flush().await.unwrap();
-        for _ in 0..8 {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let wake_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(15));
             tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if index.merge_evaluation_count() > settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < wake_deadline,
+                "a published segment no longer schedules a merge check"
+            );
         }
-        assert!(
-            index.merge_evaluation_count() > settled,
-            "a published segment no longer schedules a merge check"
-        );
     }
 
     #[tokio::test]
@@ -9300,6 +9420,23 @@ pub struct Index {
     test_pause_merge_before_apply: Arc<AtomicBool>,
     #[cfg(test)]
     test_merge_repoint_ready: Arc<AtomicBool>,
+    /// #2234 — park the merge encode on the merge pool, before any segment
+    /// bytes are written, so a test can prove `refresh` proceeds while that
+    /// encode is held. The park is a merge-pool thread, not a tokio blocking
+    /// thread: occupying the blocking pool here is the stall this hook exists
+    /// to catch.
+    #[cfg(test)]
+    test_hold_merge_encode: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_merge_encode_held: Arc<AtomicBool>,
+    /// #2234 — park `refresh` before it looks at the memtable. Off in release
+    /// builds; `xerj-api` tests turn it on with the `refresh-test-hook` feature.
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    test_pause_refresh: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    test_refresh_paused: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    test_refresh_finished: Arc<AtomicU64>,
     /// #1212 — park the next search the instant its capture bracket
     /// validates (`test_pause_search_after_capture`), announcing via
     /// `test_search_capture_parked` so a test can publish a merge or flush
@@ -9913,8 +10050,19 @@ pub struct Index {
     /// the fallback (an input the preflight refused, or
     /// `XERJ_MERGE_FTS_REANALYZE=1`). An index whose merges are silently
     /// paying the old O(text) cost shows it here and nowhere else.
-    /// `Arc` because the merge encode runs in `spawn_blocking`.
+    /// `Arc` because the merge encode runs on the merge pool, off the caller.
     merge_fts_reanalysed_docs: Arc<AtomicU64>,
+}
+
+/// Counts one `Index::refresh` that got past the test hold, on every exit.
+#[cfg(any(test, feature = "refresh-test-hook"))]
+struct TestRefreshFinished<'a>(&'a Index);
+
+#[cfg(any(test, feature = "refresh-test-hook"))]
+impl Drop for TestRefreshFinished<'_> {
+    fn drop(&mut self) {
+        self.0.test_refresh_finished.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl Index {
@@ -10193,6 +10341,16 @@ impl Index {
             test_pause_merge_before_apply: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_merge_repoint_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hold_merge_encode: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_merge_encode_held: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "refresh-test-hook"))]
+            test_pause_refresh: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "refresh-test-hook"))]
+            test_refresh_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "refresh-test-hook"))]
+            test_refresh_finished: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_pause_search_after_capture: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -10679,6 +10837,16 @@ impl Index {
             test_pause_merge_before_apply: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_merge_repoint_ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_hold_merge_encode: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_merge_encode_held: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "refresh-test-hook"))]
+            test_pause_refresh: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "refresh-test-hook"))]
+            test_refresh_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "refresh-test-hook"))]
+            test_refresh_finished: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_pause_search_after_capture: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -11709,6 +11877,10 @@ impl Index {
             }
         }
 
+        // Charge the token spike before the batch is parsed. Eight bulks can
+        // pass one RSS sample and then analyze together; the reservation
+        // makes the second one 429 while the first is still allocating (#1122).
+        let analyze_reservation = Self::reserve_batch_analyze(validated.docs())?;
         let dom_t = std::time::Instant::now();
         let validated = crate::ingest_pool()
             .install(|| xerj_storage::IndexStore::parse_validated_raw_batch(validated))
@@ -11944,6 +12116,9 @@ impl Index {
                 p_insert_us = p_t.elapsed().as_micros();
             }
         }
+        // Tokens are in the memtable. Drop the estimate so the next batch
+        // is charged the live RSS of those tokens, not the estimate as well.
+        drop(analyze_reservation);
         drop(publication_schema);
 
         if prof {
@@ -12100,6 +12275,7 @@ impl Index {
             }
         }
 
+        let analyze_reservation = Self::reserve_batch_analyze(validated.docs())?;
         let _hnsw_publication = has_vector_mapping.then(|| self.begin_hnsw_publication());
         let index_start = std::time::Instant::now();
         let wal_t = std::time::Instant::now();
@@ -12291,6 +12467,7 @@ impl Index {
                 })
                 .collect()
         });
+        drop(analyze_reservation);
         // Single batch-level atomic instead of one per doc.  At 1.7 M/s
         // × 10 k batch = 170 batches/s this cuts ~17 M atomic ops/s of
         // cache-line bouncing on `doc_count`.
@@ -12645,18 +12822,68 @@ impl Index {
         }
     }
 
+    /// Hold `refresh` until [`Self::test_set_pause_refresh`] clears.
+    ///
+    /// The flag is announced only after this call has entered, so a test can
+    /// wait until the index is actually inside refresh and not merely racing
+    /// the request.
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    async fn await_test_refresh_hold(&self) {
+        if !self.test_pause_refresh.load(Ordering::Acquire) {
+            return;
+        }
+        self.test_refresh_paused.store(true, Ordering::Release);
+        while self.test_pause_refresh.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        self.test_refresh_paused.store(false, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    pub fn test_set_pause_refresh(&self, pause: bool) {
+        self.test_pause_refresh.store(pause, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    pub fn test_refresh_is_paused(&self) -> bool {
+        self.test_refresh_paused.load(Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "refresh-test-hook"))]
+    pub fn test_refresh_finished_count(&self) -> u64 {
+        self.test_refresh_finished.load(Ordering::Acquire)
+    }
+
+    /// Make recent writes searchable.
+    ///
+    /// This is the body of HTTP `_refresh` (#2234). An empty memtable is
+    /// already searchable — return without verified WAL maintenance, which is
+    /// `flush` / `_flush` and is what used to sit behind a background segment
+    /// merge. A non-empty memtable is published to a segment. The HNSW graph
+    /// is persisted either way: background flushes skip that save, and an
+    /// explicit refresh is the checkpoint for it. `save_hnsw_to_disk` returns
+    /// immediately when the index has no graph.
     pub async fn refresh(&self) -> Result<()> {
+        #[cfg(any(test, feature = "refresh-test-hook"))]
+        self.await_test_refresh_hold().await;
+        // Count a refresh that actually returned, including the empty-memtable
+        // path and errors. The hold above is outside this guard so a paused
+        // index does not look finished.
+        #[cfg(any(test, feature = "refresh-test-hook"))]
+        let _refresh_finished = TestRefreshFinished(self);
         {
             let mem = &*self.memtable;
             if mem.doc_count() == 0 {
+                let _ = self.save_hnsw_to_disk().await;
                 return Ok(());
             }
         }
 
-        // Flush the memtable to a new segment on disk.  This drains the
-        // memtable, writes the segment file + FTS index, swaps the snapshot,
-        // and checkpoints the WAL.  The drained memtable is dropped, freeing
-        // all RAM.
+        // Publish the memtable to a new segment. This drains the memtable,
+        // writes the segment file + FTS index, and swaps the snapshot. The
+        // drained memtable is dropped, freeing its RAM. Verified WAL
+        // maintenance (snapshot fsync + prune) is `_flush` / `Index::flush`,
+        // not this path (#2234).
         let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
@@ -13329,18 +13556,36 @@ impl Index {
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
+            #[cfg(test)]
+            let hold_merge_encode = Arc::clone(&self.test_hold_merge_encode);
+            #[cfg(test)]
+            let merge_encode_held = Arc::clone(&self.test_merge_encode_held);
 
-            tokio::task::spawn_blocking(move || -> Option<MergeOutput> {
-                // Entire merge encode runs on the dedicated SMALL merge
-                // pool (nice +15, ncores/8 threads): the decompress +
-                // byte-copy + FTS/DV rebuild below saturates its workers
-                // for seconds.  On the normal-priority blocking pool it
-                // stole scheduler time from foreground searches (read-
-                // under-write tail); on the shared ingest pool it queued
-                // every bulk request's parse/analyze/insert behind it,
-                // fully stalling 1 M×c8 ingest for ~13 s per merge pass
-                // (see `crate::merge_pool`).
-                crate::merge_pool().install(move || -> Option<MergeOutput> {
+            // #2234 — the encode used to run inside `spawn_blocking` +
+            // `merge_pool().install`, which parked one tokio blocking-pool
+            // thread for the whole encode (minutes on a large segment; the
+            // shutdown path still names that leftover job). `_refresh` builds
+            // its segment on that same blocking pool, so one in-progress
+            // merge stalled refresh behind it. Queue the encode on the merge
+            // pool and wait from this async driver. `spawn` returns as soon
+            // as the job is queued. The #1122 inline fallback (the pool
+            // cannot start a thread at all) still runs the encode on the
+            // caller — the same degradation `install` already had.
+            //
+            // The CPU work is unchanged: decompress + byte-copy + FTS/DV
+            // rebuild on the small nice-+15 merge pool (`crate::merge_pool`),
+            // off the ingest pool that a merge used to stall.
+            let (encode_tx, encode_rx) = tokio::sync::oneshot::channel();
+            crate::merge_pool().spawn(move || {
+                #[cfg(test)]
+                if hold_merge_encode.load(Ordering::Acquire) {
+                    merge_encode_held.store(true, Ordering::Release);
+                    while hold_merge_encode.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    merge_encode_held.store(false, Ordering::Release);
+                }
+                let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     use serde_json::value::RawValue;
 
                     // V4 M4.8 — STREAMING BYTE-COPY MERGE.
@@ -14091,7 +14336,19 @@ impl Index {
                         ids_pairs,
                         version_repoint_intents,
                     ))
-                })
+                }));
+                let _ = encode_tx.send(encoded);
+            });
+            tokio::spawn(async move {
+                match encode_rx.await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(payload)) => std::panic::resume_unwind(payload),
+                    // The encode task vanished without a result. Panic so the
+                    // driver counts a failed batch (the `JoinError` arm)
+                    // instead of treating a lost encode as an empty output
+                    // and dropping its inputs.
+                    Err(_closed) => panic!("merge encode dropped its result"),
+                }
             })
         };
 
@@ -14109,8 +14366,8 @@ impl Index {
         while !in_flight.is_empty() {
             // Await the first handle in the queue.  tokio doesn't provide
             // a built-in "select any", but for small parallelism this FIFO
-            // drain is fine — all spawn_blocking tasks run concurrently
-            // anyway, we're just reaping their results in submission
+            // drain is fine — the encodes run concurrently on the merge
+            // pool anyway, we're just reaping their results in submission
             // order.
             let handle = in_flight.remove(0);
             match handle.await {
@@ -14439,7 +14696,7 @@ impl Index {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::error!("merge: spawn_blocking panicked: {e}");
+                    tracing::error!("merge: encode task panicked: {e}");
                     failed_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -17701,6 +17958,11 @@ impl Index {
             xerj_ai::local::local_embed(text, dims)
         } else {
             // #530: name the offending field, symmetric with the knn 400 (#498).
+            // A concrete index keeps this 400. A wildcard, `_all`, or alias
+            // expansion is isolated by the search coordinator (#2305): those
+            // indices contribute no hits instead of failing the request.
+            // Do not soften this error here — the explicit-index contract is
+            // the 400, and the coordinator matches this reason text.
             return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
                 format!(
                     "semantic query on field [{field}]: it is not a `semantic_text` field, so \
@@ -26861,6 +27123,21 @@ impl Index {
             g.check_ingest_admission().map_err(EngineError::Common)?;
         }
         Ok(())
+    }
+
+    /// Reserve headroom for the token spike of `docs` before they are parsed
+    /// (#1122). See [`crate::governor::analyze_reserve_bytes`]. No governor
+    /// reserves nothing, so an `Index` built directly in a unit test is unchanged.
+    fn reserve_batch_analyze(
+        docs: &[xerj_storage::RawJsonDoc],
+    ) -> Result<crate::governor::AnalyzeReservation> {
+        let Some(governor) = crate::governor::global() else {
+            return Ok(crate::governor::AnalyzeReservation::none());
+        };
+        let raw = docs.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        governor
+            .reserve_analyze(crate::governor::analyze_reserve_bytes(raw))
+            .map_err(EngineError::Common)
     }
 
     /// Every block name the `_block` API and `index.blocks.*` settings accept.
@@ -39057,6 +39334,12 @@ pub(crate) fn embedding_execution_identity(
         _ => unreachable!(),
     };
     let canonical = format!("{CONTRACT};backend={backend};{material}");
+    // The probe is a rate sample, not an input to the digest above. Folding
+    // it in would make every boot look like a different embedder.
+    let probe = (backend == "neural")
+        .then(|| cfg.neural_ingest_probe.get().copied().flatten())
+        .flatten()
+        .filter(|probe| probe.bytes > 0 && probe.passages > 0 && probe.millis > 0);
     Ok(crate::engine::EmbeddingExecutionIdentity {
         // This is the WIRE/API version the autoindex client pins on
         // (esclient.rs requires == 1); it is NOT the on-disk migration marker.
@@ -39071,6 +39354,9 @@ pub(crate) fn embedding_execution_identity(
         semantic_contract: CONTRACT.to_string(),
         resumable,
         non_resumable_reason: reason,
+        ingest_probe_bytes: probe.map(|probe| probe.bytes),
+        ingest_probe_passages: probe.map(|probe| probe.passages),
+        ingest_probe_millis: probe.map(|probe| probe.millis),
     })
 }
 
@@ -39385,6 +39671,31 @@ mod embedding_identity_tests {
         let encoded = serde_json::to_string(&identity).unwrap();
         assert!(!encoded.contains("endpoint"));
         assert!(!encoded.contains("path"));
+        assert!(
+            !encoded.contains("ingest_probe"),
+            "an unmeasured probe must stay off the wire: {encoded}"
+        );
+        assert!(identity.ingest_probe_millis.is_none());
+    }
+
+    /// A stored probe must not move `identity_sha256`. The digest is what
+    /// resume pins; a rate sample changes every boot.
+    #[test]
+    fn an_ingest_probe_does_not_change_the_identity_digest() {
+        let cfg = xerj_common::config::EmbeddingConfig::default();
+        let before = embedding_execution_identity(&cfg).unwrap();
+        cfg.neural_ingest_probe
+            .set(Some(xerj_common::config::NeuralIngestProbe {
+                bytes: 16_384,
+                passages: 32,
+                millis: 800,
+            }))
+            .unwrap();
+        let after = embedding_execution_identity(&cfg).unwrap();
+        assert_eq!(before.identity_sha256, after.identity_sha256);
+        assert!(after.ingest_probe_bytes.is_none());
+        let encoded = serde_json::to_string(&after).unwrap();
+        assert!(!encoded.contains("ingest_probe"), "{encoded}");
     }
 
     #[test]
@@ -39841,6 +40152,35 @@ mod embedding_identity_tests {
         let encoded = serde_json::to_string(&identity).unwrap();
         assert!(!encoded.contains(&first_dir.path().to_string_lossy().into_owned()));
         assert!(!encoded.contains("MiniLM"), "{encoded}");
+        assert!(
+            !encoded.contains("ingest_probe"),
+            "a neural identity with no probe must omit the rate fields: {encoded}"
+        );
+
+        let probed = neural(&first_dir);
+        probed
+            .neural_ingest_probe
+            .set(Some(xerj_common::config::NeuralIngestProbe {
+                bytes: 16_384,
+                passages: 32,
+                millis: 800,
+            }))
+            .unwrap();
+        let with_probe = embedding_execution_identity(&probed).unwrap();
+        assert_eq!(
+            with_probe.identity_sha256, identity.identity_sha256,
+            "the probe is not an embedder input"
+        );
+        assert_eq!(with_probe.ingest_probe_bytes, Some(16_384));
+        assert_eq!(with_probe.ingest_probe_passages, Some(32));
+        assert_eq!(with_probe.ingest_probe_millis, Some(800));
+        let probed_json = serde_json::to_string(&with_probe).unwrap();
+        assert!(
+            probed_json.contains("\"ingest_probe_millis\":800"),
+            "{probed_json}"
+        );
+        assert!(!probed_json.contains("endpoint"), "{probed_json}");
+        assert!(!probed_json.contains(&first_dir.path().to_string_lossy().into_owned()));
 
         // Same bytes in a DIFFERENT directory → same identity. This is the
         // property the fix exists for: it is a different `NeuralConfig`, so it
@@ -40439,12 +40779,43 @@ pub fn ensure_neural_ready(cfg: &xerj_common::config::EmbeddingConfig) -> Result
                 xerj_ai::neural::startup_failure_message(&neural_cfg.model_id, &error),
             )));
         }
+        record_neural_ingest_probe(cfg);
         Ok(())
     }
     #[cfg(not(feature = "neural"))]
     {
         Ok(())
     }
+}
+
+/// Time one ingest-shaped batch and store it on `cfg` for identity reporting.
+///
+/// A probe failure does not fail startup: the model loaded, and autoindex
+/// prints "not measured" rather than a made-up rate. The cell is filled
+/// either way so a later index open does not probe again.
+#[cfg(feature = "neural")]
+fn record_neural_ingest_probe(cfg: &xerj_common::config::EmbeddingConfig) {
+    if cfg.neural_ingest_probe.get().is_some() {
+        return;
+    }
+    let neural_cfg = configured_neural_config(cfg);
+    let Some(embedder) = xerj_ai::Embedder::preload_neural(&neural_cfg).ok() else {
+        let _ = cfg.neural_ingest_probe.set(None);
+        return;
+    };
+    let probe = xerj_ai::neural::measure_ingest_probe(&embedder);
+    match probe {
+        Some(probe) => info!(
+            bytes = probe.bytes,
+            passages = probe.passages,
+            millis = probe.millis,
+            "neural ingest probe (512-character passages, one untimed warmup excluded)"
+        ),
+        None => warn!(
+            "neural ingest probe did not produce a rate; autoindex will not print a time estimate"
+        ),
+    }
+    let _ = cfg.neural_ingest_probe.set(probe);
 }
 
 /// Construct the built-in neural embedder when compiled in.

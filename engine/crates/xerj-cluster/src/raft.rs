@@ -83,6 +83,17 @@ pub enum ClusterCommand {
         index: String,
         settings_json: String,
     },
+    /// Replicas of one shard that a later read or copy may use.
+    ///
+    /// `nodes` is the subset of the create-time replica list that confirmed
+    /// the last acknowledged write. The engine applier drops any id that is
+    /// not a placed replica. An empty `nodes` list means no replica is in
+    /// sync; the primary is not a member of this list.
+    SetShardInSync {
+        index: String,
+        shard: u32,
+        nodes: Vec<String>,
+    },
     /// A client-originated metadata command.
     ///
     /// `request_id` is unique on the node that accepted the caller. That node

@@ -1634,7 +1634,8 @@ pub async fn create_index(
                 if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
                     let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
                 }
-                let resp = EsIndexResponse::ok(&index);
+                let mut resp = EsIndexResponse::ok(&index);
+                resp.warnings = embedder_warnings(&state, &body);
                 (StatusCode::OK, Json(resp)).into_response()
             }
             Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
@@ -1687,7 +1688,8 @@ pub async fn create_index(
                 let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
-            let resp = EsIndexResponse::ok(&index);
+            let mut resp = EsIndexResponse::ok(&index);
+            resp.warnings = embedder_warnings(&state, &body);
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
@@ -2373,6 +2375,83 @@ mod runtime_field_type_tests {
     }
 
     #[tokio::test]
+    async fn create_index_warns_when_semantic_text_asks_for_another_embedder() {
+        let router = crate::router::build_es_compat_router(test_state());
+        let response = router
+            .oneshot(
+                Request::put("/embed-warn")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {
+                            "body": {"type": "semantic_text", "inference_id": ".elser_model_2"}
+                        }}})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(status.is_success(), "{status} {body}");
+        let warning = body["warnings"][0].as_str().unwrap_or("");
+        assert!(warning.contains("does not switch the embedder"), "{body}");
+        assert!(warning.contains("re-index"), "{body}");
+        assert!(warning.contains(".elser_model_2"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn put_mapping_without_an_embedder_request_has_no_warnings_key() {
+        let state = test_state();
+        let router = crate::router::build_es_compat_router(state.clone());
+        let created = router
+            .clone()
+            .oneshot(
+                Request::put("/embed-quiet")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {"body": {"type": "text"}}}}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create");
+        assert!(created.status().is_success());
+        let created_bytes = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created_body: Value = serde_json::from_slice(&created_bytes).unwrap();
+        assert!(
+            created_body.get("warnings").is_none(),
+            "no mismatch must leave the create JSON unchanged: {created_body}"
+        );
+        let mapped = router
+            .oneshot(
+                Request::put("/embed-quiet/_mapping")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"properties": {
+                            "note": {"type": "semantic_text", "inference_id": "lexical"}
+                        }})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("mapping");
+        let status = mapped.status();
+        let bytes = to_bytes(mapped.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(status.is_success(), "{status} {body}");
+        assert!(
+            body.get("warnings").is_none(),
+            "a matching inference_id must not add warnings: {body}"
+        );
+        assert_eq!(body["acknowledged"], true, "{body}");
+    }
+
+    #[tokio::test]
     async fn create_index_accepts_a_lookup_runtime_field_over_http() {
         let (status, body) = create_index_with_runtime_type("lookup").await;
         assert!(
@@ -2896,10 +2975,11 @@ async fn get_index_inner(
 ///
 /// Two fixes over replaying the display map alone (#1092):
 ///
-/// * The display map (`engine.index_settings`) lives in memory only, so after a
-///   restart it is empty and every create-time setting vanished from the
-///   response. A live index with no display entry falls back to its persisted
-///   `settings.json` copy — what the index was created with.
+/// * The display map (`engine.index_settings`) is rebuilt from each index's
+///   `settings.json` when that index is opened (#2294). A live index whose
+///   display entry is still missing falls back to the same file — what the
+///   index was created with — so `GET /_settings` and `default_pipeline_for`
+///   agree.
 /// * `analysis` is reported from the engine, not echoed: whatever spelling the
 ///   caller used (`settings.analysis` beside an `index` block was dropped
 ///   outright), the response carries `index.analysis` = the block the index's
@@ -3300,7 +3380,12 @@ pub async fn put_mapping(
                 return ApiError::new(xerj_common::XerjError::from(error)).into_response();
             }
         }
-        return Json(json!({ "acknowledged": true })).into_response();
+        let warnings = embedder_warnings(&state, &body);
+        let mut payload = json!({ "acknowledged": true });
+        if !warnings.is_empty() {
+            payload["warnings"] = json!(warnings);
+        }
+        return Json(payload).into_response();
     }
 
     // Publication begins only after every deterministic candidate has passed.
@@ -3323,7 +3408,30 @@ pub async fn put_mapping(
         }
     }
 
-    Json(json!({ "acknowledged": true })).into_response()
+    let warnings = embedder_warnings(&state, &body);
+    let mut payload = json!({ "acknowledged": true });
+    if !warnings.is_empty() {
+        payload["warnings"] = json!(warnings);
+    }
+    Json(payload).into_response()
+}
+
+/// The server embedder a mapping's `inference_id` is compared with. Identity
+/// failure yields no warning rather than a failed create: the mapping still
+/// does not switch the embedder, and the index-open guard remains the hard
+/// check.
+fn embedder_warnings(state: &AppState, body: &Value) -> Vec<String> {
+    let Ok(identity) = state.engine.embedding_execution_identity() else {
+        return Vec::new();
+    };
+    let embedding = &state.engine.config().embedding;
+    let resolved = crate::embed_warning::ResolvedEmbedder {
+        backend: identity.backend,
+        neural_model: embedding.neural_model.clone(),
+        proxy_model: embedding.default_model.clone(),
+        proxy_endpoint: embedding.default_endpoint.clone(),
+    };
+    crate::embed_warning::semantic_embedder_warnings(body, &resolved)
 }
 
 fn semantic_mapping_contract(
@@ -12589,6 +12697,135 @@ impl SkippedIndices {
     }
 }
 
+/// #2305: indices a wildcard, `_all`/`*`, or alias expansion included that
+/// have no `semantic_text` field for the queried name. They cannot answer
+/// and must not 400 the indices that can. An explicitly named index is not
+/// recorded here (#530 still fails that request).
+#[derive(Default)]
+struct ExpandedSemanticSkips {
+    attempted: u32,
+    skipped: u32,
+    first_reason: Option<String>,
+    failures: Vec<Value>,
+}
+
+impl ExpandedSemanticSkips {
+    fn note_attempt(&mut self) {
+        self.attempted += 1;
+    }
+
+    /// `Ok(())` — `index_name` was expanded and lacks the field; the miss is
+    /// recorded and the caller continues. `Err(err)` — the caller must fail
+    /// the request with `err` (explicit index, or a different error).
+    fn take_skippable(
+        &mut self,
+        selector: &str,
+        index_name: &str,
+        node: &str,
+        err: xerj_common::XerjError,
+    ) -> Result<(), xerj_common::XerjError> {
+        let Some(reason) = absent_semantic_field_reason(&err) else {
+            return Err(err);
+        };
+        if selector_names_index_explicitly(selector, index_name) {
+            return Err(err);
+        }
+        let reason = reason.to_string();
+        tracing::warn!(
+            index = %index_name,
+            error = %reason.chars().take(300).collect::<String>(),
+            "semantic search: expanded index has no semantic_text field; skipping it"
+        );
+        self.failures
+            .push(semantic_field_shard_failure(index_name, node, &reason));
+        self.skipped += 1;
+        if self.first_reason.is_none() {
+            self.first_reason = Some(reason);
+        }
+        Ok(())
+    }
+
+    /// When every index that was searched lacked the field, there is nothing
+    /// to answer from. A wrong field name on a wildcard must stay a 400
+    /// rather than an empty 200.
+    fn failure_if_every_index_skipped(&self) -> Option<xerj_common::XerjError> {
+        if self.attempted > 0 && self.skipped == self.attempted {
+            self.first_reason
+                .clone()
+                .map(xerj_common::XerjError::invalid_query)
+        } else {
+            None
+        }
+    }
+}
+
+/// The engine's refusal for a `semantic` query against a field that is not
+/// `semantic_text` (lexical embedder, no comparable stored vector). The
+/// clause is the contract the coordinator matches; the rest of the sentence
+/// is the operator hint and may be reworded.
+fn absent_semantic_field_reason(err: &xerj_common::XerjError) -> Option<&str> {
+    match err {
+        xerj_common::XerjError::InvalidQuery { reason }
+            if reason.contains("it is not a `semantic_text` field") =>
+        {
+            Some(reason.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// True when `index_name` is a concrete token of `selector` (comma-separated,
+/// date math already resolved the way the search path resolves it). A
+/// wildcard, `_all`/`*`, or an alias token is not the concrete index name, so
+/// members reached only through that expansion are not explicitly named.
+fn selector_names_index_explicitly(selector: &str, index_name: &str) -> bool {
+    selector.split(',').any(|token| {
+        let token = resolve_date_math_index(token.trim());
+        token == index_name
+    })
+}
+
+fn semantic_field_shard_failure(index: &str, node: &str, reason: &str) -> Value {
+    json!({
+        "shard": 0,
+        "index": index,
+        "node": node,
+        "reason": {
+            "type": "illegal_argument_exception",
+            "reason": reason
+        }
+    })
+}
+
+#[cfg(test)]
+mod expanded_semantic_selector_tests {
+    use super::selector_names_index_explicitly;
+
+    #[test]
+    fn a_concrete_token_is_explicit_and_a_pattern_is_not() {
+        assert!(selector_names_index_explicitly("proj-notes", "proj-notes"));
+        assert!(selector_names_index_explicitly(
+            "proj-notes,proj-tags",
+            "proj-tags"
+        ));
+        assert!(!selector_names_index_explicitly("proj-*", "proj-notes"));
+        assert!(!selector_names_index_explicitly("proj-*", "proj-tags"));
+        assert!(!selector_names_index_explicitly("_all", "proj-notes"));
+        assert!(!selector_names_index_explicitly("*", "proj-notes"));
+        // An alias token is not the concrete member name.
+        assert!(!selector_names_index_explicitly("proj", "proj-notes"));
+        // A concrete name beside a pattern is still explicit.
+        assert!(selector_names_index_explicitly(
+            "proj-*,proj-tags",
+            "proj-tags"
+        ));
+        assert!(!selector_names_index_explicitly(
+            "proj-*,proj-tags",
+            "proj-notes"
+        ));
+    }
+}
+
 async fn search_dispatch(
     state: AppState,
     index: String,
@@ -14993,6 +15230,9 @@ async fn search_impl(
     let mut spawned_searches = Vec::with_capacity(index_names.len());
     // Only used when an in-process caller asked to have failing indices skipped.
     let mut skipped = SkippedIndices::default();
+    // #2305: wildcard / `_all` / alias members with no `semantic_text` field.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
             Ok(i) => i,
@@ -15115,6 +15355,7 @@ async fn search_impl(
     // handles, aborting their still-running searches.
     for (idx_name, mut search_task) in spawned_searches {
         let search_result = (&mut search_task.0).await;
+        semantic_skips.note_attempt();
 
         match search_result {
             Err(join_err) => {
@@ -15139,7 +15380,17 @@ async fn search_impl(
                     shards_failed_count += 1;
                     continue;
                 }
-                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+                // #2305: a wildcard, `_all`, or alias member with no
+                // `semantic_text` field for this query contributes no hits.
+                // A concrete name in the selector still fails the request.
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, idx_name, search_node.as_str(), err) {
+                    Ok(()) => {
+                        shards_failed_count += 1;
+                        continue;
+                    }
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
             }
             Ok(Ok(result)) => {
                 // A Painless resource limit tripped somewhere in scoring or
@@ -15230,6 +15481,13 @@ async fn search_impl(
     // failure is the answer.
     if let Some(failure) = skipped.all_failed() {
         return failure;
+    }
+    // #2305: a pattern that matched only indices without the semantic field
+    // is the same 400 an explicit index would return — an empty 200 would
+    // hide a wrong field name. A mix (some indices have the field) falls
+    // through and answers from those.
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
 
     // ── Post-merge `auto_date_histogram` re-coordination ────────────────────
@@ -18399,11 +18657,16 @@ async fn search_impl(
         }
     }
 
-    // Surface the synthesized `_shards.failures` array for an HDR-percentiles
-    // negative-value shard failure (the `failed`/`successful` counts were
-    // already adjusted via `shards_failed_count` above).
+    // Surface shard failures: an expanded index with no `semantic_text` field
+    // (#2305), and an HDR-percentiles negative-value shard (the
+    // `failed`/`successful` counts were already adjusted via
+    // `shards_failed_count` above).
     if let Some(failure) = hdr_shard_failure.take() {
-        response_body["_shards"]["failures"] = json!([failure]);
+        semantic_skips.failures.push(failure);
+    }
+    if !semantic_skips.failures.is_empty() {
+        response_body["_shards"]["failures"] =
+            Value::Array(std::mem::take(&mut semantic_skips.failures));
     }
 
     // (script_fields are evaluated per hit against the hit's source in the
@@ -20945,9 +21208,10 @@ fn es_properties_to_fields(properties: &Value) -> Result<Vec<FieldConfig>, Strin
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{field_name}_vector"));
-            // Allow a mapping to point at an external inference endpoint/model
-            // (`inference_id` mirrors ES 8.x semantic_text wiring); when absent
-            // the engine falls back to the zero-config built-in embedder.
+            // `inference_id` / `model_id` / `inference_endpoint` are stored so a
+            // mapping round-trips. Ingest does not read them: the server's
+            // `--embed-mode` embeds every document, and create/put mapping
+            // warns when these keys name a different embedder (#1612).
             let endpoint = field_def
                 .get("inference_endpoint")
                 .and_then(Value::as_str)
@@ -23019,6 +23283,41 @@ fn apply_one_update_stmt(source: &mut Value, stmt: &str, params: &Value) -> Resu
 // POST /{index}/_refresh
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One `_shards.failures` entry for `_refresh`, in selector order. The first
+/// failure's HTTP status becomes the response status (ES
+/// `BaseBroadcastResponse::getStatus`).
+fn record_refresh_failure(
+    failures: &mut Vec<Value>,
+    response_status: &mut StatusCode,
+    name: &str,
+    rendered: Value,
+) {
+    let status = rendered
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|code| StatusCode::from_u16(code as u16).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if failures.is_empty() {
+        *response_status = status;
+    }
+    let reason = rendered
+        .pointer("/error/root_cause/0")
+        .or_else(|| rendered.pointer("/error"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
+    let status_name = status
+        .canonical_reason()
+        .unwrap_or("Internal Server Error")
+        .to_ascii_uppercase()
+        .replace([' ', '-'], "_");
+    failures.push(json!({
+        "shard": 0,
+        "index": name,
+        "status": status_name,
+        "reason": reason,
+    }));
+}
+
 pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -23031,39 +23330,42 @@ pub async fn refresh_index(
     let mut successful = 0u64;
     let mut failures = Vec::new();
     let mut response_status = StatusCode::OK;
-    // #1635: `Index::flush` bounds both flush admission and the caller-visible
-    // wait. One stuck index returns an error naming that index; this loop
-    // records it under `_shards.failures` and continues, so the refresh of
-    // the other indices in the pattern is not parked behind it.
-    for (name, idx) in &handles {
-        match idx.flush().await {
+    // #2234: `_refresh` makes writes searchable. It is not `_flush`.
+    // `Index::flush` also runs verified WAL maintenance (snapshot fsync and
+    // prune). That work shares the disk with a background segment merge, and
+    // this handler used to await it one index at a time — a wildcard refresh
+    // sat behind the first busy index for the whole flush budget, which is
+    // what stalled autoindex finalize. `Index::refresh` publishes an
+    // unflushed memtable and returns immediately when that memtable is
+    // already empty (#1635 still bounds a memtable that does have to be
+    // published). The indices run together, so a healthy index is searchable
+    // while a busy one is still inside its own budget. Results are collected
+    // in selector order: the first failure still sets the HTTP status.
+    let mut tasks = Vec::with_capacity(handles.len());
+    for (name, idx) in handles {
+        let task_name = name.clone();
+        tasks.push((
+            name,
+            tokio::spawn(async move { (task_name, idx.refresh().await) }),
+        ));
+    }
+    for (name, task) in tasks {
+        let (name, result) = match task.await {
+            Ok(pair) => pair,
+            Err(error) => {
+                let rendered = ApiError::new(xerj_common::XerjError::internal(format!(
+                    "index [{name}] refresh task failed: {error}"
+                )))
+                .into_value();
+                record_refresh_failure(&mut failures, &mut response_status, &name, rendered);
+                continue;
+            }
+        };
+        match result {
             Ok(()) => successful += 1,
             Err(error) => {
                 let rendered = ApiError::new(xerj_common::XerjError::from(error)).into_value();
-                let status = rendered
-                    .get("status")
-                    .and_then(Value::as_u64)
-                    .and_then(|code| StatusCode::from_u16(code as u16).ok())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                if failures.is_empty() {
-                    response_status = status;
-                }
-                let reason = rendered
-                    .pointer("/error/root_cause/0")
-                    .or_else(|| rendered.pointer("/error"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
-                let status_name = status
-                    .canonical_reason()
-                    .unwrap_or("Internal Server Error")
-                    .to_ascii_uppercase()
-                    .replace([' ', '-'], "_");
-                failures.push(json!({
-                    "shard": 0,
-                    "index": name,
-                    "status": status_name,
-                    "reason": reason,
-                }));
+                record_refresh_failure(&mut failures, &mut response_status, &name, rendered);
             }
         }
     }
@@ -25664,6 +25966,10 @@ pub async fn search_with_scroll(
     // Execute search across all indices and collect ALL hits.
     let mut all_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total_count: u64 = 0;
+    // #2305: alias expansion on this route (wildcards are not expanded here)
+    // must not 400 every member because one lacks the semantic field.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
 
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
@@ -25676,6 +25982,7 @@ pub async fn search_with_scroll(
         full_req.size = SCROLL_SNAPSHOT_MAX_HITS;
         full_req.from = 0;
 
+        semantic_skips.note_attempt();
         match idx.search(&full_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
@@ -25686,8 +25993,17 @@ pub async fn search_with_scroll(
                     all_hits.push((idx_name.clone(), hit));
                 }
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Err(e) => {
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, idx_name, search_node.as_str(), err) {
+                    Ok(()) => continue,
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
         }
+    }
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
 
     let took_ms = started.elapsed().as_millis() as u64;
@@ -28735,6 +29051,11 @@ async fn msearch_impl(
         let mut merged_aggs: Option<Value> = None;
         let mut search_error: Option<xerj_common::XerjError> = None;
         let mut script_failure: Option<String> = None;
+        // #2305: same wildcard/alias isolation as `_search`. `_msearch` fans
+        // out on its own, so a `proj-*` item used to 400 when one match lacked
+        // the semantic field.
+        let mut semantic_skips = ExpandedSemanticSkips::default();
+        let search_node = state.engine.node_id.clone();
 
         for idx_name in &index_names {
             let idx = match state.engine.get_index(idx_name) {
@@ -28744,6 +29065,7 @@ async fn msearch_impl(
                     break;
                 }
             };
+            semantic_skips.note_attempt();
             match idx.search(&search_req).await {
                 Ok(result) => {
                     // A Painless resource limit tripped during scoring/aggs:
@@ -28768,8 +29090,19 @@ async fn msearch_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(xerj_common::XerjError::from(e));
-                    break;
+                    let err = xerj_common::XerjError::from(e);
+                    match semantic_skips.take_skippable(
+                        &index_name,
+                        idx_name,
+                        search_node.as_str(),
+                        err,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            search_error = Some(err);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -28777,6 +29110,9 @@ async fn msearch_impl(
         if let Some(reason) = script_failure {
             responses.push(script_limit_error_value(&reason));
             continue;
+        }
+        if search_error.is_none() {
+            search_error = semantic_skips.failure_if_every_index_skipped();
         }
 
         // The sub-response carries the SAME body the single-request `_search`
@@ -28844,6 +29180,16 @@ async fn msearch_impl(
         });
         if let Some(aggs) = merged_aggs {
             resp["aggregations"] = aggs;
+        }
+        if semantic_skips.skipped > 0 {
+            let total = index_names.len().max(1) as u32;
+            resp["_shards"] = json!({
+                "total": total,
+                "successful": total.saturating_sub(semantic_skips.skipped),
+                "skipped": 0,
+                "failed": semantic_skips.skipped,
+                "failures": semantic_skips.failures,
+            });
         }
         // PIT sub-searches echo the pit_id first, exactly like `_search`
         // (ES 8.x msearch items carry it too — same search_after loop
@@ -38980,7 +39326,12 @@ pub async fn search_template(
     // question this sweep didn't ask.
     let mut merged_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total: u64 = 0;
+    // #2305: this minimal merge still fans a semantic query across every
+    // match of a wildcard. An expanded index without the field is skipped.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
     for (name, idx) in &handles {
+        semantic_skips.note_attempt();
         match idx.search(&search_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
@@ -38989,8 +39340,17 @@ pub async fn search_template(
                 total += result.total.value;
                 merged_hits.extend(result.hits.into_iter().map(|h| (name.clone(), h)));
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Err(e) => {
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, name, search_node.as_str(), err) {
+                    Ok(()) => continue,
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
         }
+    }
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
     merged_hits.sort_by(|(_, a), (_, b)| {
         b.score
@@ -39020,7 +39380,7 @@ pub async fn search_template(
             })
         })
         .collect();
-    Json(json!({
+    let mut resp = json!({
         "took": took_ms,
         "timed_out": false,
         "_shards": crate::responses::EsShards::search_success(),
@@ -39029,8 +39389,18 @@ pub async fn search_template(
             "max_score": max_score,
             "hits": hits,
         },
-    }))
-    .into_response()
+    });
+    if semantic_skips.skipped > 0 {
+        let shard_total = handles.len().max(1) as u32;
+        resp["_shards"] = json!({
+            "total": shard_total,
+            "successful": shard_total.saturating_sub(semantic_skips.skipped),
+            "skipped": 0,
+            "failed": semantic_skips.skipped,
+            "failures": semantic_skips.failures,
+        });
+    }
+    Json(resp).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39251,6 +39621,9 @@ async fn msearch_template_impl(
         let mut total_count: u64 = 0;
         let mut script_failure: Option<String> = None;
         let mut search_error: Option<xerj_common::XerjError> = None;
+        // #2305: `*` / `_all` and alias expansion on this route.
+        let mut semantic_skips = ExpandedSemanticSkips::default();
+        let search_node = state.engine.node_id.clone();
 
         // Both arms below used to be `if let Ok(..)` with no else, so a
         // missing index or a query the engine refused produced
@@ -39269,6 +39642,7 @@ async fn msearch_template_impl(
                     break;
                 }
             };
+            semantic_skips.note_attempt();
             match idx.search(&search_req).await {
                 Ok(result) => {
                     if let Some(reason) = result.script_failure {
@@ -39291,8 +39665,19 @@ async fn msearch_template_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(xerj_common::XerjError::from(e));
-                    break;
+                    let err = xerj_common::XerjError::from(e);
+                    match semantic_skips.take_skippable(
+                        &index_name,
+                        idx_name,
+                        search_node.as_str(),
+                        err,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            search_error = Some(err);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -39303,6 +39688,9 @@ async fn msearch_template_impl(
             responses.push(script_limit_error_value(&reason));
             continue;
         }
+        if search_error.is_none() {
+            search_error = semantic_skips.failure_if_every_index_skipped();
+        }
 
         if let Some(err) = search_error {
             responses.push(ApiError::new(err).into_value());
@@ -39310,7 +39698,7 @@ async fn msearch_template_impl(
         }
 
         let took_ms = started.elapsed().as_millis() as u64;
-        responses.push(json!({
+        let mut item = json!({
             "took": took_ms,
             "timed_out": false,
             "_shards": crate::responses::EsShards::search_success(),
@@ -39318,7 +39706,18 @@ async fn msearch_template_impl(
                 "total": { "value": total_count, "relation": "eq" },
                 "hits": merged_hits,
             },
-        }));
+        });
+        if semantic_skips.skipped > 0 {
+            let total = index_names.len().max(1) as u32;
+            item["_shards"] = json!({
+                "total": total,
+                "successful": total.saturating_sub(semantic_skips.skipped),
+                "skipped": 0,
+                "failed": semantic_skips.skipped,
+                "failures": semantic_skips.failures,
+            });
+        }
+        responses.push(item);
     }
 
     Json(json!({

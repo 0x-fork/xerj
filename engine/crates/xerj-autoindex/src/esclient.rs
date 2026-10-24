@@ -1151,6 +1151,15 @@ pub struct EmbeddingExecutionIdentity {
     pub resumable: bool,
     #[serde(default)]
     pub non_resumable_reason: Option<String>,
+    /// Advisory neural-ingest sample from `GET /v1/embedding/identity`.
+    /// Absent on older servers and on every non-neural backend. Not part of
+    /// `identity_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_passages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_millis: Option<u64>,
 }
 
 /// Ensure an autoindex index-create body pins the index to a single WAL shard.
@@ -2239,6 +2248,29 @@ impl Es {
                 }
             },
         )
+    }
+
+    /// One `_refresh`, with no retry.
+    ///
+    /// [`Self::refresh`] allows six attempts, and each attempt waits on the
+    /// client's 300s transport budget. Finalize used to call that against one
+    /// wildcard. A single index whose refresh did not return then stalled the
+    /// run for the whole budget and started again (#2234). Finalize names the
+    /// index it is waiting on and gives that request one attempt: the server
+    /// bounds a memtable publish, and a transport timeout is the backstop,
+    /// not the start of five more.
+    pub fn refresh_once(&self, pattern: &str) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::POST, &format!("/{pattern}/_refresh"))
+            .send()
+            .map_err(|e| anyhow!("refresh {pattern}: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            Err(anyhow!("refresh {pattern}: HTTP {status}: {body}"))
+        }
     }
 
     fn search_raw(&self, index: &str, body: &Value) -> Result<(reqwest::StatusCode, Value)> {
@@ -3639,6 +3671,45 @@ mod tests {
     }
 
     const BULK: &[u8] = b"{\"index\":{\"_index\":\"i\",\"_id\":\"a\"}}\n{\"v\":1}\n";
+
+    /// #2234 — finalize uses one attempt. `refresh` would open a second
+    /// connection after this 500; `refresh_once` must not.
+    #[test]
+    fn refresh_once_does_not_retry_a_failed_refresh() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_for_server = Arc::clone(&hits);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            hits_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_request(&mut stream);
+            respond_status(
+                &mut stream,
+                "500 Internal Server Error",
+                br#"{"error":"no"}"#,
+            );
+            listener.set_nonblocking(true).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            if listener.accept().is_ok() {
+                hits_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let es = client(address, 1);
+        let error = es.refresh_once("idx").unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("500"),
+            "the failure must name the HTTP status: {text}"
+        );
+        server.join().unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a failed finalize refresh must not be retried"
+        );
+    }
 
     /// A 429 must shrink the window the run offers load through, and a clean
     /// streak must probe it back up — never past what the operator asked for.

@@ -15,18 +15,22 @@ the wall clock, PR [#2167](https://github.com/xerj-org/xerj/pull/2167)).
 #1122 is partial: a helper thread that cannot be created no longer aborts
 the process (PR [#2226](https://github.com/xerj-org/xerj/pull/2226)) and one
 JSON document over 8 MiB is refused or streamed (PR
-[#2256](https://github.com/xerj-org/xerj/pull/2256)), and on Windows the
+[#2256](https://github.com/xerj-org/xerj/pull/2256)), on Windows the
 process cap follows commit space (PR
-[#2236](https://github.com/xerj-org/xerj/pull/2236)); the issue stays open
+[#2236](https://github.com/xerj-org/xerj/pull/2236)), and a bulk reserves
+memory before parsing while uncompressed JSON over 64 MiB is streamed (PR
+[#2302](https://github.com/xerj-org/xerj/pull/2302)); the issue stays open
 (the memory-ceiling class and the WSL2 VM death are not addressed). #1170 is partial:
 index metadata through the Raft log (PR
 [#2257](https://github.com/xerj-org/xerj/pull/2257)), document routing to
 the primary named in the create entry (PR
-[#2271](https://github.com/xerj-org/xerj/pull/2271)), and replica copies of
+[#2271](https://github.com/xerj-org/xerj/pull/2271)), replica copies of
 an acknowledged document write (PR
-[#2287](https://github.com/xerj-org/xerj/pull/2287)). Quorum, promotion, a
+[#2287](https://github.com/xerj-org/xerj/pull/2287)), and acknowledgement
+once a quorum of those copies confirms (PR
+[#2303](https://github.com/xerj-org/xerj/pull/2303)). Promotion, a
 durable Raft log, snapshot catch-up, and `_bulk` / native ingest routing
-stay open on #1170. The window since rc.98 is 82 merged pull requests; the
+stay open on #1170. The window since rc.98 is 91 merged pull requests; the
 CHANGELOG lists every one. x86_64 binaries run without AVX2 (PR
 [#2253](https://github.com/xerj-org/xerj/pull/2253), which supersedes the
 installer refusal in PR
@@ -385,15 +389,19 @@ be created no longer aborts the process (PR
 document over 8 MiB is refused or streamed (PR
 [#2256](https://github.com/xerj-org/xerj/pull/2256)), and on Windows the
 process cap follows commit space rather than physical RAM alone (PR
-[#2236](https://github.com/xerj-org/xerj/pull/2236)). The memory-ceiling
+[#2236](https://github.com/xerj-org/xerj/pull/2236)), and a bulk reserves
+memory before parsing while uncompressed JSON over 64 MiB is streamed
+(PR [#2302](https://github.com/xerj-org/xerj/pull/2302)). The memory-ceiling
 class and the WSL2 VM death stay open.
 [#1170](https://github.com/xerj-org/xerj/issues/1170) (cluster
 replication). Partial in the rc.99 window: index metadata through the
 Raft log (PR [#2257](https://github.com/xerj-org/xerj/pull/2257)),
 document writes and search routed to the primary named in the create
-entry (PR [#2271](https://github.com/xerj-org/xerj/pull/2271)), and an
+entry (PR [#2271](https://github.com/xerj-org/xerj/pull/2271)), an
 acknowledged document write copied onto replicas placed at create (PR
-[#2287](https://github.com/xerj-org/xerj/pull/2287)). Quorum, promotion,
+[#2287](https://github.com/xerj-org/xerj/pull/2287)), and that write
+acknowledged once a quorum of the copies confirms (PR
+[#2303](https://github.com/xerj-org/xerj/pull/2303)). Promotion,
 a durable Raft log, snapshot catch-up, `_bulk` and native ingest stay
 open.
 **Closed inside the rc.99 window and recorded in the CHANGELOG, not

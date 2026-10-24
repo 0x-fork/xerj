@@ -33,6 +33,7 @@ pub mod init;
 /// `--label`: ingest-time labelling through the node's `/_decide` (#1062).
 pub mod label;
 pub mod memory_cli;
+pub mod neural_cost;
 pub mod objsource;
 #[cfg(test)]
 mod objsource_minio_tests;
@@ -1648,6 +1649,43 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_
     );
 }
 
+fn inventory_size_map(inventory: &content::Inventory) -> HashMap<&str, u64> {
+    inventory
+        .keys
+        .iter()
+        .zip(inventory.files.iter())
+        .map(|(key, file)| (key.as_str(), file.size))
+        .collect()
+}
+
+/// Print a neural embedding-time estimate when the server measured one.
+///
+/// Best-effort: a failed identity read does not fail the run (the later pin
+/// still does, on a real semantic ingest) and never invents a rate. Zero
+/// source bytes print nothing, including a lexical corpus.
+fn note_neural_ingest_cost(
+    es: &Es,
+    source_bytes: u64,
+    kind: neural_cost::SourceBytes,
+    pr: &Progress,
+) {
+    if source_bytes == 0 {
+        return;
+    }
+    let identity = match es.embedding_execution_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            pr.note(&format!(
+                "embedding cost: could not read GET /v1/embedding/identity ({error}); no time estimate printed"
+            ));
+            return;
+        }
+    };
+    if let Some(message) = neural_cost::note(&identity, source_bytes, kind) {
+        pr.note(&message);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // cutover threads the whole run context
 fn begin_non_graph_generation(
     es: &Es,
@@ -1775,6 +1813,9 @@ fn begin_non_graph_generation(
             semantic_contract: "disabled-no-semantic-fields-v1".into(),
             resumable: true,
             non_resumable_reason: None,
+            ingest_probe_bytes: None,
+            ingest_probe_passages: None,
+            ingest_probe_millis: None,
         }
     };
 
@@ -3266,6 +3307,18 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Scan-time skip for a whole-file family over `--max-file-bytes`.
+///
+/// Names the file's actual size and the flag that raises this cap. It does
+/// not raise the 8 MiB per-document ceiling.
+fn oversized_family_reason(family: &str, size: u64, max_file_bytes: u64) -> String {
+    format!(
+        "oversized for non-streaming family {family} ({} > {}); raise --max-file-mb",
+        human_size(size),
+        human_size(max_file_bytes),
+    )
+}
+
 fn scan_file(
     path: &Path,
     size: u64,
@@ -3327,11 +3380,7 @@ fn scan_file(
     if whole_file && size > max_file_bytes {
         out.junk = Some((
             "skipped".into(),
-            format!(
-                "oversized for non-streaming family {} (> {})",
-                sn.family.as_str(),
-                human_size(max_file_bytes),
-            ),
+            oversized_family_reason(sn.family.as_str(), size, max_file_bytes),
         ));
         out.sniffed = Some(sn);
         return out;
@@ -7955,6 +8004,18 @@ fn run_index_report_inner(
                 tally,
             )?;
             let unchanged = serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)?;
+            let sizes = inventory_size_map(&inventory);
+            let changed_bytes = if unchanged {
+                0
+            } else {
+                neural_cost::changed_semantic_source_bytes(&base.plan.files, &plan, &sizes)
+            };
+            note_neural_ingest_cost(
+                &es,
+                changed_bytes,
+                neural_cost::SourceBytes::SemanticSource,
+                &pr,
+            );
             println!("{}", serde_json::to_string_pretty(&plan)?);
             // stdout is the RESULT, stderr is PROGRESS: the projection above is
             // the result, this explanation is progress and goes out through the
@@ -8075,6 +8136,15 @@ fn run_index_report_inner(
             finish_generated_progress(&pr, code, &summary, dataless_skipped);
             return Ok((code, Some(summary)));
         }
+        let sizes = inventory_size_map(&inventory);
+        let changed_bytes =
+            neural_cost::changed_semantic_source_bytes(&base.plan.files, &plan, &sizes);
+        note_neural_ingest_cost(
+            &es,
+            changed_bytes,
+            neural_cost::SourceBytes::SemanticSource,
+            &pr,
+        );
         begin_non_graph_generation(
             &es,
             &mut journal,
@@ -8723,6 +8793,14 @@ fn run_index_report_inner(
         pr.finish(true, 0, "cancelled", &[]);
         return Ok((0, None));
     }
+
+    let sizes = inventory_size_map(&inventory);
+    note_neural_ingest_cost(
+        &es,
+        neural_cost::semantic_source_bytes(&plan, &sizes),
+        neural_cost::SourceBytes::SemanticSource,
+        &pr,
+    );
 
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -9766,21 +9844,16 @@ fn run_index_report_inner(
                             truncated_files.lock().unwrap().push(f.rel.clone());
                         }
                         if stats.oversize_values > 0 {
-                            if stats.records > 0 {
-                                pr.note(&format!(
-                                    "{}: {} JSON value(s) were not indexed (over the {}-byte limit for one document). The rest of the file was indexed.",
-                                    f.rel,
-                                    stats.oversize_values,
-                                    xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
-                                ));
+                            let ceiling = xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES;
+                            let tail = if stats.records > 0 {
+                                "The rest of the file was indexed."
                             } else {
-                                pr.note(&format!(
-                                    "{}: {} JSON value(s) were not indexed (over the {}-byte limit for one document).",
-                                    f.rel,
-                                    stats.oversize_values,
-                                    xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES,
-                                ));
-                            }
+                                "Nothing else in the file was indexed."
+                            };
+                            pr.note(&format!(
+                                "{} ({} bytes): {} JSON value(s) were not indexed (over the {ceiling}-byte limit for one document). {tail} This ceiling is fixed and is not raised by --max-file-mb or limits.max_process_memory_mb; split the value into smaller documents.",
+                                f.rel, f.size, stats.oversize_values,
+                            ));
                         }
                     }
                     Err(e) => {
@@ -10293,30 +10366,43 @@ fn run_index_report_inner(
     // countable before each loop starts, so it is reported like any other
     // phase — split into named sub-phases because the mix of one-shot refreshes
     // and per-dataset round trips has no single honest denominator.
-    pr.phase("finalize-refresh", 1 + graph.is_some() as u64, 0);
-    // #1635: a refresh that never returns used to sit here at items=0 with
-    // no error (`rate=unknown`). The server now fails the stuck index by
-    // name. Swallowing that (`.ok()`) turned the failure back into a green
-    // run whose documents were not all refreshed.
-    let pattern = format!("{}-*", cfg.prefix);
-    es.refresh(&pattern).map_err(|error| {
-        anyhow::anyhow!(
-            "finalize-refresh of {pattern} failed: {error:#}. The server names the index that \
-             did not refresh; documents already written stay indexed and rerunning the same \
-             command resumes"
-        )
-    })?;
-    pr.item_done(0);
+    // #2234: one wildcard `POST /{prefix}-*/_refresh` made this phase a single
+    // request with denominator 1. The server refreshed the matches one index
+    // at a time, so a large index with a segment merge in progress held the
+    // whole call (and this phase printed nothing until it returned). Refresh
+    // each index this run wrote, name it on the bar while the request is in
+    // flight, and do not retry a timeout five more times. The server refreshes
+    // a multi-index target concurrently; one index here is one request so the
+    // wait, if there is one, is that index's own budget.
+    pr.phase(
+        "finalize-refresh",
+        plan.datasets.len() as u64 + graph.is_some() as u64,
+        0,
+    );
+    let mut refresh_failures: Vec<String> = Vec::new();
+    for dataset in &plan.datasets {
+        let _waiting = pr.file(&dataset.index, 0);
+        if let Err(error) = es.refresh_once(&dataset.index) {
+            refresh_failures.push(format!("{}: {error:#}", dataset.index));
+        }
+    }
     // The dot-prefixed edges index is outside the {prefix}-* pattern.
     if let Some(gr) = &graph {
-        es.refresh(&gr.edges_index).map_err(|error| {
-            anyhow::anyhow!(
-                "finalize-refresh of {} failed: {error:#}. Documents already written stay \
-                 indexed and rerunning the same command resumes",
-                gr.edges_index
-            )
-        })?;
-        pr.item_done(0);
+        let _waiting = pr.file(&gr.edges_index, 0);
+        if let Err(error) = es.refresh_once(&gr.edges_index) {
+            refresh_failures.push(format!("{}: {error:#}", gr.edges_index));
+        }
+    }
+    if !refresh_failures.is_empty() {
+        // #1635: swallowing a refresh failure (`.ok()`) turned it back into a
+        // green run whose documents were not all refreshed. Name every index
+        // that did not refresh. Documents already written stay indexed.
+        anyhow::bail!(
+            "finalize-refresh failed for {} index(es): {}. Documents already written stay \
+             indexed and rerunning the same command resumes",
+            refresh_failures.len(),
+            refresh_failures.join(" | ")
+        );
     }
 
     // live per-dataset counts + time ranges (every claim traces to a run)
@@ -12655,6 +12741,9 @@ mod duplicate_integration_tests {
             semantic_contract: "semantic_text-derived-vector.v1".into(),
             resumable: false,
             non_resumable_reason: Some("identity is derived from the model name".into()),
+            ingest_probe_bytes: None,
+            ingest_probe_passages: None,
+            ingest_probe_millis: None,
         };
         // All comparable fields match → the identity did NOT change.
         let err = ensure_embedding_execution_unchanged_and_resumable(
@@ -14531,6 +14620,14 @@ mod legacy_rebuild_argv_tests {
         assert_eq!(human_size(10 << 20), "10 MB");
         assert_eq!(human_size(4096), "4096 bytes");
         assert_eq!(human_size(0), "0 bytes");
+    }
+
+    #[test]
+    fn an_oversized_family_skip_names_the_file_size_and_the_flag() {
+        assert_eq!(
+            oversized_family_reason("json", 3 << 30, 2 << 30),
+            "oversized for non-streaming family json (3 GB > 2 GB); raise --max-file-mb"
+        );
     }
 
     /// #1233 back-compat: an index built before sub-GB caps existed serialised

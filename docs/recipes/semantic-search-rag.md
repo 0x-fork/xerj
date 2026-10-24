@@ -168,7 +168,7 @@ The doc is *titled* "Rotating an API key," but only its **body** is embedded, an
 the body never uses the word "rotate" — so a pure "rotate" paraphrase misses in
 lexical mode.
 
-### Upgrade to real neural semantics — still one binary, still in place
+### Upgrade to real neural semantics — still one binary
 
 ```bash
 # Built-in neural embedder — ships in the binary; downloads all-MiniLM-L6-v2
@@ -177,9 +177,12 @@ lexical mode.
 xerj --insecure --data-dir ./data --embed-mode neural
 ```
 
-With `--embed-mode neural`, the "rotate" paraphrase above lands on `kb-1` — the
-BERT encoder captures that *rotate ≈ regenerate ≈ replace* even with no shared
-term. Measured on the standard sentence-similarity pair, the built-in neural
+With `--embed-mode neural`, documents indexed after the switch are embedded by
+the BERT encoder, so the "rotate" paraphrase above lands on `kb-1` — it
+captures that *rotate ≈ regenerate ≈ replace* even with no shared term.
+Documents already in the index keep the vectors written at ingest: changing
+the flag does not re-embed them. Re-index the corpus after switching.
+Measured on the standard sentence-similarity pair, the built-in neural
 embedder scores a paraphrase at cosine **0.72** vs an unrelated sentence at
 **−0.04**; the lexical embedder cannot separate them that way.
 

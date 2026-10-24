@@ -184,6 +184,15 @@ pub struct EmbeddingExecutionIdentity {
     pub resumable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_resumable_reason: Option<String>,
+    /// Measured neural-ingest probe. Advisory and omitted when unset.
+    /// Not part of [`Self::identity_sha256`]: a different machine or a
+    /// warmer CPU must still resume the same index. Zero is never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_passages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_millis: Option<u64>,
 }
 
 // ── Clustering types ─────────────────────────────────────────────────────────
@@ -840,6 +849,11 @@ pub struct Engine {
     /// `ShardRouter::update_from_metadata` whenever the Raft log
     /// commits a new shard assignment.
     pub shard_router: Arc<parking_lot::RwLock<xerj_cluster::router::ShardRouter>>,
+    /// One lock per `(index, shard)` held across a replica copy and the
+    /// in-sync publish that follows it. Document writes for a shard all run
+    /// on its primary, so this is what keeps two of those writes from
+    /// publishing different in-sync sets.
+    replica_sync: Arc<DashMap<(String, u32), Arc<tokio::sync::Mutex<()>>>>,
 
     /// Exclusive lock on `<data_dir>/node.lock`, held for the engine's
     /// whole lifetime (RC4 blocker 13). Acquired in [`Engine::new`] BEFORE
@@ -1051,6 +1065,7 @@ impl Engine {
             shard_router: Arc::new(parking_lot::RwLock::new(
                 xerj_cluster::router::ShardRouter::new(1),
             )),
+            replica_sync: Arc::new(DashMap::new()),
             _node_lock: node_lock,
             cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
             cluster_state_boot: Arc::new(cluster_state_status),
@@ -1113,6 +1128,10 @@ impl Engine {
                                 Engine::apply_date_mapping_flags(&idx, m.value());
                             }
                             engine.load_or_backfill_index_created_at(&name_str);
+                            // Before the index is visible: a write that lands
+                            // in the same instant must already see the
+                            // persisted default pipeline (#2294).
+                            engine.rehydrate_index_settings_from_disk(&name_str);
                             engine.indices.insert(name_str, idx);
                         }
                         Err(e) => {
@@ -1705,6 +1724,54 @@ impl Engine {
                 file: path.display().to_string(),
                 reason: format!("{e} ({} bytes on disk)", bytes.len()),
             }),
+        }
+    }
+
+    /// Copy `<data_dir>/<name>/settings.json` into `index_settings`.
+    ///
+    /// Create and `PUT /_settings` fill that map, and [`Self::default_pipeline_for`]
+    /// reads only the map. `GET /_settings` falls back to the file when the
+    /// entry is missing, so after a restart the binding was still reported
+    /// and ordinary writes no longer ran it (#2294). Boot, failed-index
+    /// retry, and snapshot restore all open an existing index through
+    /// `Index::open` and must rebuild the map from the same file `open` loaded.
+    ///
+    /// A missing file, or a JSON `null`, drops any stale entry: restoring a
+    /// snapshot that was created without settings must not keep the pipeline
+    /// the previous index had in memory. An unreadable or unparseable file is
+    /// logged and left as-is. `Index::open` already refuses an unparseable
+    /// `settings.json` before this runs, so a parse error here is a change
+    /// between those two reads, not a second copy of that refusal.
+    fn rehydrate_index_settings_from_disk(&self, name: &str) {
+        let path = self.data_dir.join(name).join("settings.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(settings) if !settings.is_null() => {
+                    self.index_settings.insert(name.to_string(), settings);
+                }
+                Ok(_) => {
+                    self.index_settings.remove(name);
+                }
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "settings.json did not parse while rebuilding index settings; \
+                         leaving the in-memory binding unchanged"
+                    );
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.index_settings.remove(name);
+            }
+            Err(e) => {
+                warn!(
+                    name,
+                    error = %e,
+                    "settings.json unreadable while rebuilding index settings; \
+                     leaving the in-memory binding unchanged"
+                );
+            }
         }
     }
 
@@ -3411,6 +3478,7 @@ impl Engine {
                 if let Some(m) = self.index_mappings.get(name) {
                     Engine::apply_date_mapping_flags(&idx, m.value());
                 }
+                self.rehydrate_index_settings_from_disk(name);
                 self.indices.insert(name.to_string(), idx);
                 self.failed_indices.remove(name);
                 info!(name, "failed index reopened");
@@ -3663,9 +3731,34 @@ impl Engine {
         owner.map(|owner| (shard, owner.to_string()))
     }
 
-    /// Replica node ids for one shard, excluding the primary.
+    /// Replica node ids a read or a copy uses, excluding the primary.
+    ///
+    /// The create-time list until an in-sync update commits, then the
+    /// replicas that confirmed the last acknowledged write.
     pub fn replica_nodes(&self, index: &str, shard: u32) -> Vec<String> {
         self.shard_router.read().get_replicas(index, shard)
+    }
+
+    /// Replicas named at create, excluding the primary. The quorum uses this
+    /// count, which does not shrink when a replica falls out of sync.
+    pub fn placed_replica_nodes(&self, index: &str, shard: u32) -> Vec<String> {
+        self.shard_router.read().placed_replicas(index, shard)
+    }
+
+    /// Record the replicas that may serve a later read of this shard.
+    ///
+    /// Ids outside the create-time list are ignored. A shard with no placed
+    /// replicas is left as it is.
+    pub fn set_shard_in_sync(&self, index: &str, shard: u32, nodes: &[String]) {
+        self.shard_router.write().set_in_sync(index, shard, nodes);
+    }
+
+    /// Lock that serializes replica copies of one shard on this process.
+    pub fn replica_sync_lock(&self, index: &str, shard: u32) -> Arc<tokio::sync::Mutex<()>> {
+        self.replica_sync
+            .entry((index.to_string(), shard))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Primary shards of `index` owned by `node_id`, sorted.
@@ -4415,9 +4508,11 @@ impl Engine {
             return Some(p);
         }
         // A write that auto-creates the index resolves the pipeline before
-        // that create (#2281). The template's default applies only then: an
-        // index that already exists keeps whatever it was created with, even
-        // when this in-memory map was not rehydrated after a restart.
+        // that create (#2281). The template's default applies only then.
+        // An index that already exists keeps the pipeline persisted in its
+        // `settings.json`, which boot, retry, and snapshot restore copy back
+        // into this map (#2294). Falling through to the template would attach
+        // a pipeline the index was not created with.
         if self.indices.contains_key(index) || self.failed_indices.contains_key(index) {
             return None;
         }
@@ -4923,6 +5018,9 @@ impl Engine {
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
+                    // Replace whatever the live map held. A snapshot created
+                    // without settings must not keep the previous binding.
+                    self.rehydrate_index_settings_from_disk(idx_name);
                     self.indices.insert(idx_name.clone(), idx);
                     // Restoring from a snapshot is *the* repair for an index
                     // that failed to open, so clear the recorded failure —

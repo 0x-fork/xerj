@@ -82,6 +82,10 @@ pub struct EsIndexResponse {
     pub acknowledged: bool,
     pub shards_acknowledged: bool,
     pub index: String,
+    /// Present only when a mapping asked for an embedder this server will not
+    /// use. Empty stays off the wire so existing clients see the same JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl EsIndexResponse {
@@ -90,6 +94,7 @@ impl EsIndexResponse {
             acknowledged: true,
             shards_acknowledged: true,
             index: index.into(),
+            warnings: Vec::new(),
         }
     }
 }

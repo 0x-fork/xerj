@@ -233,7 +233,7 @@ xerj mcp                                # 2. MCP stdio server (your client runs 
 
 ### 支持的智能体
 
-二十六个客户端可以把 `xerj mcp` 注册为本地 stdio 服务。配置条目始终只有两个字段：二进制程序的绝对路径，以及作为唯一参数的 `mcp`。各客户端的差别在于条目写进哪个文件、包在哪个键下。“已测试”指在该客户端里注册过此服务，`xerj_search` 出现在了它的工具列表里；“未测试”表示路径和写法照抄自该客户端自己的文档，还没有人实际跑过。目前只有 OpenCode 一行跑过：Windows 上的 v2.1.2 对接 `xerj` v1.0.0-rc.97，`initialize` 和 `tools/list` 都得到应答，工具列表完整。修正任何一行“未测试”都是很好的第一个 PR。
+二十六个客户端可以把 `xerj mcp` 注册为本地 stdio 服务。配置条目始终只有两个字段：二进制程序的绝对路径，以及作为唯一参数的 `mcp`。各客户端的差别在于条目写进哪个文件、包在哪个键下。“已测试”指在该客户端里注册过此服务，`xerj_search` 出现在了它的工具列表里；“未测试”表示路径和写法照抄自该客户端自己的文档，还没有人实际跑过。目前跑过两行。OpenCode：Windows 上的 v2.1.2 对接 `xerj` v1.0.0-rc.97，`initialize` 和 `tools/list` 都得到应答，工具列表完整。Cline CLI 3.0.73（Linux）对接 `xerj` v1.0.0-rc.98：把本节的 `mcpServers` 块写入 `~/.cline/data/settings/cline_mcp_settings.json` 后，`xerj_search`（Cline 交给模型时的名字是 `xerj__xerj_search`）出现在该二进制的 20 个工具里，并且 Cline 执行了一次 `xerj_search` 调用。当时没有供应商密钥，模型回合用的是本地 OpenAI 兼容桩；MCP 服务是真正的 `xerj mcp` 进程。IDE 的 MCP Servers > Configure 按钮不在那次运行里。修正任何一行“未测试”都是很好的第一个 PR。
 
 | 客户端 | 配置文件 | 键 | 说明 | 测试状态 |
 |---|---|---|---|---|
@@ -245,7 +245,7 @@ xerj mcp                                # 2. MCP stdio server (your client runs 
 | GitHub Copilot in VS Code | `.vscode/mcp.json` | `servers` | 需要 `"type": "stdio"`；可移植的 `.mcp.json` 用的是 `mcpServers` | 未测试 |
 | Windsurf | `%APPDATA%\devin\mcp_config.json`、`~/.config/devin/mcp_config.json` | `mcpServers` | 路径现在属于 Devin，不再是 `~/.codeium/windsurf` | 未测试 |
 | Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json`、`~/Library/Application Support/Claude/claude_desktop_config.json`、`~/.config/Claude/claude_desktop_config.json` | `mcpServers` | 要完全退出应用，只关窗口不行 | 未测试 |
-| Cline | `~/.cline/data/settings/cline_mcp_settings.json`（CLI）；IDE 可从 MCP Servers > Configure 打开 | `mcpServers` | `disabled` 和 `autoApprove` 是 Cline 特有字段 | 未测试 |
+| Cline | `~/.cline/data/settings/cline_mcp_settings.json`（CLI）；IDE 可从 MCP Servers > Configure 打开 | `mcpServers` | `disabled` 和 `autoApprove` 是 Cline 特有字段；这次 CLI 运行不需要它们 | 已测试 |
 | Roo Code | 项目内的 `.roo/mcp.json`，或 `<VS Code User>/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json` | `mcpServers` | 名称冲突时项目条目优先 | 未测试 |
 | Kilo Code | 项目内的 `kilo.jsonc` 或 `.kilo/kilo.jsonc`，全局为 `~/.config/kilo/kilo.jsonc` | `mcp` | 单个 command 数组，同 OpenCode | 未测试 |
 | Continue | `~/.continue/config.yaml`，或 `.continue/mcpServers/` 下的任意文件 | `mcpServers` | YAML 列表而非映射；仅 Agent 模式 | 未测试 |
@@ -257,7 +257,7 @@ xerj mcp                                # 2. MCP stdio server (your client runs 
 | Kiro | 工作区内的 `.kiro/settings/mcp.json`，用户级为 `~/.kiro/settings/mcp.json` | `mcpServers` | `${VAR}` 展开需要批准 | 未测试 |
 | Antigravity | `~/.gemini/config/mcp_config.json`，或工作区内的 `.agents/mcp_config.json` | `mcpServers` | 远程服务用 `serverUrl` | 未测试 |
 | OpenClaw | `~/.openclaw/openclaw.json`（JSON5） | `mcp.servers` | `transport: "stdio"` | 未测试 |
-| DeepSeek Harness (dsh) | `$DSH_HOME/cordis.patch.yml`，或某个 profile 补丁 | 带 `@deepseek-ai/dsh-mcp-client` 的 `- insert:` | 每个服务一个插件实例 | 未测试 |
+| [DeepSeek Harness (dsh)](dsh/) | `$DSH_HOME/cordis.patch.yml`，或某个 profile 补丁 | 带 `@deepseek-ai/dsh-mcp-client` 的 `- insert:` | 每个服务一个插件实例 | 未测试 |
 | Warp | Settings > Agents > MCP servers，或 `~/.warp/.mcp.json` 与项目内的 `.warp/.mcp.json` | `mcpServers` | `working_directory` 而非 `cwd` | 未测试 |
 | Augment Code | Auggie CLI 用 `~/.augment/settings.json`；IDE 有自己的面板 | `mcpServers` | 该文件不控制 IDE | 未测试 |
 | Qwen Code | `~/.qwen/settings.json`，或项目内的 `.qwen/settings.json` | `mcpServers` | `mcp.allowed` 可能悄悄隐藏它 | 未测试 |
@@ -332,7 +332,7 @@ DeepSeek Harness 在 `$DSH_HOME/cordis.patch.yml`（或某个 profile 的 `$DSH_
       config:
         serverName: xerj
         transport: stdio
-        command: /abs/path/to/xerj
+        command: xerj
         args:
           - mcp
         env:

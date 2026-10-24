@@ -185,13 +185,20 @@ Content types:
   with `--embed-mode neural` — a built-in in-process BERT encoder (all-MiniLM-L6-v2)
   that ships in the binary and auto-downloads its model (~90 MB) on first use, no
   external service — or `--embed-mode proxy` (any OpenAI-compatible `/v1/embeddings`).
-  You can also declare `semantic_text` with an external `inference_id` /
-  `inference_endpoint`, or index your own vectors into a `dense_vector` field and use
-  `knn`. Only describe output as neural when one of those modes is actually running.
+  You can index your own vectors into a `dense_vector` field and use `knn`.
+  A `semantic_text` mapping may set `inference_id`, `model_id`, or
+  `inference_endpoint`; those keys do not switch the embedder. Ingest uses the
+  server's `--embed-mode`, and create/put mapping returns a warning when the
+  mapping names a different one. Only describe output as neural when
+  `--embed-mode neural` or `--embed-mode proxy` is actually running.
     * `--embed-mode` is a server-start flag that applies AT INGEST: a document keeps
       the embedding produced by the mode in force when it was indexed. Switching
       lexical → neural does not re-embed anything already indexed — you must
       re-index. Decide before indexing your first corpus.
+    * Before a neural `xerj autoindex` ingest, the client prints an estimated
+      embedding time from a probe this server measured when the model loaded and
+      the bytes of files that feed a `semantic_text` dataset. No duration is
+      printed when that probe did not run. The figure is embedding time only.
     * `--embed-mode neural` fetches its model over HTTPS from the HuggingFace Hub
       (`sentence-transformers/all-MiniLM-L6-v2`: config.json, tokenizer.json,
       model.safetensors, ~90 MB) into `~/.cache/huggingface` on first use, then runs
@@ -1066,7 +1073,11 @@ semantic_text:
     making it `semantic`-query searchable with zero external config (built-in embedder).
   - `dimensions`/`dims` overrides the embedder width (default 384). Similarity is cosine
     (built-in embeddings are L2-normalised).
-  - Optional `inference_id` / `inference_endpoint` route embedding to an external model.
+  - `inference_id` / `model_id` / `inference_endpoint` are accepted on the mapping
+    and the create/put mapping response warns when they name a different embedder
+    than the server is running. They do not route embedding to an external model.
+    An external model is `--embed-mode proxy` plus `embedding.default_endpoint`,
+    and that choice is fixed at ingest: changing it requires a re-index.
 
 dense_vector:
   - `dims` (required for meaningful kNN), `similarity` (default "cosine").
