@@ -1151,6 +1151,15 @@ pub struct EmbeddingExecutionIdentity {
     pub resumable: bool,
     #[serde(default)]
     pub non_resumable_reason: Option<String>,
+    /// Advisory neural-ingest sample from `GET /v1/embedding/identity`.
+    /// Absent on older servers and on every non-neural backend. Not part of
+    /// `identity_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_passages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_millis: Option<u64>,
 }
 
 /// Ensure an autoindex index-create body pins the index to a single WAL shard.

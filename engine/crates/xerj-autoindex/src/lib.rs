@@ -33,6 +33,7 @@ pub mod init;
 /// `--label`: ingest-time labelling through the node's `/_decide` (#1062).
 pub mod label;
 pub mod memory_cli;
+pub mod neural_cost;
 pub mod objsource;
 #[cfg(test)]
 mod objsource_minio_tests;
@@ -1648,6 +1649,43 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value, skipped_
     );
 }
 
+fn inventory_size_map(inventory: &content::Inventory) -> HashMap<&str, u64> {
+    inventory
+        .keys
+        .iter()
+        .zip(inventory.files.iter())
+        .map(|(key, file)| (key.as_str(), file.size))
+        .collect()
+}
+
+/// Print a neural embedding-time estimate when the server measured one.
+///
+/// Best-effort: a failed identity read does not fail the run (the later pin
+/// still does, on a real semantic ingest) and never invents a rate. Zero
+/// source bytes print nothing, including a lexical corpus.
+fn note_neural_ingest_cost(
+    es: &Es,
+    source_bytes: u64,
+    kind: neural_cost::SourceBytes,
+    pr: &Progress,
+) {
+    if source_bytes == 0 {
+        return;
+    }
+    let identity = match es.embedding_execution_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            pr.note(&format!(
+                "embedding cost: could not read GET /v1/embedding/identity ({error}); no time estimate printed"
+            ));
+            return;
+        }
+    };
+    if let Some(message) = neural_cost::note(&identity, source_bytes, kind) {
+        pr.note(&message);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // cutover threads the whole run context
 fn begin_non_graph_generation(
     es: &Es,
@@ -1775,6 +1813,9 @@ fn begin_non_graph_generation(
             semantic_contract: "disabled-no-semantic-fields-v1".into(),
             resumable: true,
             non_resumable_reason: None,
+            ingest_probe_bytes: None,
+            ingest_probe_passages: None,
+            ingest_probe_millis: None,
         }
     };
 
@@ -7963,6 +8004,18 @@ fn run_index_report_inner(
                 tally,
             )?;
             let unchanged = serde_json::to_value(&plan)? == serde_json::to_value(&base.plan)?;
+            let sizes = inventory_size_map(&inventory);
+            let changed_bytes = if unchanged {
+                0
+            } else {
+                neural_cost::changed_semantic_source_bytes(&base.plan.files, &plan, &sizes)
+            };
+            note_neural_ingest_cost(
+                &es,
+                changed_bytes,
+                neural_cost::SourceBytes::SemanticSource,
+                &pr,
+            );
             println!("{}", serde_json::to_string_pretty(&plan)?);
             // stdout is the RESULT, stderr is PROGRESS: the projection above is
             // the result, this explanation is progress and goes out through the
@@ -8083,6 +8136,15 @@ fn run_index_report_inner(
             finish_generated_progress(&pr, code, &summary, dataless_skipped);
             return Ok((code, Some(summary)));
         }
+        let sizes = inventory_size_map(&inventory);
+        let changed_bytes =
+            neural_cost::changed_semantic_source_bytes(&base.plan.files, &plan, &sizes);
+        note_neural_ingest_cost(
+            &es,
+            changed_bytes,
+            neural_cost::SourceBytes::SemanticSource,
+            &pr,
+        );
         begin_non_graph_generation(
             &es,
             &mut journal,
@@ -8731,6 +8793,14 @@ fn run_index_report_inner(
         pr.finish(true, 0, "cancelled", &[]);
         return Ok((0, None));
     }
+
+    let sizes = inventory_size_map(&inventory);
+    note_neural_ingest_cost(
+        &es,
+        neural_cost::semantic_source_bytes(&plan, &sizes),
+        neural_cost::SourceBytes::SemanticSource,
+        &pr,
+    );
 
     if cfg.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -12671,6 +12741,9 @@ mod duplicate_integration_tests {
             semantic_contract: "semantic_text-derived-vector.v1".into(),
             resumable: false,
             non_resumable_reason: Some("identity is derived from the model name".into()),
+            ingest_probe_bytes: None,
+            ingest_probe_passages: None,
+            ingest_probe_millis: None,
         };
         // All comparable fields match → the identity did NOT change.
         let err = ensure_embedding_execution_unchanged_and_resumable(

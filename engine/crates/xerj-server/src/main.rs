@@ -383,6 +383,10 @@ fn help_text(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20running and fail every ingest, and it does not write\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20lexical vectors. Restart with: xerj --embed-mode lexical\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Or set HF_ENDPOINT to a Hub mirror and start again.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20The mode is fixed per index at ingest time. Documents keep\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20the vectors written when they were indexed. Changing\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20--embed-mode does not re-embed an existing index; re-index.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Lexical is the fast default.\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20proxy    external OpenAI-compatible /v1/embeddings endpoint\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20auto     proxy if embedding.default_endpoint is set, else lexical\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20onnx-experimental  local all-MiniLM-L6-v2-compatible FP32\n\
@@ -1242,6 +1246,28 @@ fn warn_dormant_overrides(cfg: &Config) {
     }
 }
 
+/// `--embed-mode` (and `embedding.mode`) is an ingest-time property of every
+/// document. `auto` is the default and stays quiet; an explicit mode is the
+/// case that reads as a cheap switch.
+fn embed_mode_fixed_at_ingest_warning(mode: &str) -> Option<String> {
+    let trimmed = mode.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    Some(format!(
+        "embedding.mode={trimmed} is fixed per index at ingest time. Documents keep the vectors \
+         written when they were indexed. Changing --embed-mode does not re-embed an existing \
+         index; re-index into a new index. The fast default is lexical (`xerj --embed-mode lexical`, \
+         or omit the flag)."
+    ))
+}
+
+fn warn_embed_mode_is_fixed_at_ingest(cfg: &Config) {
+    if let Some(message) = embed_mode_fixed_at_ingest_warning(&cfg.embedding.mode) {
+        warn!("{message}");
+    }
+}
+
 fn init_tracing(logging: &xerj_common::config::LoggingConfig) {
     let mut filter = EnvFilter::try_from_env("XERJ_LOG")
         .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
@@ -2043,6 +2069,53 @@ fn index_help_text(feedback: bool) -> String {
     )
 }
 
+/// `xerj index` on a neural node: say how long embedding this file might take,
+/// from the startup probe, before the ingest loop starts.
+async fn warn_neural_cli_index(engine: &Engine, index: &xerj_engine::Index, file_bytes: u64) {
+    let Ok(identity) = engine.embedding_execution_identity() else {
+        return;
+    };
+    if identity.backend != "neural" {
+        return;
+    }
+    let schema = index.schema().await;
+    let embeds = schema.fields.iter().any(|field| field.embedding.is_some());
+    if !embeds {
+        eprintln!(
+            "warning: embedding.mode=neural is fixed per index at ingest time. This index has no \
+             semantic_text field, so {} of NDJSON is not an embedding-time estimate. Changing \
+             --embed-mode does not re-embed documents already written; re-index. The faster \
+             default is `xerj --embed-mode lexical` (or omit the flag).",
+            xerj_autoindex::estimate::human_bytes(file_bytes)
+        );
+        return;
+    }
+    let wire = xerj_autoindex::esclient::EmbeddingExecutionIdentity {
+        version: identity.version,
+        backend: identity.backend,
+        identity_sha256: identity.identity_sha256,
+        dimensions: identity.dimensions,
+        semantic_contract: identity.semantic_contract,
+        resumable: identity.resumable,
+        non_resumable_reason: identity.non_resumable_reason,
+        ingest_probe_bytes: identity.ingest_probe_bytes,
+        ingest_probe_passages: identity.ingest_probe_passages,
+        ingest_probe_millis: identity.ingest_probe_millis,
+    };
+    match xerj_autoindex::neural_cost::note(
+        &wire,
+        file_bytes,
+        xerj_autoindex::neural_cost::SourceBytes::NdjsonFileUpperBound,
+    ) {
+        Some(message) => eprintln!("warning: {message}"),
+        None => eprintln!(
+            "warning: embedding.mode=neural is fixed per index at ingest time. Changing \
+             --embed-mode does not re-embed documents already written; re-index. The faster \
+             default is `xerj --embed-mode lexical` (or omit the flag)."
+        ),
+    }
+}
+
 /// Run the `xerj index` subcommand — direct NDJSON → engine ingest.
 ///
 /// Memory-maps the file, finds newline boundaries in parallel via rayon,
@@ -2091,6 +2164,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     // Tracing after config so the [logging] format applies (RC4-W4 item 6).
     init_tracing(&cfg.logging);
     warn_dormant_overrides(&cfg);
+    warn_embed_mode_is_fixed_at_ingest(&cfg);
     cfg.tls.enabled = false;
     cfg.auth.enabled = false;
     cfg.cluster.enabled = false;
@@ -2131,6 +2205,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     let file =
         std::fs::File::open(&cmd.file).with_context(|| format!("open {}", cmd.file.display()))?;
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    warn_neural_cli_index(&engine, &index, file_size).await;
     let mmap: memmap2::Mmap = unsafe { memmap2::Mmap::map(&file) }
         .with_context(|| format!("mmap {}", cmd.file.display()))?;
     // Advise the kernel that we'll read sequentially and that we plan
@@ -3031,7 +3106,7 @@ mod neural_startup_tests {
 
 #[cfg(test)]
 mod help_text_tests {
-    use super::{auth_disabled_line, help_text};
+    use super::{auth_disabled_line, embed_mode_fixed_at_ingest_warning, help_text};
 
     /// #1840: `--embed-mode neural` must say the model loads at startup and
     /// that a failed download refuses to start, with the lexical command.
@@ -3068,6 +3143,38 @@ mod help_text_tests {
             window.contains("HF_ENDPOINT"),
             "neural help must name the Hub mirror variable:\n{window}"
         );
+    }
+
+    /// #1612: the flag is an ingest-time property. Help must say so next to
+    /// the mode list, including the re-index requirement.
+    #[test]
+    fn embed_mode_help_says_the_mode_is_fixed_at_ingest() {
+        let help = help_text(true);
+        assert!(
+            help.contains("fixed per index at ingest"),
+            "help must say the mode is fixed per index:\n{help}"
+        );
+        assert!(
+            help.contains("does not re-embed"),
+            "help must say changing the flag does not re-embed:\n{help}"
+        );
+        assert!(
+            help.contains("re-index"),
+            "help must say a change requires a re-index:\n{help}"
+        );
+    }
+
+    #[test]
+    fn explicit_embed_mode_warns_that_it_is_fixed_at_ingest() {
+        let neural = embed_mode_fixed_at_ingest_warning("neural").unwrap();
+        assert!(neural.contains("fixed per index"));
+        assert!(neural.contains("re-index"));
+        assert!(neural.contains("xerj --embed-mode lexical"));
+        assert!(embed_mode_fixed_at_ingest_warning("auto").is_none());
+        assert!(embed_mode_fixed_at_ingest_warning("  ").is_none());
+        assert!(embed_mode_fixed_at_ingest_warning("lexical")
+            .unwrap()
+            .contains("lexical"));
     }
 
     /// A loopback `--insecure` boot says nothing off this host can connect,
@@ -3844,6 +3951,7 @@ async fn async_main() -> Result<()> {
 
     info!("xerj v{} starting", env!("CARGO_PKG_VERSION"));
     warn_dormant_overrides(&cfg);
+    warn_embed_mode_is_fixed_at_ingest(&cfg);
 
     // 3a. `server.bind_address` must be an IP literal — and must be rejected
     //     *here*, ahead of the two exposure checks that follow.

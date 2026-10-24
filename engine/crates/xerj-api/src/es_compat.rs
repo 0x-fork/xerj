@@ -1634,7 +1634,8 @@ pub async fn create_index(
                 if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
                     let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
                 }
-                let resp = EsIndexResponse::ok(&index);
+                let mut resp = EsIndexResponse::ok(&index);
+                resp.warnings = embedder_warnings(&state, &body);
                 (StatusCode::OK, Json(resp)).into_response()
             }
             Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
@@ -1687,7 +1688,8 @@ pub async fn create_index(
                 let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
-            let resp = EsIndexResponse::ok(&index);
+            let mut resp = EsIndexResponse::ok(&index);
+            resp.warnings = embedder_warnings(&state, &body);
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
@@ -2370,6 +2372,83 @@ mod runtime_field_type_tests {
             "Failed to parse mapping: The mapper type [text] declared on runtime field [rf] does not exist. It might have been created within a future version or requires a plugin to be installed. Check the documentation.",
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_index_warns_when_semantic_text_asks_for_another_embedder() {
+        let router = crate::router::build_es_compat_router(test_state());
+        let response = router
+            .oneshot(
+                Request::put("/embed-warn")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {
+                            "body": {"type": "semantic_text", "inference_id": ".elser_model_2"}
+                        }}})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(status.is_success(), "{status} {body}");
+        let warning = body["warnings"][0].as_str().unwrap_or("");
+        assert!(warning.contains("does not switch the embedder"), "{body}");
+        assert!(warning.contains("re-index"), "{body}");
+        assert!(warning.contains(".elser_model_2"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn put_mapping_without_an_embedder_request_has_no_warnings_key() {
+        let state = test_state();
+        let router = crate::router::build_es_compat_router(state.clone());
+        let created = router
+            .clone()
+            .oneshot(
+                Request::put("/embed-quiet")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {"body": {"type": "text"}}}}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create");
+        assert!(created.status().is_success());
+        let created_bytes = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created_body: Value = serde_json::from_slice(&created_bytes).unwrap();
+        assert!(
+            created_body.get("warnings").is_none(),
+            "no mismatch must leave the create JSON unchanged: {created_body}"
+        );
+        let mapped = router
+            .oneshot(
+                Request::put("/embed-quiet/_mapping")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"properties": {
+                            "note": {"type": "semantic_text", "inference_id": "lexical"}
+                        }})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("mapping");
+        let status = mapped.status();
+        let bytes = to_bytes(mapped.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(status.is_success(), "{status} {body}");
+        assert!(
+            body.get("warnings").is_none(),
+            "a matching inference_id must not add warnings: {body}"
+        );
+        assert_eq!(body["acknowledged"], true, "{body}");
     }
 
     #[tokio::test]
@@ -3300,7 +3379,12 @@ pub async fn put_mapping(
                 return ApiError::new(xerj_common::XerjError::from(error)).into_response();
             }
         }
-        return Json(json!({ "acknowledged": true })).into_response();
+        let warnings = embedder_warnings(&state, &body);
+        let mut payload = json!({ "acknowledged": true });
+        if !warnings.is_empty() {
+            payload["warnings"] = json!(warnings);
+        }
+        return Json(payload).into_response();
     }
 
     // Publication begins only after every deterministic candidate has passed.
@@ -3323,7 +3407,30 @@ pub async fn put_mapping(
         }
     }
 
-    Json(json!({ "acknowledged": true })).into_response()
+    let warnings = embedder_warnings(&state, &body);
+    let mut payload = json!({ "acknowledged": true });
+    if !warnings.is_empty() {
+        payload["warnings"] = json!(warnings);
+    }
+    Json(payload).into_response()
+}
+
+/// The server embedder a mapping's `inference_id` is compared with. Identity
+/// failure yields no warning rather than a failed create: the mapping still
+/// does not switch the embedder, and the index-open guard remains the hard
+/// check.
+fn embedder_warnings(state: &AppState, body: &Value) -> Vec<String> {
+    let Ok(identity) = state.engine.embedding_execution_identity() else {
+        return Vec::new();
+    };
+    let embedding = &state.engine.config().embedding;
+    let resolved = crate::embed_warning::ResolvedEmbedder {
+        backend: identity.backend,
+        neural_model: embedding.neural_model.clone(),
+        proxy_model: embedding.default_model.clone(),
+        proxy_endpoint: embedding.default_endpoint.clone(),
+    };
+    crate::embed_warning::semantic_embedder_warnings(body, &resolved)
 }
 
 fn semantic_mapping_contract(
@@ -21100,9 +21207,10 @@ fn es_properties_to_fields(properties: &Value) -> Result<Vec<FieldConfig>, Strin
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{field_name}_vector"));
-            // Allow a mapping to point at an external inference endpoint/model
-            // (`inference_id` mirrors ES 8.x semantic_text wiring); when absent
-            // the engine falls back to the zero-config built-in embedder.
+            // `inference_id` / `model_id` / `inference_endpoint` are stored so a
+            // mapping round-trips. Ingest does not read them: the server's
+            // `--embed-mode` embeds every document, and create/put mapping
+            // warns when these keys name a different embedder (#1612).
             let endpoint = field_def
                 .get("inference_endpoint")
                 .and_then(Value::as_str)

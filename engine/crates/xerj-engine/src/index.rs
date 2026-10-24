@@ -39334,6 +39334,12 @@ pub(crate) fn embedding_execution_identity(
         _ => unreachable!(),
     };
     let canonical = format!("{CONTRACT};backend={backend};{material}");
+    // The probe is a rate sample, not an input to the digest above. Folding
+    // it in would make every boot look like a different embedder.
+    let probe = (backend == "neural")
+        .then(|| cfg.neural_ingest_probe.get().copied().flatten())
+        .flatten()
+        .filter(|probe| probe.bytes > 0 && probe.passages > 0 && probe.millis > 0);
     Ok(crate::engine::EmbeddingExecutionIdentity {
         // This is the WIRE/API version the autoindex client pins on
         // (esclient.rs requires == 1); it is NOT the on-disk migration marker.
@@ -39348,6 +39354,9 @@ pub(crate) fn embedding_execution_identity(
         semantic_contract: CONTRACT.to_string(),
         resumable,
         non_resumable_reason: reason,
+        ingest_probe_bytes: probe.map(|probe| probe.bytes),
+        ingest_probe_passages: probe.map(|probe| probe.passages),
+        ingest_probe_millis: probe.map(|probe| probe.millis),
     })
 }
 
@@ -39662,6 +39671,31 @@ mod embedding_identity_tests {
         let encoded = serde_json::to_string(&identity).unwrap();
         assert!(!encoded.contains("endpoint"));
         assert!(!encoded.contains("path"));
+        assert!(
+            !encoded.contains("ingest_probe"),
+            "an unmeasured probe must stay off the wire: {encoded}"
+        );
+        assert!(identity.ingest_probe_millis.is_none());
+    }
+
+    /// A stored probe must not move `identity_sha256`. The digest is what
+    /// resume pins; a rate sample changes every boot.
+    #[test]
+    fn an_ingest_probe_does_not_change_the_identity_digest() {
+        let cfg = xerj_common::config::EmbeddingConfig::default();
+        let before = embedding_execution_identity(&cfg).unwrap();
+        cfg.neural_ingest_probe
+            .set(Some(xerj_common::config::NeuralIngestProbe {
+                bytes: 16_384,
+                passages: 32,
+                millis: 800,
+            }))
+            .unwrap();
+        let after = embedding_execution_identity(&cfg).unwrap();
+        assert_eq!(before.identity_sha256, after.identity_sha256);
+        assert!(after.ingest_probe_bytes.is_none());
+        let encoded = serde_json::to_string(&after).unwrap();
+        assert!(!encoded.contains("ingest_probe"), "{encoded}");
     }
 
     #[test]
@@ -40118,6 +40152,35 @@ mod embedding_identity_tests {
         let encoded = serde_json::to_string(&identity).unwrap();
         assert!(!encoded.contains(&first_dir.path().to_string_lossy().into_owned()));
         assert!(!encoded.contains("MiniLM"), "{encoded}");
+        assert!(
+            !encoded.contains("ingest_probe"),
+            "a neural identity with no probe must omit the rate fields: {encoded}"
+        );
+
+        let probed = neural(&first_dir);
+        probed
+            .neural_ingest_probe
+            .set(Some(xerj_common::config::NeuralIngestProbe {
+                bytes: 16_384,
+                passages: 32,
+                millis: 800,
+            }))
+            .unwrap();
+        let with_probe = embedding_execution_identity(&probed).unwrap();
+        assert_eq!(
+            with_probe.identity_sha256, identity.identity_sha256,
+            "the probe is not an embedder input"
+        );
+        assert_eq!(with_probe.ingest_probe_bytes, Some(16_384));
+        assert_eq!(with_probe.ingest_probe_passages, Some(32));
+        assert_eq!(with_probe.ingest_probe_millis, Some(800));
+        let probed_json = serde_json::to_string(&with_probe).unwrap();
+        assert!(
+            probed_json.contains("\"ingest_probe_millis\":800"),
+            "{probed_json}"
+        );
+        assert!(!probed_json.contains("endpoint"), "{probed_json}");
+        assert!(!probed_json.contains(&first_dir.path().to_string_lossy().into_owned()));
 
         // Same bytes in a DIFFERENT directory → same identity. This is the
         // property the fix exists for: it is a different `NeuralConfig`, so it
@@ -40716,12 +40779,43 @@ pub fn ensure_neural_ready(cfg: &xerj_common::config::EmbeddingConfig) -> Result
                 xerj_ai::neural::startup_failure_message(&neural_cfg.model_id, &error),
             )));
         }
+        record_neural_ingest_probe(cfg);
         Ok(())
     }
     #[cfg(not(feature = "neural"))]
     {
         Ok(())
     }
+}
+
+/// Time one ingest-shaped batch and store it on `cfg` for identity reporting.
+///
+/// A probe failure does not fail startup: the model loaded, and autoindex
+/// prints "not measured" rather than a made-up rate. The cell is filled
+/// either way so a later index open does not probe again.
+#[cfg(feature = "neural")]
+fn record_neural_ingest_probe(cfg: &xerj_common::config::EmbeddingConfig) {
+    if cfg.neural_ingest_probe.get().is_some() {
+        return;
+    }
+    let neural_cfg = configured_neural_config(cfg);
+    let Some(embedder) = xerj_ai::Embedder::preload_neural(&neural_cfg).ok() else {
+        let _ = cfg.neural_ingest_probe.set(None);
+        return;
+    };
+    let probe = xerj_ai::neural::measure_ingest_probe(&embedder);
+    match probe {
+        Some(probe) => info!(
+            bytes = probe.bytes,
+            passages = probe.passages,
+            millis = probe.millis,
+            "neural ingest probe (512-character passages, one untimed warmup excluded)"
+        ),
+        None => warn!(
+            "neural ingest probe did not produce a rate; autoindex will not print a time estimate"
+        ),
+    }
+    let _ = cfg.neural_ingest_probe.set(probe);
 }
 
 /// Construct the built-in neural embedder when compiled in.

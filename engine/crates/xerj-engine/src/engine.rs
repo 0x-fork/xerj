@@ -184,6 +184,15 @@ pub struct EmbeddingExecutionIdentity {
     pub resumable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_resumable_reason: Option<String>,
+    /// Measured neural-ingest probe. Advisory and omitted when unset.
+    /// Not part of [`Self::identity_sha256`]: a different machine or a
+    /// warmer CPU must still resume the same index. Zero is never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_passages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_millis: Option<u64>,
 }
 
 // ── Clustering types ─────────────────────────────────────────────────────────

@@ -396,8 +396,10 @@ impl Default for FieldOptions {
 
 /// Optional embedding configuration attached to a field.
 ///
-/// When present, the engine calls the configured embedding service to
-/// automatically vectorise this field's text on ingest.
+/// When present, ingest vectorises this field with the server's
+/// `--embed-mode`. `endpoint` and `model` are recorded from a mapping's
+/// `inference_endpoint` / `inference_id` and are not consulted at ingest;
+/// a mismatch is a warning on the mapping response, not a different embedder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Override the global `embedding.default_endpoint`.

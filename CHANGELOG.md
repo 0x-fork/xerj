@@ -69,6 +69,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not retry a timed-out refresh
   ([#2234](https://github.com/xerj-org/xerj/issues/2234)).
 
+- Neural `xerj autoindex` prints an estimated embedding time before ingest,
+  from a probe measured when the neural model loads and the bytes of files
+  that feed a `semantic_text` dataset. The line names no duration when the
+  probe did not run, and it points at the faster lexical default.
+  `--embed-mode` help and the startup warning state that the mode is fixed
+  per index at ingest and that changing it requires a re-index. Creating or
+  updating a mapping warns when `inference_id`, `model_id`, or
+  `inference_endpoint` names a different embedder than the server is running;
+  those keys do not switch the embedder
+  ([#1612](https://github.com/xerj-org/xerj/issues/1612)).
+
 - A matching index template's `semantic_text` properties and
   `index.default_pipeline` are applied when an index is created, including
   the body `xerj autoindex` sends and the first bulk or single-document
