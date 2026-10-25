@@ -228,6 +228,30 @@ impl Drop for SpawnedThread {
     }
 }
 
+// `libc::pthread_t` is `*mut c_void` on musl and an integer on glibc
+// (`c_ulong`) and Apple (`uintptr_t`, libc 0.2.191). The integer forms
+// make `SpawnedThread` auto-`Send` + `Sync`, and a second impl would
+// conflict, so these impls exist only for musl.
+//
+// SAFETY: the stored value is an opaque POSIX thread id. This process
+// never dereferences it. `pthread_join` and `pthread_detach` are the
+// only uses, and POSIX allows either from any thread. `SpawnedThread`
+// is the single owner of that obligation: `join` takes `self`, `Drop`
+// detaches, and `joined` is written only through `&mut self`. A shared
+// `&SpawnedThread` cannot perform either call (`Debug` prints a
+// constant string), so `Sync` is sound and matches the automatic impl
+// glibc already provides and `std::thread::JoinHandle`.
+#[cfg(target_env = "musl")]
+unsafe impl Send for SpawnedThread {}
+// SAFETY: same as `Send` above. Shared references do not join or detach.
+#[cfg(target_env = "musl")]
+unsafe impl Sync for SpawnedThread {}
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SpawnedThread>()
+};
+
 /// A spawn that did not happen. `job` is the closure that would have run on
 /// the thread, returned to the caller so it can degrade (run it inline),
 /// retry, or drop it on purpose. It is `None` only if the spawner reported a
@@ -1128,6 +1152,32 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(rx.recv().unwrap().as_deref(), Some("xerj-t1122"));
         assert!(rx.try_recv().is_err(), "ran exactly once");
+    }
+
+    #[test]
+    fn a_spawned_thread_is_send_and_can_be_joined_from_another_thread() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SpawnedThread>();
+
+        let started = std::sync::Arc::new(AtomicUsize::new(0));
+        let flag = std::sync::Arc::clone(&started);
+        let handle = try_spawn("xerj-send", move || {
+            flag.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("spawn");
+        std::thread::spawn(move || handle.join())
+            .join()
+            .expect("joiner thread")
+            .expect("join");
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_spawned_thread_can_be_detached_on_another_thread() {
+        let handle = try_spawn("xerj-detach", || {}).expect("spawn");
+        std::thread::spawn(move || drop(handle))
+            .join()
+            .expect("detacher thread");
     }
 
     #[cfg(unix)]
