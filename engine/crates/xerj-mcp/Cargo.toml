@@ -25,6 +25,11 @@ tokio = { workspace = true }
 # Inherits the workspace's default-features=false + rustls-tls config, so it
 # builds in the same offline/cross-compile matrix as the rest of the tree.
 reqwest = { workspace = true }
+# Same proxy matcher reqwest consults (`HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY`).
+# Used to name the proxy in a failure. The client still lets reqwest apply it.
+# Loopback targets never reach this: they are built with `no_proxy()` (#2379).
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-proxy"] }
+http = "1"
 # All request/response bodies are handled as untyped JSON `Value`s — no
 # bespoke serde structs, which keeps the wire contract identical to what the
 # engine already accepts.

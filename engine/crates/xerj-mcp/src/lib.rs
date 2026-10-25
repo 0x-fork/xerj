@@ -370,7 +370,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let (auth, auth_key_file) =
         resolve_auth(auth_override, std::env::var("XERJ_AUTH").ok(), &base_url);
 
-    let client = reqwest::Client::builder()
+    let client = node_http_builder(&base_url)
         .timeout(REQUEST_TIMEOUT)
         .build()?;
 
@@ -493,9 +493,14 @@ pub async fn handle_message_for_test(
     auth: Option<String>,
     msg: Value,
 ) -> Option<Value> {
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let client = node_http_builder(&base_url)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build HTTP client");
     let ctx = Ctx {
-        client: reqwest::Client::new(),
-        base_url: base_url.trim_end_matches('/').to_string(),
+        client,
+        base_url,
         auth,
     };
     handle_message(&ctx, msg).await
@@ -2725,12 +2730,13 @@ impl McpXc {
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
         let url = format!("{}{}", self.base_url, path);
+        let base_url = self.base_url.clone();
         let auth = self.auth.clone();
         let timeout = self.timeout;
         let method = method.to_string();
         let body = body.cloned();
         rt.block_on(async move {
-            let client = reqwest::Client::builder()
+            let client = node_http_builder(&base_url)
                 .timeout(timeout)
                 .build()
                 .map_err(|e| format!("http client: {e}"))?;
@@ -2746,7 +2752,7 @@ impl McpXc {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| format!("no response from {url}: {e}"))?;
+                .map_err(|e| mcp_xc_send_error(&base_url, &url, &e))?;
             // Surface the status WITH the body: the tri-state callers (404 =
             // zero, not error) classify it themselves.
             let status = resp.status().as_u16();
@@ -2755,7 +2761,8 @@ impl McpXc {
             match status {
                 200..=299 => Ok(v),
                 404 => Err("__404__".to_string()),
-                other => Err(format!("HTTP {other}: {v}")),
+                other => Err(proxy_status_failure(&base_url, &url, other, &v.to_string())
+                    .unwrap_or_else(|| format!("HTTP {other}: {v}"))),
             }
         })
     }
@@ -3068,17 +3075,110 @@ async fn fetch_mapping(ctx: &Ctx, index: &str) -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+/// HTTP client for the XERJ node at `base_url`.
+///
+/// A loopback node (`127.0.0.1`, `localhost`, `::1`, and `0.0.0.0` — the
+/// same hosts [`xerj_common::localauth::url_is_loopback`] already treats as
+/// this machine) is never reached through `HTTP_PROXY`, `HTTPS_PROXY`, or
+/// `ALL_PROXY`. reqwest honours those for `127.0.0.1` unless told not to,
+/// and a proxy that cannot connect to loopback answers HTTP 503 while the
+/// node is healthy (#2379). A non-loopback URL keeps the process proxy
+/// settings, including `NO_PROXY`.
+pub(crate) fn node_http_builder(base_url: &str) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if xerj_common::localauth::url_is_loopback(base_url) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
+/// Proxy reqwest will use for `base_url`, with userinfo removed.
+///
+/// `None` for loopback (the client is built with [`node_http_builder`], which
+/// disables proxies) and when `NO_PROXY` excludes the host. This is
+/// `hyper_util`'s env matcher, the one reqwest installs — scheme-specific
+/// `HTTP_PROXY` / `HTTPS_PROXY` win over `ALL_PROXY`.
+fn env_proxy_label(base_url: &str) -> Option<String> {
+    if xerj_common::localauth::url_is_loopback(base_url) {
+        return None;
+    }
+    let uri = base_url.parse::<http::Uri>().ok()?;
+    let intercept = hyper_util::client::proxy::matcher::Matcher::from_env().intercept(&uri)?;
+    Some(redact_proxy(intercept.uri()))
+}
+
+/// `http://proxy:8080`, never `http://user:secret@proxy:8080`.
+fn redact_proxy(uri: &http::Uri) -> String {
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let Some(authority) = uri.authority() else {
+        return uri.to_string();
+    };
+    let host_port = authority
+        .as_str()
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority.as_str());
+    format!("{scheme}://{host_port}")
+}
+
+/// `Some` when this status arrived through an env proxy and is one a proxy
+/// generates when it cannot reach the upstream (502, 503, 504). The text
+/// names the proxy. A 401 or 400 stays the node's own sentence.
+pub(crate) fn proxy_status_failure(
+    base_url: &str,
+    request_url: &str,
+    status: u16,
+    body: &str,
+) -> Option<String> {
+    if !matches!(status, 502..=504) {
+        return None;
+    }
+    let proxy = env_proxy_label(base_url)?;
+    Some(proxy_gateway_message(request_url, &proxy, status, body))
+}
+
+fn proxy_gateway_message(request_url: &str, proxy: &str, status: u16, body: &str) -> String {
+    format!(
+        "request to {request_url} went through proxy {proxy}, which returned HTTP {status}: {body}"
+    )
+}
+
 /// Tool text for a proxy request that never got an HTTP response.
 ///
 /// A connect failure means nothing accepted a connection at `XERJ_URL`
 /// (#2079). The raw client error does not say so, and agents then drop xerj
 /// for the session. HTTP statuses never reach here: a 401 is a response and
 /// stays `XERJ returned HTTP 401: …`.
+///
+/// A failure that went through an env proxy names that proxy instead (#2379).
+/// Connection refused on the proxy is not "no node is listening".
+/// `McpXc` keeps the "no response" wording `xerj_code_search` tests for when
+/// the node accepts and then stays silent. A refused connect still goes
+/// through [`transport_failure_text`], so a dead proxy is not reported as a
+/// dead node.
+fn mcp_xc_send_error(base_url: &str, request_url: &str, err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        let detail = error_detail(err);
+        return match env_proxy_label(base_url) {
+            Some(proxy) => format!("no response from {request_url} via proxy {proxy}: {detail}"),
+            None => format!("no response from {request_url}: {detail}"),
+        };
+    }
+    transport_failure_text(base_url, request_url, err)
+}
+
 pub(crate) fn transport_failure_text(
     base_url: &str,
     request_url: &str,
     err: &reqwest::Error,
 ) -> String {
+    if let Some(proxy) = env_proxy_label(base_url) {
+        return format!(
+            "request to {request_url} failed via proxy {proxy}: {}",
+            error_detail(err)
+        );
+    }
     if node_unreachable(err) {
         node_not_listening(base_url, &error_detail(err))
     } else {
@@ -3301,9 +3401,17 @@ async fn engine_request(
             } else if is_memory_store_path(path) {
                 if let Some(explained) = memory_flood_tool_text(ctx, &text).await {
                     tool_text(explained, true)
+                } else if let Some(proxied) =
+                    proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &text)
+                {
+                    tool_text(proxied, true)
                 } else {
                     tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
                 }
+            } else if let Some(proxied) =
+                proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &text)
+            {
+                tool_text(proxied, true)
             } else {
                 tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
             }
@@ -3323,6 +3431,35 @@ mod tests {
     fn built(r: Result<BuiltRequest, String>) -> (Method, String, Value) {
         let (m, p, b) = r.unwrap();
         (m, p, b.expect("builder should carry a body"))
+    }
+
+    /// #2379: a proxy 503 names the proxy. A node 400 does not, because that
+    /// status is not one a proxy synthesises on the way to the upstream.
+    #[test]
+    fn proxy_status_failure_names_the_proxy_only_for_gateway_statuses() {
+        let url = "http://node.example:9200/docs/_search";
+        let proxy = "http://proxy.internal:8888";
+        let msg = proxy_gateway_message(url, proxy, 503, "upstream");
+        // The env matcher is covered by tests/loopback_proxy.rs. This pins
+        // the sentence, and that a loopback target and a node 400 are not
+        // rewritten into it.
+        assert!(msg.contains(proxy), "{msg}");
+        assert!(msg.contains("HTTP 503"), "{msg}");
+        assert!(msg.contains("went through proxy"), "{msg}");
+        assert!(!msg.contains("XERJ returned"), "{msg}");
+        assert!(proxy_status_failure("http://127.0.0.1:9200", url, 503, "x").is_none());
+        assert!(proxy_status_failure("http://node.example:9200", url, 400, "nope").is_none());
+    }
+
+    #[test]
+    fn proxy_label_drops_userinfo() {
+        let uri: http::Uri = "http://user:secret@proxy.internal:8888".parse().unwrap();
+        let label = redact_proxy(&uri);
+        assert_eq!(label, "http://proxy.internal:8888");
+        assert!(!label.contains("secret"), "{label}");
+        assert!(!label.contains("user"), "{label}");
+        let socks: http::Uri = "socks5://127.0.0.1:1080".parse().unwrap();
+        assert_eq!(redact_proxy(&socks), "socks5://127.0.0.1:1080");
     }
 
     /// `xerj_code_search` talks to the node through `McpXc`, not `Ctx.client`,

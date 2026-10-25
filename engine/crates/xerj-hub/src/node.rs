@@ -77,7 +77,8 @@ pub fn resolve_url(explicit: Option<&str>) -> String {
 /// probe to the proxy, and the proxy's own `502 Bad Gateway` page then reads as
 /// "an HTTP answer, so a node is running" — the hub would decline to start the
 /// node it needs, or talk to a proxy believing it is one. A remote `--url` keeps
-/// the system proxy settings.
+/// the system proxy settings. `xerj mcp` and the autoindex node client use the
+/// same loopback bypass (#2379).
 fn client_builder(url: &str) -> reqwest::blocking::ClientBuilder {
     let builder = reqwest::blocking::Client::builder();
     if url_is_loopback(url) {

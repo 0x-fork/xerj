@@ -1188,6 +1188,23 @@ fn with_single_wal_shard(body: &Value) -> Value {
     body
 }
 
+/// HTTP client for one XERJ node.
+///
+/// A loopback URL (`127.0.0.1`, `localhost`, `::1`, `0.0.0.0` — the same
+/// hosts as [`xerj_common::localauth::url_is_loopback`]) skips
+/// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`. reqwest would otherwise send
+/// `127.0.0.1` through them, and a proxy that cannot reach loopback answers
+/// HTTP 503 while the node is up (#2379). A non-loopback URL keeps those
+/// variables, including `NO_PROXY`.
+pub(crate) fn node_blocking_builder(url: &str) -> reqwest::blocking::ClientBuilder {
+    let builder = reqwest::blocking::Client::builder();
+    if xerj_common::localauth::url_is_loopback(url) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 impl Es {
     pub fn new(url: &str, api_key: Option<String>) -> Result<Self> {
         Self::with_bulk_timeout(url, api_key, 300)
@@ -1214,7 +1231,9 @@ impl Es {
         retry_initial_delay: Duration,
         retry_max_delay: Duration,
     ) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
+        // Loopback skips HTTP(S)_PROXY / ALL_PROXY (#2379). A non-loopback
+        // URL keeps them, including NO_PROXY. Same rule as `xerj mcp`.
+        let http = node_blocking_builder(url)
             .timeout(Duration::from_secs(300))
             .danger_accept_invalid_certs(true)
             .build()

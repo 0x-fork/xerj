@@ -2,7 +2,7 @@
 use std::io::Read;
 use std::time::Duration;
 
-use crate::{batch, resolve_auth, Ctx, DEFAULT_XERJ_URL};
+use crate::{batch, node_http_builder, resolve_auth, Ctx, DEFAULT_XERJ_URL};
 
 const HELP: &str = "xerj batch-search — ordered batch retrieval (#1801)
 
@@ -124,7 +124,7 @@ pub async fn run_batch_cli(args: &[String]) -> i32 {
             path.display()
         );
     }
-    let client = match reqwest::Client::builder()
+    let client = match node_http_builder(&base_url)
         .timeout(Duration::from_secs(30))
         .build()
     {

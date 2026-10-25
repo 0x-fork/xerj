@@ -282,15 +282,19 @@ fn item_result(
 }
 
 async fn msearch(ctx: &Ctx, ndjson: String) -> Result<Vec<Value>, String> {
+    let url = format!("{}/_msearch", ctx.base_url);
     let mut req = ctx
         .client
-        .post(format!("{}/_msearch", ctx.base_url))
+        .post(&url)
         .header("Content-Type", "application/x-ndjson")
         .body(ndjson);
     if let Some(auth) = &ctx.auth {
         req = req.header("Authorization", auth);
     }
-    let mut resp = req.send().await.map_err(|e| crate::error_detail(&e))?;
+    let mut resp = req
+        .send()
+        .await
+        .map_err(|e| crate::transport_failure_text(&ctx.base_url, &url, &e))?;
     let status = resp.status();
     let mut bytes = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| crate::error_detail(&e))? {
@@ -300,10 +304,13 @@ async fn msearch(ctx: &Ctx, ndjson: String) -> Result<Vec<Value>, String> {
         bytes.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        return Err(format!(
-            "batch endpoint returned HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        ));
+        let body = String::from_utf8_lossy(&bytes);
+        if let Some(proxied) =
+            crate::proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &body)
+        {
+            return Err(proxied);
+        }
+        return Err(format!("batch endpoint returned HTTP {status}: {body}"));
     }
     let response: Value =
         serde_json::from_slice(&bytes).map_err(|_| "batch endpoint returned invalid JSON")?;

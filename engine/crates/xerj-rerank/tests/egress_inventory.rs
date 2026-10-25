@@ -34,6 +34,12 @@ const MARKERS: &[&str] = &[
     "reqwest::blocking::Client",
     "reqwest::get(",
     "reqwest::blocking::get(",
+    // #2379: the local-node clients are built in `node_http_builder` /
+    // `node_blocking_builder`. Callers (`xerj mcp`, `xerj batch-search`,
+    // `xerj code`) no longer spell `reqwest::Client` themselves, and they
+    // still open that connection.
+    "node_http_builder(",
+    "node_blocking_builder(",
     "hf_hub::",
     "ureq::",
     "TcpStream::connect",

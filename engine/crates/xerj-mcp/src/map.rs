@@ -860,6 +860,10 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
                     ),
                     true,
                 )
+            } else if let Some(proxied) =
+                crate::proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &text)
+            {
+                tool_text(proxied, true)
             } else {
                 tool_text(
                     format!("XERJ returned HTTP {status} from {CATALOG_INDEX}: {text}"),
