@@ -7,6 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `xerj autoindex` names a file family in the run summary when every file of
+  that family was junked, or when junked files are a strict majority
+  (`junk_files * 2 > files`; stale-plan skips are not counted). The human
+  summary and the progress stream print one `warning:` line per family with
+  the count and the most common junk reason. `--json` and the catalog run
+  document gain `family_junk_warnings` only when that happens; existing
+  summary fields are unchanged and exit codes are unchanged. `xerj autoindex
+  map` and the MCP `xerj_map` response include the same warnings
+  ([#2370](https://github.com/xerj-org/xerj/issues/2370)).
+
+- `xerj autoindex map <folder>` previews a folder that has not been indexed.
+  It runs the same discovery as `xerj autoindex <folder> --dry-run` (walk,
+  sniff, infer, and print the plan) and writes nothing to an index.
+  `xerj autoindex map` with no folder still prints the catalog of what is
+  already indexed
+  ([#2368](https://github.com/xerj-org/xerj/issues/2368)).
+
+- With `[cluster] enabled = true`, `POST /{index}/_delete_by_query` runs on
+  every shard primary, whichever member accepted the request. Each primary
+  deletes the documents in its own shard and copies those deletes to the
+  in-sync replicas, with the same quorum as `DELETE /{index}/_doc/{id}`.
+  `max_docs` is one budget for the index, spent across primaries in
+  node-id order, not once per shard. A primary that does not answer
+  refuses the request before any document is written. A copy that misses
+  quorum is HTTP 503 `replica_not_acknowledged`: the primaries that ran
+  have the delete, and the response still reports `deleted` and
+  `failures`. `wait_for_completion=false` uses the same path. Native
+  `/v1` ingest still writes on the receiving node. A write still needs
+  the primary. `[cluster] enabled = false` does not take this path (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+  open).
+
+### Fixed
+
+- A graph-path `xerj autoindex` resume whose plan predates files now on disk
+  names those files in the summary. The human text under the `ok:` line, the
+  lines immediately before `xerj-done`, the run document, and the
+  `--progress json` terminal object list the first five paths
+  (`skipped_appeared_files`), how many were not listed
+  (`skipped_appeared_not_listed`, only when the list was capped), and say to
+  re-run with `--fresh`. `skipped_appeared` stays the full count. Exit code 3
+  and `reason=stale-resume-plan` are unchanged. The plain `xerj-done` line
+  stays `key=value` numbers, because a path may contain spaces
+  ([#2372](https://github.com/xerj-org/xerj/issues/2372)).
+
+- `xerj autoindex` indexes `.ts` and `.tsx` sources under Next.js route
+  directories such as `app/[locale]/booking/[token]/`. Gitignore reads
+  `[locale]` as a character class, so a line written as the directory name
+  (`!app/[locale]/**` or `app/[locale]/`) did not name that directory and a
+  broader `*` left the sources out of the docs index with no file named.
+  Each ignore-file line that contains an unescaped bracket is also applied
+  to the literal directory name. A real class such as `*.[ch]` is
+  unchanged. A route-like class is explained in the ignore summary, a
+  pruned `[…]` directory is named, and a code file that is still skipped
+  is named with the rule
+  ([#2357](https://github.com/xerj-org/xerj/issues/2357)).
+
+- `xerj autoindex` extracts JavaScript definitions from inline `<script>`
+  blocks in HTML pages. `function openDrawer()` inside a `<script>` in a
+  `.html` or `.htm` file becomes a code symbol (`defs` / `symbols`, plus a
+  per-declaration record), so `xerj def`, `xerj search`, and the MCP def
+  and search tools cite that function at its line in the HTML file. A
+  `src` script, a non-JavaScript type (`application/ld+json`, a template),
+  and `<style>` are not definitions. The page body stays the visible text.
+  A page taken as a data table (five or more consistent rows) stays row
+  records. An HTML file already sealed in a generation keeps those records
+  until the file bytes change or the tree is indexed under a new
+  `--state-dir`
+  ([#2356](https://github.com/xerj-org/xerj/issues/2356)).
+
+- Proxy embeddings (`--embed-mode proxy`, `[embedding] default_endpoint`)
+  accept an OpenAI-style base URL. A path ending in `/v1` or `/v1/`, and a
+  bare host, have `/embeddings` appended. A URL that already ends in
+  `/embeddings` is POSTed unchanged, and a trailing slash is dropped. Any
+  other path refuses to start in `mode = "proxy"` and names the URL that was
+  set plus the `{origin}/v1/embeddings` path to use. In `mode = "auto"` that
+  same path is an init failure and keeps the existing lexical fallback
+  (#1189) instead of being called. A local vLLM base such as
+  `http://localhost:8000/v1` used to be POSTed verbatim, so every embedding
+  call 404'd. The embedder identity stays the configured string, so a corpus
+  indexed with the full path does not become the `/v1` base
+  ([#2355](https://github.com/xerj-org/xerj/issues/2355)).
+
+- `xerj autoindex` no longer aborts the whole folder when a file disappears
+  between the walk and the hash, or cannot be opened because another process
+  holds it locked on Windows (sharing violation 32 / lock violation 33). The
+  file is one `skipped` catalog row with a reason, the same way a file that
+  changes size mid-run is skipped, and the run finishes (exit 3 when that
+  skip is the junk). A locked file that was already indexed keeps the
+  previous generation's copy on `--no-graph` and is not treated as an
+  exclusion on the graph path. Unix errno 32 stays a real error
+  ([#2352](https://github.com/xerj-org/xerj/issues/2352)).
+
+- A failed FTS side-car publish no longer aborts indexing when the partial
+  files can be removed, and building a field's FST no longer panics the
+  process. The logged error names the source path, the destination path,
+  and the OS error (`os error N`). Two side-car names that a case-folding
+  volume would store as one file (ASCII case, plus `µ`/`μ` and `ς`/`σ`)
+  are refused before the rename, with both paths, instead of failing the
+  batch as a not-found error with no file name or silently keeping only
+  one field. The segment is still published: queries scan its stored
+  section, and a later merge rebuilds full text. A leftover side-car that
+  cannot be removed still fails the flush, and that error names the path
+  and the OS error. A data-dir format-marker preflight failure still fails
+  the flush and leaves the documents uncommitted, so a retry can write the
+  marker and the encoded side-cars. This is the failure reported on Windows rc.98, where
+  every broad `xerj autoindex` aborted at FTS side-car publish on the
+  aggregate `-docs` index, and the fst-build panic from rc.97
+  ([#2349](https://github.com/xerj-org/xerj/issues/2349)).
+
+- `xerj search` and MCP `xerj_search` print a hint when the autoindex of a
+  folder on this machine is older than the files there. The hint names the
+  last index time and `xerj autoindex <folder> --prefix <name>`. Passages
+  are printed along with the hint. `xerj code`'s 30-day ledger refusal is
+  unchanged. The check reads the catalog run (`summary_generated_at`, or
+  `started` when the summary stamp is absent) and stats at most 4096
+  entries, newest directory first, stopping after 100ms. Hidden names,
+  `.gitignore` / `.xerjignore` / built-in ignores, and a folder that is not
+  on this machine produce no hint
+  ([#2345](https://github.com/xerj-org/xerj/issues/2345)).
+
+- The node no longer aborts when a search or a flush has to create a tokio
+  blocking thread, and `xerj autoindex` no longer aborts when its phase-A
+  scan pool or object-fetch pool cannot map a worker's alternate signal
+  stack (part of #1122; the issue stays open).
+  `std::thread::Builder::spawn` returns success and
+  then panics in the child on `ENOMEM`; the release profile is
+  `panic = "abort"`. The server runtime caps that blocking pool (twice the
+  worker count, plus a slice, at most 1024, or one thread past the worker
+  count when that is already above 1024), keeps an idle thread for a day,
+  and starts the spare threads at boot so a later `spawn_blocking` or
+  `block_in_place` queues. Tokio adds the worker count on top of
+  `max_blocking_threads`, so the value passed in is only the non-worker
+  slots. The scan and fetch pools start workers with
+  `pthread_create` and, if the OS refuses, run the work on the calling
+  thread. The object-store I/O runtime is driven on the caller; if it
+  cannot be built, that operation fails and the index stays open. A
+  global-allocator abort (`memory allocation of N bytes failed`) is
+  unchanged.
+
 ## [1.0.0-rc.99] - 2026-10-24
 
 Window since v1.0.0-rc.98: 116 merged pull requests. x86_64 release binaries

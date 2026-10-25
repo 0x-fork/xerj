@@ -1489,6 +1489,63 @@ fn a_rerun_after_an_added_file_succeeds_and_fresh_absorbs_it() {
     assert!(indexed.contains("second.csv"), "{indexed:?}");
 }
 
+/// #2372: the stale-resume-plan summary names the appeared paths and says
+/// `--fresh` next to them. `skipped_appeared` stays the count. The existing
+/// `skipped` list is unchanged. The plain `xerj-done` line stays numeric;
+/// the names are the lines immediately before it.
+fn assert_stale_resume_summary(report: &Value, stream: &str, paths: &[&str]) {
+    assert_eq!(report["files_junk"], 0, "{report}");
+    assert_eq!(report["skipped_appeared"], paths.len(), "{report}");
+    assert_eq!(report["skipped_appeared_files"], json!(paths), "{report}");
+    assert!(
+        report.get("skipped_appeared_not_listed").is_none(),
+        "these paths fit in the summary: {report}"
+    );
+    let action = report["skipped_appeared_action"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing skipped_appeared_action: {report}"));
+    assert!(action.contains("--fresh"), "{action}");
+    let listed: Vec<&str> = report["skipped"]["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("skipped list removed: {report}"))
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect();
+    assert_eq!(
+        listed, paths,
+        "the existing skipped list still names them: {report}"
+    );
+
+    let done_at = stream
+        .rfind("xerj-done ")
+        .unwrap_or_else(|| panic!("{stream}"));
+    let summary_at = stream[..done_at]
+        .rfind("not indexed —")
+        .unwrap_or_else(|| panic!("summary did not name the files before xerj-done:\n{stream}"));
+    let summary = &stream[summary_at..done_at];
+    for path in paths {
+        assert!(summary.contains(path), "summary missing {path}: {summary}");
+    }
+    assert!(summary.contains("--fresh"), "{summary}");
+    assert!(
+        !summary.contains("… and"),
+        "these paths are not a remainder: {summary}"
+    );
+    let done = stream[done_at..]
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("{stream}"));
+    assert!(done.contains("reason=stale-resume-plan"), "{done}");
+    assert!(
+        done.contains(&format!("skipped_appeared={}", paths.len())),
+        "{done}"
+    );
+    assert!(
+        !done.contains(paths[0]),
+        "the plain done line stays numeric; paths are the lines above it: {done}"
+    );
+}
+
 /// #2076: a resume whose journaled plan predates files now on disk used to
 /// record those files as junk and finish `reason=completed-with-junk`. That is
 /// the everyday "some input was unusable" success, so an agent treats the
@@ -1539,6 +1596,7 @@ fn a_resume_whose_plan_predates_new_files_reports_a_stale_plan_not_junk() {
         "post-plan files are not junk: {report}"
     );
     assert_eq!(report["skipped_appeared"], 2, "{report}");
+    assert_stale_resume_summary(&report, &stream, &["added-a.md", "added-b.md"]);
     assert!(
         stream.contains("skipped because the resumed plan is stale"),
         "{stream}"
@@ -1574,16 +1632,48 @@ fn a_resume_whose_plan_predates_new_files_reports_a_stale_plan_not_junk() {
     }
 
     // A second resume must not quietly reclassify the same files as junk.
+    // `--progress json` is the machine terminal object: the paths and the
+    // `--fresh` recovery have to be fields on it, not only prose notes.
+    config.progress = crate::progress::ProgressMode::Json;
     let (again, report, stream) = resume(&config);
     assert_eq!(again, 3);
     let report = report.unwrap();
     assert_eq!(report["files_junk"], 0, "{report}");
     assert_eq!(report["skipped_appeared"], 2, "{report}");
+    assert_eq!(
+        report["skipped_appeared_files"],
+        json!(["added-a.md", "added-b.md"]),
+        "{report}"
+    );
+    assert!(
+        report["skipped_appeared_action"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--fresh"),
+        "{report}"
+    );
     let done = stream
         .lines()
-        .find(|line| line.starts_with("xerj-done "))
-        .unwrap_or_else(|| panic!("{stream}"));
-    assert!(done.contains("reason=stale-resume-plan"), "{done}");
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["event"] == "done")
+        .unwrap_or_else(|| panic!("no JSON done event:\n{stream}"));
+    assert_eq!(done["exit"], 3, "{done}");
+    assert_eq!(done["reason"], "stale-resume-plan", "{done}");
+    assert_eq!(done["ok"], true, "{done}");
+    assert_eq!(done["skipped_appeared"], 2, "{done}");
+    assert_eq!(
+        done["skipped_appeared_files"],
+        json!(["added-a.md", "added-b.md"]),
+        "{done}"
+    );
+    assert!(done.get("skipped_appeared_not_listed").is_none(), "{done}");
+    assert!(
+        done["skipped_appeared_action"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--fresh"),
+        "{done}"
+    );
 
     config.fresh = true;
     config.quiet = true;
@@ -1681,6 +1771,81 @@ fn a_file_that_changes_mid_run_is_skipped_and_the_run_finishes() {
         .filter_map(|doc| doc["ax_path"].as_str())
         .collect();
     assert!(indexed.contains("app.lock"), "{indexed:?}");
+}
+
+/// #2352: a file that disappears between the walk and the hash (a browser
+/// profile lock file another process removes) used to abort the whole run
+/// with ENOENT. It is one skipped catalog row; every other file is indexed
+/// and the run finishes with exit 3. The next run, with the file still gone,
+/// sweeps that row and exits 0.
+#[test]
+fn a_file_deleted_after_enumeration_is_skipped_and_the_run_finishes() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus.path().join("first.csv"), "id,value\n1,first\n").unwrap();
+    fs::write(corpus.path().join("second.csv"), "id,value\n2,second\n").unwrap();
+    let live = corpus.path().join("app.lock");
+    fs::write(&live, "pid 1\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+
+    let gone = live.clone();
+    arm_before_hash_hook(state_dir.path(), move || {
+        fs::remove_file(gone).unwrap();
+    });
+    let (code, report) =
+        run_index_report(config.clone()).expect("a vanished file must not abort the run");
+    assert_eq!(
+        code, 3,
+        "a skipped file is completed-with-junk, not a failure"
+    );
+    let report = report.unwrap();
+    assert_eq!(report["files_junk"], 1, "{report}");
+    assert_eq!(
+        file_done_count(state_dir.path()),
+        2,
+        "every other file is journaled done"
+    );
+    {
+        let locked = endpoint.state.lock().unwrap();
+        let mut paths: Vec<&str> = data_rows(&locked)
+            .iter()
+            .filter_map(|doc| doc["ax_path"].as_str())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths, vec!["first.csv", "second.csv"], "{paths:?}");
+        let skipped: Vec<&Value> = locked
+            .catalog_docs
+            .values()
+            .filter(|doc| doc["path"].as_str() == Some("app.lock"))
+            .collect();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the vanished file is recorded: {skipped:?}"
+        );
+        assert_eq!(skipped[0]["status"], "skipped", "{}", skipped[0]);
+        let reason = skipped[0]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("no longer exists"), "{reason}");
+        assert!(reason.contains("disappeared"), "{reason}");
+        assert!(
+            !reason.contains("not in the frozen resume plan"),
+            "{reason}"
+        );
+    }
+
+    let (code, report) = run_index_report(config).expect("the rerun completes");
+    assert_eq!(
+        code, 0,
+        "a file that is gone on the next walk is not still junk: {report:?}"
+    );
 }
 
 #[test]
