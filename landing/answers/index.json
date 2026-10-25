@@ -319,7 +319,7 @@
       ]
     },
     {
-      "title": "How do I rebuild a reference-coding corpus index from scratch?",
+      "title": "How do I rebuild a reference-coding corpus index?",
       "question": "How do I rebuild a reference-coding corpus index from scratch?",
       "canonical_url": "https://xerj.org/answers/rebuild-reference-corpus-index",
       "markdown_url": "https://xerj.org/answers/rebuild-reference-corpus-index.md",
@@ -1000,7 +1000,7 @@
       "answer": "How do I search files that live in an S3 bucket? Run xerj autoindex s3://bucket/prefix against a running node. XERJ lists the prefix, streams in only the objects whose ETag or size changed, and indexes them with the same extractors it uses for a folder. Credentials come from the environment; the index stays local."
     },
     {
-      "title": "How do I keep an index current when the files live in a bucket?",
+      "title": "How do I keep an index current when files live in a bucket?",
       "question": "My documents live in an S3 or R2 bucket. How do I keep a XERJ index current as objects change?",
       "canonical_url": "https://xerj.org/answers/keep-s3-bucket-index-current",
       "markdown_url": "https://xerj.org/answers/keep-s3-bucket-index-current.md",

@@ -28,7 +28,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import article_data  # noqa: E402
 import fix_links  # noqa: E402
-import stars_badge  # noqa: E402
+import set_nav  # noqa: E402
 import pagedata  # noqa: E402
 import seo_head  # noqa: E402
 import urlmap  # noqa: E402
@@ -778,35 +778,9 @@ def render_article_sections(article: article_data.Article, context: BuildContext
     return "\n".join(out)
 
 
-def primary_nav() -> str:
-    return _PRIMARY_NAV.replace(stars_badge.PLAIN_LINK, stars_badge.badge(), 1)
-
-
-_PRIMARY_NAV = """<nav class="nav" aria-label="Primary">
-  <a href="/" class="brand">XERJ</a>
-  <a href="/">HOME</a>
-  <a href="/product">PRODUCT</a>
-  <span class="nav-drop">
-    <a href="/use-cases">USE CASES</a>
-  </span>
-  <a href="/case-studies">CASE STUDIES</a>
-  <a href="/benchmarks/">BENCHMARKS</a>
-  <span class="spacer"></span>
-  <a href="/for-agents">FOR AGENTS</a>
-  <a href="/docs/" class="active">DOCS</a>
-  <a href="/docs/recipes/">RECIPES</a>
-  <a href="/playground">DASHBOARDS</a>
-  <a href="https://hub.xerj.org" rel="external">HUB</a>
-  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
-  <a href="https://x.com/xerj_org" rel="external" title="XERJ on X" style="display:inline-flex;align-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg></a>
-  <a href="https://discord.com/invite/yetXFusXfs" rel="external" title="XERJ on Discord" style="display:inline-flex;align-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.74 19.74 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.1 13.1 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.3 12.3 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.84 19.84 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg></a>
-  <span class="spacer"></span>
-  <span class="theme">
-    <button type="button" data-theme="day" class="active">DAY</button>
-    <span class="dash">·</span>
-    <button type="button" data-theme="night">NIGHT</button>
-  </span>
-</nav>"""
+def primary_nav(rel: str) -> str:
+    """The site-wide primary nav; scripts/seo/set_nav.py owns its definition."""
+    return set_nav.render(rel)
 
 
 def article_nav(context: BuildContext, active: article_data.Article | None) -> str:
@@ -865,7 +839,7 @@ def footer(category: str) -> str:
     return fix_links.render_footer() + f'''\n<footer class="footer">
   <span>XERJ.AI · {esc_text(category.upper())}</span>
   <span>READ THE SOURCE</span>
-  <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+  <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/answers/">ANSWERS</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>'''
 
 
@@ -913,7 +887,7 @@ def render_article(article: article_data.Article, context: BuildContext) -> str:
     return f'''{marker}
 {_head(article.title, article.description, rel, block, markdown_path(article))}
 <body>
-{primary_nav()}
+{primary_nav(rel)}
 <div class="docs-shell article-shell">
 <main class="docs-content">
   {breadcrumb(rel, meta)}
@@ -972,7 +946,7 @@ def render_hub(category: str, articles: list[article_data.Article],
     return f'''{marker}
 {_head(meta["title"], meta["description"], rel, block)}
 <body>
-{primary_nav()}
+{primary_nav(rel)}
 <div class="docs-shell article-shell">
 <main class="docs-content">
   {breadcrumb(rel, meta)}

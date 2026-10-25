@@ -1,5 +1,5 @@
 ---
-title: "How do I rebuild a reference-coding corpus index from scratch?"
+title: "How do I rebuild a reference-coding corpus index?"
 h1: "xerj corpus index --fresh failed. How do I rebuild a corpus index?"
 description: "xerj corpus index --fresh builds a replacement index beside the old one, verifies it has records, switches the state file, and only then retires the old index. A failed build costs nothing."
 slug: "rebuild-reference-corpus-index"

@@ -67,11 +67,18 @@ FOOTER_MAP: list[tuple[str, list[tuple[str, str]]]] = [
         ("/demo/", "REAL-DATA DEMO"),
         ("/aise-demo", "PRODUCT TOUR"),
     ]),
-    ("SOLUTIONS", [
-        ("/solutions/", "SOLUTIONS"),
+    # The section hubs. Every child page is linked from its hub, so one link
+    # per hub here keeps the whole tree two clicks from any page.
+    ("LEARN", [
+        ("/answers/", "ANSWERS"),
+        ("/compare/", "COMPARE"),
         ("/use-cases", "USE CASES"),
         ("/case-studies", "CASE STUDIES"),
         ("/industries/", "INDUSTRIES"),
+        ("/blog/", "BLOG"),
+    ]),
+    ("SOLUTIONS", [
+        ("/solutions/", "SOLUTIONS"),
         ("/industries/finserv", "FINANCIAL SERVICES"),
         ("/industries/public-sector", "PUBLIC SECTOR"),
         ("/industries/healthcare", "HEALTHCARE"),
@@ -81,7 +88,10 @@ FOOTER_MAP: list[tuple[str, list[tuple[str, str]]]] = [
         # article each, which is the shape orphans grow from.
         ("/use-cases/code-security-audit", "AI CODE-SECURITY AUDIT"),
         ("/use-cases/semantic-analytics", "SEMANTIC ANALYTICS"),
+        ("/resources/", "SALES KIT"),
     ]),
+    # /brand and /brandbook/ are left out on purpose: they stay reachable by
+    # direct URL and link to each other.
     ("DOCS", [
         ("/docs/", "DOCUMENTATION"),
         ("/docs/quickstart", "QUICKSTART"),
@@ -91,14 +101,6 @@ FOOTER_MAP: list[tuple[str, list[tuple[str, str]]]] = [
         ("/docs/agents/", "DOCS FOR AI"),
         ("/for-agents", "FOR AI AGENTS"),
         ("/agent-search/", "AGENTIC SEARCH DEMO"),
-        ("/answers/", "ANSWERS"),
-        ("/compare/", "COMPARISONS"),
-    ]),
-    ("RESOURCES", [
-        ("/resources/", "SALES KIT"),
-        ("/blog/", "BLOG"),
-        ("/brand", "BRAND"),
-        ("/brandbook/", "BRAND BOOK"),
         ("/llms.txt", "LLMS.TXT"),
         ("https://github.com/xerj-org/xerj", "GITHUB"),
     ]),

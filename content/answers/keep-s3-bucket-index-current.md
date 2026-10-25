@@ -1,5 +1,5 @@
 ---
-title: "How do I keep an index current when the files live in a bucket?"
+title: "How do I keep an index current when files live in a bucket?"
 h1: "How do I keep an index current when the files live in an object store?"
 description: "A bucket has no inotify, so you poll or you subscribe to events. Poll cost is the decision: ListObjectsV2 is a Class A operation, one call per 1,000 keys, every cycle."
 slug: "keep-s3-bucket-index-current"

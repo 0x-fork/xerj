@@ -277,12 +277,14 @@ def is_noindex(rel: str) -> bool:
 # Chrome that a sitewide commit rewrites without changing the page's content.
 # Stripped before a git date is treated as a content change: the GA4 tag lives
 # in <head>, the hub/social icons live in the primary nav, and fix_links owns
-# the footer block. A lastmod taken from `git log -1` on the HTML file moves
+# the footer block; the footer strip carries sitewide links only. A lastmod taken from `git log -1` on the HTML file moves
 # every URL on the day any of those land.
 _CHROME_RES = (
     re.compile(r"<head\b[^>]*>.*?</head>", re.I | re.S),
     re.compile(r'<nav\b[^>]*\baria-label="Primary"[^>]*>.*?</nav>', re.I | re.S),
     re.compile(r"<!-- seo:footer-begin.*?<!-- seo:footer-end -->", re.S),
+    # The one-line identity strip under the map: sitewide links only.
+    re.compile(r'<footer class="footer">.*?</footer>', re.S),
 )
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UPDATED_RE = re.compile(r'(?m)^updated:\s*"?(\d{4}-\d{2}-\d{2})"?\s*$')
