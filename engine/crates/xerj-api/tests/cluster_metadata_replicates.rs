@@ -3124,3 +3124,374 @@ async fn delete_by_query_from_a_non_owner_deletes_on_every_primary_and_replica()
         let _ = member.shutdown.send(true);
     }
 }
+
+fn native_app(member: &Member) -> Router {
+    xerj_api::router::build_native_router(member.state.clone())
+}
+
+fn title_of(doc: &Value) -> Option<&str> {
+    doc.get("title").and_then(Value::as_str)
+}
+
+/// `POST /v1/indices/{name}/docs`, native `_bulk`, and
+/// `DELETE /v1/indices/{name}/docs/{id}` accepted by a node that owns
+/// neither id land on the primaries and the in-sync replicas. The
+/// receiver's user index does not keep them. A primary that does not
+/// answer refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_doc_writes_from_a_non_owner_hit_the_primary_and_the_replica() {
+    let members = ring(true).await;
+    let _leader = wait_leader(&members, &[false, false, false]).await;
+
+    let (status, body) = put_json(
+        &members[0].app,
+        "/orders",
+        json!({
+            "settings": { "index": { "number_of_replicas": 1 } },
+            "mappings": { "properties": { "title": { "type": "text" } } }
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "create: {status} {body}");
+    for member in &members {
+        wait_status(&member.app, "/orders", StatusCode::OK).await;
+    }
+
+    let mut placed: Vec<(String, usize, usize, u32)> = Vec::new();
+    for n in 0..128 {
+        let id = format!("n{n}");
+        let Some(primary) = members
+            .iter()
+            .position(|member| member.engine.owns_shard("orders", &id))
+        else {
+            continue;
+        };
+        let (shard, _) = members[primary]
+            .engine
+            .primary_of("orders", &id)
+            .expect("placement");
+        let replicas = members[primary].engine.replica_nodes("orders", shard);
+        if replicas.len() != 1 {
+            continue;
+        }
+        let Some(replica) = members
+            .iter()
+            .position(|member| member.handle.node_id() == replicas[0])
+        else {
+            continue;
+        };
+        if placed.iter().any(|(_, owner, _, _)| *owner == primary) {
+            continue;
+        }
+        placed.push((id, primary, replica, shard));
+        if placed.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(placed.len(), 2, "two primaries: {placed:?}");
+    let (id_a, primary_a, replica_a, shard_a) = placed[0].clone();
+    let (id_b, primary_b, replica_b, shard_b) = placed[1].clone();
+    assert_ne!(primary_a, primary_b);
+    let writer = (0..3)
+        .find(|n| *n != primary_a && *n != primary_b)
+        .expect("a node that owns neither id");
+    let native = native_app(&members[writer]);
+
+    let (status, body) = post_json(
+        &native,
+        "/v1/indices/orders/docs",
+        json!({ "_id": id_a, "title": "alpha" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "native index: {status} {body}");
+    assert_eq!(
+        body.pointer("/data/id").and_then(Value::as_str),
+        Some(id_a.as_str())
+    );
+    assert_eq!(
+        body.pointer("/data/result").and_then(Value::as_str),
+        Some("created")
+    );
+    assert!(
+        body.pointer("/data/seq_no")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 1,
+        "native seq_no is the engine sequence, not the ES wire value: {body}"
+    );
+    assert!(body
+        .get("request_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty()));
+    assert!(
+        user_source(&members[writer], &id_a).await.is_none(),
+        "the receiver stored {id_a}"
+    );
+    assert_eq!(
+        title_of(
+            &user_source(&members[primary_a], &id_a)
+                .await
+                .expect("primary a")
+        ),
+        Some("alpha")
+    );
+    assert_eq!(
+        title_of(
+            &replica_source(&members[replica_a], shard_a, &id_a)
+                .await
+                .expect("replica a")
+        ),
+        Some("alpha")
+    );
+    let (status, got) = get(&members[writer].app, &format!("/orders/_doc/{id_a}")).await;
+    assert_eq!(status, StatusCode::OK, "ES get of a native write: {got}");
+    assert_eq!(
+        got.pointer("/_source/title").and_then(Value::as_str),
+        Some("alpha")
+    );
+
+    let first_seq = body
+        .pointer("/data/seq_no")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let (status, body) = post_json(
+        &native,
+        "/v1/indices/orders/docs",
+        json!({ "_id": id_a, "title": "beta" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "native update: {status} {body}"
+    );
+    assert_eq!(
+        body.pointer("/data/result").and_then(Value::as_str),
+        Some("updated")
+    );
+    assert!(
+        body.pointer("/data/seq_no")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > first_seq,
+        "an update advances seq_no: {body}"
+    );
+    assert_eq!(
+        title_of(
+            &replica_source(&members[replica_a], shard_a, &id_a)
+                .await
+                .expect("replica a")
+        ),
+        Some("beta")
+    );
+
+    let (status, body) = post_json(
+        &native,
+        "/v1/indices/orders/docs",
+        json!([
+            { "_id": id_a, "title": "array" },
+            { "_id": id_b, "title": "array-b" }
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "native array: {status} {body}");
+    assert_eq!(
+        body.pointer("/data/indexed").and_then(Value::as_u64),
+        Some(2),
+        "{body}"
+    );
+    assert_eq!(
+        title_of(
+            &user_source(&members[primary_a], &id_a)
+                .await
+                .expect("primary a")
+        ),
+        Some("array")
+    );
+    assert_eq!(
+        title_of(
+            &user_source(&members[primary_b], &id_b)
+                .await
+                .expect("primary b")
+        ),
+        Some("array-b")
+    );
+    assert_eq!(
+        title_of(
+            &replica_source(&members[replica_b], shard_b, &id_b)
+                .await
+                .expect("replica b")
+        ),
+        Some("array-b")
+    );
+    assert!(user_source(&members[writer], &id_b).await.is_none());
+
+    let (status, body) = post_json(
+        &native,
+        "/v1/indices/orders/docs/_bulk",
+        json!({ "docs": [{ "_id": id_b, "title": "bulk" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "native bulk: {status} {body}");
+    assert_eq!(
+        body.pointer("/data/indexed").and_then(Value::as_u64),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        body.pointer("/data/errors").and_then(Value::as_bool),
+        Some(false),
+        "{body}"
+    );
+    assert_eq!(
+        title_of(
+            &user_source(&members[primary_b], &id_b)
+                .await
+                .expect("primary b")
+        ),
+        Some("bulk")
+    );
+    assert_eq!(
+        title_of(
+            &replica_source(&members[replica_b], shard_b, &id_b)
+                .await
+                .expect("replica b")
+        ),
+        Some("bulk")
+    );
+
+    let (status, body) = delete(&native, &format!("/v1/indices/orders/docs/{id_a}")).await;
+    assert_eq!(status, StatusCode::OK, "native delete: {status} {body}");
+    assert_eq!(
+        body.pointer("/data/result").and_then(Value::as_str),
+        Some("deleted")
+    );
+    assert!(user_source(&members[primary_a], &id_a).await.is_none());
+    assert!(replica_source(&members[replica_a], shard_a, &id_a)
+        .await
+        .is_none());
+    assert_eq!(
+        title_of(
+            &user_source(&members[primary_b], &id_b)
+                .await
+                .expect("primary b")
+        ),
+        Some("bulk")
+    );
+    let (status, got) = get(&members[writer].app, &format!("/orders/_doc/{id_a}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "ES get after native delete: {got}"
+    );
+
+    let (status, body) = delete(&native, &format!("/v1/indices/orders/docs/{id_a}")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a second delete of a missing document stays the native 200: {status} {body}"
+    );
+
+    members[primary_b].handle.clear_shard_handler();
+    let (status, body) = post_json(
+        &native,
+        "/v1/indices/orders/docs",
+        json!({ "_id": id_b, "title": "down" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a primary that does not answer is a native error: {status} {body}"
+    );
+    assert!(
+        body.get("data").is_none(),
+        "the error is not the success envelope: {body}"
+    );
+    assert!(
+        body.get("error").and_then(Value::as_str).is_some(),
+        "{body}"
+    );
+    assert!(user_source(&members[writer], &id_b).await.is_none());
+    assert_eq!(
+        title_of(
+            &user_source(&members[primary_b], &id_b)
+                .await
+                .expect("primary b")
+        ),
+        Some("bulk"),
+        "the down primary was not written"
+    );
+    assert_eq!(
+        title_of(
+            &replica_source(&members[replica_b], shard_b, &id_b)
+                .await
+                .expect("replica b")
+        ),
+        Some("bulk")
+    );
+    restore_shard_handler(&members[primary_b]);
+
+    for member in &members {
+        let _ = member.shutdown.send(true);
+    }
+}
+
+/// Native document writes with no cluster handle stay on the node that
+/// accepted them and do not open a replica store.
+#[tokio::test]
+async fn cluster_disabled_native_doc_stays_on_the_node_that_received_it() {
+    async fn lone() -> (Router, Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        assert!(!engine.has_cluster());
+        let state = xerj_api::state::AppState::new(config, engine, metrics);
+        let native = xerj_api::router::build_native_router(state.clone());
+        let es = xerj_api::router::build_es_compat_router(state);
+        (es, native, dir)
+    }
+
+    let (es_a, native_a, _dir_a) = lone().await;
+    let (es_b, _native_b, _dir_b) = lone().await;
+    let (status, body) = put_json(&es_a, "/local", json!({})).await;
+    assert!(status.is_success(), "{status} {body}");
+
+    let (status, body) = post_json(
+        &native_a,
+        "/v1/indices/local/docs",
+        json!({ "_id": "1", "title": "here" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{status} {body}");
+    assert_eq!(body.pointer("/data/id").and_then(Value::as_str), Some("1"));
+    assert_eq!(
+        body.pointer("/data/result").and_then(Value::as_str),
+        Some("created")
+    );
+    let (status, got) = get(&es_a, "/local/_doc/1").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got.pointer("/_source/title").and_then(Value::as_str),
+        Some("here")
+    );
+    let (status, _) = get(&es_b, "/local/_doc/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get(&es_a, "/.xerj_replica_local_0/_doc/1").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "single-node native ingest does not open a replica store"
+    );
+
+    let (status, body) = delete(&native_a, "/v1/indices/local/docs/1").await;
+    assert_eq!(status, StatusCode::OK, "{status} {body}");
+    assert_eq!(
+        body.pointer("/data/result").and_then(Value::as_str),
+        Some("deleted")
+    );
+    let (status, _) = get(&es_a, "/local/_doc/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

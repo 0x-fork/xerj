@@ -940,7 +940,12 @@ pub struct Engine {
     /// leave `LockFileEx` stuck on the file; `node_lock` reclaims it when
     /// the PID it records is not running, and logs that reclaim. A live
     /// holder still blocks a second start.
-    _node_lock: Arc<std::fs::File>,
+    ///
+    /// Drop unlocks explicitly (`NodeLock`) before close. A `fork` in another
+    /// thread inherits the descriptor until that child execs; close alone
+    /// does not release `flock` across that window, so a second engine on
+    /// this directory would refuse to start after the holder was dropped.
+    _node_lock: Arc<crate::node_lock::NodeLock>,
 
     /// Serializes rewrites of `<data_dir>/cluster_state.json` (issue #203).
     ///

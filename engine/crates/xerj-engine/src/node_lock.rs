@@ -56,11 +56,53 @@ enum Liveness {
     Unknown,
 }
 
+/// Exclusive `<data_dir>/node.lock` held for the life of one engine.
+///
+/// Drop from the acquiring process issues `LOCK_UN` before the descriptor is
+/// closed. `flock` lives on the open-file description, and `fork` duplicates
+/// that description into the child: closing the parent's fd leaves the lock
+/// held until the child execs and `O_CLOEXEC` closes the inherited fd. A concurrent
+/// `Command::spawn` in the same process (the node-lock tests do this) hits
+/// that window, and the next `Engine::new` on the directory fails even
+/// though the holder is gone. `LOCK_UN` releases the description immediately.
+///
+/// The child must not unlock. Its copy of this value shares the description,
+/// and `LOCK_UN` there would drop a parent that is still serving the
+/// directory. Same rule as the autoindex journal lock
+/// (`engine/crates/xerj-autoindex/src/state.rs` lines 809–827).
+#[derive(Debug)]
+pub(crate) struct NodeLock {
+    file: File,
+    owner_pid: u32,
+}
+
+impl NodeLock {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            owner_pid: std::process::id(),
+        }
+    }
+
+    #[cfg(test)]
+    fn as_file(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Drop for NodeLock {
+    fn drop(&mut self) {
+        if std::process::id() == self.owner_pid {
+            let _ = self.file.unlock();
+        }
+    }
+}
+
 /// Take the exclusive `<data_dir>/node.lock`, creating the file if needed.
 ///
-/// The returned file holds the lock until it is dropped. On success the file
-/// contains this process's PID.
-pub(crate) fn acquire(data_dir: &Path) -> Result<File> {
+/// The returned lock holds the OS lock until it is dropped. On success the
+/// file contains this process's PID.
+pub(crate) fn acquire(data_dir: &Path) -> Result<NodeLock> {
     let lock_path = data_dir.join(LOCK_NAME);
     let mut reclaimed_from: Option<u32> = None;
 
@@ -94,7 +136,7 @@ pub(crate) fn acquire(data_dir: &Path) -> Result<File> {
                 if let Some(pid) = reclaimed_from.or_else(|| dead_other(previous)) {
                     log_reclaim(&lock_path, pid);
                 }
-                return Ok(file);
+                return Ok(NodeLock::new(file));
             }
             Err(TryLockError::WouldBlock) => {
                 drop(file);
@@ -600,7 +642,7 @@ mod tests {
 
         let logs = capture_warns(|| {
             let file = acquire(dir.path()).expect("a dead pid with no os holder is stale");
-            let recorded = read_pid_from_file(&file);
+            let recorded = read_pid_from_file(file.as_file());
             assert_eq!(recorded, Some(std::process::id()));
             let err = acquire(dir.path()).expect_err("the reclaimed lock is exclusive");
             assert!(err.to_string().contains("already in use"));
@@ -633,7 +675,7 @@ mod tests {
             if readable {
                 let file =
                     result.expect("a readable dead pid is reclaimed even if try_lock is busy");
-                assert_eq!(read_pid_from_file(&file), Some(std::process::id()));
+                assert_eq!(read_pid_from_file(file.as_file()), Some(std::process::id()));
                 // Reclaim replaces the file. The same inode would mean
                 // `try_lock` succeeded on the busy file and this did not
                 // exercise the stuck-lock path.
@@ -705,5 +747,106 @@ mod tests {
             drop(held);
         });
         assert!(!data_dir_lock_held(dir.path()));
+    }
+
+    /// The integration test `second_engine_on_same_data_dir_fails_fast_with_holder_pid`
+    /// failed under `--test-threads=2` because its sibling spawns `true` /
+    /// `ps`. `fork` duplicates the held `node.lock` description into that
+    /// child; `drop` of the engine only `close`d the parent's fd, so the
+    /// reopen still saw the lock until the child exec'd.
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn drop_unlocks_while_a_forked_child_holds_the_inherited_descriptor() {
+        let _guard = serialize_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire(dir.path()).expect("first lock");
+
+        let mut pipe_fds = [-1_i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            panic!("pipe failed: {}", std::io::Error::last_os_error());
+        }
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe_fds[0]);
+                libc::close(pipe_fds[1]);
+            }
+            panic!("fork failed: {error}");
+        }
+        if child == 0 {
+            unsafe {
+                libc::close(pipe_fds[1]);
+                let mut byte = 0_u8;
+                loop {
+                    let n = libc::read(
+                        pipe_fds[0],
+                        (&mut byte as *mut u8).cast::<libc::c_void>(),
+                        1,
+                    );
+                    if n == 0 {
+                        break;
+                    }
+                    if n < 0 && child_errno() == libc::EINTR {
+                        continue;
+                    }
+                    libc::_exit(3);
+                }
+                libc::close(pipe_fds[0]);
+                libc::_exit(0);
+            }
+        }
+
+        // The child is blocked in `read` with the inherited descriptor open.
+        // Reap it on every exit path so a failed assertion cannot leave it
+        // waiting on the pipe.
+        let _child = ForkedHolder {
+            child,
+            release_fd: pipe_fds[1],
+        };
+        unsafe { libc::close(pipe_fds[0]) };
+
+        drop(held);
+        let reopened = acquire(dir.path());
+        drop(_child);
+        let again = reopened.expect(
+            "dropping the holder must unlock while a forked child still has the inherited fd",
+        );
+        drop(again);
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    fn child_errno() -> libc::c_int {
+        unsafe { *libc::__errno_location() }
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    struct ForkedHolder {
+        child: libc::pid_t,
+        release_fd: libc::c_int,
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    impl Drop for ForkedHolder {
+        fn drop(&mut self) {
+            if self.release_fd >= 0 {
+                unsafe { libc::close(self.release_fd) };
+                self.release_fd = -1;
+            }
+            if self.child > 0 {
+                loop {
+                    let mut status = 0;
+                    let waited = unsafe { libc::waitpid(self.child, &mut status, 0) };
+                    if waited == self.child {
+                        break;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
+                self.child = -1;
+            }
+        }
     }
 }

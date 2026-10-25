@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- With `[cluster] enabled = true`, `POST /v1/indices/{name}/docs` (one
+  document, or a JSON array with one document per element),
+  `DELETE /v1/indices/{name}/docs/{id}`, and
+  `POST /v1/indices/{name}/docs/_bulk` run on the shard primary, whichever
+  member accepted the request. The primary copies the stored document or
+  the delete onto the in-sync replicas and acknowledges it with the same
+  quorum as `PUT /{index}/_doc/{id}`. The caller still gets the native
+  envelope: `data.seq_no` is the engine's 1-based sequence (the ES
+  `_seq_no` plus one), a successful index or update is HTTP 201, and a
+  delete of a document that is already absent is HTTP 200 `deleted`. A
+  primary that does not answer is the native error body with HTTP 503,
+  and the accepting node does not store the document. A copy that misses
+  quorum is HTTP 503 `replica_not_acknowledged`: the primary has the
+  write. The index must already exist; this path does not create one.
+  A JSON array on this endpoint is a batch. It used to be stored as one
+  value, because the single-document shape was parsed first and accepts
+  any JSON. `POST /v1/indices/{name}/ingest` is unchanged and still
+  writes on the receiving node, as do logs, OTLP, syslog, and turbo.
+  A write still needs the primary. `[cluster] enabled = false` does not
+  take this path (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+  open).
+
 - `xerj autoindex` names a file family in the run summary when every file of
   that family was junked, or when junked files are a strict majority
   (`junk_files * 2 > files`; stale-plan skips are not counted). The human
@@ -35,9 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the request before any document is written. A copy that misses
   quorum is HTTP 503 `replica_not_acknowledged`: the primaries that ran
   have the delete, and the response still reports `deleted` and
-  `failures`. `wait_for_completion=false` uses the same path. Native
-  `/v1` ingest still writes on the receiving node. A write still needs
-  the primary. `[cluster] enabled = false` does not take this path (part of
+  `failures`. `wait_for_completion=false` uses the same path. Native `/v1` logs,
+  OTLP, syslog, turbo, and pipeline ingest still write on the receiving
+  node. A write still needs the primary. `[cluster] enabled = false` does
+  not take this path (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
   open).
 
@@ -456,13 +480,13 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
     [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
     open (PR [#2347](https://github.com/xerj-org/xerj/pull/2347)).
   - What #1170 still does not do: `wait_for_active_shards`; replica
-    promotion (a write still needs the primary); native `/v1` ingest and
-    `_delete_by_query` (they stay on the receiving node); replicating
-    pipelines; moving copies when membership changes; merging aggregations,
-    suggest, collapse, rescore, profile, `search_after` or scroll across
-    owners; node-lifecycle APIs. The snapshot is the command prefix, not
-    the documents, and a history that does not fit in 8 MiB stays in the
-    log.
+    promotion (a write still needs the primary); native `/v1` logs, OTLP,
+    syslog, turbo, and pipeline ingest (they stay on the receiving node);
+    `_reindex`; replicating pipelines; moving copies when membership
+    changes; merging aggregations, suggest, collapse, rescore, profile,
+    `search_after` or scroll across owners; node-lifecycle APIs. The
+    snapshot is the command prefix, not the documents, and a history that
+    does not fit in 8 MiB stays in the log.
 
 - A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0,
   version `1.0.0-rc.99`) inserts the README's `mcp-xerj` stdio row via

@@ -7,7 +7,10 @@
 //! [`update_by_query_on_primaries`] runs `_update_by_query` on every primary
 //! and each primary copies the documents it changed.
 //! [`delete_by_query_on_primaries`] runs `_delete_by_query` on every primary
-//! and each primary copies the deletes.
+//! and each primary copies the deletes. Native `POST /v1/indices/{name}/docs`,
+//! `DELETE /v1/indices/{name}/docs/{id}`, and
+//! `POST /v1/indices/{name}/docs/_bulk` use the same primary. Logs, OTLP,
+//! syslog, turbo, and pipeline ingest do not.
 //! The primary copies an index, delete, or the document an update stored
 //! onto the in-sync replicas and acknowledges the caller when a quorum of
 //! the copies has confirmed. A replica that does not
