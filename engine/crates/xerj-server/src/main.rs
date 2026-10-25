@@ -143,6 +143,7 @@ mod grpc;
 mod grpc_hub;
 mod ingest_memory_trace;
 mod share;
+mod startup_data_dir;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -638,7 +639,12 @@ fn auth_disabled_line(loopback: bool) -> &'static str {
     }
 }
 
-fn print_banner(cfg: &Config, bound: &BoundAddrs, startup_ms: u128) {
+fn print_banner(
+    cfg: &Config,
+    bound: &BoundAddrs,
+    startup_ms: u128,
+    data_dir: &startup_data_dir::Report,
+) {
     let tls = if cfg.tls.enabled { "TLS " } else { "plain" };
     println!();
     println!("  ██╗  ██╗███████╗██████╗      ██╗");
@@ -670,7 +676,12 @@ fn print_banner(cfg: &Config, bound: &BoundAddrs, startup_ms: u128) {
         bind,
         bound.grpc.port()
     );
-    println!(" Data dir     {}", cfg.server.data_dir);
+    println!(" Data dir     {}", data_dir.path_text());
+    println!(" Data source  {}", data_dir.source);
+    println!(" Data status  {}", data_dir.status());
+    if data_dir.created {
+        println!(" {}", startup_data_dir::NEW_DIRECTORY_HINT);
+    }
     println!(" Started in   {}ms", startup_ms);
     println!();
     println!(
@@ -757,22 +768,50 @@ fn print_banner(cfg: &Config, bound: &BoundAddrs, startup_ms: u128) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn load_config(args: &CliArgs) -> Result<Config> {
+    load_config_with_data_dir_origin(args).map(|(cfg, _)| cfg)
+}
+
+fn load_config_with_data_dir_origin(args: &CliArgs) -> Result<(Config, startup_data_dir::Origin)> {
     let config_path = args
         .config
         .clone()
-        .or_else(|| std::env::var("XERJ_CONFIG").ok().map(PathBuf::from));
-
-    let mut cfg = if let Some(path) = config_path {
-        info!("loading config from {}", path.display());
-        Config::load(&path).with_context(|| format!("load config from {}", path.display()))?
+        .map(|path| (path, "--config"))
+        .or_else(|| {
+            std::env::var("XERJ_CONFIG")
+                .ok()
+                .map(|path| (PathBuf::from(path), "XERJ_CONFIG"))
+        });
+    let mut source = format!("default {}", Config::default().server.data_dir);
+    let mut cfg = if let Some((path, selected_by)) = config_path {
+        // Parse both configuration and key presence from the same read. A
+        // selected file may omit data_dir, in which case its default wins.
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("load config from {}", path.display()))?;
+        let cfg = Config::from_toml_str(&raw)
+            .with_context(|| format!("load config from {}", path.display()))?;
+        let fields: toml::Value = toml::from_str(&raw)?;
+        let file_source = format!("config file ({selected_by}) {:?}", path);
+        if fields
+            .get("server")
+            .and_then(|server| server.get("data_dir"))
+            .is_some()
+        {
+            source = file_source;
+        } else {
+            source.push_str(&format!("; {file_source} omits server.data_dir"));
+        }
+        cfg
     } else {
-        info!("no config file — using defaults");
         Config::default()
     };
-
     if let Some(dir) = &args.data_dir {
         cfg.server.data_dir = dir.clone();
+        source = "--data-dir".into();
     }
+    let origin = startup_data_dir::Origin {
+        source,
+        requested: cfg.server.data_dir.clone(),
+    };
 
     // `rerank.endpoint` is where document text gets POSTed. `Config::validate`
     // checked the file's value; the `TYPESAFE_ENDPOINT` fallback is only
@@ -1012,7 +1051,7 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         cfg.compat.version = version;
     }
 
-    Ok(cfg)
+    Ok((cfg, origin))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4196,7 +4235,7 @@ async fn async_main() -> Result<()> {
     // 2. Config — loaded before tracing so the [logging] format (text/json)
     //    governs the very first startup line (RC4-W4 item 6). A config-load
     //    failure still surfaces via the returned Result → stderr.
-    let mut cfg = load_config(&args)?;
+    let (mut cfg, data_dir_origin) = load_config_with_data_dir_origin(&args)?;
 
     // 3. Tracing
     init_tracing(&cfg.logging);
@@ -4338,9 +4377,14 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // 4. Data directory
-    std::fs::create_dir_all(&cfg.server.data_dir)
-        .with_context(|| format!("create data dir {}", cfg.server.data_dir))?;
+    // 4. Data directory — report after resolution/creation, before admin/TLS state.
+    let data_dir_report =
+        startup_data_dir::prepare(Path::new(&cfg.server.data_dir), data_dir_origin)?;
+    info!(data_dir = %data_dir_report.path_text(), data_dir_source = %data_dir_report.source,
+        data_dir_state = data_dir_report.status(), "server data directory");
+    if data_dir_report.created {
+        warn!("{}", startup_data_dir::NEW_DIRECTORY_HINT);
+    }
     open_crash_log(Path::new(&cfg.server.data_dir));
 
     // 5. Admin key (first-run)
@@ -4869,7 +4913,7 @@ async fn async_main() -> Result<()> {
     //     process holds.
     let startup_ms = startup_start.elapsed().as_millis();
     info!("startup complete in {}ms", startup_ms);
-    print_banner(&cfg, &bound, startup_ms);
+    print_banner(&cfg, &bound, startup_ms, &data_dir_report);
 
     // 12. Background flush timer
     let flusher = storage_available.then(|| {

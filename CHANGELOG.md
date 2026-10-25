@@ -79,6 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Server startup now reports the resolved data directory, its configuration
+  source and whether this launch created it. New-directory guidance points
+  operators back to their previous `--data-dir` or `--config` when they expected
+  existing indices/accounts. Defaults, flag precedence, auto-port relocation
+  and existing data are preserved; no other data directories are scanned (#2409).
+
 - `POST /{index}/_search` applies `post_filter` to the hits, as
   Elasticsearch does. It used to be accepted and ignored: every document
   the query matched came back and `hits.total` counted them all.

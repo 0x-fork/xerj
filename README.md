@@ -67,6 +67,12 @@ Keep that data directory outside any folder you will autoindex. `data/` is not i
 built-in ignore list, so `--data-dir ./data` inside a tree you then index makes the node
 index its own storage.
 
+At startup, `Data dir` shows the resolved absolute path, `Data source` identifies
+the flag, selected config file or default, and `Data status` says whether this
+launch created the directory. A new directory can make an older node's indices
+or owner account appear missing: restart with the previous `--data-dir` or
+`--config`. XERJ does not discover or migrate other data directories automatically.
+
 Windows and a hand-verified install are under [Install by hand](#install-by-hand).
 
 That `--insecure` flag is a trust boundary, not a formality. It turns off TLS and API-key
