@@ -398,10 +398,41 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     }
 
     // stdout is the JSON-RPC channel; stderr is for logs only.
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    serve(ctx, BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
+}
+
+/// The JSON-RPC loop over newline-delimited messages, apart from the process'
+/// stdin/stdout so tests can drive it over an in-memory pipe.
+///
+/// A `tools/call` request runs on its own task, so a call that waits on the
+/// node does not hold up the messages behind it (#2390): `ping`,
+/// `initialize`, `tools/list` and notifications stay inline because they never
+/// wait on anything. Replies are matched by `id`, so they may go out in any
+/// order. `notifications/cancelled` aborts the call it names, and no response
+/// is written for it. Every reply goes through one writer task, so lines never
+/// interleave. At end of input the loop waits for the calls still running and
+/// writes their replies before returning, as the serial loop did.
+async fn serve<R, W>(ctx: Ctx, reader: R, stdout: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let ctx = std::sync::Arc::new(ctx);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = stdout;
+        while let Some(msg) = rx.recv().await {
+            write_msg(&mut stdout, &msg).await?;
+        }
+        anyhow::Ok(())
+    });
+    let in_flight = InFlight::default();
+    let mut calls = tokio::task::JoinSet::new();
+    let mut lines = reader.lines();
 
     while let Some(line) = lines.next_line().await? {
+        // Reap finished calls so a long session does not accumulate them.
+        while calls.try_join_next().is_some() {}
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -411,14 +442,19 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 // Parse error: reply per JSON-RPC (id unknown → null).
-                let resp = rpc_error(Value::Null, -32700, format!("parse error: {e}"));
-                write_msg(&mut stdout, &resp).await?;
+                if tx
+                    .send(rpc_error(Value::Null, -32700, format!("parse error: {e}")))
+                    .is_err()
+                {
+                    break;
+                }
                 continue;
             }
         };
 
         // JSON-RPC allows a batch (array) of messages. MCP 2024-11-05 uses it;
         // 2025-06-18 dropped it. Support both: object → single, array → batch.
+        // A batch keeps the serial handling it always had, one reply per line.
         let responses: Vec<Value> = match parsed {
             Value::Array(batch) => {
                 let mut out = Vec::new();
@@ -429,20 +465,119 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                 }
                 out
             }
+            msg if is_cancellation(&msg) => {
+                if let Some(id) = msg.pointer("/params/requestId") {
+                    in_flight.cancel(id);
+                }
+                Vec::new()
+            }
+            msg if is_tool_call_request(&msg) => {
+                let key = id_key(&msg["id"]);
+                let (ctx, tx, registry) = (ctx.clone(), tx.clone(), in_flight.clone());
+                in_flight.start(&mut calls, key, move |token| async move {
+                    let reply = handle_message(&ctx, msg).await;
+                    // A cancellation that got here first means: say nothing.
+                    if registry.finish(token) {
+                        if let Some(reply) = reply {
+                            let _ = tx.send(reply);
+                        }
+                    }
+                });
+                Vec::new()
+            }
             other => handle_message(&ctx, other).await.into_iter().collect(),
         };
 
-        for resp in responses {
-            write_msg(&mut stdout, &resp).await?;
+        if responses.into_iter().any(|resp| tx.send(resp).is_err()) {
+            break; // the writer stopped: its error is returned below
         }
     }
 
-    Ok(())
+    while calls.join_next().await.is_some() {}
+    drop(tx);
+    writer.await?
+}
+
+fn is_tool_call_request(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("tools/call")
+        && msg.get("id").is_some_and(|id| !id.is_null())
+}
+
+fn is_cancellation(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+}
+
+/// A request id as a map key. JSON-RPC ids are strings or numbers and `2` is
+/// not `"2"`, so the key is the id's JSON text.
+fn id_key(id: &Value) -> String {
+    id.to_string()
+}
+
+/// The `tools/call` requests still running, by request id, so a
+/// `notifications/cancelled` can abort the right one.
+#[derive(Clone, Default)]
+struct InFlight(std::sync::Arc<std::sync::Mutex<InFlightCalls>>);
+
+#[derive(Default)]
+struct InFlightCalls {
+    next: u64,
+    by_id: std::collections::HashMap<String, (u64, tokio::task::AbortHandle)>,
+}
+
+/// Which call a task is, so a reused request id cannot finish or cancel
+/// another call.
+struct CallToken {
+    key: String,
+    seq: u64,
+}
+
+impl InFlight {
+    /// Spawn `call` and register it. The lock is held across the spawn, so the
+    /// call cannot finish (and look itself up) before it is registered.
+    fn start<F, Fut>(&self, calls: &mut tokio::task::JoinSet<()>, key: String, call: F)
+    where
+        F: FnOnce(CallToken) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.next += 1;
+        let seq = guard.next;
+        let handle = calls.spawn(call(CallToken {
+            key: key.clone(),
+            seq,
+        }));
+        guard.by_id.insert(key, (seq, handle));
+    }
+
+    /// The call is done: `true` if it should reply, `false` if it was
+    /// cancelled in the meantime.
+    fn finish(&self, token: CallToken) -> bool {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.by_id.get(&token.key) {
+            Some((seq, _)) if *seq == token.seq => {
+                guard.by_id.remove(&token.key);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Abort the running call with this id, if any. An unknown or finished id
+    /// is ignored, as the MCP spec asks.
+    fn cancel(&self, id: &Value) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, handle)) = guard.by_id.remove(&id_key(id)) {
+            handle.abort();
+        }
+    }
 }
 
 /// Serialize one JSON-RPC message and write it as a single newline-terminated
 /// line (the MCP stdio framing), then flush.
-async fn write_msg(stdout: &mut tokio::io::Stdout, msg: &Value) -> anyhow::Result<()> {
+async fn write_msg<W>(stdout: &mut W, msg: &Value) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut buf = serde_json::to_vec(msg)?;
     buf.push(b'\n');
     stdout.write_all(&buf).await?;
@@ -3632,6 +3767,147 @@ mod tests {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes()).await;
             let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes()).await;
         });
+    }
+
+    /// A node that accepts every connection and never sends a byte.
+    async fn silent_node() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// `serve` over in-memory pipes: the client's stdin writer and the lines
+    /// the server writes to its stdout.
+    fn stdio_session(
+        base_url: String,
+        timeout: Duration,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+    ) {
+        let (client_in, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+        let ctx = Ctx {
+            client: reqwest::Client::builder().timeout(timeout).build().unwrap(),
+            base_url,
+            auth: None,
+        };
+        tokio::spawn(serve(ctx, BufReader::new(server_in), server_out));
+        (client_in, BufReader::new(client_out).lines())
+    }
+
+    async fn send_line(stdin: &mut tokio::io::DuplexStream, msg: Value) {
+        stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    fn stalled_search(id: u64) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "xerj_search", "arguments": {"index": "docs", "query": "retry"}}})
+    }
+
+    /// #2390: a tool call waiting on a stalled node must not hold up `ping`.
+    #[tokio::test]
+    async fn ping_is_answered_while_a_tool_call_waits_on_the_node() {
+        let (mut stdin, mut stdout) = stdio_session(silent_node().await, Duration::from_secs(3));
+        send_line(&mut stdin, stalled_search(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_line(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        )
+        .await;
+        let line = tokio::time::timeout(Duration::from_secs(1), stdout.next_line())
+            .await
+            .expect("no reply within 1 s: ping queued behind the stalled tool call")
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], 3, "{reply}");
+        assert_eq!(reply["result"], json!({}), "{reply}");
+    }
+
+    /// End of input still answers the calls that were running, then closes
+    /// stdout: the serial loop always replied before it returned.
+    #[tokio::test]
+    async fn end_of_input_waits_for_running_calls_and_answers_them() {
+        let (mut stdin, mut stdout) =
+            stdio_session(silent_node().await, Duration::from_millis(300));
+        send_line(&mut stdin, stalled_search(2)).await;
+        drop(stdin);
+        let mut replies = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(line)) = stdout.next_line().await {
+                replies.push(serde_json::from_str::<Value>(&line).unwrap());
+            }
+        })
+        .await
+        .expect("stdout was not closed after the last reply");
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0]["id"], 2, "{replies:?}");
+        assert_eq!(replies[0]["result"]["isError"], true, "{replies:?}");
+    }
+
+    /// A batch keeps its old shape: each request answered on its own line.
+    #[tokio::test]
+    async fn a_batch_is_answered_one_line_per_request() {
+        let (mut stdin, mut stdout) =
+            stdio_session(silent_node().await, Duration::from_millis(300));
+        send_line(
+            &mut stdin,
+            json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"},
+                   {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                   {"jsonrpc": "2.0", "id": 6, "method": "ping"}]),
+        )
+        .await;
+        drop(stdin);
+        let mut ids = Vec::new();
+        while let Ok(Some(line)) = stdout.next_line().await {
+            ids.push(serde_json::from_str::<Value>(&line).unwrap()["id"].clone());
+        }
+        assert_eq!(ids, vec![json!(5), json!(6)]);
+    }
+
+    /// #2390: `notifications/cancelled` stops the request it names, and no
+    /// response is written for it, even after the request would have finished.
+    #[tokio::test]
+    async fn a_cancelled_tool_call_gets_no_response() {
+        // The search would end after two 500 ms deadlines (mapping, then search).
+        let (mut stdin, mut stdout) =
+            stdio_session(silent_node().await, Duration::from_millis(500));
+        send_line(&mut stdin, stalled_search(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_line(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                   "params": {"requestId": 2, "reason": "test"}}),
+        )
+        .await;
+        send_line(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        )
+        .await;
+        let mut ids = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(2500), async {
+            while let Ok(Some(line)) = stdout.next_line().await {
+                ids.push(serde_json::from_str::<Value>(&line).unwrap()["id"].clone());
+            }
+        })
+        .await;
+        assert!(ids.contains(&json!(3)), "ping was not answered: {ids:?}");
+        assert!(
+            !ids.contains(&json!(2)),
+            "the cancelled call was answered: {ids:?}"
+        );
     }
 
     /// A 200 whose body cannot be read in full (the connection drops partway,

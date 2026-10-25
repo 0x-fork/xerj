@@ -67,6 +67,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj mcp` no longer holds every message behind a slow tool call. Each
+  `tools/call` runs on its own task, so `ping`, `tools/list` and other
+  calls are answered while one call waits on the node. A ping sent 0.2 s
+  after a call to a stalled node was answered after 60 s; it is now
+  answered at once. `notifications/cancelled` now aborts the call it names,
+  and no response is sent for that call, as the MCP spec asks; it used to
+  be ignored. Replies can go out in any order (they are matched by `id`); a
+  batch is still answered one line per request
+  ([#2390](https://github.com/xerj-org/xerj/issues/2390)).
+
 - `xerj autoindex remove --root` also deletes indices an aborted or failed
   build of that folder left behind when the build never wrote a catalog run.
   The resume journal names the folder and the index names; a catalog walk
