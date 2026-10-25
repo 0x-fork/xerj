@@ -354,7 +354,11 @@ section's `mcpServers` block at `~/.cline/data/settings/cline_mcp_settings.json`
 appeared in the tool list Cline handed the model (named `xerj__xerj_search`) among that binary's
 20 tools, and Cline executed one `xerj_search` call. The model turn was a local OpenAI-compatible
 stub, because no provider key was available; the MCP server was the real `xerj mcp` process. The
-IDE's MCP Servers > Configure button was not part of that run. Correcting an `untested` row is a
+IDE's MCP Servers > Configure button was not part of that run. Kimi Code CLI 2.3.1 and the Kimi
+desktop app on Linux against `xerj` v1.0.0-rc.99 (built from source) loaded this section's
+`mcpServers` block at `~/.kimi-code/mcp.json`: the client spawned `xerj mcp` as a child process
+with the `env` block intact (verified through `/proc/<pid>/environ`), and `xerj_search` appeared
+in the tool list. Correcting an `untested` row is a
 welcome first PR.
 
 | Client | Config file | Key | Note | Tested |
@@ -383,7 +387,7 @@ welcome first PR.
 | Warp | Settings > Agents > MCP servers, or `~/.warp/.mcp.json` and `.warp/.mcp.json` in the project | `mcpServers` | `working_directory`, not `cwd` | untested |
 | Augment Code | `~/.augment/settings.json` for the Auggie CLI; the IDE uses its own panel | `mcpServers` | that file does not drive the IDE | untested |
 | Qwen Code | `~/.qwen/settings.json`, or `.qwen/settings.json` in the project | `mcpServers` | `mcp.allowed` can silently hide it | untested |
-| Kimi CLI | `~/.kimi-code/mcp.json`, or `.kimi-code/mcp.json` in the project | `mcpServers` | the current Kimi Code CLI, not the archived `~/.kimi/mcp.json` | untested |
+| Kimi CLI | `~/.kimi-code/mcp.json`, or `.kimi-code/mcp.json` in the project | `mcpServers` | the current Kimi Code CLI, not the archived `~/.kimi/mcp.json` | tested |
 | Grok CLI | `~/.grok/config.toml`, or `.grok/config.toml` in the project | `[mcp_servers.xerj]` | Grok Bot has no local stdio registration | untested |
 
 Codex and the Grok CLI read TOML, so the entry is a table:

@@ -261,6 +261,7 @@ fn mcp_registration(bin: &str, url: &str) -> String {
         "MCP registration for other clients (restart the session after; success: `{MCP_SUCCESS_TOOL}` is in the tool list):\n\
          \x20 Claude Code, every project:  claude mcp add --scope user xerj{env} -- {} mcp\n\
          \x20 Cursor:  `.cursor/mcp.json` when that directory exists (init writes it; root key \"mcpServers\")\n\
+         \x20 Kimi CLI:  `~/.kimi-code/mcp.json` (user) or `.kimi-code/mcp.json` (project); root key \"mcpServers\"; the current CLI, not the archived `~/.kimi/mcp.json`\n\
          \x20 Windsurf, Claude Desktop, Cline:  copy the \"xerj\" entry from .mcp.json; the root key is \"mcpServers\"\n\
          \x20 VS Code (.vscode/mcp.json):  root key \"servers\", not \"mcpServers\"; the entry needs \"type\": \"stdio\"\n\
          \x20 Codex (.codex/config.toml, trusted projects only; xerj init writes it when .codex/ exists): [mcp_servers.xerj]",
