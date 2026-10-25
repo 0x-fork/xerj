@@ -13094,12 +13094,239 @@ async fn search_dispatch(
     principal: crate::auth::Principal,
     body: EsSearchJson,
 ) -> Response {
+    // #2400: `post_filter` narrows the hits, never the aggregations.
+    if let Some(split) = split_post_filter(&params, &body) {
+        return search_with_post_filter(state, index, params, principal, split).await;
+    }
+    search_routed(state, index, params, principal, body).await
+}
+
+/// One search through the cluster fan-out when it applies, else on this node.
+async fn search_routed(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchJson,
+) -> Response {
     if let Some(response) =
         crate::cluster_shard::fanout_search(&state, &index, &params, &principal, &body).await
     {
         return response;
     }
     search_impl(state, index, params, principal, body).await
+}
+
+/// The searches a request with `post_filter` becomes (#2400). Elasticsearch
+/// applies `post_filter` to the hits after the aggregations are computed, so
+/// a faceted UI can show a facet's other values while one is selected.
+///
+/// - `hits`: the query wrapped as `bool{must: [query], filter: [post_filter]}`,
+///   without aggregations. A filter clause does not score, so the hits, their
+///   scores and `hits.total` are what Elasticsearch returns.
+/// - `aggs`: when the request aggregates, the original request without
+///   `post_filter` and with `size: 0`, so the aggregations are exactly what
+///   they were before.
+struct PostFilterSplit {
+    hits: EsSearchBody,
+    aggs: Option<(EsSearchQueryParams, EsSearchBody)>,
+}
+
+/// `None` leaves the request as it is: no `post_filter`; a hybrid query, which
+/// `build_search_request` rejects beside `post_filter` (#943); or a `?q=`
+/// query, which replaces the body query this wraps.
+fn split_post_filter(params: &EsSearchQueryParams, body: &EsSearchJson) -> Option<PostFilterSplit> {
+    let original = body.0.as_ref()?;
+    let filter = original.post_filter.clone()?;
+    if params.q.is_some() {
+        return None;
+    }
+    let query = original
+        .query
+        .clone()
+        .unwrap_or_else(|| json!({ "match_all": {} }));
+    let hybrid = parse_request(&json!({ "query": query }))
+        .map(|req| req.query.contains_hybrid())
+        .unwrap_or(false);
+    if hybrid {
+        return None;
+    }
+
+    let mut hits = original.clone();
+    hits.post_filter = None;
+    hits.query = Some(json!({ "bool": { "must": [query], "filter": [filter] } }));
+    let had_aggs = hits.aggs.take().is_some();
+    let had_aggregations = hits.aggregations.take().is_some();
+
+    let aggs = (had_aggs || had_aggregations).then(|| {
+        let mut body = original.clone();
+        body.post_filter = None;
+        body.size = 0;
+        body.from = 0;
+        let mut params = params.clone();
+        // Query-string paging overrides the body, and a second scroll context
+        // would leak: this search only reads the aggregations.
+        params.size = Some("0".to_string());
+        params.from = None;
+        params.scroll = None;
+        (params, body)
+    });
+    Some(PostFilterSplit { hits, aggs })
+}
+
+/// Run the split searches and answer with the hits of one and the
+/// aggregations of the other. An error from either is returned as it is.
+async fn search_with_post_filter(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    split: PostFilterSplit,
+) -> Response {
+    let hits_search = search_routed(
+        state.clone(),
+        index.clone(),
+        params,
+        principal.clone(),
+        EsSearchJson(Some(split.hits)),
+    );
+    let Some((aggs_params, aggs_body)) = split.aggs else {
+        return hits_search.await;
+    };
+    let aggs_search = search_routed(
+        state,
+        index,
+        aggs_params,
+        principal,
+        EsSearchJson(Some(aggs_body)),
+    );
+    let (hits_response, aggs_response) = tokio::join!(Box::pin(hits_search), Box::pin(aggs_search));
+    if !hits_response.status().is_success() {
+        return hits_response;
+    }
+    if !aggs_response.status().is_success() {
+        return aggs_response;
+    }
+
+    let (mut parts, hits_body) = hits_response.into_parts();
+    let read = |body: axum::body::Body| async move {
+        axum::body::to_bytes(body, usize::MAX)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    let (Some(mut merged), Some(aggs_value)) =
+        (read(hits_body).await, read(aggs_response.into_body()).await)
+    else {
+        return ApiError::new(xerj_common::XerjError::internal(
+            "post_filter: could not read the search responses to merge them",
+        ))
+        .into_response();
+    };
+    if let (Some(obj), Some(aggregations)) =
+        (merged.as_object_mut(), aggs_value.get("aggregations"))
+    {
+        obj.insert("aggregations".to_string(), aggregations.clone());
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(merged.to_string()))
+}
+
+#[cfg(test)]
+mod post_filter_split_tests {
+    use super::*;
+
+    fn body(v: Value) -> EsSearchJson {
+        EsSearchJson(Some(serde_json::from_value(v).expect("search body")))
+    }
+
+    #[test]
+    fn no_post_filter_is_left_alone() {
+        let params = EsSearchQueryParams::default();
+        assert!(split_post_filter(&params, &body(json!({"query": {"match_all": {}}}))).is_none());
+        assert!(split_post_filter(&params, &EsSearchJson(None)).is_none());
+    }
+
+    #[test]
+    fn hits_search_wraps_the_query_and_drops_aggregations() {
+        let params = EsSearchQueryParams::default();
+        let split = split_post_filter(
+            &params,
+            &body(json!({
+                "query": {"match": {"body": "alpha"}},
+                "post_filter": {"term": {"provenance": "draft"}},
+            })),
+        )
+        .expect("split");
+        assert_eq!(
+            split.hits.query,
+            Some(json!({"bool": {
+                "must": [{"match": {"body": "alpha"}}],
+                "filter": [{"term": {"provenance": "draft"}}],
+            }}))
+        );
+        assert!(split.hits.post_filter.is_none());
+        assert!(split.aggs.is_none(), "no aggregations, no second search");
+    }
+
+    #[test]
+    fn a_missing_query_is_match_all() {
+        let split = split_post_filter(
+            &EsSearchQueryParams::default(),
+            &body(json!({"post_filter": {"term": {"provenance": "draft"}}})),
+        )
+        .expect("split");
+        assert_eq!(
+            split.hits.query.unwrap()["bool"]["must"][0],
+            json!({"match_all": {}})
+        );
+    }
+
+    #[test]
+    fn aggregations_come_from_the_unfiltered_request_with_no_hits_and_no_scroll() {
+        let params = EsSearchQueryParams {
+            size: Some("25".into()),
+            from: Some("5".into()),
+            scroll: Some("1m".into()),
+            ..Default::default()
+        };
+        let split = split_post_filter(
+            &params,
+            &body(json!({
+                "query": {"match_all": {}},
+                "size": 25,
+                "post_filter": {"term": {"provenance": "draft"}},
+                "aggs": {"p": {"terms": {"field": "provenance"}}},
+            })),
+        )
+        .expect("split");
+        assert!(split.hits.aggs.is_none() && split.hits.aggregations.is_none());
+        let (aggs_params, aggs_body) = split.aggs.expect("an aggregation search");
+        assert!(aggs_body.post_filter.is_none());
+        assert_eq!(aggs_body.query, Some(json!({"match_all": {}})));
+        assert_eq!((aggs_body.size, aggs_body.from), (0, 0));
+        assert!(aggs_body.aggs.is_some());
+        assert_eq!(aggs_params.size.as_deref(), Some("0"));
+        assert!(aggs_params.from.is_none() && aggs_params.scroll.is_none());
+    }
+
+    #[test]
+    fn hybrid_and_query_string_requests_are_not_split() {
+        let hybrid = body(json!({
+            "query": {"hybrid": {"queries": [
+                {"query": {"match": {"body": "alpha"}}},
+                {"query": {"match": {"body": "beta"}}},
+            ]}},
+            "post_filter": {"term": {"provenance": "draft"}},
+        }));
+        assert!(split_post_filter(&EsSearchQueryParams::default(), &hybrid).is_none());
+        let q_param = EsSearchQueryParams {
+            q: Some("body:alpha".into()),
+            ..Default::default()
+        };
+        let with_filter = body(json!({"post_filter": {"term": {"provenance": "draft"}}}));
+        assert!(split_post_filter(&q_param, &with_filter).is_none());
+    }
 }
 
 /// One shard's search, used by the cluster fan-out. Does not fan out again.

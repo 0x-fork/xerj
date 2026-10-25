@@ -79,6 +79,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `POST /{index}/_search` applies `post_filter` to the hits, as
+  Elasticsearch does. It used to be accepted and ignored: every document
+  the query matched came back and `hits.total` counted them all.
+  Aggregations still see the unfiltered query, which is the point of the
+  parameter: a faceted UI keeps offering a facet's other values while one
+  is selected. A request that aggregates now runs as two searches, one for
+  the filtered hits and one for the aggregations. `post_filter` beside a
+  hybrid query is still a 400 (#943). `_msearch`, async search, scroll and
+  a `?q=` query still ignore `post_filter`
+  ([#2400](https://github.com/xerj-org/xerj/issues/2400)).
+
 - `xerj mcp` no longer holds every message behind a slow tool call. Each
   `tools/call` runs on its own task, so `ping`, `tools/list` and other
   calls are answered while one call waits on the node. A ping sent 0.2 s
