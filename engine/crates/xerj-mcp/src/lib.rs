@@ -3378,7 +3378,21 @@ async fn engine_request(
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // The status line arrived, but the body may still fail (the
+            // connection drops, the request deadline fires mid-body). An empty
+            // string here would turn that into an empty *successful* result.
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    return tool_text(
+                        format!(
+                            "XERJ returned HTTP {status}, but the response body from {url} \
+                             could not be read: {e}"
+                        ),
+                        true,
+                    );
+                }
+            };
             if status.is_success() {
                 let text = match demote_page {
                     Some(page) => {
@@ -3618,6 +3632,35 @@ mod tests {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes()).await;
             let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes()).await;
         });
+    }
+
+    /// A 200 whose body cannot be read in full (the connection drops partway,
+    /// or the request deadline fires mid-body) is a failure, not an empty
+    /// successful result: an agent reading `isError: false` with no text would
+    /// conclude the query matched nothing.
+    #[tokio::test]
+    async fn engine_request_reports_a_body_that_could_not_be_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            // Promise 100 bytes, send 12, hang up.
+            let reply = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{\"hits\":{\"to";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, reply.as_bytes()).await;
+        });
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: None,
+        };
+        let res = engine_request(&ctx, Method::Get, "/docs/_search", None, None, None, None).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("could not be read"), "{text}");
     }
 
     /// #2284: the server already explained the flood-stage block. The tool

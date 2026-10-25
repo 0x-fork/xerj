@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj mcp`: a proxied tool call whose response body cannot be read in
+  full (the connection drops partway, or the request deadline fires
+  mid-body) is now an error that names the URL and the cause. It used to
+  come back as an empty *successful* result, which reads as "no matches".
+
 - MCP calls to a loopback node (`127.0.0.1`, `localhost`, `::1`) no longer
   follow `ALL_PROXY`, `HTTP_PROXY`, or `HTTPS_PROXY`. reqwest sends those
   addresses through the proxy unless the client opts out, so a socks or HTTP
