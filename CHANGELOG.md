@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
+  prepares an explicit Claude Code JSONL transcript for ordinary `autoindex`.
+  It emits text-bearing user/assistant records through the existing native
+  PII plugin before writing, preserving UUIDs, parent links, source filename,
+  line/byte offset and explicitly referenced file paths. Tool bodies,
+  thinking and metadata records are omitted. The export is an offline,
+  new-file snapshot: malformed input, unsupported turn shapes, repeated UUIDs
+  or a changed source refuse publication; existing output is never replaced.
+  This covers one preparation format for #1793, not automatic session
+  discovery, incremental synchronization or universal secret removal. See
+  [the import guide](tools/session-import/README.md).
+
 - With `[cluster] enabled = true`, `POST /v1/indices/{name}/docs` (one
   document, or a JSON array with one document per element),
   `DELETE /v1/indices/{name}/docs/{id}`, and

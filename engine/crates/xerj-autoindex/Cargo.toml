@@ -10,6 +10,9 @@ description = "xerj autoindex — point it at any folder and make the contents A
 # The machine-resource policy (cores, memory safe zone, thread priority) is
 # shared with the server: one policy, one place (#240).
 xerj-common = { path = "../xerj-common" }
+# Session exports use the same native PII redactor as ingest pipelines.
+xerj-wasm = { path = "../xerj-wasm" }
+uuid.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

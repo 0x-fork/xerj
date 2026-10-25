@@ -7459,8 +7459,10 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+ "uuid",
  "walkdir",
  "xerj-common",
+ "xerj-wasm",
  "xxhash-rust",
  "zip 9.0.5",
 ]

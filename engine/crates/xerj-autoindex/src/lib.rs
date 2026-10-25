@@ -49,6 +49,7 @@ mod reconcile_plan;
 pub mod remove;
 pub mod resources;
 pub mod search;
+pub mod sessions;
 pub mod sniff;
 pub mod source;
 pub mod staleness;

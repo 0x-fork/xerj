@@ -173,6 +173,7 @@ fn is_top_level_command(arg: &str) -> bool {
         "index"
             | "search"
             | "batch-search"
+            | "sessions"
             | "def"
             | "init"
             | "gain"
@@ -451,6 +452,7 @@ fn help_text(feedback: bool) -> String {
          \n\
          SUBCOMMANDS:\n\
          \x20\x20\x20\x20xerj batch-search --input FILE  ordered batch retrieval, JSON in/out (see xerj batch-search --help)\n\
+         \x20\x20\x20\x20xerj sessions import     export selected session turns with PII redaction (see xerj sessions --help)\n\
          \x20\x20\x20\x20xerj index      <opts>          direct NDJSON → engine ingest (see xerj index --help)\n\
          \x20\x20\x20\x20xerj autoindex  <folder> [opts] zero-config folder discovery + indexing (see xerj autoindex --help)\n\
          \x20\x20\x20\x20xerj autoindex  map [folder]    data map of indexed data, or a read-only folder preview\n\
@@ -2935,6 +2937,10 @@ fn main() -> Result<()> {
         let args = xerj_common::argv::args_after_subcommand();
         let rt = build_runtime(2)?;
         std::process::exit(rt.block_on(xerj_mcp::run_batch_cli(&args)));
+    }
+    if matches!(xerj_common::argv::subcommand().as_deref(), Some("sessions")) {
+        let args = xerj_common::argv::args_after_subcommand();
+        std::process::exit(xerj_autoindex::sessions::run_cli(&args));
     }
     // Cores from the resource policy, so `XERJ_NUM_CPUS` and a container CPU
     // quota reach the async runtime the same way they reach every pool (#240).
