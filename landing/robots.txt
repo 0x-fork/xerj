@@ -3,6 +3,8 @@
 User-agent: *
 Content-Signal: search=yes, ai-input=yes, ai-train=yes
 Allow: /
+# /api/ holds POST-only Pages Functions (field reports); nothing there is a page.
+Disallow: /api/
 
 # AI agents: start here — concise capability + API map
 # https://xerj.org/llms.txt  (full reference: /llms-full.txt)

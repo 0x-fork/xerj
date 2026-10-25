@@ -19,8 +19,8 @@ Last updated: 2026-10-23 (canonical description, ES-YAML and MCP tool counts syn
 This document is the expanded, agent-oriented reference: a curated, hand-written
 capability and API contract, NOT a dump of the whole documentation corpus. The short
 front door — an index of every page on the site, with the caveats inline — is at
-https://xerj.org/llms.txt; start there if you do not already know which section you
-need. Every endpoint, command, and request shape below is grounded in the running
+https://xerj.org/llms.txt
+Start there if you do not already know which section you need. Every endpoint, command, and request shape below is grounded in the running
 engine and CLI (xerj-api: es_compat.rs, native.rs, memory_api.rs, router.rs; the
 `autoindex` subcommand of the `xerj` binary). Where a capability is partial, stubbed,
 or compatibility-only, it is called out explicitly — do not infer capabilities that

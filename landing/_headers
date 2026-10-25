@@ -61,17 +61,20 @@
 /get
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300
+  X-Robots-Tag: noindex
 
 # Windows installer: powershell -ExecutionPolicy Bypass -c "irm https://xerj.org/get.ps1 | iex"
 /get.ps1
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300
+  X-Robots-Tag: noindex
 
 # /get.sh alias (#740): text/plain so the Functions-off fallback rewrite to /get
 # serves the installer as plain text, never HTML.
 /get.sh
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300
+  X-Robots-Tag: noindex
 
 # Agent-readable Markdown twins are alternate representations of the HTML
 # articles, not HTML pages. Keep the charset explicit for direct fetches.
@@ -85,4 +88,11 @@
   X-Robots-Tag: noindex
 /compare/*.md
   Content-Type: text/markdown; charset=utf-8
+  X-Robots-Tag: noindex
+
+# Demo videos are page assets, not search results of their own. Same reason
+# as the installer scripts: fetchable, just not indexed as standalone URLs.
+/xerj-biz-demo.mp4
+  X-Robots-Tag: noindex
+/aise-demo.mp4
   X-Robots-Tag: noindex
