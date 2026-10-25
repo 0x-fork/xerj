@@ -7,6 +7,15 @@
 //! folder's catalog row still names is left in place. `autoindex-catalog`
 //! itself is never deleted.
 //!
+//! A build writes dataset indices before it writes the catalog run (that
+//! document is the finalize step). An abort — a disk flood-stage block, a
+//! killed process — leaves those indices with no catalog run, so a catalog
+//! walk cannot see them (#2391). The resume journal already recorded the
+//! root, the prefix, and the plan's index names. This command reads that
+//! journal and deletes those indices too. An index a completed catalog run
+//! still names (the working copy the abort preserved, or another folder)
+//! is not deleted.
+//!
 //! Without `--yes` on a non-interactive stdin, nothing is deleted and the
 //! process exits 4 with the plan on stdout. A terminal prompts. `--yes` is
 //! the confirmation, not a root selector: two folders under one prefix still
@@ -51,6 +60,9 @@ struct RootGroup {
     run_ids: BTreeSet<String>,
     last_started: String,
     datasets: Vec<Row>,
+    /// This folder is known only from an unfinished resume journal. The
+    /// build never wrote a catalog run.
+    from_journal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +97,21 @@ struct PlannedIndex {
     store_bytes: Option<u64>,
     record_count: u64,
     catalog_bytes: u64,
+    /// Named by an unfinished resume journal and by no catalog dataset row
+    /// this plan is deleting.
+    orphan: bool,
+}
+
+/// One index an unfinished autoindex build of `root` / `prefix` planned or
+/// created, and never published as a catalog run.
+///
+/// `remove` and `status` both consume this. The journal is the attribution:
+/// a live `{prefix}-*` index with no journal is not assumed to be this folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortedIndex {
+    pub name: String,
+    pub root: String,
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -123,9 +150,15 @@ pub fn execute(req: RemoveRequest) -> Result<RemoveReport> {
         )
     })?;
     let docs = fetch_catalog(&es, &req.prefix)?;
-    let mentioned = index_names_of(&docs, &req.prefix);
+    let aborted = discover_aborted(&req);
+    let mut mentioned = index_names_of(&docs, &req.prefix);
+    for item in &aborted {
+        if deletable_index(&item.name) {
+            mentioned.insert(item.name.clone());
+        }
+    }
     let live = fetch_live(&es, &mentioned)?;
-    let plan = plan_remove(&req.prefix, req.root.as_deref(), &docs, &live);
+    let plan = plan_remove(&req.prefix, req.root.as_deref(), &docs, &live, &aborted);
     if plan.needs_root || plan.root_not_found || plan.empty {
         let code = if plan.empty || plan.root_not_found {
             1
@@ -178,7 +211,7 @@ pub fn execute(req: RemoveRequest) -> Result<RemoveReport> {
             }
         }
         Err(err) => {
-            let left = match refetch(&es, &req.prefix, req.root.as_deref()) {
+            let left = match refetch(&es, &req) {
                 Ok(left) => Some(left),
                 Err(read_err) => {
                     return Ok(report(
@@ -204,10 +237,23 @@ pub fn execute(req: RemoveRequest) -> Result<RemoveReport> {
     }
 }
 
-fn refetch(es: &Es, prefix: &str, root: Option<&str>) -> Result<RemovePlan> {
-    let docs = fetch_catalog(es, prefix)?;
-    let live = fetch_live(es, &index_names_of(&docs, prefix))?;
-    Ok(plan_remove(prefix, root, &docs, &live))
+fn refetch(es: &Es, req: &RemoveRequest) -> Result<RemovePlan> {
+    let docs = fetch_catalog(es, &req.prefix)?;
+    let aborted = discover_aborted(req);
+    let mut mentioned = index_names_of(&docs, &req.prefix);
+    for item in &aborted {
+        if deletable_index(&item.name) {
+            mentioned.insert(item.name.clone());
+        }
+    }
+    let live = fetch_live(es, &mentioned)?;
+    Ok(plan_remove(
+        &req.prefix,
+        req.root.as_deref(),
+        &docs,
+        &live,
+        &aborted,
+    ))
 }
 
 fn prompt_line(plan: &RemovePlan) -> String {
@@ -232,11 +278,16 @@ fn read_yes() -> bool {
 /// Pure: no HTTP. `root_filter` of `None` selects the only root, and refuses
 /// when there is more than one. Indices another remaining root still names,
 /// and `autoindex-catalog`, are never in the delete set.
+///
+/// `aborted` is the unfinished resume journal's index list (#2391). Those
+/// indices are deleted for the folder the journal names, unless a catalog
+/// row this plan is keeping still names them.
 pub fn plan_remove(
     prefix: &str,
     root_filter: Option<&str>,
     docs: &[CatalogDoc],
     live: &[LiveIndex],
+    aborted: &[AbortedIndex],
 ) -> RemovePlan {
     let mut by_id: BTreeMap<&str, &CatalogDoc> = BTreeMap::new();
     for doc in docs {
@@ -268,6 +319,7 @@ pub fn plan_remove(
             run_ids: BTreeSet::new(),
             last_started: String::new(),
             datasets: Vec::new(),
+            from_journal: false,
         });
         if started > group.last_started {
             group.last_started = started;
@@ -275,6 +327,42 @@ pub fn plan_remove(
         }
         group.run_ids.insert(run_identity(doc));
         group.run_ids.insert(doc.id.clone());
+    }
+
+    // #2391: an aborted build's resume journal is a root even when no catalog
+    // run was written. The indices land on that root's dataset list as
+    // `orphan` rows; they are not catalog ids and are never bulk-deleted.
+    let siblings = sibling_prefixes_of(&docs, prefix);
+    let mut orphan_names: BTreeSet<String> = BTreeSet::new();
+    for item in aborted {
+        if item.prefix != prefix || !index_owned_by_prefix(&item.name, prefix, &siblings) {
+            continue;
+        }
+        if !deletable_index(&item.name) {
+            continue;
+        }
+        orphan_names.insert(item.name.clone());
+        let key = root_key(&item.root);
+        let group = groups.entry(key.clone()).or_insert_with(|| RootGroup {
+            display: item.root.clone(),
+            key,
+            run_ids: BTreeSet::new(),
+            last_started: String::new(),
+            datasets: Vec::new(),
+            from_journal: true,
+        });
+        if group.datasets.iter().any(|row| row.index_name == item.name) {
+            continue;
+        }
+        group.datasets.push(Row {
+            id: format!("journal:{}:{}", item.prefix, item.name),
+            doc_kind: "orphan".into(),
+            root: group.display.clone(),
+            index_name: item.name.clone(),
+            record_count: 0,
+            bytes: 0,
+            file_count: 0,
+        });
     }
 
     let mut roots: Vec<RootGroup> = groups.into_values().collect();
@@ -294,6 +382,7 @@ pub fn plan_remove(
             run_ids: BTreeSet::new(),
             last_started: String::new(),
             datasets: Vec::new(),
+            from_journal: false,
         });
     }
     roots.sort_by(|a, b| a.display.cmp(&b.display));
@@ -455,10 +544,32 @@ pub fn plan_remove(
         }
     }
 
+    // Journal indices for the selected folder. A name `kept_index_reasons`
+    // already holds (another root's catalog row, a shared edges index) is
+    // removed again just below, so the preserved working index stays.
+    if deciding {
+        if let Some(key) = selected_key.as_deref() {
+            if let Some(group) = roots.iter().find(|g| g.key == key) {
+                for row in &group.datasets {
+                    if row.doc_kind == "orphan" && orphan_names.contains(&row.index_name) {
+                        delete_index_names
+                            .entry(row.index_name.clone())
+                            .or_insert((0, 0));
+                    }
+                }
+            }
+        }
+    }
+
     for name in kept_index_reasons.keys() {
         delete_index_names.remove(name);
     }
 
+    let catalog_named_in_rows: BTreeSet<&str> = rows
+        .iter()
+        .filter(|row| row.doc_kind == "dataset" || row.doc_kind == "correlation")
+        .map(|row| row.index_name.as_str())
+        .collect();
     let mut indices = Vec::new();
     let mut kept_indices = Vec::new();
     for (name, (record_count, catalog_bytes)) in &delete_index_names {
@@ -476,6 +587,7 @@ pub fn plan_remove(
             store_bytes: found.map(|idx| idx.store_bytes),
             record_count: *record_count,
             catalog_bytes: *catalog_bytes,
+            orphan: orphan_names.contains(name) && !catalog_named_in_rows.contains(name.as_str()),
         });
     }
     for (name, reason) in kept_index_reasons {
@@ -563,6 +675,277 @@ fn deletable_index(name: &str) -> bool {
         && name != "_all"
         && !name.contains('*')
         && !name.contains('?')
+}
+
+/// Prefixes longer than `prefix` that a catalog run records (`ax-2` when this
+/// command is removing `ax`). `ax-2-docs` starts with `ax-` and is not ours.
+fn sibling_prefixes_of(docs: &[&CatalogDoc], prefix: &str) -> BTreeSet<String> {
+    let mut siblings = BTreeSet::new();
+    for doc in docs {
+        if kind(doc) != "run" || run_matches_prefix(doc, prefix) {
+            continue;
+        }
+        let Some(other) = doc
+            .source
+            .get("prefix")
+            .or_else(|| doc.source.get(catalog::CORPUS_SCOPE_FIELD))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if other.len() > prefix.len() && other.starts_with(&format!("{prefix}-")) {
+            siblings.insert(other.to_string());
+        }
+    }
+    siblings
+}
+
+/// `{prefix}-{slug}`, and not `{sibling}-{slug}` for a longer prefix.
+fn index_owned_by_prefix(name: &str, prefix: &str, siblings: &BTreeSet<String>) -> bool {
+    let scoped = format!("{prefix}-");
+    if !name.starts_with(&scoped) {
+        return false;
+    }
+    !siblings
+        .iter()
+        .any(|other| name.starts_with(&format!("{other}-")))
+}
+
+fn same_endpoint(recorded: &str, current: &str) -> bool {
+    fn norm(s: &str) -> &str {
+        s.trim().trim_end_matches('/')
+    }
+    norm(recorded) == norm(current)
+}
+
+fn collect_dataset_indices(plan: &Value, into: &mut BTreeSet<String>) {
+    let Some(datasets) = plan.get("datasets").and_then(Value::as_array) else {
+        return;
+    };
+    for dataset in datasets {
+        if let Some(name) = dataset.get("index").and_then(Value::as_str) {
+            if !name.is_empty() {
+                into.insert(name.to_string());
+            }
+        }
+    }
+}
+
+/// Index names an unfinished journal attributes to `prefix`.
+///
+/// A journal that ended in `finish` or `sync_commit` published a catalog run;
+/// its indices belong to that run, and this returns nothing. A `resume` or
+/// `sync_begin` after that opens the build again. `allow_missing_url` accepts
+/// a journal written before `url` was recorded; a home-directory scan passes
+/// false so an old journal cannot be claimed by every endpoint.
+pub fn aborted_indices_from_journal(
+    text: &str,
+    prefix: &str,
+    url: &str,
+    allow_missing_url: bool,
+) -> Vec<AbortedIndex> {
+    unfinished_journal_indices(text, url, allow_missing_url)
+        .into_iter()
+        .filter(|item| item.prefix == prefix)
+        .collect()
+}
+
+/// Every index an unfinished journal names, under the prefix the journal recorded.
+///
+/// `status` uses this so a leftover of a prefix other than the one `status`
+/// was asked about is still flagged. `remove` filters to its own prefix.
+pub fn unfinished_journal_indices(
+    text: &str,
+    url: &str,
+    allow_missing_url: bool,
+) -> Vec<AbortedIndex> {
+    let mut open = false;
+    let mut saw_run = false;
+    let mut root = String::new();
+    let mut recorded_url = String::new();
+    let mut recorded_prefix = String::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("kind").and_then(Value::as_str) {
+            Some("run") => {
+                saw_run = true;
+                open = true;
+                root = value
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                recorded_url = value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                recorded_prefix = value
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+            }
+            Some("resume") | Some("sync_abort") => open = true,
+            Some("plan") if open => {
+                if let Some(plan) = value.get("plan") {
+                    collect_dataset_indices(plan, &mut names);
+                }
+            }
+            Some("index_created") if open => {
+                if let Some(name) = value.get("index").and_then(Value::as_str) {
+                    if !name.is_empty() {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            Some("sync_begin") => {
+                open = true;
+                if let Some(plan) = value.pointer("/desired/plan") {
+                    collect_dataset_indices(plan, &mut names);
+                }
+            }
+            Some("finish") | Some("sync_commit") => open = false,
+            _ => {}
+        }
+    }
+    if !saw_run || !open || recorded_prefix.is_empty() || root.is_empty() {
+        return Vec::new();
+    }
+    if recorded_url.is_empty() {
+        if !allow_missing_url {
+            return Vec::new();
+        }
+    } else if !same_endpoint(&recorded_url, url) {
+        return Vec::new();
+    }
+    names
+        .into_iter()
+        .map(|name| AbortedIndex {
+            name,
+            root: root.clone(),
+            prefix: recorded_prefix.clone(),
+        })
+        .collect()
+}
+
+fn autoindex_state_root() -> PathBuf {
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".xerj")
+        .join("autoindex")
+}
+
+/// Unfinished journals for this prefix and endpoint.
+///
+/// Explicit `--state-dir` and the default directory for `--root` are read
+/// even when the journal predates the `url` field. Every other state
+/// directory under `~/.xerj/autoindex` counts only when its `run` record
+/// names this endpoint, so a scan cannot adopt another node's build.
+fn discover_aborted(req: &RemoveRequest) -> Vec<AbortedIndex> {
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut consider = |path: PathBuf, allow_missing_url: bool| {
+        if !seen.insert(path.clone()) {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        found.extend(aborted_indices_from_journal(
+            &text,
+            &req.prefix,
+            &req.url,
+            allow_missing_url,
+        ));
+    };
+    if let Some(dir) = &req.state_dir {
+        consider(dir.join("journal.ndjson"), true);
+    }
+    if let Some(root) = &req.root {
+        for dir in resume_state_dirs(root, &req.url, &req.prefix, None) {
+            consider(dir.join("journal.ndjson"), true);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(autoindex_state_root()) {
+        for entry in entries.flatten() {
+            consider(entry.path().join("journal.ndjson"), false);
+        }
+    }
+    let mut dedup: BTreeMap<(String, String), AbortedIndex> = BTreeMap::new();
+    for item in found {
+        dedup
+            .entry((root_key(&item.root), item.name.clone()))
+            .or_insert(item);
+    }
+    dedup.into_values().collect()
+}
+
+/// Live indices an aborted build left, and that no catalog dataset names.
+///
+/// `cataloged` is the set of index names a completed catalog run of this
+/// prefix still claims. The working index is in that set and is not flagged.
+pub fn orphan_flags(
+    live: &[String],
+    cataloged: &BTreeSet<String>,
+    aborted: &[AbortedIndex],
+) -> Vec<(String, String)> {
+    let mut by_name: BTreeMap<&str, &str> = BTreeMap::new();
+    for item in aborted {
+        by_name
+            .entry(item.name.as_str())
+            .or_insert(item.root.as_str());
+    }
+    let mut flags = Vec::new();
+    for name in live {
+        if cataloged.contains(name) {
+            continue;
+        }
+        let Some(root) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        flags.push((name.clone(), (*root).to_string()));
+    }
+    flags.sort();
+    flags
+}
+
+/// One `status` line per orphan root: the indices and the remove command.
+pub fn orphan_status_lines(prefix: &str, flags: &[(String, String)]) -> Vec<String> {
+    let mut by_root: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, root) in flags {
+        by_root
+            .entry(root.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
+    let mut lines = Vec::new();
+    for (root, names) in by_root {
+        lines.push(format!(
+            "orphans (aborted build, no catalog run) under {root}: {}",
+            names.join(", ")
+        ));
+        lines.push(format!(
+            "  xerj autoindex remove --prefix {} --root {} --yes",
+            shell_quote(prefix),
+            shell_quote(root)
+        ));
+    }
+    lines
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.contains([' ', '\t', '\'', '"', '\\', '$']) {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    } else {
+        s.to_string()
+    }
 }
 
 fn kind(doc: &CatalogDoc) -> &str {
@@ -699,6 +1082,33 @@ fn fetch_catalog(es: &Es, prefix: &str) -> Result<Vec<CatalogDoc>> {
         ]}}),
     )?);
     Ok(docs)
+}
+
+/// Index names a catalog dataset row of `prefix` still claims.
+///
+/// A missing catalog is an empty set (the aborted build). Any other search
+/// failure is returned so a caller can refuse to call the working index an
+/// orphan just because the catalog could not be read.
+pub(crate) fn cataloged_index_names(es: &Es, prefix: &str) -> Result<BTreeSet<String>> {
+    let docs = search_kind(
+        es,
+        json!({"bool": {"filter": [
+            {"term": {"doc_kind": "dataset"}},
+            {"prefix": {"index_name": format!("{prefix}-")}}
+        ]}}),
+    )?;
+    let mut names = BTreeSet::new();
+    for doc in docs {
+        if !catalog::dataset_matches_prefix(&doc.source, prefix) {
+            continue;
+        }
+        if let Some(name) = doc.source.get("index_name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn search_kind(es: &Es, query: Value) -> Result<Vec<CatalogDoc>> {
@@ -950,6 +1360,7 @@ fn plan_body(plan: &RemovePlan, exit_code: i32, deleted: bool, error: Option<Str
         "roots": plan.roots.iter().map(|g| json!({
             "root": g.display,
             "last_started": if g.last_started.is_empty() { Value::Null } else { json!(g.last_started) },
+            "from_journal": g.from_journal,
             "datasets": g.datasets.iter().map(row_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "remove": {
@@ -959,6 +1370,7 @@ fn plan_body(plan: &RemovePlan, exit_code: i32, deleted: bool, error: Option<Str
                 "store_bytes": idx.store_bytes,
                 "record_count": idx.record_count,
                 "bytes": idx.catalog_bytes,
+                "orphan": idx.orphan,
             })).collect::<Vec<_>>(),
             "catalog_rows": plan.rows.iter().map(row_json).collect::<Vec<_>>(),
         },
@@ -1002,7 +1414,12 @@ fn summary_text(plan: &RemovePlan, exit_code: i32, deleted: bool, error: Option<
             } else {
                 format!("  last {}", root.last_started)
             };
-            lines.push(format!("  {}{when}", root.display));
+            let journal = if root.from_journal {
+                "  (aborted build, no catalog run)"
+            } else {
+                ""
+            };
+            lines.push(format!("  {}{when}{journal}", root.display));
         }
     }
     if plan.needs_root {
@@ -1031,8 +1448,13 @@ fn summary_text(plan: &RemovePlan, exit_code: i32, deleted: bool, error: Option<
                 .store_bytes
                 .map(|n| format!("{n}b"))
                 .unwrap_or_else(|| "unknown".into());
+            let orphan = if idx.orphan {
+                "  aborted build, no catalog run"
+            } else {
+                ""
+            };
             lines.push(format!(
-                "  index {}  live docs {docs}  store {size}  catalog records {}  catalog bytes {}",
+                "  index {}  live docs {docs}  store {size}  catalog records {}  catalog bytes {}{orphan}",
                 idx.name, idx.record_count, idx.catalog_bytes
             ));
         }
@@ -1174,7 +1596,7 @@ mod tests {
             ),
         ];
         docs.push(dataset("ds:ax:code", "ax-code", "code", "a", 1, 10));
-        let plan = plan_remove("ax", None, &docs, &[]);
+        let plan = plan_remove("ax", None, &docs, &[], &[]);
         assert!(!plan.needs_root, "{plan:?}");
         let n = names(&plan);
         assert_eq!(
@@ -1189,7 +1611,7 @@ mod tests {
 
     #[test]
     fn two_roots_without_a_root_delete_nothing() {
-        let plan = plan_remove("ax", None, &two_roots(), &[]);
+        let plan = plan_remove("ax", None, &two_roots(), &[], &[]);
         assert!(plan.needs_root, "{plan:?}");
         assert!(plan.indices.is_empty());
         assert!(plan.rows.is_empty());
@@ -1231,7 +1653,7 @@ mod tests {
                 store_bytes: 500,
             },
         ];
-        let plan = plan_remove("ax", Some("/data/a"), &two_roots(), &live);
+        let plan = plan_remove("ax", Some("/data/a"), &two_roots(), &live, &[]);
         assert!(!plan.needs_root && !plan.root_not_found, "{plan:?}");
         assert_eq!(names(&plan), vec!["ax-only-a".to_string()]);
         assert!(plan.indices[0].live_docs == Some(2));
@@ -1271,7 +1693,7 @@ mod tests {
             dataset("ds:ax:docs", "ax-docs", "docs", "a", 2, 10),
             dataset("ds:ax:docs-b", "ax-docs", "docs", "b", 5, 50),
         ];
-        let plan = plan_remove("ax", Some("/data/a"), &docs, &[]);
+        let plan = plan_remove("ax", Some("/data/a"), &docs, &[], &[]);
         assert!(
             !names(&plan).iter().any(|n| n == "ax-docs"),
             "{:?}",
@@ -1289,7 +1711,7 @@ mod tests {
     fn a_shared_edges_index_is_not_deleted() {
         let mut docs = two_roots();
         docs[0].source["graph"] = json!({"edges_index": ".xerj-memory-shared-edges"});
-        let plan = plan_remove("ax", Some("/data/a"), &docs, &[]);
+        let plan = plan_remove("ax", Some("/data/a"), &docs, &[], &[]);
         assert!(
             !names(&plan).iter().any(|n| n.contains("edges")),
             "{:?}",
@@ -1308,7 +1730,7 @@ mod tests {
             dataset("ds:ax:docs", "ax-docs", "docs", "a", 1, 1),
         ];
         docs[0].source["graph"] = json!({"edges_index": ".xerj-memory-a-edges"});
-        let plan = plan_remove("ax", None, &docs, &[]);
+        let plan = plan_remove("ax", None, &docs, &[], &[]);
         assert!(
             names(&plan).contains(&".xerj-memory-a-edges".into()),
             "{:?}",
@@ -1323,7 +1745,7 @@ mod tests {
             run("run:a", "ax", "/data/a", "2026-01-01T00:00:00Z"),
             dataset("ds:ax:catalog", CATALOG_INDEX, "catalog", "a", 1, 1),
         ];
-        let plan = plan_remove("ax", None, &docs, &[]);
+        let plan = plan_remove("ax", None, &docs, &[], &[]);
         assert!(
             !names(&plan).iter().any(|n| n == CATALOG_INDEX),
             "{:?}",
@@ -1333,7 +1755,7 @@ mod tests {
 
     #[test]
     fn an_unknown_root_deletes_nothing() {
-        let plan = plan_remove("ax", Some("/data/missing"), &two_roots(), &[]);
+        let plan = plan_remove("ax", Some("/data/missing"), &two_roots(), &[], &[]);
         assert!(plan.root_not_found);
         assert!(plan.indices.is_empty());
         assert!(plan.rows.is_empty());
@@ -1345,7 +1767,7 @@ mod tests {
             run("run:a", "ax", "/data/a", "2026-01-01T00:00:00Z"),
             dataset("ds:ax:docs", "ax-docs", "docs", "a", 4, 40),
         ];
-        let plan = plan_remove("ax", None, &docs, &[]);
+        let plan = plan_remove("ax", None, &docs, &[], &[]);
         assert!(!plan.needs_root, "{plan:?}");
         assert_eq!(names(&plan), vec!["ax-docs".to_string()]);
         assert_eq!(plan.indices[0].record_count, 4);
@@ -1355,7 +1777,7 @@ mod tests {
     #[test]
     fn trailing_slash_on_root_matches_the_catalog_path() {
         let docs = vec![run("run:a", "ax", "/data/a", "2026-01-01T00:00:00Z")];
-        let plan = plan_remove("ax", Some("/data/a/"), &docs, &[]);
+        let plan = plan_remove("ax", Some("/data/a/"), &docs, &[], &[]);
         assert!(!plan.root_not_found, "{plan:?}");
         assert!(row_ids(&plan).contains(&"run:a".into()));
     }
@@ -1634,5 +2056,327 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&selected);
         let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    fn aborted(name: &str, root: &str, prefix: &str) -> AbortedIndex {
+        AbortedIndex {
+            name: name.to_string(),
+            root: root.to_string(),
+            prefix: prefix.to_string(),
+        }
+    }
+
+    /// #2391: a rebuild aborted before finalize. The partial prefix has indices
+    /// and a resume journal, and no catalog run. The working index is a
+    /// different prefix that did finish. Removing the partial prefix by root
+    /// deletes only the partial indices.
+    #[test]
+    fn an_aborted_build_with_no_catalog_run_is_removed_by_root() {
+        let working = vec![
+            run("run:wp", "wp", "/site", "2026-10-01T00:00:00Z"),
+            dataset("ds:wp:docs", "wp-docs", "docs", "wp", 40, 400),
+            run("run:other", "ax", "/elsewhere", "2026-10-02T00:00:00Z"),
+            dataset("ds:ax:docs", "ax-docs", "docs", "other", 3, 30),
+        ];
+        let live = vec![
+            LiveIndex {
+                name: "wp-docs".into(),
+                docs: 40,
+                store_bytes: 4000,
+            },
+            LiveIndex {
+                name: "wp-rebuild-posts".into(),
+                docs: 12,
+                store_bytes: 1200,
+            },
+            LiveIndex {
+                name: "wp-rebuild-pages".into(),
+                docs: 4,
+                store_bytes: 400,
+            },
+            LiveIndex {
+                name: "ax-docs".into(),
+                docs: 3,
+                store_bytes: 300,
+            },
+        ];
+        let aborted = vec![
+            aborted("wp-rebuild-posts", "/site", "wp-rebuild"),
+            aborted("wp-rebuild-pages", "/site", "wp-rebuild"),
+            // A journal must not be able to name the preserved working index
+            // or another root's index just by listing it.
+            aborted("wp-docs", "/site", "wp-rebuild"),
+            aborted("ax-docs", "/site", "wp-rebuild"),
+        ];
+        let plan = plan_remove("wp-rebuild", Some("/site"), &working, &live, &aborted);
+        assert!(
+            !plan.needs_root && !plan.root_not_found && !plan.empty,
+            "{plan:?}"
+        );
+        assert_eq!(
+            names(&plan),
+            vec![
+                "wp-rebuild-pages".to_string(),
+                "wp-rebuild-posts".to_string()
+            ],
+            "{plan:?}"
+        );
+        assert!(plan.indices.iter().all(|idx| idx.orphan), "{plan:?}");
+        assert_eq!(plan.indices[0].live_docs, Some(4));
+        assert!(
+            !names(&plan)
+                .iter()
+                .any(|n| n == "wp-docs" || n == "ax-docs"),
+            "working index and the other root stay: {:?}",
+            names(&plan)
+        );
+        assert!(
+            row_ids(&plan).is_empty(),
+            "an aborted build has no catalog row to delete: {:?}",
+            row_ids(&plan)
+        );
+        let body = plan_body(&plan, 0, false, None);
+        assert_eq!(body["remove"]["indices"][1]["orphan"], true);
+        assert!(
+            summary_text(&plan, 0, false, None).contains("aborted build, no catalog run"),
+            "{}",
+            summary_text(&plan, 0, false, None)
+        );
+    }
+
+    /// The same prefix, two folders. The aborted folder's journal names the
+    /// index the other folder's catalog still owns. That index stays.
+    #[test]
+    fn an_aborted_journal_cannot_delete_another_roots_cataloged_index() {
+        let docs = vec![
+            run("run:keep", "ax", "/data/keep", "2026-10-01T00:00:00Z"),
+            dataset("ds:ax:docs", "ax-docs", "docs", "keep", 9, 90),
+        ];
+        let aborted = vec![
+            aborted("ax-docs", "/data/abort", "ax"),
+            aborted("ax-partial", "/data/abort", "ax"),
+        ];
+        let plan = plan_remove("ax", Some("/data/abort"), &docs, &[], &aborted);
+        assert_eq!(names(&plan), vec!["ax-partial".to_string()], "{plan:?}");
+        assert!(plan.indices[0].orphan);
+        assert!(
+            plan.kept_indices.iter().any(|k| k.name == "ax-docs"),
+            "the cataloged working index is kept: {:?}",
+            plan.kept_indices
+        );
+    }
+
+    #[test]
+    fn two_aborted_roots_need_a_root_and_delete_nothing() {
+        let aborted = vec![
+            aborted("ax-a", "/data/a", "ax"),
+            aborted("ax-b", "/data/b", "ax"),
+        ];
+        let plan = plan_remove("ax", None, &[], &[], &aborted);
+        assert!(plan.needs_root, "{plan:?}");
+        assert!(plan.indices.is_empty());
+        assert!(plan.rows.is_empty());
+    }
+
+    #[test]
+    fn one_aborted_root_is_selected_without_passing_root() {
+        let plan = plan_remove(
+            "ax",
+            None,
+            &[],
+            &[],
+            &[aborted("ax-posts", "/data/a", "ax")],
+        );
+        assert!(!plan.needs_root && !plan.empty, "{plan:?}");
+        assert_eq!(names(&plan), vec!["ax-posts".to_string()]);
+    }
+
+    #[test]
+    fn a_sibling_prefix_index_in_the_journal_is_not_deleted() {
+        let docs = vec![run("run:sib", "ax-2", "/data/sib", "2026-10-01T00:00:00Z")];
+        let aborted = vec![
+            aborted("ax-docs", "/data/a", "ax"),
+            aborted("ax-2-docs", "/data/a", "ax"),
+        ];
+        let plan = plan_remove("ax", Some("/data/a"), &docs, &[], &aborted);
+        assert_eq!(names(&plan), vec!["ax-docs".to_string()], "{plan:?}");
+    }
+
+    #[test]
+    fn a_finished_journal_is_not_an_orphan_source() {
+        let text = "\
+{\"kind\":\"run\",\"root\":\"/site\",\"url\":\"http://127.0.0.1:9200\",\"prefix\":\"wp-rebuild\"}\n\
+{\"kind\":\"plan\",\"plan\":{\"datasets\":[{\"index\":\"wp-rebuild-posts\"}]}}\n\
+{\"kind\":\"finish\",\"summary\":{}}\n";
+        assert!(
+            aborted_indices_from_journal(text, "wp-rebuild", "http://127.0.0.1:9200", true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unfinished_journal_names_the_partial_prefix() {
+        let text = "\
+{\"kind\":\"run\",\"root\":\"/site\",\"url\":\"http://127.0.0.1:9200/\",\"prefix\":\"wp-rebuild\"}\n\
+{\"kind\":\"plan\",\"plan\":{\"datasets\":[{\"index\":\"wp-rebuild-pages\"},{\"index\":\"wp-rebuild-posts\"}],\"files\":{}}}\n";
+        let got = aborted_indices_from_journal(text, "wp-rebuild", "http://127.0.0.1:9200", true);
+        let names: Vec<_> = got.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, vec!["wp-rebuild-pages", "wp-rebuild-posts"]);
+        assert!(got.iter().all(|item| item.root == "/site"));
+        let any = unfinished_journal_indices(text, "http://127.0.0.1:9200", true);
+        assert!(
+            any.iter().all(|item| item.prefix == "wp-rebuild"),
+            "status uses the prefix the journal recorded, not the one it was asked about: {any:?}"
+        );
+        assert!(
+            aborted_indices_from_journal(text, "wp", "http://127.0.0.1:9200", true).is_empty(),
+            "a different prefix does not adopt this journal"
+        );
+        assert!(
+            aborted_indices_from_journal(text, "wp-rebuild", "http://10.0.0.2:9200", true)
+                .is_empty(),
+            "a different endpoint does not adopt this journal"
+        );
+    }
+
+    #[test]
+    fn a_pending_generation_is_an_orphan_source_and_a_commit_is_not() {
+        let open = "\
+{\"kind\":\"run\",\"root\":\"/site\",\"url\":\"http://127.0.0.1:9200\",\"prefix\":\"wp-rebuild\"}\n\
+{\"kind\":\"sync_begin\",\"desired\":{\"plan\":{\"datasets\":[{\"index\":\"wp-rebuild-posts\"}]}}}\n";
+        assert_eq!(
+            aborted_indices_from_journal(open, "wp-rebuild", "http://127.0.0.1:9200", true).len(),
+            1
+        );
+        let committed = format!("{open}{{\"kind\":\"sync_commit\"}}\n");
+        assert!(aborted_indices_from_journal(
+            &committed,
+            "wp-rebuild",
+            "http://127.0.0.1:9200",
+            true
+        )
+        .is_empty());
+        let resumed = format!(
+            "{committed}{{\"kind\":\"resume\"}}\n{{\"kind\":\"index_created\",\"index\":\"wp-rebuild-extra\"}}\n"
+        );
+        let got =
+            aborted_indices_from_journal(&resumed, "wp-rebuild", "http://127.0.0.1:9200", true);
+        let names: Vec<_> = got.iter().map(|item| item.name.as_str()).collect();
+        assert!(names.contains(&"wp-rebuild-posts"), "{names:?}");
+        assert!(names.contains(&"wp-rebuild-extra"), "{names:?}");
+    }
+
+    #[test]
+    fn status_flags_the_partial_prefix_and_not_the_working_index() {
+        let live = vec![
+            "wp-docs".into(),
+            "wp-rebuild-posts".into(),
+            "ax-docs".into(),
+        ];
+        let mut cataloged = BTreeSet::new();
+        cataloged.insert("wp-docs".to_string());
+        let aborted = vec![aborted("wp-rebuild-posts", "/site", "wp-rebuild")];
+        let flags = orphan_flags(&live, &cataloged, &aborted);
+        assert_eq!(flags, vec![("wp-rebuild-posts".into(), "/site".into())]);
+        let lines = orphan_status_lines("wp-rebuild", &flags);
+        assert!(
+            lines.iter().any(|line| line.contains("wp-rebuild-posts")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("xerj autoindex remove --prefix wp-rebuild --root /site --yes")
+            }),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("wp-docs")),
+            "{lines:?}"
+        );
+    }
+
+    /// The acceptance path: the node holds the preserved working index and the
+    /// partial prefix. `remove --root` of the partial prefix deletes only the
+    /// partial indices. The journal is the only record of them.
+    #[test]
+    fn remove_by_root_deletes_the_aborted_prefix_and_leaves_the_working_index() {
+        let docs = vec![
+            run("run:wp", "wp", "/site", "2026-10-01T00:00:00Z"),
+            dataset("ds:wp:docs", "wp-docs", "docs", "wp", 40, 400),
+            run("run:else", "ax", "/elsewhere", "2026-10-02T00:00:00Z"),
+            dataset("ds:ax:docs", "ax-docs", "docs", "else", 2, 20),
+        ];
+        let (url, log) = spawn_catalog_server(&docs);
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state.path().join("journal.ndjson"),
+            format!(
+                "{{\"kind\":\"run\",\"root\":\"/site\",\"url\":\"{url}\",\"prefix\":\"wp-rebuild\"}}\n\
+                 {{\"kind\":\"plan\",\"plan\":{{\"datasets\":[{{\"index\":\"wp-rebuild-posts\"}},{{\"index\":\"wp-rebuild-pages\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        let report = execute(RemoveRequest {
+            url,
+            api_key: None,
+            prefix: "wp-rebuild".into(),
+            root: Some("/site".into()),
+            yes: true,
+            prompt: false,
+            state_dir: Some(state.path().to_path_buf()),
+        })
+        .expect("remove");
+        assert_eq!(report.exit_code, 0, "{}\n{}", report.summary, report.body);
+        assert_eq!(report.body["deleted"], true);
+        let removed: Vec<String> = report.body["remove"]["indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|idx| idx["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            removed,
+            vec![
+                "wp-rebuild-pages".to_string(),
+                "wp-rebuild-posts".to_string()
+            ]
+        );
+        assert!(report.body["remove"]["indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|idx| idx["orphan"] == true));
+        let calls = log.lock().unwrap().clone();
+        let deletes: Vec<_> = calls
+            .iter()
+            .filter(|c| c.starts_with("DELETE "))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deletes,
+            vec![
+                "DELETE /wp-rebuild-pages".to_string(),
+                "DELETE /wp-rebuild-posts".to_string()
+            ],
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("wp-docs") && c.starts_with("DELETE")),
+            "the preserved working index was deleted: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("ax-docs") && c.starts_with("DELETE")),
+            "another root's index was deleted: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("BULK") && c.contains("ds:wp:docs")),
+            "the working catalog row was deleted: {calls:?}"
+        );
     }
 }

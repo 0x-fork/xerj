@@ -13421,6 +13421,7 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
                 .unwrap_or_default()
         }
     };
+    let mut aborted: Vec<remove::AbortedIndex> = Vec::new();
     for d in dirs {
         let jp = d.join("journal.ndjson");
         if !jp.exists() {
@@ -13443,15 +13444,80 @@ fn run_status(cfg: StatusCfg) -> Result<i32> {
         if let Some(line) = facts.graph_line {
             println!("  {line}");
         }
+        // #2391: an unfinished journal is the only record of indices a build
+        // created before it wrote a catalog run. The prefix is the one the
+        // journal recorded, not `--prefix`: a leftover of another prefix is
+        // still a leftover. A missing or unreadable journal adds nothing; a
+        // finished one is not an orphan source.
+        if let Ok(text) = std::fs::read_to_string(&jp) {
+            aborted.extend(remove::unfinished_journal_indices(&text, &cfg.url, true));
+        }
     }
     // live indices
     if let Ok(es) = Es::new(&cfg.url, cfg.api_key.clone()) {
         if es.ping().is_ok() {
             let pat = format!("{}-", cfg.prefix);
+            let all_live = es.cat_indices().unwrap_or_default();
+            let mut live: Vec<(String, u64)> = all_live
+                .iter()
+                .filter(|(name, _)| name.starts_with(&pat) || name == catalog::CATALOG_INDEX)
+                .cloned()
+                .collect();
+            // A catalog the node cannot read is not treated as empty: that
+            // would flag the working index. A missing catalog is empty, which
+            // is the aborted build. One prefix's failure does not suppress
+            // another prefix's leftovers.
+            let live_names: Vec<String> = all_live.iter().map(|(name, _)| name.clone()).collect();
+            let mut flags = Vec::new();
+            let mut prefixes: Vec<&str> = aborted.iter().map(|item| item.prefix.as_str()).collect();
+            prefixes.sort_unstable();
+            prefixes.dedup();
+            for prefix in prefixes {
+                let Ok(cataloged) = remove::cataloged_index_names(&es, prefix) else {
+                    continue;
+                };
+                let subset: Vec<remove::AbortedIndex> = aborted
+                    .iter()
+                    .filter(|item| item.prefix == prefix)
+                    .cloned()
+                    .collect();
+                flags.extend(remove::orphan_flags(&live_names, &cataloged, &subset));
+            }
+            let flagged: std::collections::BTreeSet<&str> =
+                flags.iter().map(|(name, _)| name.as_str()).collect();
+            for (name, _) in &flags {
+                if live.iter().any(|(shown, _)| shown == name) {
+                    continue;
+                }
+                if let Some(pair) = all_live.iter().find(|(shown, _)| shown == name) {
+                    live.push(pair.clone());
+                }
+            }
+            live.sort();
             println!("\nlive indices at {}:", cfg.url);
-            for (name, docs) in es.cat_indices().unwrap_or_default() {
-                if name.starts_with(&pat) || name == catalog::CATALOG_INDEX {
+            for (name, docs) in &live {
+                if flagged.contains(name.as_str()) {
+                    println!("  {name:<40} {docs:>10} docs  ORPHAN aborted build, no catalog run");
+                } else {
                     println!("  {name:<40} {docs:>10} docs");
+                }
+            }
+            let mut by_prefix: std::collections::BTreeMap<&str, Vec<(String, String)>> =
+                std::collections::BTreeMap::new();
+            for (name, root) in &flags {
+                let prefix = aborted
+                    .iter()
+                    .find(|item| item.name == *name)
+                    .map(|item| item.prefix.as_str())
+                    .unwrap_or(cfg.prefix.as_str());
+                by_prefix
+                    .entry(prefix)
+                    .or_default()
+                    .push((name.clone(), root.clone()));
+            }
+            for (prefix, group) in &by_prefix {
+                for line in remove::orphan_status_lines(prefix, group) {
+                    println!("{line}");
                 }
             }
         }
