@@ -14381,6 +14381,44 @@ impl Index {
                 );
                 true
             };
+            // #2427 — the output-write step (doc-values build, stored
+            // encode, FTS side-car build) runs after the last `must_yield`
+            // checkpoint and is the batch's peak: large pg-docs merges took a
+            // 3,072 MB search node to 4.4–4.9 GB there, about 5 s before they
+            // completed. It is charged to the batch's merge reservation before
+            // it starts, and refused (the batch yields, inputs kept, later
+            // batches narrowed) when it would take RSS to the hard limit. See
+            // `ResourceGovernor::admit_merge_write`.
+            let admit_write = move |reservation: Option<&mut crate::governor::MergeReservation>,
+                                    held: u64,
+                                    extra: u64|
+                  -> bool {
+                let Some(governor) = crate::governor::global() else {
+                    return true;
+                };
+                // #2468 lets a small background batch run to completion
+                // after a streak of yields with nothing merged. When that
+                // rule is what waived this batch's yield, the write runs
+                // too, or refusing it would bring the stall back.
+                let exempt = governor.merge_write_exempt(forced_for_task, input_bytes_for_task);
+                if governor.admit_merge_write(reservation, held, extra, forced_for_task, exempt) {
+                    return true;
+                }
+                let cap = governor.note_merge_yield(input_bytes_for_task);
+                tracing::warn!(
+                    input_mb = input_bytes_for_task / (1024 * 1024),
+                    write_mb = extra / (1024 * 1024),
+                    rss_mb = governor.observed_rss_bytes() / (1024 * 1024),
+                    limit_mb = governor.process_memory_limit_bytes() / (1024 * 1024),
+                    next_batch_cap_mb = cap / (1024 * 1024),
+                    "merge batch yielded before its output write: the write would take RSS \
+                     to the process limit; inputs kept, later batches narrowed"
+                );
+                false
+            };
+            // Held by the encode job until it ends, so the write step can
+            // grow it (see `admit_write`).
+            let mut reservation_for_encode = reservation;
             #[cfg(test)]
             let hold_merge_encode = Arc::clone(&self.test_hold_merge_encode);
             #[cfg(test)]
@@ -14484,14 +14522,19 @@ impl Index {
                     // remapped, not re-derived). `retained_bytes` charges only
                     // what the reader OWNS (an mmap'd `.post` contributes 0),
                     // matching what this batch adds to the heap.
-                    let merge_reader_retained = merge_readers.as_ref().map(|readers| {
-                        let bytes: u64 = readers
-                            .iter()
-                            .map(|reader| reader.retained_bytes())
-                            .sum();
+                    let merge_reader_bytes: u64 = merge_readers
+                        .as_ref()
+                        .map(|readers| {
+                            readers
+                                .iter()
+                                .map(|reader| reader.retained_bytes())
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0);
+                    let merge_reader_retained = merge_readers.as_ref().map(|_| {
                         crate::ingest_memory::Retained::new(
                             crate::ingest_memory::Category::MergeDecoded,
-                            bytes as usize,
+                            merge_reader_bytes as usize,
                         )
                     });
 
@@ -14979,6 +15022,29 @@ impl Index {
                         yielded_for_task.fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
+                    // #2427 — last chance to stop: everything below allocates
+                    // on top of what the batch holds now and cannot yield.
+                    // Charge it to the merge budget first, or yield.
+                    {
+                        let json_bytes = merged_json_buf.len() as u64;
+                        let fts_bytes = fts_input_bytes as u64;
+                        let write_fts_bytes = if merge_postings {
+                            merge_reader_bytes
+                        } else {
+                            fts_bytes
+                        };
+                        let held = json_bytes
+                            .saturating_add(fts_bytes)
+                            .saturating_add(merge_reader_bytes);
+                        let extra = crate::merge_budget::merge_write_phase_bytes(
+                            json_bytes,
+                            write_fts_bytes,
+                        );
+                        if !admit_write(reservation_for_encode.as_mut(), held, extra) {
+                            yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    }
                     // Doc-values columns, built here from the merged stored
                     // JSON one document at a time (#2427) and written once the
                     // merged segment id exists, below. The columns are what
@@ -15292,12 +15358,12 @@ impl Index {
                         version_repoint_intents,
                     ))
                 }));
+                // Held until the encode (the allocation-heavy part: stored
+                // decode, FST and doc-values build) has finished.
+                drop(reservation_for_encode);
                 let _ = encode_tx.send(encoded);
             });
             tokio::spawn(async move {
-                // Held until the encode (the allocation-heavy part: stored
-                // decode, FST and doc-values build) has finished.
-                let _reservation = reservation;
                 match encode_rx.await {
                     Ok(Ok(value)) => {
                         if value.is_some() && !forced_for_task {

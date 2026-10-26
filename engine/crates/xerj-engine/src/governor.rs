@@ -769,6 +769,65 @@ impl ResourceGovernor {
             .pressure_cap
     }
 
+    /// Whether a batch's output-write step is exempt from
+    /// [`Self::admit_merge_write`]'s hard-limit refusal (#2427, #2468).
+    ///
+    /// True exactly when #2468's streak rule is what keeps this batch
+    /// running: the plain rule ([`Self::merge_must_yield`]) says yield, and
+    /// the streak-aware rule ([`Self::merge_must_yield_for`]) waives it for
+    /// a small batch after a streak of yields with nothing merged. Refusing
+    /// that batch's write would bring back the stall the rule exists to
+    /// break.
+    pub fn merge_write_exempt(&self, forced: bool, input_bytes: u64) -> bool {
+        self.merge_must_yield(forced) && !self.merge_must_yield_for(forced, input_bytes)
+    }
+
+    /// Charge a merge batch's output-write step to the merge budget before
+    /// it runs (#2427).
+    ///
+    /// The step comes after the last yield checkpoint: the doc-values
+    /// build, the stored encode and the FTS side-car build. It allocates
+    /// `extra` bytes (`merge_budget::merge_write_phase_bytes`) on top of the
+    /// `held` bytes the batch already has. Before this, neither admission
+    /// nor the yield checks saw it, and large pg-docs merges took a
+    /// 3,072 MB search node to 4.4–4.9 GB in their last seconds.
+    ///
+    /// Returns `false` when the step would take observed process memory to
+    /// the hard limit (`merge_budget::decide_merge_write`). The caller then
+    /// yields the batch, keeping its inputs. On `true`, `reservation` grows
+    /// to at least `held + extra`, so admission for other merges sees the
+    /// step until the batch drops its reservation. A refused step leaves
+    /// the ledger as it was. `exempt` covers batches that #2468's streak
+    /// rule lets run to completion.
+    pub fn admit_merge_write(
+        &self,
+        reservation: Option<&mut MergeReservation>,
+        held: u64,
+        extra: u64,
+        forced: bool,
+        exempt: bool,
+    ) -> bool {
+        let observed = self.observed_process_memory();
+        if !crate::merge_budget::decide_merge_write(
+            observed,
+            self.memory_limit_bytes,
+            extra,
+            forced,
+            exempt,
+        ) {
+            return false;
+        }
+        if let Some(reservation) = reservation {
+            let wanted = held.saturating_add(extra);
+            if wanted > reservation.bytes {
+                let mut ledger = self.merge_ledger.lock().unwrap_or_else(|e| e.into_inner());
+                ledger.reserved = ledger.reserved.saturating_add(wanted - reservation.bytes);
+                reservation.bytes = wanted;
+            }
+        }
+        true
+    }
+
     /// Whether the summed-memtable budget breaker is currently engaged.
     pub fn memtable_breaker_engaged(&self) -> bool {
         self.memtable_tripped.load(Ordering::Relaxed)
@@ -4088,6 +4147,129 @@ mod tests {
         assert!(g.merge_must_yield_for(false, 512 * MIB));
         g.note_merge_completed(49 * MIB);
         assert!(g.merge_must_yield_for(false, 49 * MIB));
+    }
+
+    /// #2427: the merge output-write step (doc-values build, stored encode,
+    /// FTS build) runs after the last yield checkpoint. It is charged to the
+    /// merge ledger before it starts. A step that would take RSS to the hard
+    /// limit is refused and leaves the ledger as it was. An admitted step
+    /// grows the batch's reservation, which other merges' admission sees,
+    /// and dropping the reservation releases all of it.
+    #[test]
+    fn the_merge_write_step_is_charged_and_refused_at_the_hard_limit() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        let limit = g.process_memory_limit_bytes();
+        assert!(wm > 0 && limit > wm, "this test needs a live RSS watermark");
+
+        // RSS at half the watermark: one merge admitted.
+        g.refresh(0, wm / 2, 0);
+        let input = wm / 16 / crate::merge_budget::MERGE_WORKING_SET_NUMERATOR;
+        let mut reservation = g
+            .try_reserve_merge(input, false)
+            .expect("first merge starts");
+        let admitted = reservation.bytes();
+        assert_eq!(g.merge_reserved_bytes(), admitted);
+
+        // A write that fits under the limit is admitted and charged.
+        let held = admitted;
+        let extra = wm / 8;
+        assert!(g.admit_merge_write(Some(&mut reservation), held, extra, false, false));
+        assert_eq!(reservation.bytes(), held + extra);
+        assert_eq!(g.merge_reserved_bytes(), held + extra);
+        // Charging again for a smaller step never shrinks the reservation.
+        assert!(g.admit_merge_write(Some(&mut reservation), 1, 1, false, false));
+        assert_eq!(g.merge_reserved_bytes(), held + extra);
+
+        // The charge is visible to admission: a second batch that fit
+        // beside the admitted estimate no longer fits beside the write.
+        let second = (wm / 2 - admitted) / crate::merge_budget::MERGE_WORKING_SET_NUMERATOR - 1;
+        assert!(wm / 2 + admitted + second * crate::merge_budget::MERGE_WORKING_SET_NUMERATOR < wm);
+        assert!(g.try_reserve_merge(second, false).is_none());
+
+        // A write that would reach the hard limit is refused, and the
+        // ledger does not change, background or not engaged.
+        let before = g.merge_reserved_bytes();
+        let too_big = limit - wm / 2;
+        assert!(!g.admit_merge_write(Some(&mut reservation), held, too_big, false, false));
+        assert_eq!(g.merge_reserved_bytes(), before);
+        assert_eq!(reservation.bytes(), held + extra);
+        // No reservation (no governor at launch): only the decision.
+        assert!(!g.admit_merge_write(None, 0, too_big, false, false));
+        assert!(g.admit_merge_write(None, 0, 1, false, false));
+        // A #2468 streak-exempt batch and `_forcemerge` still write.
+        assert!(g.admit_merge_write(None, 0, too_big, false, true));
+        assert!(g.admit_merge_write(Some(&mut reservation), held, too_big, true, false));
+        assert_eq!(reservation.bytes(), held + too_big);
+        assert_eq!(g.merge_reserved_bytes(), held + too_big);
+
+        drop(reservation);
+        assert_eq!(g.merge_reserved_bytes(), 0);
+        assert_eq!(g.merges_in_flight(), 0);
+    }
+
+    /// #2427 x #2468: a small background batch that the yield-streak rule
+    /// lets run to completion is not refused at its output write, even with
+    /// RSS at the hard limit. A large batch, a batch before the streak, and
+    /// a batch the plain rule never stopped get no exemption. A completed
+    /// batch ends it.
+    #[test]
+    fn a_streak_exempt_batch_is_not_refused_at_its_write() {
+        const MIB: u64 = 1024 * 1024;
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        let limit = g.process_memory_limit_bytes();
+        assert!(wm > 0 && limit > wm, "this test needs a live RSS watermark");
+        let small = 49 * MIB;
+        let large = crate::merge_budget::MERGE_YIELD_STREAK_MAX_INPUT_BYTES + 1;
+        let write = 256 * MIB;
+
+        // Below the limit the plain rule never stops a batch: no exemption,
+        // and the write decision is the hard-limit check alone.
+        g.refresh(0, wm / 2, 0);
+        assert!(!g.merge_write_exempt(false, small));
+
+        // Engaged at the limit, before the streak: the small batch yields at
+        // its checkpoints and its write would be refused.
+        g.refresh(0, limit, 0);
+        assert!(g.memory_breaker_engaged());
+        assert!(!g.merge_write_exempt(false, small));
+        let exempt = g.merge_write_exempt(false, small);
+        assert!(!g.admit_merge_write(None, small, write, false, exempt));
+
+        // After the streak, #2468 lets the small batch run, and so does its
+        // write. The large batch still yields and its write is still refused.
+        for _ in 0..crate::merge_budget::MERGE_YIELD_STREAK_LIMIT {
+            g.note_merge_yield(small);
+        }
+        assert!(!g.merge_must_yield_for(false, small));
+        assert!(g.merge_write_exempt(false, small));
+        let exempt = g.merge_write_exempt(false, small);
+        let mut reservation = g.try_reserve_merge(small, true).expect("forced admission");
+        let held = reservation.bytes();
+        assert!(g.admit_merge_write(Some(&mut reservation), held, write, false, exempt));
+        // The exempt write is still charged to the ledger.
+        assert_eq!(reservation.bytes(), held + write);
+        assert_eq!(g.merge_reserved_bytes(), held + write);
+        drop(reservation);
+        assert!(!g.merge_write_exempt(false, large));
+        let exempt = g.merge_write_exempt(false, large);
+        assert!(!g.admit_merge_write(None, large, write, false, exempt));
+
+        // `_forcemerge` is never stopped by either rule, so it needs no
+        // exemption; its write runs on `forced` alone.
+        assert!(!g.merge_write_exempt(true, small));
+        assert!(g.admit_merge_write(None, small, write, true, false));
+
+        // A completed batch resets the streak: no exemption again.
+        g.note_merge_completed(small);
+        assert!(!g.merge_write_exempt(false, small));
     }
 
     /// #2427: the 1 GB release gate released at rss=5,121MB against a

@@ -302,6 +302,73 @@ pub fn effective_batch_cap_bytes(static_cap: u64, pressure_cap: u64) -> u64 {
     }
 }
 
+/// Multiplier on the merged stored JSON for the merge output-write step
+/// (#2427).
+///
+/// After the last yield checkpoint, a batch builds its doc-values columns
+/// from the merged JSON and then runs the stored encode
+/// (`encode_stored_v2_*_at_level`). The encode parses the whole JSON array
+/// into a `Vec<serde_json::Value>` (about 4–5× the JSON bytes in maps,
+/// strings and per-value overhead), then builds per-column buffers (about
+/// 1×) and the compressed output. All of that sits on top of the merged
+/// buffer, which is still alive. On the 3,072 MB search node, the large
+/// pg-docs merges (29k–166k docs) peaked at 4.4–4.9 GB about 5 s before
+/// they completed, which is this step. Neither admission nor the yield
+/// checks charged it.
+pub const MERGE_WRITE_JSON_NUMERATOR: u64 = 6;
+
+/// Multiplier on the FTS input for the output's FTS side-car build
+/// (#2427). The rebuild path re-analyses `fts_input` into in-memory
+/// posting lists. The replay path remaps the inputs' decoded postings,
+/// whose retained bytes bound it. In both cases about 2× covers the
+/// writer's buffers plus its encoded output.
+pub const MERGE_WRITE_FTS_NUMERATOR: u64 = 2;
+
+/// Extra bytes the merge output-write step allocates beyond what the
+/// batch already holds at its last yield checkpoint (#2427).
+///
+/// `json_bytes` is the merged stored JSON. `fts_bytes` is what the FTS
+/// side-car build works from: `fts_input`'s bytes on the rebuild path, or
+/// the replay readers' retained bytes. The stored encode and the FTS build
+/// run one after the other, and the encode's parsed copy is dropped before
+/// the FTS build starts, so the step's peak is the larger of the two, not
+/// their sum. Saturates instead of wrapping.
+pub fn merge_write_phase_bytes(json_bytes: u64, fts_bytes: u64) -> u64 {
+    json_bytes
+        .saturating_mul(MERGE_WRITE_JSON_NUMERATOR)
+        .max(fts_bytes.saturating_mul(MERGE_WRITE_FTS_NUMERATOR))
+}
+
+/// Whether a merge batch may run its output-write step (#2427).
+///
+/// The step comes after the last yield checkpoint, and once it starts it
+/// cannot stop without throwing the batch away, so the check runs before
+/// it starts. `extra` is [`merge_write_phase_bytes`], and `observed_rss`
+/// already includes what the batch holds. The step is refused when
+/// `observed_rss + extra` would reach the process `limit` (the hard limit,
+/// not the watermark). A refused batch yields like any other: no output,
+/// inputs kept, and later batches narrowed.
+///
+/// These always run:
+/// * `forced` batches (`_forcemerge`), which are never stopped;
+/// * `exempt` batches. This is for the #2468 rule: once a background
+///   batch has been allowed to run to completion after a streak of yields
+///   with nothing merged, refusing its write would bring back the stall
+///   that rule exists to break;
+/// * batches where the limit or RSS is unknown (`0`).
+pub fn decide_merge_write(
+    observed_rss: u64,
+    limit: u64,
+    extra: u64,
+    forced: bool,
+    exempt: bool,
+) -> bool {
+    if forced || exempt || limit == 0 || observed_rss == 0 {
+        return true;
+    }
+    observed_rss.saturating_add(extra) < limit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +708,60 @@ mod tests {
         );
         // Saturates instead of wrapping.
         assert_eq!(merge_reservation_bytes(0, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_write_phase_charges_the_larger_of_encode_and_fts() {
+        const MIB: u64 = 1024 * 1024;
+        // Encode dominates on a JSON-heavy batch.
+        assert_eq!(
+            merge_write_phase_bytes(300 * MIB, 100 * MIB),
+            300 * MIB * MERGE_WRITE_JSON_NUMERATOR
+        );
+        // The FTS build dominates when its input is the larger one.
+        assert_eq!(
+            merge_write_phase_bytes(10 * MIB, 100 * MIB),
+            100 * MIB * MERGE_WRITE_FTS_NUMERATOR
+        );
+        assert_eq!(merge_write_phase_bytes(0, 0), 0);
+        assert_eq!(merge_write_phase_bytes(u64::MAX, 1), u64::MAX);
+        assert_eq!(merge_write_phase_bytes(1, u64::MAX), u64::MAX);
+    }
+
+    /// The search-node shape from #2427: a 3,072 MB limit, RSS at about
+    /// 2.9 GB, and a large pg-docs batch whose merged JSON is a few hundred
+    /// MB. Its write step would take RSS to 4.4–4.9 GB, so it must not start.
+    #[test]
+    fn a_write_that_would_cross_the_hard_limit_is_refused() {
+        const MIB: u64 = 1024 * 1024;
+        let limit = 3072 * MIB;
+        let rss = 2900 * MIB;
+        let extra = merge_write_phase_bytes(300 * MIB, 50 * MIB);
+        assert!(rss + extra > 4400 * MIB);
+        assert!(!decide_merge_write(rss, limit, extra, false, false));
+        // Exactly reaching the limit is refused, just under is allowed.
+        assert!(!decide_merge_write(rss, limit, limit - rss, false, false));
+        assert!(decide_merge_write(
+            rss,
+            limit,
+            limit - rss - 1,
+            false,
+            false
+        ));
+        // A small write with headroom runs, whatever the breaker state.
+        assert!(decide_merge_write(
+            1000 * MIB,
+            limit,
+            600 * MIB,
+            false,
+            false
+        ));
+        // `_forcemerge`, a #2468 streak-exempt batch, or unknown limit/RSS: runs.
+        assert!(decide_merge_write(rss, limit, extra, true, false));
+        assert!(decide_merge_write(rss, limit, extra, false, true));
+        assert!(decide_merge_write(rss, 0, extra, false, false));
+        assert!(decide_merge_write(0, limit, extra, false, false));
+        // Saturates instead of wrapping past the limit.
+        assert!(!decide_merge_write(rss, limit, u64::MAX, false, false));
     }
 }

@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A segment merge's output-write step (doc-values build, stored encode, FTS
+  side-car build) is now charged to the merge budget before it starts, and a
+  background batch yields instead of starting it when it would take RSS to
+  the process limit (#2427). That step runs after the last yield checkpoint,
+  and neither admission nor the yield checks saw it: large pg-docs merges
+  (29k-166k docs) took a 3,072 MB search node to 4.4-4.9 GB about 5 s before
+  they completed. The step is estimated at 6x the merged stored JSON or 2x
+  the FTS build input, whichever is larger. An admitted step grows the
+  batch's merge reservation, so concurrent merge admission sees it.
+  `_forcemerge` batches are charged but never refused, and neither is a
+  small batch that the yield-streak rule (#2468) lets run to completion.
+
 - The parent memory breaker no longer flaps, and background merges and flush
   finalizes are bounded while it is engaged (#2427). A 3,000 MB autoindex run
   engaged the breaker 20 times in 16 minutes, often releasing 100-500 ms
