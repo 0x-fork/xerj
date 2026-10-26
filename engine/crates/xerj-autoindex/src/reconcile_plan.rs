@@ -298,10 +298,17 @@ pub(crate) fn reconcile_plan(
                 .iter()
                 .any(|d| d.family == sniffed.family.as_str() && d.group.is_none());
         let new_document = docs_target && all_empty_key_fields;
+        // A file too small to be a dataset (`dataset::MIN_DATASET_RECORDS`)
+        // folds the same way a fresh plan folds it: a 3-row HTML table or a
+        // 2-key JSON file joins docs rather than failing the run for want of a
+        // frozen dataset of its own.
         let new_demoted_config = docs_target
             && !all_empty_key_fields
-            && crate::dataset::demotable_family(sniffed.family)
-            && scan.sketches.iter().map(|s| s.records).sum::<u64>() == 1;
+            && ((crate::dataset::demotable_family(sniffed.family)
+                && scan.sketches.iter().map(|s| s.records).sum::<u64>() == 1)
+                || (crate::dataset::foldable_family(sniffed.family)
+                    && scan.sketches.iter().map(|s| s.population).sum::<u64>()
+                        < crate::dataset::MIN_DATASET_RECORDS));
         let route_to_docs = new_document || new_demoted_config;
 
         // Only a demoted CONFIG re-samples through the document renderer (its

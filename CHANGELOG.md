@@ -174,6 +174,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queries on stray digits. Re-index to drop them from existing indices.
   (#2423)
 
+- `xerj autoindex` no longer makes one index for every small table or JSON
+  file (#2422). On a 5 GB benchmark tree the old rules made 454 indices,
+  two thirds of them under 16 rows. On a 300 MB test tree the same run now
+  makes 34 indices instead of 228. Now:
+  - A JSON, YAML, XML or HTML dataset with fewer than 16 rows, in at most
+    8 files, goes into the folder's document index (`<prefix>-docs`, or
+    `<prefix>-<repo>-docs` inside a repository) and is searchable there as
+    text. Every record still carries its file path. An HTML page indexed
+    this way keeps its title and headings, and its table rows are in the
+    body.
+  - JSON files with several arrays (for example `grammar.json` or OpenAPI
+    specs) now count toward the limit of 12 small datasets per folder or
+    repository. Before, each array of such a file was its own index with no
+    limit. A file's arrays stay together: all of them stay datasets, or the
+    whole file goes to the document index.
+  - One run makes at most 32 datasets. Past that, the smallest JSON, YAML,
+    XML and HTML datasets go to the document index, and small CSV, JSONL and
+    log datasets of the same folder or repository share one index per
+    format, so their rows stay rows. Datasets with 1024 rows or more, SQL
+    tables and spreadsheet sheets always keep their own index, so a run can
+    still go over 32 with those. Rows of large CSV, JSONL and log files are
+    counted in full for this, not only the 500 rows read as a sample.
+  - A file is moved whole or not at all, so a dataset that stays never
+    loses rows.
+
 - **Indexing is fast again under a memory cap** (issue
   [#2438](https://github.com/xerj-org/xerj/issues/2438), part of
   [#2423](https://github.com/xerj-org/xerj/issues/2423)). Since rc.78 every
@@ -389,6 +414,13 @@ Jarvis636431, Tong-bit-art, redwolf2019, ArkNill, pallidev,
 samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
 
 ### Upgrade notes
+
+- #2422: an existing autoindex keeps the datasets it already has. Later
+  runs on the same folder use the new rules only for new files. To get the
+  smaller set of indices, index the folder again with a new `--prefix` and a
+  new `--state-dir`, check it, then delete the old indices with
+  `xerj autoindex remove --prefix <old>`. `--fresh` does not do this for a
+  `--no-graph` run that has already committed: it refuses, as before.
 
 - **No downgrade after a case-distinguished field write** (PR
   [#2261](https://github.com/xerj-org/xerj/pull/2261)). Opening a data

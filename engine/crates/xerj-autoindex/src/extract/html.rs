@@ -133,6 +133,49 @@ pub fn extract(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
     Ok(stats)
 }
 
+/// Render a page as ONE document — `{title, headings, body}` — even when it
+/// has a dominant table. This is how a page whose table was too small to be
+/// a dataset of its own is indexed after the fold into the scope's document
+/// dataset (`dataset::MIN_DATASET_RECORDS`). The table's rows are already in
+/// `body` as ` | `-joined lines, so no cell text is lost. The title comes
+/// from `logical_path`, as in `extract_as_document_with_name`.
+pub(crate) fn extract_document(
+    content_path: &Path,
+    logical_path: &Path,
+    gzip: bool,
+    sink: Sink,
+) -> Result<ExtractStats> {
+    let mut stats = ExtractStats::default();
+    let Some(bytes) = super::read_whole(content_path, gzip, MAX_WHOLE_FILE)? else {
+        stats.junk += 1;
+        return Ok(stats);
+    };
+    let (text, _) = crate::sniff::decode_text(&bytes);
+    let doc = parse(&text);
+    if doc.title.trim().is_empty() && doc.headings.is_empty() && doc.body.trim().is_empty() {
+        stats.junk += 1;
+        return Ok(stats);
+    }
+    let title = if doc.title.trim().is_empty() {
+        doc.headings
+            .first()
+            .cloned()
+            .unwrap_or_else(|| stem_of(logical_path))
+    } else {
+        doc.title.trim().to_string()
+    };
+    emit_document(
+        &title,
+        &doc.headings,
+        doc.body.trim(),
+        None,
+        MAX_RECORDS_PER_FILE,
+        sink,
+        &mut stats,
+    );
+    Ok(stats)
+}
+
 fn stem_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -1257,5 +1300,29 @@ function notCss() {}
             );
             assert!(stats.records >= 4, "{name} records {}", stats.records);
         }
+    }
+
+    /// A page whose small table folded into the document dataset is indexed
+    /// as the page: its title, and a body holding the table's rows as text,
+    /// with no markup and no per-row records.
+    #[test]
+    fn a_folded_table_page_renders_as_one_tag_free_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.html");
+        let page = table_html(Some(["Measure", "Value"]), 5)
+            .replace("<html>", "<html><head><title>Port audit</title></head>");
+        std::fs::write(&path, page).unwrap();
+        let mut recs = Vec::new();
+        let stats = crate::extract::extract_as_document(&path, false, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        assert_eq!(stats.records, 1, "{recs:?}");
+        assert_eq!(recs[0].fields["title"], "Port audit");
+        let body = body_of(&recs[0]);
+        assert!(body.contains("item3 | 3"), "{body}");
+        assert!(!body.contains('<'), "{body}");
+        assert!(!recs[0].fields.contains_key("Measure"));
     }
 }

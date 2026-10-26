@@ -4258,6 +4258,36 @@ fn scan_file(
             }
         })
         .collect();
+    // CSV, JSONL and logs declare no length, so `records` is the sample: it
+    // stops at `sample` rows (500 by default) or at the sample byte cap. A
+    // 100_000-row CSV then looked like a 500-row one, and the dataset caps
+    // (`dataset::DATASET_CAP_PROTECT_RECORDS`) merged it into a shared index
+    // as if it were small. When the sample may have stopped early, count on
+    // with the same extractor up to the protect threshold. That is enough to
+    // decide the caps and stays bounded however large the file is.
+    if matches!(sn.family, Family::Csv | Family::Jsonl | Family::Logs) {
+        let threshold = dataset::DATASET_CAP_PROTECT_RECORDS;
+        let sample_cut = |s: &GroupSketch| {
+            s.population < threshold
+                && (s.records >= sample as u64 || limit.is_some_and(|l| sn.gzip || size > l))
+        };
+        if out.sketches.iter().any(sample_cut) {
+            let groups_seen = out.sketches.len();
+            let mut counts: HashMap<Option<String>, u64> = HashMap::new();
+            let mut count = |rec: extract::RawRecord| -> bool {
+                *counts.entry(rec.group).or_default() += 1;
+                counts.len() < groups_seen || counts.values().any(|n| *n < threshold)
+            };
+            // A read error part-way still leaves a lower bound: every
+            // record counted was really there.
+            let _ = extract::extract(path, &sn, None, &mut count);
+            for s in &mut out.sketches {
+                if let Some(&n) = counts.get(&s.group) {
+                    s.population = s.population.max(n);
+                }
+            }
+        }
+    }
     out.sketches.sort_by(|a, b| a.group.cmp(&b.group));
     out.sniffed = Some(sn);
     out
@@ -4444,6 +4474,108 @@ mod clustering_key_tests {
             .expect("runs group");
         assert_eq!(runs.records, 2);
         assert_eq!(runs.population, 3);
+    }
+
+    fn csv_body(tag: &str, rows: usize) -> String {
+        let mut b = format!("{tag}_id,{tag}_name,{tag}_val\n");
+        for i in 0..rows {
+            b.push_str(&format!("{i},name{i},{}\n", i * 3));
+        }
+        b
+    }
+
+    fn jsonl_body(tag: &str, rows: usize) -> String {
+        let mut b = String::new();
+        for i in 0..rows {
+            b.push_str(&format!(
+                "{{\"{tag}_id\":{i},\"{tag}_name\":\"name{i}\",\"{tag}_val\":{}}}\n",
+                i * 3
+            ));
+        }
+        b
+    }
+
+    /// Line-record files declare no length, so the sample (500 rows) used to
+    /// be the population and a 2000-row CSV/JSONL counted as small (#2422).
+    /// Phase A now counts on to the protect threshold; a 10-row file still
+    /// reports exactly its 10 rows.
+    #[test]
+    fn a_sampled_line_record_file_reports_rows_past_the_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("big.csv", csv_body("b", 2000)),
+            ("big.jsonl", jsonl_body("j", 2000)),
+        ] {
+            let s = scan(dir.path(), name, &body);
+            assert_eq!(s.sketches.len(), 1, "{name}");
+            let sk = &s.sketches[0];
+            assert_eq!(sk.records, 500, "{name}: the sample still stops at 500");
+            assert!(
+                sk.population >= dataset::DATASET_CAP_PROTECT_RECORDS,
+                "{name}: population {} is the sample, not the file",
+                sk.population
+            );
+        }
+        let small = scan(dir.path(), "small.csv", &csv_body("s", 10));
+        assert_eq!(small.sketches[0].records, 10);
+        assert_eq!(small.sketches[0].population, 10);
+    }
+
+    /// End to end through `cluster()`: past the run cap, 2000-row CSV and
+    /// JSONL files keep their own datasets, and the 10-row CSVs still merge
+    /// into one shared CSV dataset.
+    #[test]
+    fn past_the_run_cap_large_sampled_csv_and_jsonl_keep_their_own_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files: Vec<(String, String)> = Vec::new();
+        let n_big = dataset::MAX_DATASETS_PER_RUN + 2;
+        for i in 0..n_big {
+            files.push((format!("big{i}.csv"), csv_body(&format!("b{i}"), 2000)));
+        }
+        files.push(("big.jsonl".into(), jsonl_body("j", 2000)));
+        let n_small = 3;
+        for i in 0..n_small {
+            files.push((format!("small{i}.csv"), csv_body(&format!("s{i}"), 10)));
+        }
+        let mut rels = Vec::new();
+        let mut sketches = Vec::new();
+        for (idx, (name, body)) in files.iter().enumerate() {
+            let s = scan(dir.path(), name, body);
+            assert_eq!(s.sketches.len(), 1, "{name}");
+            let sk = &s.sketches[0];
+            sketches.push(dataset::Sketch {
+                file_idx: idx,
+                group: sk.group.clone(),
+                family: s.sniffed.as_ref().unwrap().family,
+                fields: sk.fields.clone(),
+                key_fields: sk.key_fields.clone(),
+                records: sk.records,
+                population: sk.population,
+            });
+            rels.push(name.clone());
+        }
+        let scopes = vec![String::new(); rels.len()];
+        let clusters = dataset::cluster(sketches, &rels, &scopes);
+        let data: Vec<&dataset::Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        let home = |idx: usize| {
+            data.iter()
+                .find(|c| c.members.contains(&idx))
+                .unwrap_or_else(|| panic!("{} has no data dataset: {clusters:#?}", rels[idx]))
+        };
+        // Every large file — the CSVs and the JSONL — is alone in its dataset.
+        for (idx, rel) in rels.iter().enumerate().take(n_big + 1) {
+            assert_eq!(home(idx).members, vec![idx], "{rel} was merged");
+        }
+        // The 10-row CSVs share one dataset, rows intact.
+        let shared = home(n_big + 1);
+        let mut members = shared.members.clone();
+        members.sort();
+        assert_eq!(
+            members,
+            (n_big + 1..n_big + 1 + n_small).collect::<Vec<_>>()
+        );
+        assert_eq!(shared.records, 10 * n_small as u64);
+        assert_eq!(data.len(), n_big + 2);
     }
 }
 

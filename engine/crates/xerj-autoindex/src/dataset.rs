@@ -21,9 +21,17 @@
 //! *demoted* to the scope's document dataset and indexed as a document
 //! (title/body), because its one-off key set is configuration, not a
 //! collection (#173: valkey's per-command JSON files made 382 such
-//! "datasets"). A scope that still has more medium structured clusters than
-//! [`MAX_STRUCTURED_DATASETS_PER_SCOPE`] folds the smallest into documents;
-//! a cluster of [`DATASET_CAP_PROTECT_RECORDS`] or more stays.
+//! "datasets"). Any JSON/YAML/XML/HTML cluster with fewer than
+//! [`MIN_DATASET_RECORDS`] rows folds the same way, grouped or not: a page's
+//! 5-row table is not an index. A scope that still has
+//! more medium structured clusters than [`MAX_STRUCTURED_DATASETS_PER_SCOPE`]
+//! folds the smallest into documents. A run keeps at most
+//! [`MAX_DATASETS_PER_RUN`] data datasets in all: past it the smallest
+//! self-describing clusters fold into documents, then the smallest CSV/JSONL/
+//! log clusters merge into one shared dataset per scope and family (their
+//! rows stay rows, and every row keeps its `path`). A cluster of
+//! [`DATASET_CAP_PROTECT_RECORDS`] or more never moves. A file folds whole or
+//! not at all, so no kept dataset loses a row.
 //!
 //! Only DATA-derived names take part in schema clustering. A name the
 //! extractor invented — `defs`, `symbols`, `title`, `page` — is not evidence
@@ -51,15 +59,36 @@ pub const DOC_DEMOTE_MAX_FILES: usize = 8;
 pub const DOC_DEMOTE_MAX_RECORDS_PER_FILE: u64 = 32;
 
 /// After the small-config fold, one repository scope keeps at most this many
-/// `json`/`yaml`/`xml` data datasets below [`DATASET_CAP_PROTECT_RECORDS`].
-/// The smallest are folded into the document dataset until the scope is at
-/// the cap. CSV, JSONL, logs and SQL are collections by nature and are never
-/// folded by this cap.
+/// `json`/`yaml`/`xml`/`html` data datasets below
+/// [`DATASET_CAP_PROTECT_RECORDS`]. The smallest are folded into the document
+/// dataset until the scope is at the cap. CSV, JSONL and logs are collections
+/// by nature and are not counted here; SQL tables never fold.
 pub const MAX_STRUCTURED_DATASETS_PER_SCOPE: usize = 12;
 
-/// A `json`/`yaml`/`xml` cluster with at least this many records is a real
-/// collection. The per-scope cap never folds it.
+/// A cluster with at least this many records is a real collection. Neither
+/// cap folds it.
 pub const DATASET_CAP_PROTECT_RECORDS: u64 = 1024;
+
+/// A data cluster of a [`foldable_family`] with fewer rows than this, across
+/// all its files, is folded into the scope's document dataset. A separate
+/// index for a 5-row page table costs every query over the prefix a shard
+/// visit and holds nothing a document search does not find. On a 5 GB
+/// benchmark tree, 278 of 357 JSON/HTML/XML/YAML datasets were this small.
+pub const MIN_DATASET_RECORDS: u64 = 16;
+
+/// One run aims for at most this many data datasets (document datasets are
+/// not counted), over all scopes (#2422: one 5 GB folder made 454 indices,
+/// and a search over the prefix visits every one). Past the cap the smallest
+/// clusters below [`DATASET_CAP_PROTECT_RECORDS`] rows go first:
+///
+/// 1. a [`foldable_family`] cluster folds into its scope's documents;
+/// 2. a [`mergeable_family`] cluster (CSV, JSONL, logs) merges into one
+///    shared dataset per scope and family, so its rows stay rows.
+///
+/// A protected collection, a workbook sheet, an SQL table and a grouped
+/// (multi-array) file never move, so a tree with more of those than the
+/// cap keeps them all and ends above it.
+pub const MAX_DATASETS_PER_RUN: usize = 32;
 
 /// A small `json`/`yaml`/`xml` cluster (no sub-file group) is configuration,
 /// not a dataset: few files, and not many records in each file.
@@ -130,6 +159,35 @@ fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
 /// carry a real table schema.
 pub(crate) fn demotable_family(f: Family) -> bool {
     matches!(f, Family::Json | Family::Yaml | Family::Xml)
+}
+
+/// May a data cluster of this family fold into the document dataset by size
+/// or by a cap? Self-describing formats only — the shapes one tree repeats
+/// per file: a page's table, a config's keys, one small JSON array. Each
+/// renders as useful text through `extract_as_document` (an HTML page
+/// through the HTML renderer). CSV, JSONL and logs are collections by
+/// nature, and workbooks, SQLite and SQL carry real table schemas: they
+/// stay datasets.
+pub(crate) fn foldable_family(f: Family) -> bool {
+    matches!(f, Family::Json | Family::Yaml | Family::Xml | Family::Html)
+}
+
+/// May a data cluster of this family merge, past [`MAX_DATASETS_PER_RUN`],
+/// with others of its scope and family into one shared dataset? Line-record
+/// formats only: every record is a row of its own and the merged mapping is
+/// the union of the members' fields. Workbooks and SQL keep their tables.
+pub(crate) fn mergeable_family(f: Family) -> bool {
+    matches!(f, Family::Csv | Family::Jsonl | Family::Logs)
+}
+
+/// A foldable data cluster too small to be a dataset of its own. A schema
+/// that recurs across more than [`DOC_DEMOTE_MAX_FILES`] files is a real
+/// collection however few rows each file holds, and stays.
+pub(crate) fn below_min_dataset(c: &Cluster) -> bool {
+    foldable_family(c.family)
+        && !c.members.is_empty()
+        && c.members.len() <= DOC_DEMOTE_MAX_FILES
+        && c.population < MIN_DATASET_RECORDS
 }
 
 /// Cluster sketches into datasets. `rels` and `scopes` are indexed by
@@ -251,64 +309,251 @@ impl Clusterer {
 
     /// Demote, cap and name the clusters. `rels` is indexed by file index.
     pub fn finish(self, rels: &[String]) -> Vec<Cluster> {
-        let Clusterer { mut docs, data } = self;
-        // Demote small config clusters — one record each, or a short multi-doc
-        // YAML/JSON/XML file — to their scope's document dataset. Their sampled
-        // fields are dropped — the caller re-samples the demoted files through
-        // the document renderer, which is also what indexes them.
+        let Clusterer { mut docs, mut data } = self;
+        // Fold what is not a dataset into the scope's document dataset. Three
+        // rules choose the clusters; a fourth keeps files whole:
         //
-        // A file that also produced a grouped dataset (a second top-level JSON
-        // array) must not be folded: folding marks the whole file `as_document`
-        // and phase B then drops the grouped rows.
-        let grouped_files: HashSet<usize> = data
-            .iter()
-            .filter(|c| c.group.is_some())
-            .flat_map(|c| c.members.iter().copied())
-            .collect();
-        let mut kept: Vec<Cluster> = Vec::with_capacity(data.len());
-        let mut capped: BTreeMap<String, Vec<Cluster>> = BTreeMap::new();
-        for c in data {
-            let shares_grouped_sibling = c.members.iter().any(|m| grouped_files.contains(m));
-            if small_structured_config(&c) && !shares_grouped_sibling {
-                let d = docs_cluster(&mut docs, &c.scope);
-                d.members.extend(c.members.iter().copied());
-                d.demoted.extend(c.members);
-                continue;
-            }
-            // Candidates for the per-scope cap: structured formats, no sub-file
-            // group, and not a large collection. Everything else stays.
-            if demotable_family(c.family)
-                && c.group.is_none()
-                && c.population < DATASET_CAP_PROTECT_RECORDS
-                && !shares_grouped_sibling
-            {
-                capped.entry(c.scope.clone()).or_default().push(c);
-                continue;
-            }
-            kept.push(c);
+        // 1. A small config cluster — one record each, or a short multi-doc
+        //    YAML/JSON/XML file — is configuration (#173).
+        // 2. A JSON/YAML/XML/HTML cluster below `MIN_DATASET_RECORDS` rows is
+        //    not a collection anyone queries as one: a page's 5-row table, one
+        //    tiny grouped JSON array. Each used to become its own index (one
+        //    5 GB tree → 454 indices, two thirds of them under 16 rows).
+        // 3. Caps on the same families below `DATASET_CAP_PROTECT_RECORDS`
+        //    rows: at most `MAX_STRUCTURED_DATASETS_PER_SCOPE` per scope, and
+        //    the run as a whole at `MAX_DATASETS_PER_RUN`. The smallest fold
+        //    first; past the run cap, small CSV/JSONL/log clusters then merge
+        //    per scope and family (below).
+        // 4. Folding marks the whole file `as_document`, so phase B indexes the
+        //    file as one document and none of its rows. A file folds only when
+        //    EVERY cluster it is a member of folds; otherwise all of its
+        //    clusters stay, and no row of a kept dataset is dropped.
+        //
+        // Folded members' sampled fields are dropped — the caller re-samples
+        // them through the document renderer, which is also what indexes them.
+        let n = data.len();
+        let mut fold = vec![false; n];
+        for (i, c) in data.iter().enumerate() {
+            fold[i] = small_structured_config(c) || below_min_dataset(c);
         }
-        for (scope, mut group) in capped {
-            // Largest collections stay. Ties break toward the earlier file so
-            // the fold does not depend on hash order. Size is the real row
-            // count, so a file sampled at 500 does not tie with a 100-row file
-            // that happened to fit in the sample.
-            group.sort_by(|a, b| {
-                b.population
-                    .cmp(&a.population)
-                    .then(b.members.len().cmp(&a.members.len()))
-                    .then_with(|| {
-                        let am = a.members.iter().copied().min().unwrap_or(usize::MAX);
-                        let bm = b.members.iter().copied().min().unwrap_or(usize::MAX);
-                        am.cmp(&bm)
-                    })
-            });
-            let keep_n = MAX_STRUCTURED_DATASETS_PER_SCOPE.min(group.len());
-            for c in group.drain(keep_n..) {
-                let d = docs_cluster(&mut docs, &scope);
-                d.members.extend(c.members.iter().copied());
-                d.demoted.extend(c.members);
+        // Clusters of each file. A file that also belongs to an unfoldable
+        // cluster (a large collection, an SQL table, a workbook sheet) never
+        // folds: its unit below is not a cap candidate.
+        let mut file_clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, c) in data.iter().enumerate() {
+            for &m in &c.members {
+                file_clusters.entry(m).or_default().push(i);
             }
-            kept.extend(group);
+        }
+        let foldable_at_all =
+            |c: &Cluster| foldable_family(c.family) && c.population < DATASET_CAP_PROTECT_RECORDS;
+        // The caps move FILES, so they work on units of clusters joined by a
+        // shared file: a multi-array JSON file (grammar.json, an OpenAPI spec)
+        // and every grouped cluster of it. On main the caps skipped grouped
+        // clusters outright (`c.group.is_none()`), and those were most of the
+        // 454 indices in #2422. A unit folds whole, and only when every cluster
+        // in it may fold and their rows together are below the protect size.
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn root(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i {
+                p[i] = p[p[i]];
+                i = p[i];
+            }
+            i
+        }
+        for cs in file_clusters.values() {
+            for w in cs.windows(2) {
+                let (x, y) = (root(&mut parent, w[0]), root(&mut parent, w[1]));
+                if x != y {
+                    parent[x.max(y)] = x.min(y);
+                }
+            }
+        }
+        let mut units: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in 0..n {
+            let r = root(&mut parent, i);
+            units.entry(r).or_default().push(i);
+        }
+        // A unit with any cluster left unfolded keeps ALL its clusters (rule 4
+        // unfolds the rest of its files), so a kept unit counts u.len().
+        let mut total_live = units
+            .values()
+            .filter(|u| u.iter().any(|&j| !fold[j]))
+            .map(Vec::len)
+            .sum::<usize>();
+        // (clusters, rows, first file, members) per foldable unit.
+        let mut cand: Vec<(usize, u64, usize, Vec<usize>)> = units
+            .into_values()
+            .filter_map(|u| {
+                if u.iter().all(|&j| fold[j]) || !u.iter().all(|&j| foldable_at_all(&data[j])) {
+                    return None;
+                }
+                let rows: u64 = u.iter().map(|&j| data[j].population).sum();
+                if rows >= DATASET_CAP_PROTECT_RECORDS {
+                    return None;
+                }
+                let first = u
+                    .iter()
+                    .flat_map(|&j| data[j].members.iter().copied())
+                    .min()
+                    .unwrap_or(usize::MAX);
+                Some((u.len(), rows, first, u))
+            })
+            .collect();
+        // Largest collections stay. Ties break toward the earlier file so the
+        // fold does not depend on hash order. Size is the real row count, so a
+        // file sampled at 500 does not tie with a 100-row file that happened to
+        // fit in the sample.
+        cand.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)).then(a.2.cmp(&b.2)));
+        let order = |a: &usize, b: &usize| {
+            let (a, b) = (&data[*a], &data[*b]);
+            b.population
+                .cmp(&a.population)
+                .then(b.members.len().cmp(&a.members.len()))
+                .then_with(|| {
+                    let am = a.members.iter().copied().min().unwrap_or(usize::MAX);
+                    let bm = b.members.iter().copied().min().unwrap_or(usize::MAX);
+                    am.cmp(&bm)
+                })
+        };
+        // Per-scope cap on small self-describing datasets.
+        let mut kept_in_scope: HashMap<String, usize> = HashMap::new();
+        let mut folded_unit = vec![false; cand.len()];
+        for (k, (live, _, _, u)) in cand.iter().enumerate() {
+            let scope = data[u[0]].scope.clone();
+            let kept = kept_in_scope.entry(scope).or_default();
+            if *kept + live > MAX_STRUCTURED_DATASETS_PER_SCOPE {
+                for &j in u {
+                    fold[j] = true;
+                }
+                folded_unit[k] = true;
+                total_live -= live;
+            } else {
+                *kept += live;
+            }
+        }
+        // Per-run cap, all scopes together (#2422). The fold half: the smallest
+        // self-describing units go to documents until the run is at the cap.
+        // The merge half runs after rule 4, on what is left.
+        let mut live = total_live;
+        for (k, (n_live, _, _, u)) in cand.iter().enumerate().rev() {
+            if live <= MAX_DATASETS_PER_RUN {
+                break;
+            }
+            if folded_unit[k] {
+                continue;
+            }
+            for &j in u {
+                fold[j] = true;
+            }
+            live -= n_live;
+        }
+        // Rule 4, to a fixed point: unfolding only ever clears flags.
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                if fold[i]
+                    && data[i]
+                        .members
+                        .iter()
+                        .any(|m| file_clusters[m].iter().any(|&j| !fold[j]))
+                {
+                    fold[i] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // The merge half of the per-run cap. Still over it, the smallest
+        // CSV/JSONL/log clusters (no sub-file group, below the protect size,
+        // whose files hold no other cluster) merge into ONE dataset per scope
+        // and family. The first candidate of a bucket becomes the shared
+        // dataset; each later one joins it and saves an index.
+        let mut merge_into: Vec<Option<usize>> = vec![None; n];
+        let mut live = fold.iter().filter(|f| !**f).count();
+        if live > MAX_DATASETS_PER_RUN {
+            let mut cands: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let c = &data[i];
+                    !fold[i]
+                        && mergeable_family(c.family)
+                        && c.group.is_none()
+                        && c.population < DATASET_CAP_PROTECT_RECORDS
+                        && c.members.iter().all(|m| file_clusters[m].len() == 1)
+                })
+                .collect();
+            cands.sort_by(order);
+            let mut shared: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+            for &i in cands.iter().rev() {
+                if live <= MAX_DATASETS_PER_RUN {
+                    break;
+                }
+                let key = (data[i].scope.clone(), data[i].family.as_str());
+                match shared.get(&key) {
+                    Some(&t) => {
+                        merge_into[i] = Some(t);
+                        live -= 1;
+                    }
+                    None => {
+                        shared.insert(key, i);
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            let Some(t) = merge_into[i] else { continue };
+            let src = std::mem::replace(
+                &mut data[i],
+                Cluster {
+                    family: Family::Code,
+                    group: None,
+                    members: Vec::new(),
+                    fields: HashMap::new(),
+                    key_fields: HashSet::new(),
+                    records: 0,
+                    population: 0,
+                    slug: String::new(),
+                    scope: String::new(),
+                    is_docs: false,
+                    demoted: Vec::new(),
+                },
+            );
+            let dst = &mut data[t];
+            dst.members.extend(src.members);
+            dst.records += src.records;
+            dst.population += src.population;
+            dst.key_fields.extend(src.key_fields);
+            for (k, acc) in src.fields {
+                match dst.fields.get_mut(&k) {
+                    Some(existing) => existing.merge(&acc),
+                    None => {
+                        dst.fields.insert(k, acc);
+                    }
+                }
+            }
+        }
+        let mut kept: Vec<Cluster> = Vec::with_capacity(n);
+        let mut folded_files: HashSet<usize> = HashSet::new();
+        for (i, c) in data.into_iter().enumerate() {
+            if merge_into[i].is_some() {
+                continue;
+            }
+            if !fold[i] {
+                kept.push(c);
+                continue;
+            }
+            let d = docs_cluster(&mut docs, &c.scope);
+            for m in c.members {
+                // A file with several folded clusters is one document.
+                if folded_files.insert(m) {
+                    if !d.members.contains(&m) {
+                        d.members.push(m);
+                    }
+                    d.demoted.push(m);
+                }
+            }
         }
 
         // Docs slugs are scope-derived — independent of which other files exist,
@@ -1139,7 +1384,9 @@ mod tests {
     }
 
     /// Folding the primary array of a multi-array file would mark the whole
-    /// file as a document and drop the sibling array's rows.
+    /// file as a document and drop the sibling array's rows. Since #2422 the
+    /// file's two arrays count toward the scope cap as one unit; this unit is
+    /// the largest, so it stays whole and the single-array files fold.
     #[test]
     fn a_grouped_sibling_keeps_its_file_out_of_the_structured_cap() {
         let mut sketches = vec![prose_sketch(0)];
@@ -1177,6 +1424,56 @@ mod tests {
         assert!(clusters
             .iter()
             .any(|c| { c.group.is_none() && !c.is_docs && c.members.contains(&primary_idx) }));
+    }
+
+    /// #2422 root cause: the per-scope cap skipped every grouped cluster, so
+    /// a tree of multi-array JSON files (tree-sitter `grammar.json`, OpenAPI
+    /// specs) kept one index per array. Grouped clusters now count toward
+    /// the cap; a file's arrays fold together, so a kept file keeps all of
+    /// its arrays and a folded one is one document.
+    #[test]
+    fn grouped_arrays_count_toward_the_scope_cap_and_fold_per_file() {
+        let mut sketches = vec![prose_sketch(0)];
+        let mut rels = vec!["README.md".to_string()];
+        let files = 20;
+        for f in 1..=files {
+            rels.push(format!("grammars/g{f}/grammar.json"));
+            sketches.push(data_sketch_n(
+                f,
+                Family::Json,
+                &[&format!("name{f}"), "word"],
+                20,
+            ));
+            let mut g = data_sketch_n(
+                f,
+                Family::Json,
+                &[&format!("rule{f}"), "kind"],
+                20 + f as u64,
+            );
+            g.group = Some(format!("rules{f}"));
+            sketches.push(g);
+        }
+        let clusters = cluster(sketches, &rels, &root_scopes(rels.len()));
+        let data: Vec<&Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        assert_eq!(data.len(), MAX_STRUCTURED_DATASETS_PER_SCOPE, "{data:#?}");
+        let docs = clusters.iter().find(|c| c.is_docs).expect("docs");
+        let kept_files = MAX_STRUCTURED_DATASETS_PER_SCOPE / 2;
+        assert_eq!(
+            docs.demoted.len(),
+            files - kept_files,
+            "one document per folded file"
+        );
+        for c in &data {
+            let f = c.members[0];
+            assert!(!docs.demoted.contains(&f));
+            assert_eq!(
+                data.iter().filter(|d| d.members == vec![f]).count(),
+                2,
+                "both arrays kept"
+            );
+        }
+        // The largest files (by rows) are the ones kept.
+        assert!(data.iter().all(|c| c.members[0] > files - kept_files));
     }
 
     /// Scope is a hard boundary for data schemas too: the same CSV schema in
@@ -1255,5 +1552,172 @@ mod tests {
         drop_repeated_prefix("ax", &mut untouched);
         let after: Vec<String> = untouched.iter().map(|c| c.slug.clone()).collect();
         assert_eq!(before, after, "the default prefix must not rename slugs");
+    }
+
+    /// One page per table used to be one index per page: a tree of 200 HTML
+    /// reports with 5-row tables became 200 indices of a few documents each.
+    /// A page table below `MIN_DATASET_RECORDS` rows folds into the scope's
+    /// documents; a real table stays a dataset.
+    #[test]
+    fn small_html_tables_fold_into_documents_and_a_real_table_stays() {
+        let mut sketches = vec![prose_sketch(0)];
+        let mut rels = vec!["README.md".to_string()];
+        for i in 1..=40 {
+            rels.push(format!("reports/r{i}.html"));
+            sketches.push(data_sketch_n(
+                i,
+                Family::Html,
+                &[&format!("measure{i}"), "value"],
+                5,
+            ));
+        }
+        rels.push("reports/table.html".into());
+        sketches.push(data_sketch_n(
+            41,
+            Family::Html,
+            &["crate", "downloads"],
+            400,
+        ));
+        let clusters = cluster(sketches, &rels, &root_scopes(rels.len()));
+        let docs = clusters.iter().find(|c| c.is_docs).expect("docs");
+        assert_eq!(docs.demoted.len(), 40, "{clusters:#?}");
+        assert_eq!(docs.members.len(), 41, "README + 40 folded pages");
+        let data: Vec<&Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        assert_eq!(data.len(), 1, "{data:#?}");
+        assert_eq!(data[0].members, vec![41]);
+    }
+
+    /// A multi-array JSON file folds only whole. When every array is tiny the
+    /// file is one document (listed once, not once per array); when one
+    /// array is a real collection, every array of the file stays a dataset,
+    /// so no kept dataset loses rows.
+    #[test]
+    fn a_multi_array_file_folds_whole_or_not_at_all() {
+        let mut sketches = vec![prose_sketch(0)];
+        let rels: Vec<String> = vec!["README.md".into(), "tiny.json".into(), "mixed.json".into()];
+        sketches.push(data_sketch_n(1, Family::Json, &["a", "b"], 3));
+        let mut g = data_sketch_n(1, Family::Json, &["c", "d"], 2);
+        g.group = Some("rules".into());
+        sketches.push(g);
+        sketches.push(data_sketch_n(2, Family::Json, &["x", "y"], 600));
+        let mut g = data_sketch_n(2, Family::Json, &["p", "q"], 2);
+        g.group = Some("notes".into());
+        sketches.push(g);
+        let clusters = cluster(sketches, &rels, &root_scopes(rels.len()));
+        let docs = clusters.iter().find(|c| c.is_docs).expect("docs");
+        assert_eq!(docs.demoted, vec![1], "{clusters:#?}");
+        assert_eq!(docs.members.iter().filter(|&&m| m == 1).count(), 1);
+        let data: Vec<&Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        assert_eq!(data.len(), 2, "both arrays of mixed.json stay: {data:#?}");
+        assert!(data.iter().all(|c| c.members == vec![2]));
+    }
+
+    /// The per-scope cap alone let a tree of many repositories keep 12 small
+    /// datasets in each. One run keeps at most `MAX_DATASETS_PER_RUN` data
+    /// datasets: the protected collection and the CSV count toward it but
+    /// never fold, and the largest small JSON datasets fill the rest.
+    #[test]
+    fn a_run_keeps_at_most_the_run_cap_of_small_structured_datasets() {
+        let mut sketches = Vec::new();
+        let mut rels = Vec::new();
+        let mut scopes = Vec::new();
+        let repos = 10;
+        let per_repo = MAX_STRUCTURED_DATASETS_PER_SCOPE;
+        for r in 0..repos {
+            for k in 0..per_repo {
+                let idx = rels.len();
+                rels.push(format!("repo{r}/f{k}.json"));
+                scopes.push(format!("repo{r}"));
+                sketches.push(data_sketch_n(
+                    idx,
+                    Family::Json,
+                    &[&format!("k{r}_{k}")],
+                    40 + idx as u64,
+                ));
+            }
+        }
+        let big = rels.len();
+        rels.push("repo0/events.json".into());
+        scopes.push("repo0".into());
+        sketches.push(data_sketch_n(
+            big,
+            Family::Json,
+            &["evt"],
+            DATASET_CAP_PROTECT_RECORDS,
+        ));
+        let csv = rels.len();
+        rels.push("repo0/rows.csv".into());
+        scopes.push("repo0".into());
+        sketches.push(data_sketch_n(csv, Family::Csv, &["a", "b"], 40));
+        let clusters = cluster(sketches, &rels, &scopes);
+        let data: Vec<&Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        assert_eq!(data.len(), MAX_DATASETS_PER_RUN);
+        let small: Vec<&&Cluster> = data
+            .iter()
+            .filter(|c| c.family == Family::Json && c.population < DATASET_CAP_PROTECT_RECORDS)
+            .collect();
+        let keep_small = MAX_DATASETS_PER_RUN - 2;
+        assert_eq!(small.len(), keep_small);
+        let smallest_kept = small.iter().map(|c| c.population).min().unwrap();
+        assert_eq!(
+            smallest_kept,
+            40 + (repos * per_repo - keep_small) as u64,
+            "the largest are the ones kept"
+        );
+        assert!(clusters.iter().any(|c| c.members == vec![big]));
+        assert!(clusters
+            .iter()
+            .any(|c| c.members == vec![csv] && !c.is_docs));
+        let demoted: usize = clusters.iter().map(|c| c.demoted.len()).sum();
+        assert_eq!(demoted, repos * per_repo - keep_small);
+    }
+
+    /// Past the run cap, small CSV/JSONL datasets are not turned into text:
+    /// they merge into one dataset per scope and family, every row still a
+    /// row. A protected CSV stays as it is.
+    #[test]
+    fn past_the_run_cap_small_record_datasets_merge_per_scope_and_family() {
+        let mut sketches = Vec::new();
+        let mut rels = Vec::new();
+        let mut scopes = Vec::new();
+        let n_csv = MAX_DATASETS_PER_RUN + 10;
+        for k in 0..n_csv {
+            let idx = rels.len();
+            rels.push(format!("bench/run{k}.csv"));
+            scopes.push(String::new());
+            sketches.push(data_sketch_n(
+                idx,
+                Family::Csv,
+                &[&format!("col{k}"), &format!("val{k}")],
+                100 + idx as u64,
+            ));
+        }
+        let big = rels.len();
+        rels.push("bench/all.csv".into());
+        scopes.push(String::new());
+        sketches.push(data_sketch_n(
+            big,
+            Family::Csv,
+            &["q", "ndcg"],
+            DATASET_CAP_PROTECT_RECORDS * 4,
+        ));
+        let clusters = cluster(sketches, &rels, &scopes);
+        let data: Vec<&Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        assert_eq!(data.len(), MAX_DATASETS_PER_RUN, "{data:#?}");
+        assert!(
+            clusters.iter().all(|c| c.demoted.is_empty()),
+            "no CSV became text"
+        );
+        let total: usize = data.iter().map(|c| c.members.len()).sum();
+        assert_eq!(total, n_csv + 1, "every file still lands in one dataset");
+        assert!(data.iter().any(|c| c.members == vec![big]));
+        let shared = data.iter().max_by_key(|c| c.members.len()).unwrap();
+        assert_eq!(shared.members.len(), n_csv + 1 - (MAX_DATASETS_PER_RUN - 1));
+        assert!(
+            shared.fields.contains_key("col0"),
+            "the union of the members' columns"
+        );
+        // The merge takes the smallest: file 0 (100 rows) is in the shared one.
+        assert!(shared.members.contains(&0));
     }
 }

@@ -199,6 +199,12 @@ pub fn extract_as_document_with_name(
     if skip_phrase_index(logical_path, content_path, gzip) {
         return emit_phrase_skip(logical_path, sink);
     }
+    // A folded HTML page is rendered as the page, not as its markup: the
+    // same title/headings/body an HTML document gets, with its table rows in
+    // the body. Raw text would index tags and scripts.
+    if is_html_name(logical_path) {
+        return html::extract_document(content_path, logical_path, gzip, sink);
+    }
     let mut stats = ExtractStats::default();
     let Some(bytes) = read_whole(content_path, gzip, MAX_WHOLE_FILE)? else {
         stats.junk += 1;
@@ -223,6 +229,17 @@ pub fn extract_as_document_with_name(
         &mut stats,
     );
     Ok(stats)
+}
+
+/// `.html`/`.htm`/`.xhtml`, optionally gzipped, by the logical name.
+fn is_html_name(logical: &Path) -> bool {
+    let name = logical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".gz").unwrap_or(&name);
+    name.ends_with(".html") || name.ends_with(".htm") || name.ends_with(".xhtml")
 }
 
 /// Bytes of a JS/CSS prefix read to decide "this is a bundle, not source".
