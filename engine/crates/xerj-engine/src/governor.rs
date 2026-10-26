@@ -674,7 +674,21 @@ impl ResourceGovernor {
     /// for the rule.
     /// `None` means defer: the caller leaves the batch for a later pass.
     pub fn try_reserve_merge(&self, input_bytes: u64, forced: bool) -> Option<MergeReservation> {
-        let bytes = crate::merge_budget::merge_working_set_bytes(input_bytes);
+        self.try_reserve_merge_with_footprint(input_bytes, 0, forced)
+    }
+
+    /// [`Self::try_reserve_merge`] for a batch whose inputs also occupy
+    /// `on_disk_bytes` on disk, side-cars included (#2427). The reservation
+    /// is `merge_budget::merge_reservation_bytes`: the planned-input
+    /// estimate or `on_disk_bytes * MERGE_ON_DISK_WORKING_SET_NUMERATOR`,
+    /// whichever is larger. `0` means unknown.
+    pub fn try_reserve_merge_with_footprint(
+        &self,
+        input_bytes: u64,
+        on_disk_bytes: u64,
+        forced: bool,
+    ) -> Option<MergeReservation> {
+        let bytes = crate::merge_budget::merge_reservation_bytes(input_bytes, on_disk_bytes);
         let watermark = self.memory_watermark_bytes();
         let observed = self.observed_process_memory();
         let engaged = self.memory_breaker_engaged();
@@ -3962,6 +3976,44 @@ mod tests {
             .expect("forcemerge progresses alone");
         assert!(g.try_reserve_merge(1, true).is_none());
         drop(forced);
+    }
+
+    /// #2427: a batch whose side-cars dwarf its segment file reserves on its
+    /// on-disk footprint, so a second merge that the planned estimate would
+    /// admit next to it waits.
+    #[test]
+    fn merge_reservation_uses_the_on_disk_footprint() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        assert!(wm > 0, "this test needs a live RSS watermark");
+        g.refresh(0, wm / 2 + 1, 0);
+
+        // Planned input small enough that two batches fit by the old rule.
+        let planned = wm / 16 / crate::merge_budget::MERGE_WORKING_SET_NUMERATOR;
+        // On disk, a footprint whose estimate is over a quarter of the watermark.
+        let on_disk = wm / 4 / crate::merge_budget::MERGE_ON_DISK_WORKING_SET_NUMERATOR + 1;
+        let first = g
+            .try_reserve_merge_with_footprint(planned, on_disk, false)
+            .expect("the first merge always starts");
+        assert_eq!(
+            first.bytes(),
+            crate::merge_budget::merge_reservation_bytes(planned, on_disk)
+        );
+        assert!(first.bytes() > crate::merge_budget::merge_working_set_bytes(planned));
+        // The same second batch: 50% + >25% + >25% is past the watermark.
+        assert!(g
+            .try_reserve_merge_with_footprint(planned, on_disk, false)
+            .is_none());
+        // By the planned estimate alone it would have been admitted.
+        let second = g
+            .try_reserve_merge(planned, false)
+            .expect("planned-only fits");
+        drop(second);
+        drop(first);
+        assert_eq!(g.merge_reserved_bytes(), 0);
     }
 
     /// #2427: on the 1 GB gate an admitted merge batch grew a 3,072 MB node

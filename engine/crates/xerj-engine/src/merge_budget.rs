@@ -132,6 +132,31 @@ pub fn merge_working_set_bytes(input_bytes: u64) -> u64 {
     input_bytes.saturating_mul(MERGE_WORKING_SET_NUMERATOR)
 }
 
+/// Reservation multiplier on a batch's whole on-disk footprint (#2427).
+///
+/// `SegmentMeta::size_bytes`, which the planner and
+/// [`MERGE_WORKING_SET_NUMERATOR`] use, is the segment file alone. A
+/// merge also reads every input's FTS, doc-values and ids side-cars
+/// (about 60 files per segment on the autoindex corpora), so the planned
+/// input under-counts what the batch decodes. On the reduced #2427 repro
+/// (1,024 MB cap, `docs` corpus) a 9-input batch (13 MB on disk) ran
+/// beside an 8-input batch (23 MB on disk) with only 24 MB reserved in
+/// the ledger, and RSS went from about 740 MB to a 1,503 MB peak: about
+/// 21x the two batches' combined on-disk bytes. The 3 GB gate analysis
+/// puts a merge's working set at about 30x its on-disk input. 32x keeps
+/// the reservation at or above both.
+pub const MERGE_ON_DISK_WORKING_SET_NUMERATOR: u64 = 32;
+
+/// Bytes one merge batch reserves against the watermark (#2427): the
+/// larger of the planned-input estimate ([`merge_working_set_bytes`]) and
+/// [`MERGE_ON_DISK_WORKING_SET_NUMERATOR`] × the inputs' on-disk bytes,
+/// side-cars included. `on_disk_bytes == 0` (unknown) keeps the planned
+/// estimate.
+pub fn merge_reservation_bytes(planned_input_bytes: u64, on_disk_bytes: u64) -> u64 {
+    merge_working_set_bytes(planned_input_bytes)
+        .max(on_disk_bytes.saturating_mul(MERGE_ON_DISK_WORKING_SET_NUMERATOR))
+}
+
 /// Process-wide merge admission against the RSS watermark (#2427).
 ///
 /// [`throttle_merge_batches`] plans one index's pass from an RSS snapshot
@@ -487,5 +512,29 @@ mod tests {
             10 * MERGE_WORKING_SET_NUMERATOR
         );
         assert_eq!(merge_working_set_bytes(u64::MAX), u64::MAX);
+    }
+
+    /// #2427: the reservation follows the on-disk footprint, side-cars
+    /// included, when that is the larger estimate.
+    #[test]
+    fn merge_reservation_counts_the_on_disk_footprint() {
+        const MIB: u64 = 1024 * 1024;
+        // Unknown footprint: the planned estimate, unchanged.
+        assert_eq!(
+            merge_reservation_bytes(3 * MIB, 0),
+            merge_working_set_bytes(3 * MIB)
+        );
+        // A repro-sized batch: 3 MB planned, 23 MB on disk. 8x planned is
+        // 24 MB; the footprint estimate covers the ~700 MB RSS rise measured.
+        let reserved = merge_reservation_bytes(3 * MIB, 23 * MIB);
+        assert_eq!(reserved, 23 * MIB * MERGE_ON_DISK_WORKING_SET_NUMERATOR);
+        assert!(reserved >= 700 * MIB);
+        // A footprint smaller than the planned estimate never lowers it.
+        assert_eq!(
+            merge_reservation_bytes(64 * MIB, MIB),
+            merge_working_set_bytes(64 * MIB)
+        );
+        // Saturates instead of wrapping.
+        assert_eq!(merge_reservation_bytes(0, u64::MAX), u64::MAX);
     }
 }

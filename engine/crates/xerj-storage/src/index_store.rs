@@ -1694,6 +1694,34 @@ impl IndexStore {
         crate::bundle::valid_flush_artifact_set(segment_id, &declared) && declared == actual
     }
 
+    /// Bytes on disk of every local file belonging to `segment_ids`: the
+    /// segment file and all its side-cars (FTS, doc-values, ids, ...), matched
+    /// by the same `<36-char id>.<suffix>` rule [`Self::delete_segment_files`]
+    /// uses. Read-only. `0` when the directory cannot be listed (#2427: merge
+    /// admission reserves against this footprint).
+    pub fn segment_files_bytes(&self, segment_ids: &[SegmentId]) -> u64 {
+        let ids: std::collections::HashSet<&str> = segment_ids.iter().map(|s| s.as_str()).collect();
+        if ids.is_empty() {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(self.data_dir.join("segments")) else {
+            return 0;
+        };
+        let mut bytes = 0u64;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.len() < 37 || !name_str.is_char_boundary(36) {
+                continue;
+            }
+            if !ids.contains(&name_str[..36]) {
+                continue;
+            }
+            bytes = bytes.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+        }
+        bytes
+    }
+
     /// Unlink every on-disk file belonging to the given segment ids — the
     /// primary `.seg` plus all side-cars (`.sidx`, `.ids`, `.dv`,
     /// `.<field>.post` / `.fst` / `.meta` / `.norms`) and the optional

@@ -666,6 +666,63 @@ mod collection_publication_fail_closed_tests {
     /// spellings, and a flush that lands them in ONE segment (the 2-core CI
     /// shape) built the lying column — `terms {b:["true"]}` then returned the
     /// pre-upgrade document and silently dropped the coerced one.
+    /// #2427: the merge builds doc-values from its merged stored JSON one
+    /// document at a time instead of holding every `_source` tree. The
+    /// columns must match what the held trees produced, ordinals included:
+    /// a document with no `_source`, a non-object `_source`, and one that
+    /// does not parse as an object each keep their row.
+    #[test]
+    fn merge_doc_value_sources_matches_held_source_trees() {
+        let docs = [
+            json!({"_id": "a", "_seq_no": 1, "_source": {"k": "x", "n": 1, "b": true}}),
+            json!({"_id": "b", "_seq_no": 2}),
+            json!({"_id": "c", "_seq_no": 3, "_source": {"k": "y", "n": 2.5, "arr": [1, 2]}}),
+            json!({"_id": "d", "_seq_no": 4, "_source": "not-an-object"}),
+            json!({"_id": "e", "_seq_no": 5, "_source": {"k": "z", "msg": "hello"}}),
+        ];
+        let mut merged = b"[".to_vec();
+        for (i, doc) in docs.iter().enumerate() {
+            if i > 0 {
+                merged.push(b',');
+            }
+            merged.extend_from_slice(serde_json::to_string(doc).unwrap().as_bytes());
+        }
+        // A raw element that is not an object takes a row too.
+        merged.extend_from_slice(b",42]");
+
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("msg".to_string());
+
+        // The pre-#2427 input: one held `_source` tree per document.
+        let mut held: Vec<Value> = docs
+            .iter()
+            .map(|doc| doc.get("_source").cloned().unwrap_or(Value::Null))
+            .collect();
+        held.push(Value::Null);
+        let expected = super::build_doc_value_columns(held.iter().map(Some), &skip);
+
+        let streamed = super::build_doc_value_columns(
+            super::merge_doc_value_sources(&merged).expect("array parses"),
+            &skip,
+        );
+        assert_eq!(
+            format!("{streamed:?}"),
+            format!("{expected:?}"),
+            "streamed doc-values must equal the held-tree build"
+        );
+        assert!(streamed.contains_key("k") && streamed.contains_key("n"));
+        assert!(
+            !streamed.contains_key("arr"),
+            "multi-valued field ships no column"
+        );
+        assert_eq!(
+            super::merge_doc_value_sources(&merged).unwrap().count(),
+            docs.len() + 1,
+            "one item per merged document, in order"
+        );
+        assert!(super::merge_doc_value_sources(b"not json").is_err());
+    }
+
     #[test]
     fn build_doc_value_columns_ships_nothing_for_a_type_mixed_field() {
         let legacy = json!({"b": "true", "n": "5", "ok": "kw"});
@@ -14119,7 +14176,16 @@ impl Index {
                 return Some(None);
             };
             let input: u64 = metas.iter().map(|meta| meta.size_bytes).sum();
-            governor.try_reserve_merge(input, forced_merge).map(Some)
+            // #2427: reserve on the inputs' whole footprint. `size_bytes` is
+            // the segment file alone; the side-cars the merge decodes are
+            // usually several times larger (see
+            // `merge_budget::MERGE_ON_DISK_WORKING_SET_NUMERATOR`).
+            let ids: Vec<xerj_storage::segment::SegmentId> =
+                metas.iter().map(|meta| meta.id.clone()).collect();
+            let on_disk = self.store.segment_files_bytes(&ids);
+            governor
+                .try_reserve_merge_with_footprint(input, on_disk, forced_merge)
+                .map(Some)
         };
         let mut governor_deferred = 0usize;
 
@@ -14344,10 +14410,20 @@ impl Index {
                     // for the doc-values pass.  Drops `dv_sources` entirely.
                     // Halves merge working memory and frees the Arc<Value>
                     // immediately after both passes complete.
+                    // #2427: the third slot used to carry each surviving
+                    // document's whole `_source` `Value` tree for the
+                    // doc-values pass, held from the drain loop through the
+                    // stored encode (which parses the same batch into a
+                    // second `Vec<Value>` of its own), the FTS build and the
+                    // doc-values build. Two full Value trees of the batch
+                    // were live at once after the last yield point. The
+                    // doc-values columns are now built from `merged_json_buf`
+                    // one document at a time (`merge_doc_value_sources`), so
+                    // the slot is empty.
                     let mut fts_input: Vec<(
                         String,
                         HashMap<String, xerj_fts::index::FieldValues>,
-                        Value,
+                        (),
                     )> = Vec::new();
                     // (seq_no, doc_id) for every surviving doc — kept exactly
                     // aligned with the stored-section byte copy (pushed right
@@ -14683,40 +14759,38 @@ impl Index {
                         // addresses a document by. An empty `_source` indexes and
                         // columnises nothing for it, which is the same as the
                         // skip minus the shift.
-                        let doc_value: Value =
-                            serde_json::from_str(&raw_str).unwrap_or_else(|error| {
-                                tracing::warn!(
-                                    doc = %id_str,
-                                    "merge: surviving doc failed its re-parse, indexing it empty: {error}"
-                                );
-                                Value::Null
-                            });
-                        let source = doc_value.get("_source").cloned().unwrap_or(Value::Null);
                         // The merged FTS/doc-values ordinal is this document's
                         // index in `fts_input`.
                         doc_maps[source_index as usize][source_ordinal as usize] =
                             Some(fts_input.len() as u32);
                         // The re-analysis input. `merge_postings` replays the
                         // inputs' posting lists instead, so it needs no field
-                        // values at all — only the `_source` the doc-values
-                        // builder reads below. An empty `HashMap` allocates
-                        // nothing.
+                        // values and no per-document parse at all (#2427: the
+                        // doc-values pass re-reads `merged_json_buf`). An
+                        // empty `HashMap` allocates nothing. The `Value` the
+                        // rebuild parses drops at the end of this iteration.
                         let fields = if merge_postings {
                             HashMap::new()
                         } else {
-                            extract_fts_fields_excluding(&source, &excluded_fts_fields_for_task)
+                            let doc_value: Value =
+                                serde_json::from_str(&raw_str).unwrap_or_else(|error| {
+                                    tracing::warn!(
+                                        doc = %id_str,
+                                        "merge: surviving doc failed its re-parse, indexing it empty: {error}"
+                                    );
+                                    Value::Null
+                                });
+                            let source = doc_value.get("_source").unwrap_or(&Value::Null);
+                            // #948 attribution: the transient parse, per doc,
+                            // only when tracing is enabled.
+                            if crate::ingest_memory::enabled() {
+                                fts_input_bytes = fts_input_bytes
+                                    .saturating_add(crate::ingest_memory::estimated_json_heap(source));
+                            }
+                            extract_fts_fields_excluding(source, &excluded_fts_fields_for_task)
                         };
-                        // #948 attribution: the Value tree the FTS/DV passes
-                        // hold until the end of the batch. The walk is
-                        // per-document but only when tracing is enabled.
-                        if crate::ingest_memory::enabled() {
-                            fts_input_bytes = fts_input_bytes
-                                .saturating_add(crate::ingest_memory::estimated_json_heap(
-                                    doc_value.get("_source").unwrap_or(&Value::Null),
-                                ));
-                        }
                         if let Err(error) =
-                            crate::merge_reserve::try_push_merge(&mut fts_input, (id_str, fields, source))
+                            crate::merge_reserve::try_push_merge(&mut fts_input, (id_str, fields, ()))
                         {
                             tracing::error!("{error}");
                             failed_for_task.fetch_add(1, Ordering::Relaxed);
@@ -14771,6 +14845,26 @@ impl Index {
                         yielded_for_task.fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
+                    // Doc-values columns, built here from the merged stored
+                    // JSON one document at a time (#2427) and written once the
+                    // merged segment id exists, below. The columns are what
+                    // survives; the per-document `_source` trees do not.
+                    // Before, those trees were held in `fts_input` for the
+                    // whole batch, through the stored encode that parses the
+                    // same documents into a second `Vec<Value>`: two decoded
+                    // copies of the batch at once, past the last yield point.
+                    let dv_timer = std::time::Instant::now();
+                    let dv_columns = match merge_doc_value_sources(&merged_json_buf) {
+                        Ok(sources) => Some(build_doc_value_columns(sources, &dv_skip_for_merge)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "merge: merged stored JSON did not re-parse for doc-values, \
+                                 segment ships no doc-values side-car: {e}"
+                            );
+                            None
+                        }
+                    };
+                    let dv_build_us = dv_timer.elapsed().as_micros();
                     // Write merged stored section using the columnar v2 codec.
                     let mut writer = match SegmentWriter::new(&segments_dir_for_task, 1, 0, 0) {
                         Ok(w) => w,
@@ -15022,14 +15116,10 @@ impl Index {
                     version_repoint_intents
                         .extend(tomb_carry.iter().map(|(seq, id)| (*seq, id.clone(), true)));
 
-                    // Doc-values side-car — reuse the same `Value`s we
-                    // stashed in fts_input above (M5.22).
+                    // Doc-values side-car — the columns were built before the
+                    // stored encode (#2427, see `dv_columns`).
                     let dv_timer = std::time::Instant::now();
-                    {
-                        let columns = build_doc_value_columns(
-                            fts_input.iter().map(|(_, _, v)| Some(v)),
-                            &dv_skip_for_merge,
-                        );
+                    if let Some(columns) = dv_columns {
                         if !columns.is_empty() {
                             if let Err(e) = write_doc_values_sidecar_at_level(
                                 &segments_dir_for_task,
@@ -15042,10 +15132,11 @@ impl Index {
                         }
                     }
 
-                    let dv_us = dv_timer.elapsed().as_micros();
-                    // `fts_input` (raw ids + the per-doc `_source` Value
-                    // trees) survives its last reader here — the batch's
-                    // parsed-side attribution ends with it.
+                    let dv_us = dv_build_us + dv_timer.elapsed().as_micros();
+                    // `fts_input` (raw ids + the re-analysis field values;
+                    // no `_source` trees since #2427) survives its last
+                    // reader here — the batch's parsed-side attribution ends
+                    // with it.
                     crate::ingest_memory::observe_checkpoint(
                         crate::ingest_memory::Category::MergeParsed,
                         0,
@@ -29353,6 +29444,38 @@ pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String>
     skip
 }
 
+/// The doc-values input of a merge batch, read back from the batch's
+/// merged stored JSON one document at a time (#2427).
+///
+/// `merged_json` is the `[doc,doc,...]` array the merge byte-copies its
+/// survivors into, in merged ordinal order. Each item is that document's
+/// `_source` (or `Null` when it has none or does not parse, the same
+/// fallback the merge used when it held the trees), and is dropped by
+/// [`build_doc_value_columns`] before the next one is parsed. Only one
+/// `_source` tree is alive at a time; before #2427 the merge held one per
+/// surviving document from the drain loop to the end of the batch, on top
+/// of the stored encoder's own `Vec<Value>` of the same documents.
+///
+/// `Err` means the buffer is not a JSON array (it is built from documents
+/// that already parsed as `RawValue`, so this does not happen in practice).
+fn merge_doc_value_sources(
+    merged_json: &[u8],
+) -> std::result::Result<impl Iterator<Item = Option<Value>> + '_, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct SourceOnly {
+        #[serde(rename = "_source", default)]
+        source: Value,
+    }
+    let docs: Vec<&serde_json::value::RawValue> = serde_json::from_slice(merged_json)?;
+    Ok(docs.into_iter().map(|raw| {
+        Some(
+            serde_json::from_str::<SourceOnly>(raw.get())
+                .map(|doc| doc.source)
+                .unwrap_or(Value::Null),
+        )
+    }))
+}
+
 /// Build the per-segment doc-values columns.
 ///
 /// `skip` names fields whose declared mapping says they must not have
@@ -29366,8 +29489,8 @@ pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String>
 /// and 35.6% of the whole index. It is much smaller where `_source` dominates
 /// (6.97% across the `xc-*` code corpora), so the saving is corpus-dependent and
 /// must always be quoted as a range.
-fn build_doc_value_columns<'a>(
-    sources: impl Iterator<Item = Option<&'a Value>>,
+fn build_doc_value_columns<V: std::borrow::Borrow<Value>>(
+    sources: impl Iterator<Item = Option<V>>,
     skip: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, xerj_storage::doc_values::Column> {
     use std::collections::BTreeMap;
@@ -29412,7 +29535,10 @@ fn build_doc_value_columns<'a>(
     for src in sources {
         let doc_idx = total_docs;
         total_docs += 1;
-        let Some(obj) = src.and_then(|v| v.as_object()) else {
+        let Some(obj) = src
+            .as_ref()
+            .and_then(|v| <V as std::borrow::Borrow<Value>>::borrow(v).as_object())
+        else {
             continue;
         };
         for (field, val) in obj {
@@ -36319,7 +36445,7 @@ async fn do_flush_shard(
                 let columns = build_doc_value_columns(
                     drained_fts_for_build
                         .iter()
-                        .map(|(_id, _fields, src)| Some(src.as_ref())),
+                        .map(|(_id, _fields, src)| Some(&**src)),
                     &dv_skip_for_flush,
                 );
                 if !columns.is_empty() {
