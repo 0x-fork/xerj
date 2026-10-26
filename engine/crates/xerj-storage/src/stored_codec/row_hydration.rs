@@ -862,6 +862,32 @@ where
     let mut stats = StoredV2RowHydrationStats::default();
     let requested: Option<HashSet<&str>> =
         source_fields.map(|fields| fields.iter().copied().collect());
+    // #1122/#2433: a row whose derived semantic vectors were stripped gets
+    // them rebuilt from its text when the projection wants them, so decode
+    // every column for it and trim back to the projection afterwards.
+    let wants_derived = {
+        let mut targets = directory
+            .columns
+            .iter()
+            .filter_map(|column| derived_vectors::metadata_target(column.name))
+            .peekable();
+        targets.peek().is_some()
+            && match requested.as_ref() {
+                None => true,
+                Some(fields) => targets.any(|target| {
+                    fields.contains(target)
+                        || fields.contains(derived_vectors::chunks_name(target).as_str())
+                }),
+            }
+    };
+    let allowed: Option<HashSet<String>> = if wants_derived {
+        requested
+            .as_ref()
+            .map(|fields| fields.iter().map(|field| field.to_string()).collect())
+    } else {
+        None
+    };
+    let requested = if wants_derived { None } else { requested };
     let mut columns: Vec<Option<Vec<serde_json::Value>>> =
         (0..directory.columns.len()).map(|_| None).collect();
     let mut dict_ids = HashMap::new();
@@ -965,6 +991,12 @@ where
                 // Present explicit null (#415) — re-insert, unlike an absent field.
                 source.insert(column.name.to_string(), serde_json::Value::Null);
                 stats.output_values_cloned += 1;
+            }
+        }
+        if wants_derived {
+            derived_vectors::rehydrate_source_map(&mut source);
+            if let Some(allowed) = allowed.as_ref() {
+                source.retain(|name, _| allowed.contains(name));
             }
         }
         stats.output_values_cloned += 2;

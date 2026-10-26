@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Stored `semantic_text` vectors** (PR
+  [#2471](https://github.com/xerj-org/xerj/pull/2471)). Segments written by
+  this build no longer store the vectors the built-in lexical embedder
+  derives for a `semantic_text` field (`<target>` and `<target>_chunks`) in
+  the stored `_source`; readers rebuild them from the text. Older segments
+  open unchanged and lose their stored copy when a merge rewrites them.
+  There is no format-marker change, so an older binary still opens the
+  index, but it reads those rows without vectors: `_source` lacks them and
+  semantic and kNN recall on them drops until the index is reindexed.
+  Before downgrading, restart this build with
+  `XERJ_STORE_SEMANTIC_VECTORS=1` and run `POST /{index}/_forcemerge?max_num_segments=1`
+  on each index with a `semantic_text` field: with the variable set, flushes
+  store full vectors and a merge writes them back for rows stored without
+  them. Vectors from neural, ONNX or proxy embedders, and vectors supplied
+  by the caller, were always kept and are not affected.
+
 ### Added
 
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
@@ -76,6 +94,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not take this path (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
   open).
+
+### Changed
+
+- A `semantic_text` field with the built-in lexical embedder no longer
+  stores its embedding twice. The pooled and per-passage vectors were kept
+  in the stored `_source` as well as in the vector index; the columnar
+  stored encoder now drops them when they rebuild bit-exactly from the
+  text, and every reader (`_source`, `GET`, kNN, reindex, snapshot)
+  rebuilds them, so responses are unchanged. On a 6,000-document test the
+  segment file went from 20.1 MB to 1.8 MB and the index from 3.67x to
+  1.63x its source size. The saving is on disk; the HNSW graph in memory is
+  unchanged. Sections under 128 documents keep their vectors.
+  `XERJ_STORE_SEMANTIC_VECTORS=1` turns this off; see the upgrade note
+  (part of [#1122](https://github.com/xerj-org/xerj/issues/1122) and
+  [#2433](https://github.com/xerj-org/xerj/issues/2433)).
 
 ### Fixed
 

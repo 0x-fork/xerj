@@ -298,6 +298,13 @@ understands format 2.</pre>
   <h2>Rolling back</h2>
   <p>Roll back by reinstalling the previous binary. That works for every index whose marker is still at a version the previous binary reads; check the <code class="inline">xerj_meta.json</code> files first. An index whose marker has moved past it will not open under the old binary, and rolling it back means restoring the backup you took before the upgrade.</p>
 
+  <h3>Rolling back past stored <code class="inline">semantic_text</code> vectors</h3>
+  <p>Builds that include PR <a href="https://github.com/xerj-org/xerj/pull/2471">#2471</a> do not store the vectors the built-in lexical embedder derives for a <code class="inline">semantic_text</code> field (<code class="inline">&lt;target&gt;</code> and <code class="inline">&lt;target&gt;_chunks</code>) in a segment's stored <code class="inline">_source</code>; they rebuild them from the text when a document is read. The format marker does not change, so an older binary opens those indices, but it reads the affected documents without vectors: <code class="inline">_source</code> lacks them and semantic and kNN recall drops until the index is reindexed. To roll back without a reindex, first restart the newer binary with <code class="inline">XERJ_STORE_SEMANTIC_VECTORS=1</code> and force-merge each index that has a <code class="inline">semantic_text</code> field. With the variable set, flushes store full vectors and a forcemerge rewrites every segment that holds documents stored without them, including an index that is already one segment:</p>
+<pre class="code">$ sudo systemctl edit xerj   # Environment=XERJ_STORE_SEMANTIC_VECTORS=1
+$ sudo systemctl restart xerj
+$ curl -XPOST 'localhost:9200/&lt;index&gt;/_forcemerge?max_num_segments=1'</pre>
+  <p>Vectors from neural, ONNX or proxy embedders, and vectors the caller supplied, are always stored and need no step.</p>
+
   <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-storage/src/index_store.rs (check_data_dir_version) · engine/crates/xerj-fts/src/index.rs (field_file_component)</p>
   
 

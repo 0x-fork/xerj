@@ -4631,13 +4631,16 @@ impl IndexStore {
                 Ok(Some(b)) => b,
                 _ => continue,
             };
-            let stored_bytes = match crate::stored_codec::decode_stored(stored_bytes_raw) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(segment = %meta.id, error = %e, "cannot decode stored section");
-                    continue;
-                }
-            };
+            // Only (id, seq_no) are read and nothing is re-encoded, so the
+            // opt-out does not apply: skip rebuilding derived vectors.
+            let stored_bytes =
+                match crate::stored_codec::decode_stored_preserving_derived(stored_bytes_raw) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(segment = %meta.id, error = %e, "cannot decode stored section");
+                        continue;
+                    }
+                };
 
             let docs: Vec<serde_json::Value> = match serde_json::from_slice(&stored_bytes) {
                 Ok(d) => d,
