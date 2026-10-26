@@ -135,31 +135,61 @@ pub(crate) fn demotable_family(f: Family) -> bool {
 /// Cluster sketches into datasets. `rels` and `scopes` are indexed by
 /// `Sketch::file_idx`: `rels` are root-relative paths (slug naming), `scopes`
 /// the repository scope of each file ("" = root) — see `module` docs.
+///
+/// Equivalent to feeding every sketch, in order, to a [`Clusterer`] and
+/// calling [`Clusterer::finish`].
 pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec<Cluster> {
-    // scope → docs cluster (BTreeMap: deterministic scope order).
-    let mut docs: BTreeMap<String, Cluster> = BTreeMap::new();
-    let mut data: Vec<Cluster> = Vec::new();
-    fn docs_cluster<'a>(docs: &'a mut BTreeMap<String, Cluster>, scope: &str) -> &'a mut Cluster {
-        docs.entry(scope.to_string()).or_insert_with(|| Cluster {
-            family: Family::Code,
-            group: None,
-            members: Vec::new(),
-            fields: HashMap::new(),
-            key_fields: HashSet::new(),
-            records: 0,
-            population: 0,
-            slug: String::new(),
-            scope: scope.to_string(),
-            is_docs: true,
-            demoted: Vec::new(),
-        })
-    }
-
+    let mut clusterer = Clusterer::default();
     for sk in sketches {
         let scope = scopes[sk.file_idx].as_str();
+        clusterer.push(sk, scope);
+    }
+    clusterer.finish(rels)
+}
+
+fn docs_cluster<'a>(docs: &'a mut BTreeMap<String, Cluster>, scope: &str) -> &'a mut Cluster {
+    docs.entry(scope.to_string()).or_insert_with(|| Cluster {
+        family: Family::Code,
+        group: None,
+        members: Vec::new(),
+        fields: HashMap::new(),
+        key_fields: HashSet::new(),
+        records: 0,
+        population: 0,
+        slug: String::new(),
+        scope: scope.to_string(),
+        is_docs: true,
+        demoted: Vec::new(),
+    })
+}
+
+/// Incremental form of [`cluster`]: sketches are folded into their dataset as
+/// they arrive, so a caller never has to hold every file's sketch at once.
+///
+/// A sketch carries one [`FieldAcc`] per sampled field (a 1 KiB byte histogram,
+/// up to 512 length samples and up to [`crate::infer::RAW_CAP`] raw values
+/// each). Phase A used to collect every file's sketches before clustering:
+/// tens of KiB per file, and 4.4 GB of client RSS on a 146k-file folder before
+/// a single document was sent. Folding them as they are produced bounds that
+/// to the clusters themselves. Sketches must be pushed in file order for the
+/// result to match [`cluster`] exactly (clustering is greedy and
+/// order-dependent).
+#[derive(Default)]
+pub struct Clusterer {
+    // scope → docs cluster (BTreeMap: deterministic scope order).
+    docs: BTreeMap<String, Cluster>,
+    data: Vec<Cluster>,
+}
+
+impl Clusterer {
+    /// Fold one sketch into its dataset. `scope` is the repository scope of
+    /// `sk.file_idx`.
+    pub fn push(&mut self, sk: Sketch, scope: &str) {
+        let docs = &mut self.docs;
+        let data = &mut self.data;
         // Documents: no data-derived names, no sub-file group.
         if sk.key_fields.is_empty() && sk.group.is_none() {
-            let c = docs_cluster(&mut docs, scope);
+            let c = docs_cluster(docs, scope);
             c.members.push(sk.file_idx);
             c.records += sk.records;
             c.population += sk.population;
@@ -171,7 +201,7 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
                     }
                 }
             }
-            continue;
+            return;
         }
         // Data: schema clustering within (scope, family, group).
         let names: HashSet<&str> = sk.key_fields.iter().map(|s| s.as_str()).collect();
@@ -219,92 +249,96 @@ pub fn cluster(sketches: Vec<Sketch>, rels: &[String], scopes: &[String]) -> Vec
         }
     }
 
-    // Demote small config clusters — one record each, or a short multi-doc
-    // YAML/JSON/XML file — to their scope's document dataset. Their sampled
-    // fields are dropped — the caller re-samples the demoted files through
-    // the document renderer, which is also what indexes them.
-    //
-    // A file that also produced a grouped dataset (a second top-level JSON
-    // array) must not be folded: folding marks the whole file `as_document`
-    // and phase B then drops the grouped rows.
-    let grouped_files: HashSet<usize> = data
-        .iter()
-        .filter(|c| c.group.is_some())
-        .flat_map(|c| c.members.iter().copied())
-        .collect();
-    let mut kept: Vec<Cluster> = Vec::with_capacity(data.len());
-    let mut capped: BTreeMap<String, Vec<Cluster>> = BTreeMap::new();
-    for c in data {
-        let shares_grouped_sibling = c.members.iter().any(|m| grouped_files.contains(m));
-        if small_structured_config(&c) && !shares_grouped_sibling {
-            let d = docs_cluster(&mut docs, &c.scope);
-            d.members.extend(c.members.iter().copied());
-            d.demoted.extend(c.members);
-            continue;
+    /// Demote, cap and name the clusters. `rels` is indexed by file index.
+    pub fn finish(self, rels: &[String]) -> Vec<Cluster> {
+        let Clusterer { mut docs, data } = self;
+        // Demote small config clusters — one record each, or a short multi-doc
+        // YAML/JSON/XML file — to their scope's document dataset. Their sampled
+        // fields are dropped — the caller re-samples the demoted files through
+        // the document renderer, which is also what indexes them.
+        //
+        // A file that also produced a grouped dataset (a second top-level JSON
+        // array) must not be folded: folding marks the whole file `as_document`
+        // and phase B then drops the grouped rows.
+        let grouped_files: HashSet<usize> = data
+            .iter()
+            .filter(|c| c.group.is_some())
+            .flat_map(|c| c.members.iter().copied())
+            .collect();
+        let mut kept: Vec<Cluster> = Vec::with_capacity(data.len());
+        let mut capped: BTreeMap<String, Vec<Cluster>> = BTreeMap::new();
+        for c in data {
+            let shares_grouped_sibling = c.members.iter().any(|m| grouped_files.contains(m));
+            if small_structured_config(&c) && !shares_grouped_sibling {
+                let d = docs_cluster(&mut docs, &c.scope);
+                d.members.extend(c.members.iter().copied());
+                d.demoted.extend(c.members);
+                continue;
+            }
+            // Candidates for the per-scope cap: structured formats, no sub-file
+            // group, and not a large collection. Everything else stays.
+            if demotable_family(c.family)
+                && c.group.is_none()
+                && c.population < DATASET_CAP_PROTECT_RECORDS
+                && !shares_grouped_sibling
+            {
+                capped.entry(c.scope.clone()).or_default().push(c);
+                continue;
+            }
+            kept.push(c);
         }
-        // Candidates for the per-scope cap: structured formats, no sub-file
-        // group, and not a large collection. Everything else stays.
-        if demotable_family(c.family)
-            && c.group.is_none()
-            && c.population < DATASET_CAP_PROTECT_RECORDS
-            && !shares_grouped_sibling
-        {
-            capped.entry(c.scope.clone()).or_default().push(c);
-            continue;
+        for (scope, mut group) in capped {
+            // Largest collections stay. Ties break toward the earlier file so
+            // the fold does not depend on hash order. Size is the real row
+            // count, so a file sampled at 500 does not tie with a 100-row file
+            // that happened to fit in the sample.
+            group.sort_by(|a, b| {
+                b.population
+                    .cmp(&a.population)
+                    .then(b.members.len().cmp(&a.members.len()))
+                    .then_with(|| {
+                        let am = a.members.iter().copied().min().unwrap_or(usize::MAX);
+                        let bm = b.members.iter().copied().min().unwrap_or(usize::MAX);
+                        am.cmp(&bm)
+                    })
+            });
+            let keep_n = MAX_STRUCTURED_DATASETS_PER_SCOPE.min(group.len());
+            for c in group.drain(keep_n..) {
+                let d = docs_cluster(&mut docs, &scope);
+                d.members.extend(c.members.iter().copied());
+                d.demoted.extend(c.members);
+            }
+            kept.extend(group);
         }
-        kept.push(c);
-    }
-    for (scope, mut group) in capped {
-        // Largest collections stay. Ties break toward the earlier file so
-        // the fold does not depend on hash order. Size is the real row
-        // count, so a file sampled at 500 does not tie with a 100-row file
-        // that happened to fit in the sample.
-        group.sort_by(|a, b| {
-            b.population
-                .cmp(&a.population)
-                .then(b.members.len().cmp(&a.members.len()))
-                .then_with(|| {
-                    let am = a.members.iter().copied().min().unwrap_or(usize::MAX);
-                    let bm = b.members.iter().copied().min().unwrap_or(usize::MAX);
-                    am.cmp(&bm)
-                })
-        });
-        let keep_n = MAX_STRUCTURED_DATASETS_PER_SCOPE.min(group.len());
-        for c in group.drain(keep_n..) {
-            let d = docs_cluster(&mut docs, &scope);
-            d.members.extend(c.members.iter().copied());
-            d.demoted.extend(c.members);
-        }
-        kept.extend(group);
-    }
 
-    // Docs slugs are scope-derived — independent of which other files exist,
-    // so adding a file can never rename (and re-home, #178) a docs dataset.
-    let mut clusters: Vec<Cluster> = Vec::with_capacity(docs.len() + kept.len());
-    let mut used: HashSet<String> = HashSet::new();
-    for (scope, mut c) in docs {
-        let base = if scope.is_empty() {
-            "docs".to_string()
-        } else {
-            let s = sanitize_slug(&scope);
-            if s.is_empty() {
+        // Docs slugs are scope-derived — independent of which other files exist,
+        // so adding a file can never rename (and re-home, #178) a docs dataset.
+        let mut clusters: Vec<Cluster> = Vec::with_capacity(docs.len() + kept.len());
+        let mut used: HashSet<String> = HashSet::new();
+        for (scope, mut c) in docs {
+            let base = if scope.is_empty() {
                 "docs".to_string()
             } else {
-                format!("{s}-docs")
+                let s = sanitize_slug(&scope);
+                if s.is_empty() {
+                    "docs".to_string()
+                } else {
+                    format!("{s}-docs")
+                }
+            };
+            let mut slug = base.clone();
+            let mut k = 2;
+            while !used.insert(slug.clone()) {
+                slug = format!("{base}-{k}");
+                k += 1;
             }
-        };
-        let mut slug = base.clone();
-        let mut k = 2;
-        while !used.insert(slug.clone()) {
-            slug = format!("{base}-{k}");
-            k += 1;
+            c.slug = slug;
+            clusters.push(c);
         }
-        c.slug = slug;
-        clusters.push(c);
+        assign_slugs(&mut kept, rels, &mut used);
+        clusters.extend(kept);
+        clusters
     }
-    assign_slugs(&mut kept, rels, &mut used);
-    clusters.extend(kept);
-    clusters
 }
 
 pub fn sanitize_slug(s: &str) -> String {
@@ -543,9 +577,113 @@ pub fn drop_repeated_prefix(prefix: &str, clusters: &mut [Cluster]) {
     }
 }
 
+/// Longest dataset slug autoindex derives. Slugs come from file paths and
+/// group names with no natural bound — a Go module path produced a 329-char
+/// index name that the server refused (index names are capped at 255 bytes),
+/// failing the run (part of #1122). 128 leaves room for the `--prefix` and for
+/// the suffixes rebuilds add to it (`-reindex`, `-generation-v1`).
+pub const MAX_SLUG_LEN: usize = 128;
+
+/// Shorten slugs longer than [`MAX_SLUG_LEN`]: keep the leading part and
+/// append `-` plus 8 hex digits of a hash of the full slug, so the name stays
+/// readable, is the same on every run, and two long slugs sharing a long
+/// beginning still get different names. Slugs within the limit are untouched.
+pub fn cap_slug_len(clusters: &mut [Cluster]) {
+    if clusters.iter().all(|c| c.slug.len() <= MAX_SLUG_LEN) {
+        return;
+    }
+    let mut used: HashSet<String> = clusters
+        .iter()
+        .filter(|c| c.slug.len() <= MAX_SLUG_LEN)
+        .map(|c| c.slug.clone())
+        .collect();
+    let mut order: Vec<usize> = (0..clusters.len())
+        .filter(|&i| clusters[i].slug.len() > MAX_SLUG_LEN)
+        .collect();
+    order.sort_by_key(|&i| clusters[i].slug.clone());
+    for i in order {
+        let full = clusters[i].slug.clone();
+        let mut salt = 0u64;
+        loop {
+            let slug = capped_slug(&full, salt);
+            if used.insert(slug.clone()) {
+                clusters[i].slug = slug;
+                break;
+            }
+            salt += 1;
+        }
+    }
+}
+
+fn capped_slug(full: &str, salt: u64) -> String {
+    let hash = xxhash_rust::xxh3::xxh3_64_with_seed(full.as_bytes(), salt) as u32;
+    let suffix = format!("-{hash:08x}");
+    // Slugs are ASCII (`sanitize_slug`); the boundary check keeps this safe
+    // for any other caller.
+    let mut cut = MAX_SLUG_LEN - suffix.len();
+    while !full.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = full[..cut].trim_end_matches('-');
+    format!("{head}{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(slug: &str) -> Cluster {
+        Cluster {
+            family: Family::Json,
+            group: None,
+            members: Vec::new(),
+            fields: HashMap::new(),
+            key_fields: HashSet::new(),
+            records: 0,
+            population: 0,
+            slug: slug.to_string(),
+            scope: String::new(),
+            is_docs: false,
+            demoted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn long_slugs_are_capped_with_a_stable_hash_suffix() {
+        // The real 329-char index name from a Go module tree (part of #1122).
+        let long = format!(
+            "gomod-github-com-paths-v1-example-a-bit-of-everything-floatvalue-{}",
+            "nested-message-repeated-string-value-".repeat(7)
+        );
+        let sibling = format!("{long}other");
+        let mut clusters = vec![named("short"), named(&long), named(&sibling)];
+        cap_slug_len(&mut clusters);
+        assert_eq!(clusters[0].slug, "short");
+        for c in &clusters[1..] {
+            assert!(c.slug.len() <= MAX_SLUG_LEN, "{} chars", c.slug.len());
+            assert!(c.slug.starts_with("gomod-github-com-paths-v1-example"));
+            assert_eq!(c.slug, sanitize_slug(&c.slug), "still a valid slug");
+            assert!(xerj_common::IndexName::validate(&format!("b5-{}", c.slug)).is_ok());
+        }
+        assert_ne!(clusters[1].slug, clusters[2].slug);
+        // Deterministic: the same input names the same index on every run.
+        let mut again = vec![named("short"), named(&long), named(&sibling)];
+        cap_slug_len(&mut again);
+        let a: Vec<_> = clusters.iter().map(|c| c.slug.clone()).collect();
+        let b: Vec<_> = again.iter().map(|c| c.slug.clone()).collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn capped_slug_never_collides_with_an_existing_one() {
+        let long = "a".repeat(MAX_SLUG_LEN + 50);
+        let taken = capped_slug(&long, 0);
+        let mut clusters = vec![named(&taken), named(&long)];
+        cap_slug_len(&mut clusters);
+        assert_eq!(clusters[0].slug, taken);
+        assert_ne!(clusters[1].slug, taken);
+        assert!(clusters[1].slug.len() <= MAX_SLUG_LEN);
+    }
 
     #[test]
     fn a_digit_leading_prefix_is_rejected_before_any_walk() {

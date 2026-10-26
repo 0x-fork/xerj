@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` no longer runs out of memory while planning a large folder.
+  It used to keep the sampled values of every file in memory at once before
+  grouping them into datasets, and kept them all until the end of the run;
+  on a 5 GB folder of about 146,000 files that was several GB on the client
+  before anything was indexed. Files are now grouped as they are read, and only
+  what the end-of-run key correlation needs is kept. The datasets and index
+  names it plans are unchanged (part of #1122).
+- `xerj autoindex` no longer fails a run because a dataset name built from a
+  long path (for example a Go module path) is over the 255-character index name
+  limit. Names longer than 128 characters are shortened and end in a short
+  hash, so they stay the same on every run and never clash (part of #1122).
+
 - Server startup now reports the resolved data directory, its configuration
   source and whether this launch created it. New-directory guidance points
   operators back to their previous `--data-dir` or `--config` when they expected
