@@ -2041,6 +2041,43 @@ where
 }
 
 fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>> {
+    decode_stored_v2_filtered(body, present_nulls, None)
+}
+
+/// Decode a stored section like [`decode_stored`], but emit only the
+/// `_source` columns `keep` accepts (`_id` and `_seq_no` are always
+/// emitted). Same canonical `[{"_id","_seq_no","_source":{…}}, …]` framing,
+/// with the dropped fields absent from every `_source` — byte-identical to
+/// running `decode_stored` and deleting those keys.
+///
+/// A column that is not kept is not decompressed at all, unless a kept
+/// `COPY_OF` / `CROSS_DEP` column is derived from it, in which case it is
+/// decoded as a dependency and still left out of the output.
+///
+/// #2427: a brute stored scan decoded EVERY column of a cold segment to
+/// evaluate a lexical query, and on a semantic_text corpus the generated
+/// embedding companions (`*_vector`, `*_vector_chunks`, passage metadata)
+/// are ~85% of the decoded bytes and of the transient peak (a 20k-doc
+/// segment: 342 MB decoded, ~720 MB peak, ~600 MB of it vectors).
+///
+/// `Ok(None)` for a legacy (non-columnar) section; the caller falls back to
+/// [`decode_stored`].
+pub fn decode_stored_keeping(bytes: &[u8], keep: &dyn Fn(&str) -> bool) -> Result<Option<Vec<u8>>> {
+    if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
+        let (present_nulls, inner) = split_stored_v3(bytes)?;
+        return decode_stored_v2_filtered(&inner[4..], &present_nulls, Some(keep)).map(Some);
+    }
+    if is_columnar_stored_magic(bytes) {
+        return decode_stored_v2_filtered(&bytes[4..], &[], Some(keep)).map(Some);
+    }
+    Ok(None)
+}
+
+fn decode_stored_v2_filtered(
+    body: &[u8],
+    present_nulls: &[(u32, u32)],
+    keep: Option<&dyn Fn(&str) -> bool>,
+) -> Result<Vec<u8>> {
     // Positions that were a *present* explicit `_source` null (issue #415).
     // Empty for plain ZBS2 segments; populated by `split_stored_v3` for ZBS3.
     let present_null_set: std::collections::HashSet<(u32, u32)> =
@@ -2095,11 +2132,49 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
     // 100 MB autoindex section's decode; serially every other column queued
     // behind it on the first (cold) search of a segment. Errors surface in
     // column order, as the serial loop reported them.
+    // #2427: which columns are emitted, and which must be decoded (the
+    // emitted ones plus whatever a kept COPY_OF / CROSS_DEP derives from).
+    let emit: Vec<bool> = entries
+        .iter()
+        .map(|(name, _, _)| {
+            keep.is_none_or(|keep| name == "__id" || name == "__seq_no" || keep(name))
+        })
+        .collect();
+    let mut needed = emit.clone();
+    if keep.is_some() {
+        loop {
+            let mut grew = false;
+            for ix in 0..entries.len() {
+                if !needed[ix] {
+                    continue;
+                }
+                let (_, codec, payload) = &entries[ix];
+                let source = match codec {
+                    ColCodec::CopyOf => Some(copy_of_source_index(payload)?),
+                    ColCodec::CrossDep => Some(cross_dep_source_index(payload, num_docs)?),
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    if source < needed.len() && !needed[source] {
+                        needed[source] = true;
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
     let decoded: Vec<Result<Vec<serde_json::Value>>> = {
         use rayon::prelude::*;
         entries
             .par_iter()
-            .map(|(_, codec, payload)| {
+            .zip(needed.par_iter())
+            .map(|((_, codec, payload), needed)| {
+                if !*needed {
+                    return Ok(Vec::new());
+                }
                 let payload = *payload;
                 Ok(match codec {
                     ColCodec::RawJson => decode_raw_json(payload)?,
@@ -2309,7 +2384,7 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
                         }
                         let mut source_map = serde_json::Map::new();
                         for (cix, name) in col_names.iter().enumerate() {
-                            if cix == id_col_ix || cix == seq_col_ix {
+                            if cix == id_col_ix || cix == seq_col_ix || !emit[cix] {
                                 continue;
                             }
                             let v = cell(cix);
@@ -4942,6 +5017,62 @@ mod tests {
             assert_eq!(doc["_seq_no"].as_u64(), Some(100 + i as u64), "row {i}");
             assert_eq!(doc["_id"].as_str(), Some(format!("s{}", i).as_str()));
         }
+    }
+
+    /// #2427: the kept-column decode equals the full decode with the dropped
+    /// fields deleted — including a kept COPY_OF whose source is dropped
+    /// (decoded as a dependency, not emitted) and explicit nulls (ZBS3/V3
+    /// present-null set) on both kept and dropped columns.
+    #[test]
+    fn decode_stored_keeping_matches_filtered_full_decode() {
+        let docs: Vec<serde_json::Value> = (0..300u64)
+            .map(|i| {
+                let long = format!("source-text-{i}-padded-so-copy-of-wins-over-dict");
+                let mut source = json!({
+                    "title": format!("title {}", i % 7),
+                    "long_a": long.clone(),
+                    "long_b": long,
+                    "body_vector": [i as f64 * 0.5, 1.25, -2.0],
+                    "body_vector_chunks": [{ "text": "chunk", "vector": [0.1, 0.2] }],
+                    "__xerj_passage_meta__body_vector": { "n": i },
+                    "line": i,
+                });
+                if i % 5 == 0 {
+                    source["title"] = serde_json::Value::Null;
+                    source["body_vector"] = serde_json::Value::Null;
+                }
+                json!({ "_id": format!("d{i}"), "_seq_no": i, "_source": source })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        let full: Vec<serde_json::Value> =
+            serde_json::from_slice(&decode_stored(&encoded).unwrap()).unwrap();
+        assert_eq!(full.len(), docs.len());
+
+        let kept = ["title", "long_b", "line"];
+        let keep = |name: &str| kept.contains(&name);
+        let projected_bytes = decode_stored_keeping(&encoded, &keep)
+            .unwrap()
+            .expect("columnar section");
+        let projected: Vec<serde_json::Value> = serde_json::from_slice(&projected_bytes).unwrap();
+        assert_eq!(projected.len(), full.len());
+        for (i, (got, mut want)) in projected.into_iter().zip(full).enumerate() {
+            want["_source"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, _| kept.contains(&key.as_str()));
+            assert_eq!(got, want, "row {i}");
+            assert!(got["_source"].get("long_a").is_none(), "row {i}");
+            assert!(got["_source"].get("body_vector").is_none(), "row {i}");
+        }
+        assert!(
+            projected_bytes.len() * 2 < decode_stored(&encoded).unwrap().len(),
+            "dropping the vector columns must shrink the decode"
+        );
+
+        // A legacy LZ4 section is not columnar: the caller falls back.
+        let legacy = encode_stored_lz4(&serde_json::to_vec(&docs).unwrap());
+        assert!(decode_stored_keeping(&legacy, &keep).unwrap().is_none());
     }
 
     /// The `_id` ↔ `doc_id` echo: the later column stores a 4-byte reference

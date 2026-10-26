@@ -2306,6 +2306,140 @@ mod flush_publication_recovery_tests {
         }
     }
 
+    /// #2427: a query the segment FTS declines (here a clause on a field no
+    /// document has, the shape the multi-index code-search CLI sends) walks
+    /// every cold segment through the brute stored scan. That scan decoded
+    /// every column — on a semantic_text corpus ~85% embedding companions —
+    /// although the page can only observe the `_source` includes plus the
+    /// fields the query reads. With an include list the cold decode must
+    /// read only those columns, answer exactly like the full decode, and
+    /// never publish the partial section to `decoded_stored_cache`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_stored_scan_with_source_includes_decodes_only_kept_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("scan-cold", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("scan-cold").unwrap();
+        idx.abort_background_tasks();
+        let vector: Vec<f64> = (0..64).map(|d| d as f64 * 0.015625).collect();
+        for i in 0..1500u64 {
+            let body = if i % 31 == 0 {
+                format!("needle report {i} needle")
+            } else {
+                format!("hay stack {i}")
+            };
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({
+                    "title": format!("title {i}"),
+                    "body": body,
+                    "blob": "padding ".repeat(64),
+                    "body_vector": vector,
+                    "body_vector_chunks": [{"text": body, "vector": vector}],
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(engine);
+
+        let reopen = || {
+            let mut c = Config::default();
+            c.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(c).unwrap();
+            let idx = engine.get_index("scan-cold").unwrap();
+            idx.abort_background_tasks();
+            let held: Vec<String> = {
+                let snapshot = idx.store.snapshot();
+                snapshot.segments.iter().map(|s| s.id.to_string()).collect()
+            };
+            for id in &held {
+                idx.cold_stored_warms.insert(id.clone(), ());
+            }
+            (engine, idx, held)
+        };
+        let body = |source: Option<serde_json::Value>| {
+            let mut body = json!({
+                "query": {"bool": {
+                    "should": [
+                        {"match": {"body": "needle"}},
+                        {"match_phrase": {"defs": "no such field"}}
+                    ],
+                    "minimum_should_match": 1
+                }},
+                "size": 10
+            });
+            if let Some(source) = source {
+                body["_source"] = source;
+            }
+            xerj_query::parse_request(&body).unwrap()
+        };
+        let projected = body(Some(json!(["title"])));
+        let full = body(None);
+        assert!(fts_row_hydration_keep(&projected, &projected.query).is_some());
+
+        // Full-source query: the stored scan decodes and caches the section.
+        let (engine, idx, segs) = reopen();
+        let full_res = idx.search(&full).await.unwrap();
+        assert!(
+            segs.iter()
+                .any(|s| idx.decoded_stored_cache.contains_key(s)),
+            "precondition: this query shape takes the stored-scan path"
+        );
+        drop(idx);
+        drop(engine);
+
+        let (engine, idx, segs) = reopen();
+        let cold = idx.search(&projected).await.unwrap();
+        assert!(
+            segs.iter()
+                .all(|s| !idx.decoded_stored_cache.contains_key(s)
+                    && !idx.stored_slices_cache.contains_key(s)),
+            "a projected decode must never be cached as the full section"
+        );
+        let key = |r: &xerj_query::executor::SearchResult| {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), (h.score * 1e4).round() as i64))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(full_res.hits.len(), 10);
+        assert_eq!(key(&cold), key(&full_res));
+        assert_eq!(cold.total.value, full_res.total.value);
+        for (c, f) in cold.hits.iter().zip(&full_res.hits) {
+            assert_eq!(c.source, json!({"title": f.source["title"].clone()}));
+            assert!(f.source["body_vector"].is_array());
+        }
+
+        // The whole-document reader can still locate and restore every
+        // projected hit's full row.
+        let mut row_projected = HashMap::new();
+        let seg_of: HashMap<String, String> = cold
+            .hits
+            .iter()
+            .map(|h| (h.id.clone(), segs[0].clone()))
+            .collect();
+        if segs.len() == 1 {
+            idx.locate_scan_projected_rows(&cold.hits, &seg_of, &mut row_projected);
+            assert_eq!(row_projected.len(), cold.hits.len());
+            for h in &cold.hits {
+                let (seg, pos) = &row_projected[&h.id];
+                let mut rows = idx.hydrate_fts_rows_cold(seg, &[*pos], None).unwrap();
+                let doc = rows.remove(pos).unwrap();
+                assert_eq!(doc["_id"].as_str(), Some(h.id.as_str()));
+                assert!(doc["_source"]["body_vector_chunks"].is_array());
+            }
+        }
+        drop(idx);
+        drop(engine);
+    }
+
     #[test]
     fn row_projection_keep_set_covers_query_and_include_fields() {
         let req = xerj_query::parse_request(&json!({
@@ -17745,6 +17879,56 @@ impl Index {
         });
     }
 
+    /// #2427: find the row of every `hits` entry whose `_source` came from a
+    /// column-projected stored scan (`scan_projected`: id → segment) and
+    /// record it in `row_projected`, so the whole-document reader (TF-IDF
+    /// fallback) can restore the full source. Decodes only the identity
+    /// columns of each segment involved; rare path.
+    fn locate_scan_projected_rows(
+        &self,
+        hits: &[Hit],
+        scan_projected: &HashMap<String, String>,
+        row_projected: &mut HashMap<String, (String, u32)>,
+    ) {
+        let mut wanted: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for hit in hits {
+            if let Some(segment) = scan_projected.get(&hit.id) {
+                wanted
+                    .entry(segment.as_str())
+                    .or_default()
+                    .insert(hit.id.as_str());
+            }
+        }
+        for (segment, ids) in wanted {
+            let Some(reader) = self.store.open_segment_arc(segment).ok() else {
+                continue;
+            };
+            let Some(bytes) = reader.section(SectionType::Stored).ok().flatten() else {
+                continue;
+            };
+            let Some(identity) =
+                xerj_storage::stored_codec::decode_stored_keeping(bytes, &|_: &str| false)
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&identity) else {
+                continue;
+            };
+            for (position, row) in rows.iter().enumerate() {
+                let Some(id) = row.get("_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if ids.contains(id) {
+                    if let Ok(position) = u32::try_from(position) {
+                        row_projected.insert(id.to_string(), (segment.to_string(), position));
+                    }
+                }
+            }
+        }
+    }
+
     fn hydrate_fts_rows_cold(
         &self,
         segment_id: &str,
@@ -24669,6 +24853,10 @@ impl Index {
         // position), so the one post-page reader that looks at the WHOLE
         // document (the TF-IDF fallback below) can restore it.
         let mut row_projected: HashMap<String, (String, u32)> = HashMap::new();
+        // #2427: stored-scan hits whose `_source` came from a column-projected
+        // cold decode, by id → segment (row located lazily, see
+        // `locate_scan_projected_rows`).
+        let mut scan_projected: HashMap<String, String> = HashMap::new();
         // Cold score-ordered FTS hits whose `_source` is read only once the
         // segment loop has settled the page: `_id` -> (segment, row).
         let mut deferred_sources: HashMap<String, (String, u32, u64)> = HashMap::new();
@@ -26554,39 +26742,88 @@ impl Index {
                         // Re-check both caches now that we hold this
                         // segment's flight lock — another thread may have
                         // decoded and published while we waited.
-                        let cached_bytes: Option<Vec<u8>> = self
+                        // #2427: hold the cached entry by `Arc` instead of
+                        // cloning the whole decoded section (hundreds of MB
+                        // per waiter on a large segment).
+                        enum ColdBytes<D, S> {
+                            Decoded(D),
+                            Slices(S),
+                            // `bool`: column-projected (never cached).
+                            Fresh(Vec<u8>, bool),
+                        }
+                        let cached = self
                             .decoded_stored_cache
                             .get(seg_id.as_str())
-                            .map(|e| e.value().value().clone())
+                            .map(|e| ColdBytes::Decoded(Arc::clone(e.value())))
                             .or_else(|| {
                                 self.stored_slices_cache
                                     .get(seg_id.as_str())
-                                    .map(|e| e.value().bytes.clone())
+                                    .map(|e| ColdBytes::Slices(Arc::clone(e.value())))
                             });
-                        let stored_bytes_opt = if let Some(bytes) = cached_bytes {
-                            Some(bytes)
+                        // #2427: an unsorted scan whose page can observe only
+                        // a known column set (`fts_row_keep`: the `_source`
+                        // includes plus every field the query reads) decodes
+                        // just those columns. On a semantic_text corpus the
+                        // generated `*_vector` / `*_vector_chunks` / passage
+                        // metadata columns are ~85% of a full decode and of
+                        // its transient peak (20k-doc segment: ~716 MB peak
+                        // full vs ~82 MB projected), none of which the
+                        // response can return. Projected bytes are never
+                        // published to `decoded_stored_cache`.
+                        let scan_keep: Option<&[String]> =
+                            if sorted_candidates_path || sort_topk.is_some() {
+                                None
+                            } else {
+                                fts_row_keep.as_deref()
+                            };
+                        let stored_src = if cached.is_some() {
+                            cached
                         } else {
                             let seg_reader = self.store.open_segment_arc(&seg_id)?;
                             match seg_reader.section(SectionType::Stored) {
                                 Ok(Some(stored_bytes_raw)) => {
-                                    xerj_storage::stored_codec::decode_stored(stored_bytes_raw).ok()
+                                    let projected = scan_keep.and_then(|keep| {
+                                        xerj_storage::stored_codec::decode_stored_keeping(
+                                            stored_bytes_raw,
+                                            &|column: &str| {
+                                                row_projection_keeps_column(keep, column)
+                                            },
+                                        )
+                                        .ok()
+                                        .flatten()
+                                    });
+                                    match projected {
+                                        Some(bytes) => Some(ColdBytes::Fresh(bytes, true)),
+                                        None => xerj_storage::stored_codec::decode_stored(
+                                            stored_bytes_raw,
+                                        )
+                                        .ok()
+                                        .map(|bytes| ColdBytes::Fresh(bytes, false)),
+                                    }
                                 }
                                 _ => None,
                             }
                         };
                         dbg_decode_ms += t_dec.elapsed().as_millis() as u64;
-                        if let Some(stored_bytes) = stored_bytes_opt {
+                        if let Some(stored_src) = stored_src {
                             {
                                 let t_scan = std::time::Instant::now();
+                                let stored_bytes: &[u8] = match &stored_src {
+                                    ColdBytes::Decoded(entry) => entry.value(),
+                                    ColdBytes::Slices(slices) => &slices.bytes,
+                                    ColdBytes::Fresh(bytes, _) => bytes,
+                                };
+                                let projected = matches!(stored_src, ColdBytes::Fresh(_, true));
                                 // Record per-doc offsets on the sorted path so
                                 // the decompressed section can be cached for
                                 // the next query (subject to the budget).
                                 let mut offsets: Vec<(u32, u32)> = Vec::new();
                                 let want_cache = sorted_candidates_path
+                                    && !projected
                                     && stored_bytes.len() <= u32::MAX as usize
                                     && !self.stored_slices_cache.contains_key(seg_id.as_str());
                                 self.scan_stored_section_into(
-                                    &stored_bytes,
+                                    stored_bytes,
                                     query,
                                     is_match_all,
                                     ids_only,
@@ -26607,12 +26844,23 @@ impl Index {
                                     &dmq_schema,
                                 );
                                 dbg_scan_ms += t_scan.elapsed().as_millis() as u64;
+                                if projected {
+                                    for hit in all_hits.iter().skip(hits_before_segment) {
+                                        scan_projected.insert(hit.id.clone(), seg_id.clone());
+                                    }
+                                }
                                 // Cache only a COMPLETE offsets map (a
                                 // malformed section bails early) and only
                                 // within the retained-bytes budget.
                                 if want_cache && offsets.len() as u64 == meta.doc_count {
                                     let slices = StoredSlices {
-                                        bytes: stored_bytes,
+                                        bytes: match stored_src {
+                                            ColdBytes::Fresh(bytes, _) => bytes,
+                                            // Promote a decoded-cache entry
+                                            // into the sorted-path cache.
+                                            ColdBytes::Decoded(entry) => entry.value().clone(),
+                                            ColdBytes::Slices(slices) => slices.bytes.clone(),
+                                        },
                                         offsets,
                                     };
                                     let bytes = cache_estimates::stored_slices_bytes(
@@ -26629,12 +26877,18 @@ impl Index {
                                         bytes,
                                         slices,
                                     );
-                                } else if !want_cache {
+                                } else if let (false, ColdBytes::Fresh(stored_bytes, false)) =
+                                    (want_cache, stored_src)
+                                {
                                     // Unsorted path: retain the decompressed
                                     // section so the NEXT query on this
                                     // segment skips the decompress (the
                                     // read-under-write match_all/bool/range
                                     // tail fix — see `decoded_stored_cache`).
+                                    // Only a fresh FULL decode: a cache hit
+                                    // is already resident, and projected
+                                    // bytes would serve other queries a
+                                    // partial `_source`.
                                     let bytes = cache_estimates::decoded_stored_bytes(
                                         &seg_id,
                                         std::mem::size_of::<CacheResident<Vec<u8>>>(),
@@ -27024,6 +27278,13 @@ impl Index {
                     // This heuristic reads the whole serialized document, so
                     // a column-projected cold hit gets its full source back
                     // first (#2422/#2423); rare path, a handful of rows.
+                    if !scan_projected.is_empty() {
+                        self.locate_scan_projected_rows(
+                            &final_hits,
+                            &scan_projected,
+                            &mut row_projected,
+                        );
+                    }
                     if !row_projected.is_empty() {
                         for hit in final_hits.iter_mut() {
                             let Some((seg, pos)) = row_projected.get(&hit.id) else {
