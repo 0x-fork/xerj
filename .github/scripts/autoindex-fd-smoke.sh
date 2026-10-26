@@ -33,16 +33,34 @@ BIN="${XERJ_BIN:-engine/target/release/xerj}"
 [ -f "$BIN.exe" ] && BIN="$BIN.exe" # windows
 
 # ── generate 400 distinct-schema datasets (one index each) ─────────────────
+# Each dataset must stay its OWN index, or the descriptor pressure this gate
+# exists for disappears. Since #2422/#2430 one run aims for at most
+# MAX_DATASETS_PER_RUN (32) data datasets: past that, CSV/JSONL/log clusters
+# below DATASET_CAP_PROTECT_RECORDS (1024) rows merge into one shared dataset
+# per scope and family (400 x 3-row CSVs became 32 indices). A cluster of
+# 1024+ rows "never moves", so every folder gets ROWS >= 1024 rows. For CSV the
+# cluster size is the SAMPLED row count (the extractor declares no length),
+# so autoindex below runs with --sample SAMPLE > ROWS. Keep
+# ROWS > DATASET_CAP_PROTECT_RECORDS in engine/crates/xerj-autoindex/src/dataset.rs.
+N_DATASETS=400
+ROWS=1050
+SAMPLE=1100
 ROOT="$(mktemp -d)"
 CORPUS="$ROOT/corpus"
 mkdir -p "$CORPUS"
-for i in $(seq 1 400); do
-  d="$CORPUS/ds_$i"
-  mkdir -p "$d"
-  # Unique column names per folder => a distinct inferred dataset per folder.
-  printf 'k_%d_id,k_%d_name,k_%d_val\n1,alpha,10\n2,beta,20\n3,gamma,30\n' "$i" "$i" "$i" > "$d/data.csv"
-done
-echo "generated $(find "$CORPUS" -name '*.csv' | wc -l | tr -d ' ') dataset files"
+for i in $(seq 1 "$N_DATASETS"); do mkdir -p "$CORPUS/ds_$i"; done
+# Unique column names per folder => a distinct inferred dataset per folder.
+# One awk process writes all files (cheap on git-bash, where forks are slow).
+awk -v n="$N_DATASETS" -v rows="$ROWS" -v root="$CORPUS" 'BEGIN {
+  split("alpha beta gamma delta", w, " ")
+  for (i = 1; i <= n; i++) {
+    f = root "/ds_" i "/data.csv"
+    printf "k_%d_id,k_%d_name,k_%d_val\n", i, i, i > f
+    for (r = 1; r <= rows; r++) printf "%d,%s,%d\n", r, w[(r % 4) + 1], r * 10 > f
+    close(f)
+  }
+}' || { echo "::error::corpus generation failed"; exit 1; }
+echo "generated $(find "$CORPUS" -name '*.csv' | wc -l | tr -d ' ') dataset files of $ROWS rows"
 
 # ── boot the server (inherits the constrained fd budget) ───────────────────
 DATA="$ROOT/data"
@@ -76,7 +94,12 @@ HITS="$(curl -s -m10 'localhost:9200/smoke-crud/_search?q=durability' | tr -d ' 
 echo "write/read round-trip OK on $(uname -s)"
 
 # ── autoindex the corpus ───────────────────────────────────────────────────
-"$BIN" autoindex "$CORPUS" > "$DATA/ax.log" 2>&1
+# --sample: see the corpus comment (CSV cluster size is the sampled count).
+# --max-minutes 0: never stop at the estimate gate (exit 4) on a slow runner.
+# --no-semantic: no embeddings for ~420k rows; FD pressure comes from the
+# index count, not from semantic fields.
+"$BIN" autoindex "$CORPUS" --sample "$SAMPLE" --max-minutes 0 --no-semantic \
+  > "$DATA/ax.log" 2>&1
 RC=$?
 echo "autoindex exit=$RC"
 tail -20 "$DATA/ax.log" || true
@@ -94,8 +117,20 @@ if [ "$RC" != "0" ] && [ "$RC" != "3" ]; then
 fi
 CREATED="$(curl -s 'localhost:9200/_cat/indices?h=index' 2>/dev/null | grep -c 'ax-' || true)"
 echo "ax-* indices created: $CREATED"
+# One index per folder is the FD pressure; 300 leaves slack for the engine
+# legitimately joining a few. Far fewer means the corpus no longer produces
+# one index per dataset (e.g. the run cap merged them): fix the corpus, not
+# the threshold, or the gate stops guarding EMFILE.
 if [ "${CREATED:-0}" -lt 300 ]; then
-  echo "::error::expected >=300 datasets indexed, got ${CREATED:-0}"
+  echo "::error::expected >=300 datasets indexed, got ${CREATED:-0} (are the datasets still >= DATASET_CAP_PROTECT_RECORDS rows?)"
+  FAIL=1
+fi
+# Every row indexed, read from autoindex's own summary line.
+WANT_RECORDS=$((N_DATASETS * ROWS))
+RECORDS="$(sed -n 's/.*xerj-done .*[[:space:]]records=\([0-9]*\).*/\1/p' "$DATA/ax.log" | tail -1)"
+echo "records indexed: ${RECORDS:-?} (want $WANT_RECORDS)"
+if [ "${RECORDS:-0}" -lt "$WANT_RECORDS" ]; then
+  echo "::error::expected $WANT_RECORDS records indexed, got ${RECORDS:-none}"
   FAIL=1
 fi
 
