@@ -6798,6 +6798,7 @@ mod delete_gate {
                     digest: "prepared".into(),
                 }),
                 prepared_identity: None,
+                blob_released: false,
             }],
             snapshot_digest: "snapshot".into(),
         };

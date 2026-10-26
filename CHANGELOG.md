@@ -98,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   long path (for example a Go module path) is over the 255-character index name
   limit. Names longer than 128 characters are shortened and end in a short
   hash, so they stay the same on every run and never clash (part of #1122).
+- `xerj autoindex` no longer keeps a second full copy of your files in its
+  state directory. Each sync used to keep every indexed file's bytes under
+  `sync-snapshots/` next to the prepared records, so the state directory grew
+  larger than the folder it indexed. Those copies are now deleted as soon as
+  the file's prepared records are safely on disk; resume and crash recovery
+  still replay from the verified prepared records. On a 344 MB test corpus the
+  state directory went from 503 MB to 242 MB after a sync (#2421).
 - The first searches after a restart, or after a segment left the cache,
   no longer read every stored document to return a page of hits. When the
   request names its `_source` fields (as `xerj search` does), only the

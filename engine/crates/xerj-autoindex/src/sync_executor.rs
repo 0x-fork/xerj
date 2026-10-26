@@ -58,6 +58,17 @@ pub struct SnapshotFile {
     /// this file therefore also means "a pre-#971 snapshot: never reuse".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_identity: Option<String>,
+    /// #2421: the sealed blob was deleted once this file's prepared artifact
+    /// was durable. Nothing after preparation reads the blob — replay, resume
+    /// and metadata updates all stream `prepared.relative_ndjson` — so keeping
+    /// a second copy of every indexed source byte made the state dir larger
+    /// than the corpus. Only ever true with `prepared: Some`; `open_snapshot`
+    /// then verifies the artifact instead of the blob, and a later generation
+    /// reuses the artifact by identity or re-copies from the verified live
+    /// source. Skip-serialized when false so a manifest sealed before this
+    /// field existed keeps hashing to the digest the journal recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blob_released: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3319,6 +3330,16 @@ fn create_snapshot_inner(
             .copied()
             .filter(|prior| {
                 prior.content_digest == *content_digest && prior.content_size == source.size
+            })
+            // #2421: a prior file whose blob was released can only be reused
+            // through its prepared artifact. If the preparation identity moved,
+            // there are no sealed bytes to re-extract from, so it re-seals from
+            // the live source (verified against this run's digest) below.
+            .filter(|prior| {
+                !prior.blob_released
+                    || (prior.prepared.is_some()
+                        && prior.prepared_identity.is_some()
+                        && prior.prepared_identity == prepared_identity)
             });
         match reusable {
             Some(prior) => {
@@ -3326,13 +3347,15 @@ fn create_snapshot_inner(
                     .as_ref()
                     .expect("reuse root exists whenever reuse_by_content is non-empty")
                     .join(&prior.relative_blob);
-                std::fs::hard_link(&prior_blob, &destination).with_context(|| {
-                    format!(
-                        "hardlink unchanged snapshot blob {} -> {}",
-                        prior_blob.display(),
-                        destination.display()
-                    )
-                })?;
+                if !prior.blob_released {
+                    std::fs::hard_link(&prior_blob, &destination).with_context(|| {
+                        format!(
+                            "hardlink unchanged snapshot blob {} -> {}",
+                            prior_blob.display(),
+                            destination.display()
+                        )
+                    })?;
+                }
                 budget.charge(source.size as usize)?;
                 let prepared = match &prior.prepared {
                     Some(prior_artifact)
@@ -3383,6 +3406,7 @@ fn create_snapshot_inner(
                         None => None,
                     },
                 };
+                let blob_released = release_prepared_blob(&destination, prepared.as_ref())?;
                 files.push(SnapshotFile {
                     content_id: content_id.clone(),
                     content_digest: content_digest.clone(),
@@ -3390,6 +3414,7 @@ fn create_snapshot_inner(
                     relative_blob,
                     prepared,
                     prepared_identity,
+                    blob_released,
                 });
             }
             None => {
@@ -3428,6 +3453,7 @@ fn create_snapshot_inner(
                     )?),
                     None => None,
                 };
+                let blob_released = release_prepared_blob(&destination, prepared.as_ref())?;
                 files.push(SnapshotFile {
                     content_id: content_id.clone(),
                     content_digest: content_digest.clone(),
@@ -3435,6 +3461,7 @@ fn create_snapshot_inner(
                     relative_blob,
                     prepared,
                     prepared_identity,
+                    blob_released,
                 });
             }
         }
@@ -3489,6 +3516,28 @@ fn create_snapshot_inner(
     open_snapshot(state_dir, tx_id)
 }
 
+/// #2421: once a file's prepared artifact is durable (`prepare_artifact`
+/// fsyncs it before returning), its sealed blob has served its only purpose —
+/// a stable input for extraction — so it is unlinked from the staging dir
+/// before the manifest is written. The blob is a hardlink when reused, so this
+/// never touches the prior generation's copy. Files with nothing prepared
+/// (junk/skipped, or a plan-less snapshot) keep their blob.
+fn release_prepared_blob(destination: &Path, prepared: Option<&PreparedArtifact>) -> Result<bool> {
+    if prepared.is_none() {
+        return Ok(false);
+    }
+    match std::fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("release prepared snapshot blob {}", destination.display())
+            })
+        }
+    }
+    Ok(true)
+}
+
 pub fn open_snapshot(state_dir: &Path, tx_id: &str) -> Result<SourceSnapshot> {
     validate_tx_id(tx_id)?;
     let dir = state_dir.join("sync-snapshots").join(tx_id);
@@ -3534,11 +3583,20 @@ pub fn open_snapshot(state_dir: &Path, tx_id: &str) -> Result<SourceSnapshot> {
                 && !Path::new(&file.relative_blob).is_absolute(),
             "invalid source snapshot blob path"
         );
-        crate::content::verify(
-            &dir.join(&file.relative_blob),
-            file.content_size,
-            &file.content_digest,
-        )?;
+        if file.blob_released {
+            // #2421: the bytes live only in the prepared artifact, which is
+            // size- and digest-verified below.
+            anyhow::ensure!(
+                file.prepared.is_some(),
+                "source snapshot released a blob that has no prepared artifact"
+            );
+        } else {
+            crate::content::verify(
+                &dir.join(&file.relative_blob),
+                file.content_size,
+                &file.content_digest,
+            )?;
+        }
         if let Some(prepared) = &file.prepared {
             validate_relative_path(&prepared.relative_ndjson, "prepared/")?;
             let path = dir.join(&prepared.relative_ndjson);
@@ -4398,11 +4456,22 @@ mod tests {
             .unwrap()
             .ino()
         };
-        let prior_blob_inodes: std::collections::HashSet<_> = first
+        // #2421: every prepared file's blob is released at seal, in both
+        // generations — reuse carries the prepared artifact, not the bytes.
+        for (snapshot, file) in first
             .files
             .iter()
-            .map(|file| artifact_inode(&first, &file.relative_blob))
-            .collect();
+            .map(|file| (&first, file))
+            .chain(second.files.iter().map(|file| (&second, file)))
+        {
+            assert!(file.blob_released, "{}", file.content_id);
+            assert!(!state
+                .path()
+                .join("sync-snapshots")
+                .join(&snapshot.tx_id)
+                .join(&file.relative_blob)
+                .exists());
+        }
 
         for file in &second.files {
             let new_prepared = file.prepared.as_ref().unwrap();
@@ -4413,10 +4482,6 @@ mod tests {
                 None => {
                     // The changed file: everything sealed fresh, under the new
                     // generation's identity.
-                    assert!(
-                        !prior_blob_inodes.contains(&artifact_inode(&second, &file.relative_blob)),
-                        "the changed file's blob must be a fresh inode"
-                    );
                     let ndjson = std::fs::read_to_string(
                         state
                             .path()
@@ -4430,11 +4495,6 @@ mod tests {
                     );
                 }
                 Some(prior) => {
-                    assert_eq!(
-                        artifact_inode(&first, &prior.relative_blob),
-                        artifact_inode(&second, &file.relative_blob),
-                        "an unchanged file's blob must be the prior generation's inode"
-                    );
                     let prior_prepared = prior.prepared.as_ref().unwrap();
                     assert_eq!(
                         artifact_inode(&first, &prior_prepared.relative_ndjson),
@@ -4461,6 +4521,136 @@ mod tests {
         // hardlinked or not.
         let reopened = open_snapshot(state.path(), "tx-g2").unwrap();
         assert_eq!(reopened, second);
+    }
+
+    /// #2421: a committed generation's snapshot used to hold a full copy of
+    /// every source byte (`blobs/`) next to the prepared NDJSON, so the state
+    /// dir was larger than the corpus it indexed. With prepared blobs released
+    /// at seal, nothing under `blobs/` survives, and what the protected
+    /// snapshots hold beyond the prepared records a resume replays from —
+    /// counted per inode, so hardlinked reuse is not double-counted — stays
+    /// under 1x the source after a commit and after the next generation's gc.
+    /// (The prepared records themselves are the replay authority; their size
+    /// depends on the corpus: overlapping text chunks run above the source,
+    /// compacted JSON below it.)
+    #[cfg(unix)]
+    #[test]
+    fn committed_snapshot_keeps_no_source_copy_beside_its_prepared_records() {
+        use std::os::unix::fs::MetadataExt;
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for file in 0..8 {
+            let body: String = (0..400)
+                .map(|line| format!("file {file} line {line}: the quick brown fox jumps over it\n"))
+                .collect();
+            std::fs::write(corpus.path().join(format!("f{file}.md")), body).unwrap();
+        }
+        // (bytes beyond the prepared records, prepared bytes)
+        let footprint = |state: &Path| -> (u64, u64) {
+            let mut seen = std::collections::HashSet::new();
+            let mut other = 0;
+            let mut prepared = 0;
+            for entry in walkdir::WalkDir::new(state.join("sync-snapshots")) {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_file() && seen.insert(metadata.ino()) {
+                    let parts: Vec<_> = entry.path().components().collect();
+                    let under = |dir: &str| parts.iter().any(|part| part.as_os_str() == dir);
+                    assert!(
+                        !under("blobs"),
+                        "a released snapshot keeps no source copy: {}",
+                        entry.path().display()
+                    );
+                    if under("prepared") {
+                        prepared += metadata.len();
+                    } else {
+                        other += metadata.len();
+                    }
+                }
+            }
+            (other, prepared)
+        };
+        let seal = |tx: &str, prior: Option<&SourceSnapshot>| {
+            let inventory = inventory(corpus.path());
+            let plan = plan_for_all(&inventory);
+            let source: u64 = inventory.files.iter().map(|file| file.size).sum();
+            let snapshot = create_prepared_snapshot_reporting(
+                state.path(),
+                tx,
+                &inventory,
+                &plan,
+                "test-preparation-v1",
+                u64::MAX,
+                &crate::progress::Progress::silent(),
+                prior,
+                "chunker-v1",
+                None,
+            )
+            .unwrap();
+            (snapshot, source)
+        };
+        let (first, source) = seal("tx-g1", None);
+        let (used, prepared) = footprint(state.path());
+        assert!(prepared > 0);
+        assert!(
+            used < source,
+            "snapshot bytes beyond the prepared records ({used}) must stay below the \
+             {source}-byte source"
+        );
+        assert!(first.files.iter().all(|file| file.blob_released));
+
+        std::fs::write(corpus.path().join("f3.md"), "changed\n").unwrap();
+        let (second, source) = seal("tx-g2", Some(&first));
+        // What gc does once g2 is the committed authority.
+        std::fs::remove_dir_all(state.path().join("sync-snapshots/tx-g1")).unwrap();
+        let (used, _) = footprint(state.path());
+        assert!(
+            used < source,
+            "after gc the bytes beyond the prepared records ({used}) must stay below the \
+             {source}-byte source"
+        );
+        assert_eq!(open_snapshot(state.path(), "tx-g2").unwrap(), second);
+    }
+
+    /// #2421: a released blob is never silently trusted. The prepared artifact
+    /// that replaces it is still size- and digest-verified on every open.
+    #[test]
+    fn released_blob_snapshot_still_verifies_its_prepared_artifact() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("a.md"), "alpha contents one\n").unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = plan_for_all(&inventory);
+        let snapshot = create_prepared_snapshot(
+            state.path(),
+            "tx-released",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(snapshot.files[0].blob_released);
+        let artifact = state
+            .path()
+            .join("sync-snapshots/tx-released")
+            .join(&snapshot.files[0].prepared.as_ref().unwrap().relative_ndjson);
+        let original = std::fs::read(&artifact).unwrap();
+        let mut corrupt = original.clone();
+        corrupt[0] ^= 0x20;
+        std::fs::write(&artifact, &corrupt).unwrap();
+        assert!(open_snapshot(state.path(), "tx-released").is_err());
+        std::fs::write(&artifact, &original).unwrap();
+        assert_eq!(
+            open_snapshot(state.path(), "tx-released").unwrap(),
+            snapshot
+        );
     }
 
     /// #971: gc removes the prior snapshot's directory entries after a new
@@ -4524,10 +4714,11 @@ mod tests {
 
     /// #971: a preparation-input change (chunker identity) busts prepared
     /// reuse even when the bytes are identical — the artifact is re-extracted
-    /// under the new contract, while the blob itself is still shared.
+    /// under the new contract. #2421: the prior blob was released at seal, so
+    /// the bytes are re-sealed from the verified live source and released again.
     #[cfg(unix)]
     #[test]
-    fn changed_preparation_identity_reextracts_but_still_shares_the_blob() {
+    fn changed_preparation_identity_reextracts_from_the_live_source() {
         let _guard = SNAPSHOT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4578,11 +4769,8 @@ mod tests {
                 )
         };
         let inode = |path: std::path::PathBuf| std::fs::metadata(path).unwrap().ino();
-        assert_eq!(
-            inode(blob(&first)),
-            inode(blob(&second)),
-            "identical content still shares the blob"
-        );
+        assert!(!blob(&first).exists() && !blob(&second).exists());
+        assert!(first.files[0].blob_released && second.files[0].blob_released);
         // The artifacts live in different snapshot directories under the same
         // ordinal name, so compare inodes, not relative paths.
         let prepared = |snapshot: &SourceSnapshot| {
@@ -5176,10 +5364,10 @@ mod tests {
             assert!(document.get("id").is_none(), "{document}");
             assert!(document.get("value").is_none(), "{document}");
         }
-        assert_eq!(
-            std::fs::read(root.join(&snapshot.files[0].relative_blob)).unwrap(),
-            sealed
-        );
+        // #2421: the sealed bytes served extraction and were then released;
+        // the artifact above is the durable copy.
+        assert!(snapshot.files[0].blob_released);
+        assert!(!root.join(&snapshot.files[0].relative_blob).exists());
     }
 
     /// #294: snapshot blobs are content-addressed and extensionless
