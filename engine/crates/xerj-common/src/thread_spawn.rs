@@ -325,6 +325,22 @@ where
     try_spawn_with(&StdSpawn, true, name, f)
 }
 
+/// Spawn a helper whose only job is to *free* memory (e.g. the memtable's
+/// `xerj-drain-free`, which drops drained generations off the publish path).
+///
+/// Ignores the watermark gate on purpose: the gate closes exactly when RSS
+/// is at the governor watermark, which is exactly when a memory-relief
+/// helper should run. Gating it meant the drain's frees ran inline on the
+/// publish thread under pressure (logged as "best-effort helper thread was
+/// not started"). A real OS failure is still an `Err` with the job handed
+/// back, and the caller drops it inline.
+pub fn try_spawn_memory_relief<F>(name: &str, f: F) -> Result<SpawnedThread, SpawnFailure<F>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    try_spawn_with(&StdSpawn, true, name, f)
+}
+
 /// [`try_spawn`] with an explicit stack size.
 ///
 /// Used by the in-process shard call, whose handler does not fit on the

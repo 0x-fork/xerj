@@ -2825,9 +2825,10 @@ impl FrozenClaim {
                 removed_bytes,
             )
         });
-        // Free the dead generations off the publish critical path.  If
-        // the thread cannot be created — the governor watermark is already
-        // engaged, `pthread_create` fails, or (the #1122 failure) the new
+        // Free the dead generations off the publish critical path. The
+        // spawn ignores the watermark gate: at the watermark is exactly when
+        // this memory-relief helper must run. If the thread cannot be
+        // created — `pthread_create` fails, or (the #1122 failure) the new
         // thread's stack cannot be reserved — the Arcs drop inline: same
         // correctness, we only lose the async-free optimisation. The spawn
         // itself must not panic: std panics *inside* the child when its
@@ -2838,7 +2839,9 @@ impl FrozenClaim {
         // flush storm under pressure does not emit a line per generation.
         static DRAIN_FREE_DEGRADED: AtomicBool = AtomicBool::new(false);
         if let Err(failure) =
-            xerj_common::thread_spawn::try_spawn("xerj-drain-free", move || drop(dead))
+            xerj_common::thread_spawn::try_spawn_memory_relief("xerj-drain-free", move || {
+                drop(dead)
+            })
         {
             xerj_common::thread_spawn::warn_best_effort_degraded(
                 &DRAIN_FREE_DEGRADED,

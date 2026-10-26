@@ -105,6 +105,128 @@ async fn await_publication_barrier<T>(rx: tokio::sync::oneshot::Receiver<T>, wha
     }
 }
 
+/// Forcemerge batch selection over segments sorted smallest first: chunks
+/// of at most `chunk_len` segments whose input stays under `cap` bytes
+/// (`0` = no cap, #948). Returns index lists into `sizes`.
+///
+/// Convergence: when every segment is already larger than half the cap,
+/// no chunk can hold two, and the old selection returned nothing — an
+/// explicit `max_num_segments=1` stopped at 2+ segments (seen on a 2 GiB
+/// cap: two 16-27 MB segments vs a 32 MiB batch cap). In that case the two
+/// smallest segments are merged anyway: one minimal batch is the least an
+/// explicit force-merge must do to make progress, and the caller loops
+/// passes until it reaches its target.
+pub(crate) fn forcemerge_chunks(sizes: &[u64], chunk_len: usize, cap: u64) -> Vec<Vec<usize>> {
+    let chunk_len = chunk_len.max(2);
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut batch: Vec<usize> = Vec::new();
+    let mut batch_bytes = 0u64;
+    for (i, &size) in sizes.iter().enumerate() {
+        if !batch.is_empty()
+            && (batch.len() >= chunk_len || (cap > 0 && batch_bytes.saturating_add(size) > cap))
+        {
+            chunks.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes.saturating_add(size);
+        batch.push(i);
+    }
+    if !batch.is_empty() {
+        chunks.push(batch);
+    }
+    chunks.retain(|c| c.len() >= 2);
+    if chunks.is_empty() && sizes.len() >= 2 {
+        chunks.push(vec![0, 1]);
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod forcemerge_chunks_tests {
+    use super::forcemerge_chunks;
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn segments_over_the_cap_still_converge_to_one() {
+        // The corpus200 case: two segments, each over half a 32 MiB cap.
+        assert_eq!(
+            forcemerge_chunks(&[16 * MIB, 27 * MIB], 16, 32 * MIB),
+            vec![vec![0, 1]]
+        );
+        // Three oversized segments: merge the two smallest this pass.
+        assert_eq!(
+            forcemerge_chunks(&[40 * MIB, 50 * MIB, 60 * MIB], 16, 32 * MIB),
+            vec![vec![0, 1]]
+        );
+    }
+
+    #[test]
+    fn cap_and_count_still_split_batches() {
+        let sizes = [MIB; 5];
+        assert_eq!(
+            forcemerge_chunks(&sizes, 2, 0),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+        assert_eq!(
+            forcemerge_chunks(&[10 * MIB, 10 * MIB, 10 * MIB, 10 * MIB], 16, 25 * MIB),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+    }
+
+    #[test]
+    fn one_segment_is_nothing_to_do() {
+        assert!(forcemerge_chunks(&[MIB], 16, 32 * MIB).is_empty());
+        assert!(forcemerge_chunks(&[], 16, 32 * MIB).is_empty());
+    }
+}
+
+/// Whether a merge runs the level-19 long-effort stored encode
+/// (`encode_stored_v2_forcemerge_at_level`).
+///
+/// An explicit `_forcemerge` always does: the operator asked for the
+/// smallest index. A background (tiered) merge does only when the
+/// operator opts in with `XERJ_MERGE_MAX_EFFORT=true|1|yes|on`. Since
+/// rc.78 every background merge ran it, which made the stored encode ~35x
+/// slower and held the breaker latched (429 to ingest) for the whole merge.
+pub(crate) fn merge_uses_long_effort_stored_encode(
+    explicit_forcemerge: bool,
+    opt_in: Option<&str>,
+) -> bool {
+    if explicit_forcemerge {
+        return true;
+    }
+    matches!(
+        opt_in.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[cfg(test)]
+mod merge_long_effort_tests {
+    use super::merge_uses_long_effort_stored_encode as uses;
+
+    #[test]
+    fn background_merge_uses_fast_encode_by_default() {
+        assert!(!uses(false, None));
+        assert!(!uses(false, Some("")));
+        assert!(!uses(false, Some("false")));
+        assert!(!uses(false, Some("0")));
+    }
+
+    #[test]
+    fn forcemerge_always_uses_long_effort_encode() {
+        assert!(uses(true, None));
+        assert!(uses(true, Some("false")));
+    }
+
+    #[test]
+    fn background_long_effort_is_opt_in() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(uses(false, Some(v)), "{v}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod collection_publication_fail_closed_tests {
     use super::*;
@@ -13620,24 +13742,10 @@ impl Index {
                 let sizes: Vec<u64> = segs.iter().map(|s| s.size_bytes).collect();
                 let ids: Vec<SegmentId> = segs.into_iter().map(|s| s.id.clone()).collect();
                 let chunk_len = (mc.max_merge_count as usize).max(2);
-                let mut chunks: Vec<Vec<SegmentId>> = Vec::new();
-                let mut batch: Vec<SegmentId> = Vec::new();
-                let mut batch_bytes = 0u64;
-                for (id, size) in ids.into_iter().zip(sizes) {
-                    if !batch.is_empty()
-                        && (batch.len() >= chunk_len || (cap > 0 && batch_bytes + size > cap))
-                    {
-                        chunks.push(std::mem::take(&mut batch));
-                        batch_bytes = 0;
-                    }
-                    batch_bytes = batch_bytes.saturating_add(size);
-                    batch.push(id);
-                }
-                if !batch.is_empty() {
-                    chunks.push(batch);
-                }
-                chunks.retain(|c| c.len() >= 2);
-                chunks
+                forcemerge_chunks(&sizes, chunk_len, cap)
+                    .into_iter()
+                    .map(|chunk| chunk.into_iter().map(|i| ids[i].clone()).collect())
+                    .collect()
             }
             Some(_) => Vec::new(),
             None => policy.select_merges(&segments_snapshot_init),
@@ -13858,6 +13966,15 @@ impl Index {
             // is precisely why raising the effort here is safe and raising it
             // on flush was not.
             let merge_zstd_level = self.compression_config.level.zstd_level();
+            // Ingest-regression fix: only an explicit `_forcemerge` (or the
+            // `XERJ_MERGE_MAX_EFFORT` opt-in) pays for the level-19 stored
+            // chooser. A background merge holds RSS at the breaker
+            // watermark for as long as it runs, so its encode speed is
+            // ingest throughput.
+            let long_effort_merge = merge_uses_long_effort_stored_encode(
+                force_max_segments.is_some(),
+                std::env::var("XERJ_MERGE_MAX_EFFORT").ok().as_deref(),
+            );
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
@@ -14450,11 +14567,19 @@ impl Index {
                     };
                     let stored_timer = std::time::Instant::now();
                     // The merge entry also runs the per-column long-effort
-                    // zstd chooser (#1038) — background-only by contract.
-                    let encoded = xerj_storage::stored_codec::encode_stored_v2_merge_at_level(
-                        &merged_json_buf,
-                        merge_zstd_level,
-                    );
+                    // zstd chooser (#1038) only on an explicit `_forcemerge`
+                    // or the opt-in; background merges use the plain level.
+                    let encoded = if long_effort_merge {
+                        xerj_storage::stored_codec::encode_stored_v2_forcemerge_at_level(
+                            &merged_json_buf,
+                            merge_zstd_level,
+                        )
+                    } else {
+                        xerj_storage::stored_codec::encode_stored_v2_merge_at_level(
+                            &merged_json_buf,
+                            merge_zstd_level,
+                        )
+                    };
                     // #948 attribution: the compressed output buffer is an
                     // exact owned length; it coexists with the drained buffer
                     // for one encode call.

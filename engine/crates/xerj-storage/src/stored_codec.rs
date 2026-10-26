@@ -70,7 +70,8 @@
 //! * form `0` — the payload is a zstd frame written at the encode-time level
 //!   (the only form ZBS2 segments can carry);
 //! * form `1` — `[0x01][level: u8][window_log: u8][zstd frame]`, written by
-//!   the merge-path effort chooser (see [`RAW_LONG_LEVEL`]): level 19 +
+//!   the merge-path effort chooser (see [`RAW_LONG_LEVEL`]): level 19 on an
+//!   explicit `_forcemerge` (background merges do not run it), plus
 //!   long-distance matching + an explicit window, which finds repeats tens
 //!   of MB apart that a default window cannot.  `level`/`window_log` are
 //!   informational — the zstd frame is self-describing.
@@ -269,6 +270,17 @@ impl ColCodec {
 /// column; the chooser keeps whichever candidate is smaller, so a column
 /// that level 3 already answers (e.g. short ids) is stored exactly as
 /// before.
+///
+/// Level 19 is reserved for an explicit `_forcemerge`
+/// ([`encode_stored_v2_forcemerge_at_level`]) or an operator opt-in.
+/// Background merges skip this candidate: zstd 19 encodes at ~2 MB/s per
+/// thread, and on a 1M-doc / 200 MB corpus at a 2 GiB cap the stored
+/// encode was 98% of every background merge (`XERJ_PROF merge-batch`:
+/// stored_us 94-107 s vs 2.4-3.3 s before this chooser existed, rc.77).
+/// While a merge runs its working set keeps RSS above the governor
+/// watermark, so the parent breaker answered 429 to ingest for the whole
+/// merge: bulk throughput fell from ~41k docs/s (rc.77) to ~5-14k docs/s
+/// (rc.78-rc.99).
 const RAW_LONG_LEVEL: i32 = 19;
 const RAW_LONG_WINDOW_LOG_MAX: u32 = 24;
 
@@ -294,23 +306,32 @@ pub fn encode_stored_v2(stored_docs_json: &[u8]) -> Vec<u8> {
 /// operator changes `compression.level` interleave with no migration and no
 /// format flag.
 pub fn encode_stored_v2_at_level(stored_docs_json: &[u8], level: i32) -> Vec<u8> {
-    encode_stored_v2_at_level_inner(stored_docs_json, level, false)
+    encode_stored_v2_at_level_inner(stored_docs_json, level, None)
 }
 
-/// Merge-path variant of [`encode_stored_v2_at_level`]: in addition to the
-/// operator's level, each JSON fallback column is also compressed at
-/// [`RAW_LONG_LEVEL`] with long-distance matching, and the smaller payload is
-/// kept (the same measured-chooser rule the `.dv` ZNV2 codec uses).  Merges
-/// are background work, so the extra encode pass is not on any
-/// back-pressure-critical path; flush never calls this.
+/// Background-merge entry. Encodes exactly like [`encode_stored_v2_at_level`]
+/// at the operator's level: **no** long-effort candidate. Background merges
+/// are on the back-pressure path — their working set holds RSS at the
+/// breaker watermark while they run, so their encode speed is ingest
+/// throughput (see [`RAW_LONG_LEVEL`]). Use
+/// [`encode_stored_v2_forcemerge_at_level`] for the max-effort encode.
 pub fn encode_stored_v2_merge_at_level(stored_docs_json: &[u8], level: i32) -> Vec<u8> {
-    encode_stored_v2_at_level_inner(stored_docs_json, level, true)
+    encode_stored_v2_at_level_inner(stored_docs_json, level, None)
+}
+
+/// Explicit-`_forcemerge` (or operator opt-in) variant: in addition to the
+/// operator's level, each JSON fallback column is also compressed at
+/// [`RAW_LONG_LEVEL`] (19) with long-distance matching, and the smaller
+/// payload is kept (the same measured-chooser rule the `.dv` ZNV2 codec
+/// uses). A force-merge is an operator request for the smallest index.
+pub fn encode_stored_v2_forcemerge_at_level(stored_docs_json: &[u8], level: i32) -> Vec<u8> {
+    encode_stored_v2_at_level_inner(stored_docs_json, level, Some(RAW_LONG_LEVEL))
 }
 
 fn encode_stored_v2_at_level_inner(
     stored_docs_json: &[u8],
     level: i32,
-    long_effort_chooser: bool,
+    long_effort_level: Option<i32>,
 ) -> Vec<u8> {
     // Parse the JSON array of documents.  Failure → v1 fallback.
     let docs: Vec<serde_json::Value> = match serde_json::from_slice(stored_docs_json) {
@@ -381,7 +402,7 @@ fn encode_stored_v2_at_level_inner(
             &columns,
             Some(stored_docs_json),
             level,
-            long_effort_chooser,
+            long_effort_level,
         ),
         present_nulls,
     )
@@ -545,7 +566,7 @@ fn encode_stored_v2_from_values_inner(
             &columns,
             stored_docs_json,
             STORED_ZSTD_LEVEL,
-            false,
+            None,
         ),
         present_nulls,
     )
@@ -559,15 +580,16 @@ fn encode_stored_v2_from_values_inner(
 /// fast path on large segments where the columnar form always wins and
 /// serialising a multi-MB JSON array per flush is measurable CPU).
 ///
-/// `long_effort_chooser` adds a second, higher-effort zstd candidate for
-/// each JSON fallback column (see [`RAW_LONG_LEVEL`]) — merge only.
+/// `long_effort_level` adds a second, higher-effort zstd candidate (LDM +
+/// explicit window) at that level for each JSON fallback column (see
+/// [`RAW_LONG_LEVEL`]) — force-merge only.
 fn encode_v2_columns(
     num_docs: usize,
     col_order: &[String],
     columns: &[Vec<&serde_json::Value>],
     stored_docs_json: Option<&[u8]>,
     level: i32,
-    long_effort_chooser: bool,
+    long_effort_level: Option<i32>,
 ) -> Vec<u8> {
     // THROWAWAY prof (XERJ_PROF): encode-phase breakdown.
     let prof = std::env::var_os("XERJ_PROF").is_some();
@@ -731,8 +753,8 @@ fn encode_v2_columns(
         let col_json = serde_json::to_vec(col).unwrap_or_default();
         let zstd_payload =
             zstd::encode_all(Cursor::new(&col_json), level).unwrap_or_else(|_| col_json.clone());
-        let (zstd_payload, zstd_form) = if long_effort_chooser {
-            try_long_effort_zstd(&col_json, zstd_payload)
+        let (zstd_payload, zstd_form) = if let Some(long_level) = long_effort_level {
+            try_long_effort_zstd_at(&col_json, zstd_payload, long_level)
         } else {
             (zstd_payload, 0u8)
         };
@@ -2713,10 +2735,16 @@ fn zigzag_varint_decode(cur: &mut Cursor<&[u8]>) -> Result<i64> {
 /// [`RAW_LONG_WINDOW_LOG_MAX`] and the input's own size (a window larger
 /// than the payload cannot match anything and only inflates the decode
 /// buffer).
+#[cfg(test)]
 fn compress_long_effort(input: &[u8]) -> Option<(Vec<u8>, u32)> {
+    compress_long_effort_at(input, RAW_LONG_LEVEL)
+}
+
+/// [`compress_long_effort`] at a caller-chosen zstd level.
+fn compress_long_effort_at(input: &[u8], long_level: i32) -> Option<(Vec<u8>, u32)> {
     let size_log = 64 - (input.len() as u64).saturating_sub(1).leading_zeros();
     let window_log = RAW_LONG_WINDOW_LOG_MAX.min(size_log);
-    let mut compressor = zstd::bulk::Compressor::new(RAW_LONG_LEVEL).ok()?;
+    let mut compressor = zstd::bulk::Compressor::new(long_level).ok()?;
     use zstd::zstd_safe::CParameter;
     compressor
         .set_parameter(CParameter::WindowLog(window_log))
@@ -2732,12 +2760,19 @@ fn compress_long_effort(input: &[u8]) -> Option<(Vec<u8>, u32)> {
 /// payload is smaller.  Form 1 carries the 3-byte `[1][level][window_log]`
 /// prefix; when the plain form wins, the caller's original payload is
 /// returned untouched so the segment can stay byte-identical ZBS2.
+#[cfg(test)]
 fn try_long_effort_zstd(col_json: &[u8], plain: Vec<u8>) -> (Vec<u8>, u8) {
-    match compress_long_effort(col_json) {
+    try_long_effort_zstd_at(col_json, plain, RAW_LONG_LEVEL)
+}
+
+/// [`try_long_effort_zstd`] at a caller-chosen level; the level byte of
+/// the form-1 prefix records it (informational — decode ignores it).
+fn try_long_effort_zstd_at(col_json: &[u8], plain: Vec<u8>, long_level: i32) -> (Vec<u8>, u8) {
+    match compress_long_effort_at(col_json, long_level) {
         Some((long, window_log)) if long.len() + 3 < plain.len() => {
             let mut payload = Vec::with_capacity(3 + long.len());
             payload.push(1u8);
-            payload.push(RAW_LONG_LEVEL as u8);
+            payload.push(long_level.clamp(0, u8::MAX as i32) as u8);
             payload.push(window_log as u8);
             payload.extend_from_slice(&long);
             (payload, 1u8)
@@ -5101,6 +5136,72 @@ mod tests {
         let (kept, form) = try_long_effort_zstd(&tiny, incumbent.clone());
         assert_eq!(form, 0);
         assert_eq!(kept, incumbent);
+    }
+
+    /// Ingest-regression fix: a background merge encodes at the operator's
+    /// level with no long-effort candidate (byte-identical to the plain
+    /// encode), an explicit force-merge runs the level-19 candidate (form-1
+    /// level byte 19 and a smaller section on LDM-friendly text), and both
+    /// decode to exactly the documents the flush encoding holds.
+    #[test]
+    fn background_merge_skips_long_effort_forcemerge_keeps_level_19() {
+        let corpus: Vec<u8> = "the quick brown fox jumps over the lazy dog. "
+            .repeat(5000)
+            .into_bytes();
+        let (fm, form) = try_long_effort_zstd_at(&corpus, corpus.clone(), RAW_LONG_LEVEL);
+        assert_eq!(form, 1);
+        assert_eq!(fm[1], RAW_LONG_LEVEL as u8);
+        assert_eq!(zstd::decode_all(&fm[3..]).unwrap(), corpus);
+
+        // A free-text column whose sentences repeat at long distance (what
+        // the LDM candidate exists for).
+        let pool: Vec<String> = (0..400u64)
+            .map(|i| {
+                format!(
+                    "sentence {i} about shard {} replica {} and segment merge {} with payload {}",
+                    i * 7919 % 1013,
+                    i * 104_729 % 997,
+                    i * 31 % 89,
+                    i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20
+                )
+            })
+            .collect();
+        // More distinct bodies than DICT_MAX_CARDINALITY, so `body` is a
+        // JSON fallback column rather than a dict.
+        let docs: Vec<serde_json::Value> = (0..(DICT_MAX_CARDINALITY as u64 + 2000))
+            .map(|i| {
+                let a = &pool[(i * 37 % 400) as usize];
+                let b = &pool[(i * 101 % 400) as usize];
+                let c = &pool[(i * 211 % 400) as usize];
+                json!({
+                    "_id": format!("doc-{i}"),
+                    "_seq_no": i,
+                    "_source": { "body": format!("{a} {b} {c} doc {i}"), "n": i }
+                })
+            })
+            .collect();
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let level = 6;
+        let plain = encode_stored_v2_at_level(&raw, level);
+        let background = encode_stored_v2_merge_at_level(&raw, level);
+        let forcemerge = encode_stored_v2_forcemerge_at_level(&raw, level);
+        assert_eq!(
+            background, plain,
+            "a background merge must not run the long-effort candidate"
+        );
+        assert!(
+            forcemerge.len() < background.len(),
+            "force-merge keeps the max-effort encode ({} vs {})",
+            forcemerge.len(),
+            background.len()
+        );
+        let want: serde_json::Value =
+            serde_json::from_slice(&decode_stored(&encode_stored_v2(&raw)).unwrap()).unwrap();
+        for (name, enc) in [("background", &background), ("forcemerge", &forcemerge)] {
+            let got: serde_json::Value =
+                serde_json::from_slice(&decode_stored(enc).unwrap()).unwrap();
+            assert_eq!(got, want, "{name} merge encode must round-trip");
+        }
     }
 
     /// A handcrafted form-1 `RAW_JSON` column (what the merge-path chooser
