@@ -718,6 +718,10 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   [#2137](https://github.com/xerj-org/xerj/pull/2137), Jarvis636431; the
   prefix half of #2080).
 
+- Read-only post-deployment agent-discovery verifier for final GET/HEAD Link
+  headers, documentation targets and optional public-skill digest checks.
+  CI exercises local HTTP fixtures rather than contacting production.
+
 ### Fixed
 
 - `xerj autoindex` updates a brain's `nodes_index` when this run's dataset
