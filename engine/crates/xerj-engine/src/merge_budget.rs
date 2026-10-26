@@ -125,9 +125,170 @@ pub fn throttle_merge_batches(
     start
 }
 
+/// Estimated peak working set of a merge batch whose inputs total
+/// `input_bytes`: the same `input * MERGE_WORKING_SET_NUMERATOR` that
+/// [`decide_merge_batch`] uses.
+pub fn merge_working_set_bytes(input_bytes: u64) -> u64 {
+    input_bytes.saturating_mul(MERGE_WORKING_SET_NUMERATOR)
+}
+
+/// Process-wide merge admission against the RSS watermark (#2427).
+///
+/// [`throttle_merge_batches`] plans one index's pass from an RSS snapshot
+/// and always lets that index's first batch start. With hundreds of indices
+/// (autoindex) every index started one, and none of them saw the others'
+/// working sets until they had allocated. This is checked under the
+/// governor's merge ledger at launch time instead:
+///
+/// * `watermark == 0` (breaker off) or `observed_rss == 0` (no probe):
+///   start.
+/// * No merge in flight anywhere in the process: start one, so merging can
+///   always make progress, unless the breaker is engaged and the merge is a
+///   background one. A `forced` merge (`_forcemerge`) is still allowed as
+///   the single in-flight merge while engaged; it is a deliberate operator
+///   request and it waits on its own.
+/// * Breaker engaged: defer. Background merges are the one memory consumer
+///   the node can postpone, so they wait for the drain.
+/// * Otherwise start only if `observed_rss + reserved + request` stays under
+///   the watermark.
+pub fn decide_merge_admission(
+    watermark: u64,
+    observed_rss: u64,
+    reserved: u64,
+    in_flight: u64,
+    breaker_engaged: bool,
+    request: u64,
+    forced: bool,
+) -> bool {
+    if watermark == 0 || observed_rss == 0 {
+        return true;
+    }
+    if in_flight == 0 {
+        return !breaker_engaged || forced;
+    }
+    if breaker_engaged {
+        return false;
+    }
+    observed_rss
+        .saturating_add(reserved)
+        .saturating_add(request)
+        < watermark
+}
+
+/// Whether an in-flight background merge batch must stop (#2427).
+///
+/// Admission checks a batch against `input * MERGE_WORKING_SET_NUMERATOR`
+/// before it starts. On the 1 GB gate corpus that estimate was several
+/// times too small: JSON-heavy segments compress 10–20×, and a merge holds
+/// the decoded survivors plus a parsed `Value` per document. One admitted
+/// batch took a 3,072 MB node to 8,122 MB in 18 s while the breaker was
+/// engaged and writes were already getting 429s. Nothing else could free
+/// that memory, because the merge was the thing allocating it.
+///
+/// A batch stops when the breaker is engaged and RSS has reached the full
+/// process limit (past the 95% watermark). A stopped batch commits nothing
+/// and keeps its inputs, like any aborted merge. `forced` (`_forcemerge`)
+/// batches are not stopped. `limit == 0` or `rss == 0` (unknown) never
+/// stops a batch.
+pub fn merge_must_yield(rss: u64, limit: u64, breaker_engaged: bool, forced: bool) -> bool {
+    !forced && breaker_engaged && limit > 0 && rss > 0 && rss >= limit
+}
+
+/// The adaptive batch input cap after a batch of `input_bytes` stopped
+/// under memory pressure (#2427). `current == 0` means no adaptive cap yet.
+/// The next batch may use at most half of what did not fit. Never below 1.
+pub fn pressure_cap_after_yield(current: u64, input_bytes: u64) -> u64 {
+    let halved = (input_bytes / 2).max(1);
+    if current == 0 {
+        halved
+    } else {
+        current.min(halved)
+    }
+}
+
+/// The adaptive batch input cap after a background batch of `input_bytes`
+/// completed (#2427). A batch that used at least half of the cap doubles
+/// it. Once the cap reaches [`HISTORICAL_BATCH_CAP_BYTES`] it is removed
+/// (`0`), and the static cap applies again.
+pub fn pressure_cap_after_success(current: u64, input_bytes: u64) -> u64 {
+    if current == 0 {
+        return 0;
+    }
+    if input_bytes.saturating_mul(2) < current {
+        return current;
+    }
+    let doubled = current.saturating_mul(2);
+    if doubled >= HISTORICAL_BATCH_CAP_BYTES {
+        0
+    } else {
+        doubled
+    }
+}
+
+/// The batch input cap to plan with: the static cap, narrowed by the
+/// adaptive pressure cap when one is set. A static cap of `0` (the
+/// `XERJ_MERGE_BATCH_MAX_INPUT_MB=0` opt-out) still takes a pressure cap.
+pub fn effective_batch_cap_bytes(static_cap: u64, pressure_cap: u64) -> u64 {
+    match (static_cap, pressure_cap) {
+        (s, 0) => s,
+        (0, p) => p,
+        (s, p) => s.min(p),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_merge_yields_only_when_engaged_at_the_limit() {
+        const MIB: u64 = 1024 * 1024;
+        let limit = 1024 * MIB;
+        assert!(merge_must_yield(1024 * MIB, limit, true, false));
+        assert!(merge_must_yield(1600 * MIB, limit, true, false));
+        // Watermark band (95%..100%) and below: keep going.
+        assert!(!merge_must_yield(1000 * MIB, limit, true, false));
+        // Not engaged: keep going (the sampler will engage first).
+        assert!(!merge_must_yield(1600 * MIB, limit, false, false));
+        // `_forcemerge` is never stopped.
+        assert!(!merge_must_yield(1600 * MIB, limit, true, true));
+        // Unknown limit or RSS.
+        assert!(!merge_must_yield(1600 * MIB, 0, true, false));
+        assert!(!merge_must_yield(0, limit, true, false));
+    }
+
+    #[test]
+    fn the_pressure_cap_halves_on_yield_and_recovers_on_success() {
+        const MIB: u64 = 1024 * 1024;
+        let cap = pressure_cap_after_yield(0, 66 * MIB);
+        assert_eq!(cap, 33 * MIB);
+        // A second, larger yield never widens it.
+        assert_eq!(pressure_cap_after_yield(cap, 200 * MIB), 33 * MIB);
+        let cap = pressure_cap_after_yield(cap, 30 * MIB);
+        assert_eq!(cap, 15 * MIB);
+        // A tiny batch's success does not widen it.
+        assert_eq!(pressure_cap_after_success(cap, MIB), cap);
+        // Batches that use the cap double it until it is removed.
+        let mut cap = cap;
+        let mut rounds = 0;
+        while cap != 0 {
+            cap = pressure_cap_after_success(cap, cap);
+            rounds += 1;
+            assert!(rounds < 16);
+        }
+        assert_eq!(pressure_cap_after_success(0, 512 * MIB), 0);
+        assert_eq!(pressure_cap_after_yield(0, 0), 1);
+    }
+
+    #[test]
+    fn the_pressure_cap_narrows_the_static_cap() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(effective_batch_cap_bytes(32 * MIB, 0), 32 * MIB);
+        assert_eq!(effective_batch_cap_bytes(32 * MIB, 8 * MIB), 8 * MIB);
+        assert_eq!(effective_batch_cap_bytes(32 * MIB, 64 * MIB), 32 * MIB);
+        assert_eq!(effective_batch_cap_bytes(0, 8 * MIB), 8 * MIB);
+        assert_eq!(effective_batch_cap_bytes(0, 0), 0);
+    }
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
@@ -201,5 +362,130 @@ mod tests {
     fn the_batch_cap_floors_at_thirty_two_mebibytes() {
         assert_eq!(merge_batch_input_cap_bytes(GIB), MIN_BATCH_CAP_BYTES);
         assert_eq!(merge_batch_input_cap_bytes(2 * GIB), MIN_BATCH_CAP_BYTES);
+    }
+
+    #[test]
+    fn merge_admission_is_open_when_the_breaker_is_off_or_rss_is_unknown() {
+        assert!(decide_merge_admission(
+            0,
+            10_000 * MIB,
+            0,
+            5,
+            true,
+            4_000 * MIB,
+            false
+        ));
+        assert!(decide_merge_admission(
+            2_850 * MIB,
+            0,
+            0,
+            5,
+            true,
+            4_000 * MIB,
+            false
+        ));
+    }
+
+    #[test]
+    fn merge_admission_always_lets_one_merge_run_when_not_engaged() {
+        // Even an estimate that alone exceeds the watermark starts when no
+        // other merge is in flight: merging must make progress.
+        assert!(decide_merge_admission(
+            2_850 * MIB,
+            2_700 * MIB,
+            0,
+            0,
+            false,
+            400 * MIB,
+            false
+        ));
+    }
+
+    #[test]
+    fn merge_admission_counts_other_in_flight_reservations() {
+        let wm = 2_850 * MIB;
+        // One 47 MiB batch (376 MiB working set) already reserved.
+        let reserved = merge_working_set_bytes(47 * MIB);
+        assert!(decide_merge_admission(
+            wm,
+            2_000 * MIB,
+            reserved,
+            1,
+            false,
+            reserved,
+            false
+        ));
+        // At 2,200 MiB RSS a second one would cross the watermark.
+        assert!(!decide_merge_admission(
+            wm,
+            2_200 * MIB,
+            reserved,
+            1,
+            false,
+            reserved,
+            false
+        ));
+        // And a third does not fit at all once two are reserved.
+        assert!(!decide_merge_admission(
+            wm,
+            2_000 * MIB,
+            2 * reserved,
+            2,
+            false,
+            reserved,
+            false
+        ));
+    }
+
+    #[test]
+    fn merge_admission_defers_background_merges_while_engaged() {
+        let wm = 2_850 * MIB;
+        // Engaged: no background merge starts, not even the first.
+        assert!(!decide_merge_admission(
+            wm,
+            2_900 * MIB,
+            0,
+            0,
+            true,
+            8 * MIB,
+            false
+        ));
+        assert!(!decide_merge_admission(
+            wm,
+            1_000 * MIB,
+            0,
+            1,
+            true,
+            8 * MIB,
+            false
+        ));
+        // A forced merge may run alone while engaged, but not beside another.
+        assert!(decide_merge_admission(
+            wm,
+            2_900 * MIB,
+            0,
+            0,
+            true,
+            8 * MIB,
+            true
+        ));
+        assert!(!decide_merge_admission(
+            wm,
+            2_900 * MIB,
+            64 * MIB,
+            1,
+            true,
+            8 * MIB,
+            true
+        ));
+    }
+
+    #[test]
+    fn merge_working_set_matches_the_batch_decision() {
+        assert_eq!(
+            merge_working_set_bytes(10),
+            10 * MERGE_WORKING_SET_NUMERATOR
+        );
+        assert_eq!(merge_working_set_bytes(u64::MAX), u64::MAX);
     }
 }
