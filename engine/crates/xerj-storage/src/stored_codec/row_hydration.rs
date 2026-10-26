@@ -175,7 +175,7 @@ fn select_json_rows<R: std::io::Read>(
     checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
 ) -> Result<std::result::Result<Vec<serde_json::Value>, ()>> {
     let cancelled = Cell::new(false);
-    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let mut deserializer = serde_json::Deserializer::from_reader(buffered_json_stream(reader));
     let values = match deserializer.deserialize_seq(SelectedRowsVisitor {
         selected,
         expected_rows,
@@ -871,6 +871,50 @@ mod tests {
                 ("body", body_codec, body_payload),
             ],
         )
+    }
+
+    /// #2422: `select_json_rows` reads its column through a buffer.
+    /// `serde_json`'s reader pulls one byte per `read`, and over zstd's
+    /// streaming decoder every `read` was a `ZSTD_decompressStream` call, so
+    /// one selected row of a large column cost one zstd call per byte.
+    #[test]
+    fn selected_rows_read_the_column_in_large_chunks_not_byte_by_byte() {
+        struct CountingReader<'a> {
+            inner: &'a [u8],
+            reads: &'a Cell<usize>,
+        }
+        impl std::io::Read for CountingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.read(buf)
+            }
+        }
+        let rows: Vec<_> = (0..4096)
+            .map(|i| json!({"row": i, "text": "x".repeat(200)}))
+            .collect();
+        let column = serde_json::to_vec(&rows).unwrap();
+        let reads = Cell::new(0);
+        let selected = select_json_rows(
+            CountingReader {
+                inner: &column,
+                reads: &reads,
+            },
+            &[7, 4000],
+            rows.len(),
+            "test json",
+            0,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected, vec![rows[7].clone(), rows[4000].clone()]);
+        let chunk_reads = column.len().div_ceil(JSON_STREAM_READ_BUFFER) + 2;
+        assert!(
+            reads.get() <= chunk_reads,
+            "{} reads for a {} byte column; a byte-at-a-time parse makes one per byte",
+            reads.get(),
+            column.len()
+        );
     }
 
     #[test]

@@ -130,6 +130,19 @@ where
     .is_break()
 }
 
+/// Read buffer for the streaming JSON column parsers (#2422).
+pub(crate) const JSON_STREAM_READ_BUFFER: usize = 64 * 1024;
+
+/// Buffer a reader before `serde_json::Deserializer::from_reader`, which
+/// pulls ONE byte per `read` call. Over zstd's streaming `Decoder` that was
+/// one `ZSTD_decompressStream` call per byte of column JSON: hydrating one
+/// row of a 20k-row, 87 MB stored section took ~1.3 s, five times the full
+/// decode it exists to avoid. Buffering keeps the bounded memory of
+/// streaming (one 64 KiB buffer) and drops that cost to the parse itself.
+pub(crate) fn buffered_json_stream<R: std::io::Read>(reader: R) -> std::io::BufReader<R> {
+    std::io::BufReader::with_capacity(JSON_STREAM_READ_BUFFER, reader)
+}
+
 // ── V1: flat LZ4 over JSON (legacy) ───────────────────────────────────────
 
 /// Magic prefix for LZ4-compressed stored sections (v1, pre-columnar).
@@ -1103,6 +1116,40 @@ fn zstd_frame_content_size(payload: &[u8], context: &str) -> Result<Option<u64>>
         .map_err(|_| StorageError::Other(anyhow::anyhow!("{context} zstd frame header is invalid")))
 }
 
+/// Largest output `zstd_decode_presized` reserves up front from a frame
+/// header. A header is untrusted input; above this the decode falls back to
+/// growing the buffer as data actually arrives.
+const ZSTD_PRESIZE_CAP: u64 = 1 << 30;
+
+/// Decode a zstd column payload into a buffer sized from the frame header
+/// (#2422). `zstd::decode_all` has no size hint, so a 50 MB embedding column
+/// grew its buffer by repeated reallocation and copying (13.75% of a cold
+/// search's CPU was `rallocx`). Payloads that are not exactly one frame with
+/// a declared size, or that declare more than `ZSTD_PRESIZE_CAP`, keep the
+/// `decode_all` path, as does any frame the one-shot decode rejects, so the
+/// output and the errors are those of `decode_all`.
+fn zstd_decode_presized(frame: &[u8]) -> std::io::Result<Vec<u8>> {
+    let single_frame =
+        zstd::zstd_safe::find_frame_compressed_size(frame).is_ok_and(|size| size == frame.len());
+    let declared = zstd::zstd_safe::get_frame_content_size(frame)
+        .ok()
+        .flatten();
+    if let (true, Some(size)) = (single_frame, declared) {
+        if size <= ZSTD_PRESIZE_CAP {
+            let mut out = Vec::new();
+            if out.try_reserve_exact(size as usize).is_ok() {
+                let decoded = zstd::bulk::Decompressor::new().and_then(|mut decompressor| {
+                    decompressor.decompress_to_buffer(frame, &mut out)
+                });
+                if decoded.is_ok() && out.len() as u64 == size {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    zstd::decode_all(frame)
+}
+
 fn decode_zstd_exact(payload: &[u8], expected: usize, context: &str) -> Result<Vec<u8>> {
     if zstd_frame_content_size(payload, context)?.is_some_and(|size| size != expected as u64) {
         return Err(StorageError::Other(anyhow::anyhow!(
@@ -1679,7 +1726,7 @@ fn parse_typed_vector_reader<R: std::io::Read>(
 ) -> Result<std::result::Result<Option<StoredVectorRows>, ()>> {
     use serde::de::Deserializer as _;
     let cancelled = std::cell::Cell::new(false);
-    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let mut deserializer = serde_json::Deserializer::from_reader(buffered_json_stream(reader));
     let value = match deserializer.deserialize_seq(TypedVectorRowsVisitor {
         expected_rows: num_docs,
         column_index,
@@ -1821,7 +1868,7 @@ fn parse_typed_chunk_reader<R: std::io::Read>(
         }
     }
     let cancelled = std::cell::Cell::new(false);
-    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let mut deserializer = serde_json::Deserializer::from_reader(buffered_json_stream(reader));
     let value = match deserializer.deserialize_seq(Visitor {
         rows: num_docs,
         column: column_index,
@@ -2007,11 +2054,9 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
         .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 num_cols: {e}")))?
         as usize;
 
-    // First pass: decode each column into Vec<Value>.  Store the name
-    // alongside so we can re-assemble the docs.
-    let mut col_names: Vec<String> = Vec::with_capacity(num_cols);
-    let mut col_data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(num_cols);
-
+    // First pass: walk the column directory, then decode each column into
+    // Vec<Value>.  Store the name alongside so we can re-assemble the docs.
+    let mut entries: Vec<(String, ColCodec, &[u8])> = Vec::with_capacity(num_cols.min(4096));
     for _ in 0..num_cols {
         let name_len = cur
             .read_u16::<LittleEndian>()
@@ -2041,50 +2086,63 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
         }
         let payload = &body[pos..pos + payload_len];
         cur.set_position((pos + payload_len) as u64);
+        entries.push((name, codec, payload));
+    }
 
-        let values = match codec {
-            ColCodec::RawJson => decode_raw_json(payload)?,
-            ColCodec::Lz4Json => decode_lz4_json(payload)?,
-            ColCodec::Constant => decode_constant(payload, num_docs)?,
-            ColCodec::DictBitpack => decode_dict_bitpack(payload, num_docs)?,
-            ColCodec::TypedInt => decode_typed_int(payload, num_docs)?,
-            // CROSS_DEP and COPY_OF both require their source column to be
-            // materialised first.  We emit a placeholder here and revisit
-            // both in the deferred fixpoint below — COPY_OF is written with
-            // an earlier pass-1 source by construction, but decode treats a
-            // crafted segment's references the same way instead of trusting
-            // that.
-            ColCodec::CopyOf | ColCodec::CrossDep => {
-                let (key, value) = match codec {
-                    ColCodec::CopyOf => (
-                        "__deferred_copy_of__",
-                        serde_json::Value::Number((copy_of_source_index(payload)? as u64).into()),
-                    ),
-                    _ => (
-                        "__deferred_cross_dep__",
-                        serde_json::Value::Array(
-                            payload
-                                .iter()
-                                .map(|b| serde_json::Value::Number((*b).into()))
-                                .collect(),
-                        ),
-                    ),
-                };
-                col_names.push(name);
-                col_data.push(Vec::new());
-                col_data
-                    .last_mut()
-                    .unwrap()
-                    .push(serde_json::Value::Object({
+    // #2422: the columns are independent zstd/JSON streams, so decode them
+    // in parallel. One embedding column (`*_vector_chunks`) is ~30% of a
+    // 100 MB autoindex section's decode; serially every other column queued
+    // behind it on the first (cold) search of a segment. Errors surface in
+    // column order, as the serial loop reported them.
+    let decoded: Vec<Result<Vec<serde_json::Value>>> = {
+        use rayon::prelude::*;
+        entries
+            .par_iter()
+            .map(|(_, codec, payload)| {
+                let payload = *payload;
+                Ok(match codec {
+                    ColCodec::RawJson => decode_raw_json(payload)?,
+                    ColCodec::Lz4Json => decode_lz4_json(payload)?,
+                    ColCodec::Constant => decode_constant(payload, num_docs)?,
+                    ColCodec::DictBitpack => decode_dict_bitpack(payload, num_docs)?,
+                    ColCodec::TypedInt => decode_typed_int(payload, num_docs)?,
+                    // CROSS_DEP and COPY_OF both require their source column
+                    // to be materialised first.  We emit a placeholder here
+                    // and revisit both in the deferred fixpoint below —
+                    // COPY_OF is written with an earlier pass-1 source by
+                    // construction, but decode treats a crafted segment's
+                    // references the same way instead of trusting that.
+                    ColCodec::CopyOf | ColCodec::CrossDep => {
+                        let (key, value) = match codec {
+                            ColCodec::CopyOf => (
+                                "__deferred_copy_of__",
+                                serde_json::Value::Number(
+                                    (copy_of_source_index(payload)? as u64).into(),
+                                ),
+                            ),
+                            _ => (
+                                "__deferred_cross_dep__",
+                                serde_json::Value::Array(
+                                    payload
+                                        .iter()
+                                        .map(|b| serde_json::Value::Number((*b).into()))
+                                        .collect(),
+                                ),
+                            ),
+                        };
                         let mut m = serde_json::Map::new();
                         m.insert(key.into(), value);
-                        m
-                    }));
-                continue;
-            }
-        };
+                        vec![serde_json::Value::Object(m)]
+                    }
+                })
+            })
+            .collect()
+    };
+    let mut col_names: Vec<String> = Vec::with_capacity(entries.len());
+    let mut col_data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(entries.len());
+    for ((name, _, _), values) in entries.into_iter().zip(decoded) {
         col_names.push(name);
-        col_data.push(values);
+        col_data.push(values?);
     }
 
     // Second pass: resolve deferred CROSS_DEP columns now that the pass-1
@@ -2199,45 +2257,95 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
             ))
         })?;
     out.push(b'[');
-    for d in 0..num_docs {
-        if d > 0 {
-            out.push(b',');
+    // #2422: rows are independent, so serialise them in parallel row chunks
+    // and append the chunks in order — byte-identical to the serial loop.
+    // Each cell is moved out of `col_data` (it is used exactly once) instead
+    // of cloned: the clone of every embedding array was half the reassembly
+    // cost, and moving lets each row's memory go as soon as it is written.
+    // Chunks are produced in bounded waves so the transient buffers stay a
+    // small fraction of the output rather than a second full copy (#950).
+    const ROWS_PER_CHUNK: usize = 256;
+    let n_chunks = num_docs.div_ceil(ROWS_PER_CHUNK);
+    let mut per_chunk: Vec<Vec<&mut [serde_json::Value]>> = (0..n_chunks)
+        .map(|_| Vec::with_capacity(col_data.len()))
+        .collect();
+    for column in col_data.iter_mut() {
+        let mut rest: &mut [serde_json::Value] = column.as_mut_slice();
+        for chunk_cols in per_chunk.iter_mut() {
+            let take = ROWS_PER_CHUNK.min(rest.len());
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
+            chunk_cols.push(head);
+            rest = tail;
         }
-        let mut source_map = serde_json::Map::new();
-        for (cix, name) in col_names.iter().enumerate() {
-            if cix == id_col_ix || cix == seq_col_ix {
-                continue;
-            }
-            let v = col_data[cix]
-                .get(d)
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            if !v.is_null() {
-                source_map.insert(name.clone(), v);
-            } else if present_null_set.contains(&(d as u32, cix as u32)) {
-                // Present explicit null (#415): re-insert in column order, as
-                // opposed to an absent field, which stays dropped.
-                source_map.insert(name.clone(), serde_json::Value::Null);
+    }
+    let wave = rayon::current_num_threads().max(1) * 2;
+    let mut chunks = per_chunk.into_iter().enumerate();
+    let mut done_chunks = 0usize;
+    loop {
+        let batch: Vec<(usize, Vec<&mut [serde_json::Value]>)> =
+            chunks.by_ref().take(wave).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let bufs: Vec<Result<Vec<u8>>> = {
+            use rayon::prelude::*;
+            batch
+                .into_par_iter()
+                .map(|(chunk_ix, mut cols)| {
+                    let start = chunk_ix * ROWS_PER_CHUNK;
+                    let end = (start + ROWS_PER_CHUNK).min(num_docs);
+                    let mut buf = Vec::new();
+                    for d in start..end {
+                        let local = d - start;
+                        let mut cell = |cix: usize| {
+                            cols[cix]
+                                .get_mut(local)
+                                .map(std::mem::take)
+                                .unwrap_or(serde_json::Value::Null)
+                        };
+                        if d > 0 {
+                            buf.push(b',');
+                        }
+                        let mut source_map = serde_json::Map::new();
+                        for (cix, name) in col_names.iter().enumerate() {
+                            if cix == id_col_ix || cix == seq_col_ix {
+                                continue;
+                            }
+                            let v = cell(cix);
+                            if !v.is_null() {
+                                source_map.insert(name.clone(), v);
+                            } else if present_null_set.contains(&(d as u32, cix as u32)) {
+                                // Present explicit null (#415): re-insert in
+                                // column order, as opposed to an absent
+                                // field, which stays dropped.
+                                source_map.insert(name.clone(), serde_json::Value::Null);
+                            }
+                        }
+                        let mut doc = serde_json::Map::new();
+                        doc.insert("_id".into(), cell(id_col_ix));
+                        doc.insert("_seq_no".into(), cell(seq_col_ix));
+                        doc.insert("_source".into(), serde_json::Value::Object(source_map));
+                        serde_json::to_writer(&mut buf, &serde_json::Value::Object(doc)).map_err(
+                            |e| StorageError::Other(anyhow::anyhow!("v2 reassemble: {e}")),
+                        )?;
+                    }
+                    Ok(buf)
+                })
+                .collect()
+        };
+        for buf in bufs {
+            out.extend_from_slice(&buf?);
+        }
+        // After the first wave, size the output from the bytes actually
+        // produced so far instead of doubling (and copying) up to ~100 MB.
+        if done_chunks == 0 && n_chunks > wave {
+            let estimate = out.len() / wave.min(n_chunks) * n_chunks;
+            let estimate = estimate + estimate / 16;
+            if estimate > out.capacity() {
+                let _ = out.try_reserve_exact(estimate - out.len());
             }
         }
-        let mut doc = serde_json::Map::new();
-        doc.insert(
-            "_id".into(),
-            col_data[id_col_ix]
-                .get(d)
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
-        doc.insert(
-            "_seq_no".into(),
-            col_data[seq_col_ix]
-                .get(d)
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
-        doc.insert("_source".into(), serde_json::Value::Object(source_map));
-        serde_json::to_writer(&mut out, &serde_json::Value::Object(doc))
-            .map_err(|e| StorageError::Other(anyhow::anyhow!("v2 reassemble: {e}")))?;
+        done_chunks += wave;
     }
     out.push(b']');
     Ok(out)
@@ -2845,7 +2953,7 @@ fn decode_dict_bitpack(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json
             "dict bitpack truncated"
         )));
     }
-    let dict_json = zstd::decode_all(&payload[pos..pos + dict_zstd_len])
+    let dict_json = zstd_decode_presized(&payload[pos..pos + dict_zstd_len])
         .map_err(|e| StorageError::Other(anyhow::anyhow!("dict zstd decode: {e}")))?;
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&dict_json)
         .map_err(|e| StorageError::Other(anyhow::anyhow!("dict json decode: {e}")))?;
@@ -3114,7 +3222,7 @@ fn decode_cross_dep(
 
 fn decode_raw_json(payload: &[u8]) -> Result<Vec<serde_json::Value>> {
     let frame = decode_raw_payload(payload)?;
-    let raw = zstd::decode_all(frame)
+    let raw = zstd_decode_presized(frame)
         .map_err(|e| StorageError::Other(anyhow::anyhow!("raw zstd decode: {e}")))?;
     serde_json::from_slice(&raw)
         .map_err(|e| StorageError::Other(anyhow::anyhow!("raw json decode: {e}")))
@@ -5246,5 +5354,78 @@ mod tests {
             .unwrap();
         let actual = decode_stored(&encoded).unwrap().len() as u64;
         assert!(bound >= actual, "bound {bound} < actual {actual}");
+    }
+
+    /// #2422: the columnar decode runs its columns and its row chunks in
+    /// parallel. The result must stay byte-identical to the input across
+    /// several row chunks and waves, with present nulls (#415), absent
+    /// fields, embedding arrays and strings that need escaping.
+    #[test]
+    fn v2_parallel_decode_is_byte_identical_across_row_chunks() {
+        let mut docs: Vec<serde_json::Value> = Vec::new();
+        for i in 0..9000u64 {
+            let mut source = serde_json::Map::new();
+            source.insert("a".into(), json!(["x", "y", "z"][(i % 3) as usize]));
+            // Doc 0 carries every field, so the decoder's first-seen column
+            // order matches each document's key order.
+            if i % 7 == 3 {
+                source.insert("b".into(), serde_json::Value::Null);
+            } else if i % 5 != 4 {
+                source.insert("b".into(), json!(i * 3));
+            }
+            if i % 11 != 10 {
+                source.insert("c".into(), json!(format!("line \"{i}\"\n\ttab")));
+            }
+            source.insert(
+                "vec".into(),
+                // Eighths are exact in f32, which the stored vector path keeps.
+                json!((0..8).map(|k| (i * 8 + k) as f64 / 8.0).collect::<Vec<_>>()),
+            );
+            docs.push(json!({ "_id": i.to_string(), "_seq_no": i, "_source": source }));
+        }
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let encoded = encode_stored_v2(&raw);
+        assert!(
+            is_columnar_stored_magic(&encoded) || &encoded[..4] == STORED_V3_MAGIC,
+            "fixture must take the columnar codec"
+        );
+        let decoded = decode_stored(&encoded).unwrap();
+        assert!(decoded == raw, "parallel columnar decode changed the bytes");
+    }
+
+    /// #2422: `zstd_decode_presized` must return exactly what
+    /// `zstd::decode_all` does, including for frames without a declared
+    /// size and for concatenated frames, which keep the `decode_all` path.
+    #[test]
+    fn presized_zstd_decode_matches_decode_all() {
+        let data: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i % 251).to_le_bytes())
+            .collect();
+        let sized = zstd::bulk::compress(&data, 3).unwrap();
+        assert!(zstd::zstd_safe::get_frame_content_size(&sized)
+            .unwrap()
+            .is_some());
+        let mut unsized_frame = Vec::new();
+        {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut unsized_frame, 3).unwrap();
+            encoder.include_contentsize(false).unwrap();
+            std::io::Write::write_all(&mut encoder, &data).unwrap();
+            encoder.finish().unwrap();
+        }
+        assert!(zstd::zstd_safe::get_frame_content_size(&unsized_frame)
+            .unwrap()
+            .is_none());
+        let mut concatenated = sized.clone();
+        concatenated.extend_from_slice(&sized);
+        for frame in [&sized, &unsized_frame, &concatenated] {
+            assert_eq!(
+                zstd_decode_presized(frame).unwrap(),
+                zstd::decode_all(frame.as_slice()).unwrap()
+            );
+        }
+        let mut corrupt = sized.clone();
+        let mid = corrupt.len() / 2;
+        corrupt.truncate(mid);
+        assert!(zstd_decode_presized(&corrupt).is_err());
     }
 }
