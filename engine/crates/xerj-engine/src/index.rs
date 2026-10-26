@@ -55328,6 +55328,42 @@ fn multi_match_field_is_mapped(
     false
 }
 
+/// Is `q` a single-field term-level or phrase leaf whose field is UNMAPPED
+/// in this index (no schema field anywhere on its dotted prefix chain, by
+/// the same rule as [`multi_match_field_is_mapped`])?
+///
+/// Such a leaf matches no document, so the FTS projection may skip it as a
+/// `should` child. Declines (returns `false`) when the index has no schema
+/// fields at all — an unmapped index keeps the stored-doc scan, as before —
+/// and for every other node shape, including `range` / `exists`, whose
+/// unmapped semantics this does not need to change.
+fn should_leaf_targets_unmapped_field(
+    q: &QueryNode,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+) -> bool {
+    if text_fields.is_empty() && exact_fields.is_empty() {
+        return false;
+    }
+    let field = match q {
+        QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::MatchPhrasePrefix { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Fuzzy { field, .. }
+        | QueryNode::Regexp { field, .. } => field.as_str(),
+        _ => return false,
+    };
+    // Metadata fields (`_id`, `_index`, …) are never schema fields but are
+    // always "mapped"; leave them on their existing path.
+    if field.starts_with('_') {
+        return false;
+    }
+    !multi_match_field_is_mapped(field, text_fields, exact_fields)
+}
+
 /// Collect every field name referenced by an FTS query tree.
 ///
 /// Used to (a) extend the set of side-car fields `FtsIndexReader::open`
@@ -56266,6 +56302,21 @@ fn query_node_to_fts_projected(
                 }
             }
             for sub in should {
+                // A term-level / phrase leaf on a field this index does not
+                // map at all matches NO document (ES rewrites it to
+                // `MatchNoDocsQuery`), so as a `should` child it can neither
+                // add a hit nor change a score — skip it instead of letting
+                // its `None` abort the whole projection. Without this, the
+                // CLI's code-shaped body (`term` on `name`, `match_phrase` on
+                // `defs`) sent across a mixed code+docs prefix pushed every
+                // docs index onto the full stored-doc scan (`needs_fts=false`,
+                // every row decoded): 13 s on 93k docs, the 30 s search
+                // deadline on larger ones. `minimum_should_match` was already
+                // resolved above against the ORIGINAL clause count, which is
+                // what ES does too (the no-docs clause still counts).
+                if should_leaf_targets_unmapped_field(sub, text_fields, exact_fields) {
+                    continue;
+                }
                 // A `should` clause that can't be projected to FTS (e.g.
                 // MatchPhrase over indexed phrases) must NOT be silently
                 // dropped — dropping it makes the bool LESS permissive and
@@ -60072,6 +60123,122 @@ mod fts_projection_tests {
             &kw(&["status"]),
         )
         .is_none());
+    }
+
+    /// A `should` `term` / `match_phrase` on a field this index does not map
+    /// matches nothing, so it must not abort the projection (which sent the
+    /// CLI's code-shaped body onto the full stored-doc scan of every docs
+    /// index). The projection equals the same bool without those clauses.
+    #[test]
+    fn bool_should_unmapped_term_and_phrase_are_skipped() {
+        let text_fields = vec!["body".to_string()];
+        let exact = kw(&["title"]);
+        let mapped = QueryNode::Match {
+            field: "body".into(),
+            query: "span context".into(),
+            operator: xerj_query::ast::BoolOperator::Or,
+            boost: None,
+            analyzer: None,
+            minimum_should_match: None,
+            lenient: false,
+        };
+        let ghost_term = QueryNode::Term {
+            field: "name".into(),
+            value: serde_json::json!("span context"),
+            boost: Some(10.0),
+        };
+        let ghost_phrase = QueryNode::MatchPhrase {
+            field: "defs".into(),
+            query: "span context".into(),
+            slop: 0,
+            analyzer: None,
+            boost: Some(8.0),
+            lenient: false,
+        };
+        let bool_of = |should: Vec<QueryNode>| QueryNode::Bool {
+            must: vec![],
+            should,
+            filter: vec![],
+            must_not: vec![],
+            minimum_should_match: None,
+        };
+        let with_ghosts = query_node_to_fts(
+            &bool_of(vec![
+                mapped.clone(),
+                ghost_term.clone(),
+                ghost_phrase.clone(),
+            ]),
+            &text_fields,
+            &exact,
+        )
+        .expect("unmapped should leaves must not abort the projection");
+        let control = query_node_to_fts(&bool_of(vec![mapped.clone()]), &text_fields, &exact)
+            .expect("control projects");
+        assert_eq!(format!("{with_ghosts:?}"), format!("{control:?}"));
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&with_ghosts, &mut fields);
+        assert_eq!(fields, vec!["body".to_string()]);
+
+        // Only unmapped leaves: nothing positive projects, so the projection
+        // still declines (stored scan answers, as before).
+        assert!(query_node_to_fts(
+            &bool_of(vec![ghost_term, ghost_phrase]),
+            &text_fields,
+            &exact
+        )
+        .is_none());
+    }
+
+    /// The skip is for UNMAPPED fields only: a `should` `term` on a mapped
+    /// TEXT field (not projectable as a term) still declines the projection,
+    /// a dotted sub-field of a mapped parent is still treated as mapped, and
+    /// a schema-less index never skips anything.
+    #[test]
+    fn bool_should_skip_is_limited_to_unmapped_fields() {
+        let text_fields = vec!["body".to_string(), "path".to_string()];
+        let exact = kw(&[]);
+        let mapped = QueryNode::Match {
+            field: "body".into(),
+            query: "span".into(),
+            operator: xerj_query::ast::BoolOperator::Or,
+            boost: None,
+            analyzer: None,
+            minimum_should_match: None,
+            lenient: false,
+        };
+        let term_on = |f: &str| QueryNode::Term {
+            field: f.into(),
+            value: serde_json::json!("x"),
+            boost: None,
+        };
+        let bool_of = |should: Vec<QueryNode>| QueryNode::Bool {
+            must: vec![],
+            should,
+            filter: vec![],
+            must_not: vec![],
+            minimum_should_match: None,
+        };
+        for f in ["body", "path.keyword", "_id"] {
+            assert!(
+                query_node_to_fts(
+                    &bool_of(vec![mapped.clone(), term_on(f)]),
+                    &text_fields,
+                    &exact
+                )
+                .is_none(),
+                "term on {f} must keep the stored-scan route"
+            );
+        }
+        assert!(!should_leaf_targets_unmapped_field(
+            &term_on("ghost"),
+            &[],
+            &kw(&[])
+        ));
+        assert!(should_leaf_targets_unmapped_field(
+            &term_on("ghost"),
+            &text_fields,
+            &exact
+        ));
     }
 
     /// Dotted sub-paths under a mapped parent (`title.keyword`, `user.name`)
