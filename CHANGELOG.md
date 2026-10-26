@@ -87,6 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indexing worker now retries with a short backoff when thread creation is
   refused, and the replay finishes on the calling thread if no worker can be
   started, so a refusal is no longer fatal (#2428).
+- `_bulk` now checks the memory limiter before it parses the request, not
+  only when each index's batch is written. A bulk that arrived while the memory
+  or memtable breaker was engaged still split and copied its whole body first.
+  Several concurrent bulks between two RSS samples were each admitted on the
+  same old sample, which could carry the node past its memory cap. Each
+  request now counts its body against live RSS plus every other in-flight
+  reservation until its parse ends, and is answered with one HTTP 429 per action (top-level 429,
+  `Retry-After: 1`) when that would reach the watermark or a breaker is
+  engaged, so clients back off and re-offer every record (part of #2427).
 - `xerj autoindex` no longer runs out of memory while planning a large folder.
   It used to keep the sampled values of every file in memory at once before
   grouping them into datasets, and kept them all until the end of the run;

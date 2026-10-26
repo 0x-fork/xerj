@@ -387,6 +387,26 @@ impl ResourceGovernor {
         Err(self.analyze_reservation_refused(bytes))
     }
 
+    /// Admit one `_bulk` request before its body is split and parsed (#2427).
+    ///
+    /// Every write path checks the breaker, but only after the bulk parse
+    /// has already built its per-action line, pair and document-copy vectors.
+    /// A request that arrives while a breaker is latched still did all of that
+    /// work, and concurrent bulks between two sampler ticks were admitted
+    /// on a sample that predates each other's parse buffers. This refuses the
+    /// request with the same 429 when either latch is engaged, and otherwise
+    /// reserves `body_bytes` against live RSS plus every other in-flight
+    /// reservation, so parse buffers are counted before they are allocated.
+    /// The caller drops the reservation when the parse ends; the per-index
+    /// write path then takes its own analyze reservation for the tokens.
+    pub(crate) fn admit_bulk_parse(
+        &self,
+        body_bytes: u64,
+    ) -> Result<AnalyzeReservation, XerjError> {
+        self.check_ingest_admission()?;
+        self.reserve_analyze(body_bytes)
+    }
+
     fn observed_process_memory(&self) -> u64 {
         self.rss_bytes
             .load(Ordering::Relaxed)
@@ -2053,6 +2073,62 @@ mod tests {
     /// The guard is a thin wrapper around [`analyze_reservation_fits`]. The
     /// watermark sits above a live probe so the test does not depend on this
     /// process's RSS, and a second reserve sees the first until it is dropped.
+    /// #2427: a bulk that arrives while a breaker is latched is refused
+    /// before its parse, and reserves nothing.
+    #[test]
+    fn bulk_parse_admission_refuses_while_a_breaker_is_latched() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        let governor = build(&cfg);
+        let live = governor.observed_process_memory();
+        governor
+            .memory_watermark_bytes
+            .store(live.saturating_add(512 * 1024 * 1024), Ordering::Relaxed);
+        governor.rss_bytes.store(live, Ordering::Relaxed);
+
+        governor.memory_tripped.store(true, Ordering::Relaxed);
+        let refused = governor.admit_bulk_parse(1024).unwrap_err();
+        assert_eq!(refused.http_status(), 429, "{refused}");
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+        governor.memory_tripped.store(false, Ordering::Relaxed);
+
+        governor.memtable_tripped.store(true, Ordering::Relaxed);
+        let refused = governor.admit_bulk_parse(1024).unwrap_err();
+        assert_eq!(refused.http_status(), 429, "{refused}");
+        assert!(refused.to_string().contains("memtable"), "{refused}");
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+    }
+
+    /// #2427: an admitted bulk's body is counted against the watermark until
+    /// its parse ends, so concurrent bulks cannot each be admitted on the
+    /// same stale sample and together cross the cap.
+    #[test]
+    fn bulk_parse_admission_counts_concurrent_bodies_against_the_watermark() {
+        const MIB: u64 = 1024 * 1024;
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        let governor = build(&cfg);
+        let live = governor.observed_process_memory();
+        governor
+            .memory_watermark_bytes
+            .store(live.saturating_add(1024 * MIB), Ordering::Relaxed);
+        governor.rss_bytes.store(live, Ordering::Relaxed);
+
+        let first = governor.admit_bulk_parse(400 * MIB).unwrap();
+        let second = governor.admit_bulk_parse(400 * MIB).unwrap();
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 800 * MIB);
+        // A third body would reach the watermark: backpressure, not admission.
+        let refused = governor.admit_bulk_parse(400 * MIB).unwrap_err();
+        assert_eq!(refused.http_status(), 429, "{refused}");
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 800 * MIB);
+
+        drop(first);
+        let third = governor.admit_bulk_parse(400 * MIB).unwrap();
+        drop(second);
+        drop(third);
+        assert_eq!(governor.analyze_reserved.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn analyze_reservation_releases_and_sees_a_prior_reserve() {
         let governor = build(&Config::default());
