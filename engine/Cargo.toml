@@ -71,7 +71,7 @@ fst = "0.4"
 bitpacking = "0.9"
 # Compression
 lz4_flex = "0.11"
-zstd = "0.13"
+zstd = "0.14.3"
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rustc-hash = "2"
