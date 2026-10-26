@@ -10410,6 +10410,22 @@ fn referenced_or_recurse(v: &Value, out: &mut Vec<(String, String)>) {
 /// reasonable guess — and got a silent zero, because this corpus classifies
 /// Markdown as `txt-prose`/`txt-lines`. Discovering that cost the agent two
 /// round trips and a terms aggregation it had to think to write.
+/// Whether a response qualifies for the zero-hit `unknown_value` sample
+/// (#2451). Only a request that asked for hits (`size > 0`) and whose whole
+/// match set is empty: an empty page with a non-zero tracked total is a page
+/// past the end, not a wrong value, and a `size: 0` count/existence probe must
+/// stay as cheap as its own query — the sample is a 256-row full-source read.
+/// With `track_total_hits: false` the total is not authoritative, so the
+/// empty page (with `size > 0`) is the only signal, as before.
+fn zero_hit_value_sample_applies(
+    size: usize,
+    page_empty: bool,
+    total_count: u64,
+    track_total_disabled: bool,
+) -> bool {
+    size > 0 && page_empty && (track_total_disabled || total_count == 0)
+}
+
 fn unknown_value_hint(index: &str, field: &str, value: &str, present: &[String]) -> Value {
     json!({
         "hints": [{
@@ -11067,6 +11083,69 @@ mod search_response_hint_tests {
         let text = String::from_utf8(bytes.to_vec()).expect("utf8 response body");
         let json: Value = serde_json::from_str(&text).expect("valid JSON response body");
         (json, text)
+    }
+
+    fn has_unknown_value_hint(json: &Value) -> bool {
+        json["_xerj"]["hints"].as_array().is_some_and(|hints| {
+            hints
+                .iter()
+                .any(|h| h["code"].as_str() == Some("unknown_value"))
+        })
+    }
+
+    #[test]
+    fn zero_hit_value_sample_gates_on_the_match_set_not_the_page() {
+        // #2451: a `size: 0` probe never samples, hit or miss.
+        assert!(!super::zero_hit_value_sample_applies(0, true, 0, false));
+        assert!(!super::zero_hit_value_sample_applies(0, true, 7, false));
+        assert!(!super::zero_hit_value_sample_applies(0, true, 0, true));
+        // A page past the end of a non-empty match set is not a wrong value.
+        assert!(!super::zero_hit_value_sample_applies(10, true, 7, false));
+        // The case the hint exists for, tracked total or not.
+        assert!(super::zero_hit_value_sample_applies(10, true, 0, false));
+        assert!(super::zero_hit_value_sample_applies(10, true, 0, true));
+        assert!(!super::zero_hit_value_sample_applies(10, false, 3, false));
+    }
+
+    #[tokio::test]
+    async fn size_zero_term_probe_skips_the_unknown_value_sample() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("kind", FieldType::Keyword));
+        state.engine.create_index("hint-probe", schema).unwrap();
+        let idx = state.engine.get_index("hint-probe").unwrap();
+        for (id, kind) in [("1", "alpha"), ("2", "beta")] {
+            idx.index_document(Some(id.into()), json!({ "kind": kind }))
+                .await
+                .unwrap();
+        }
+        idx.refresh().await.unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        // A search that asked for hits and matched nothing keeps the hint.
+        let (json, _) = run_search(
+            &router,
+            "hint-probe",
+            json!({"size": 10, "query": {"term": {"kind": "gamma"}}}),
+        )
+        .await;
+        assert!(has_unknown_value_hint(&json), "hint expected: {json}");
+
+        // The autoindex existence-probe shape, miss and hit: an exact total,
+        // no sample (#2451).
+        for (value, total) in [("gamma", 0), ("alpha", 1)] {
+            let (json, _) = run_search(
+                &router,
+                "hint-probe",
+                json!({"size": 0, "track_total_hits": true,
+                       "query": {"term": {"kind": value}}}),
+            )
+            .await;
+            assert_eq!(json["hits"]["total"]["value"], total, "{json}");
+            assert!(!has_unknown_value_hint(&json), "no hint for size 0: {json}");
+        }
     }
 
     #[tokio::test]
@@ -18987,7 +19066,22 @@ async fn search_impl(
             // and name the values that do exist. Only on zero hits, only for
             // exact clauses, and capped — this must never cost anything on a
             // query that worked.
-            if all_hints.is_empty() && hits.is_empty() {
+            //
+            // #2451: "zero hits" means the MATCH SET is empty, not the page. A
+            // `size: 0` request (a count or existence probe — autoindex's
+            // per-upsert `index_holds_content` is one) always has an empty
+            // page, so gating on `hits.is_empty()` alone ran the 256-row
+            // `match_all` sample — a full-source decode of ~356 rows, 1.4 s on
+            // a 234k-doc code index — after EVERY probe, hit or miss. The
+            // sample is for a caller who asked for hits and got none.
+            if all_hints.is_empty()
+                && zero_hit_value_sample_applies(
+                    body.size,
+                    hits.is_empty(),
+                    total_count,
+                    track_total_disabled,
+                )
+            {
                 let mut clauses = Vec::new();
                 if let Some(q) = body.query.as_ref() {
                     exact_term_clauses(q, &mut clauses);
