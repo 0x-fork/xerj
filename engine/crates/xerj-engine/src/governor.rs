@@ -723,12 +723,32 @@ impl ResourceGovernor {
         )
     }
 
+    /// [`Self::merge_must_yield`] for a batch of `input_bytes`: after a
+    /// streak of yields a small batch completes, so compaction cannot stall
+    /// for good. See `merge_budget::merge_must_yield_after`.
+    pub fn merge_must_yield_for(&self, forced: bool, input_bytes: u64) -> bool {
+        let streak = self
+            .merge_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .yield_streak;
+        crate::merge_budget::merge_must_yield_after(
+            self.observed_process_memory(),
+            self.memory_limit_bytes,
+            self.memory_breaker_engaged(),
+            forced,
+            input_bytes,
+            streak,
+        )
+    }
+
     /// Record a background batch of `input_bytes` that stopped under memory
     /// pressure: the next batches are planned under half of it (#2427).
     pub fn note_merge_yield(&self, input_bytes: u64) -> u64 {
         let mut ledger = self.merge_ledger.lock().unwrap_or_else(|e| e.into_inner());
         ledger.pressure_cap =
             crate::merge_budget::pressure_cap_after_yield(ledger.pressure_cap, input_bytes);
+        ledger.yield_streak = ledger.yield_streak.saturating_add(1);
         ledger.pressure_cap
     }
 
@@ -738,6 +758,7 @@ impl ResourceGovernor {
         let mut ledger = self.merge_ledger.lock().unwrap_or_else(|e| e.into_inner());
         ledger.pressure_cap =
             crate::merge_budget::pressure_cap_after_success(ledger.pressure_cap, input_bytes);
+        ledger.yield_streak = 0;
     }
 
     /// The adaptive merge batch input cap, `0` when none is set (#2427).
@@ -2263,6 +2284,9 @@ struct MergeLedger {
     /// under memory pressure. `0` = none. See
     /// `merge_budget::pressure_cap_after_yield`.
     pressure_cap: u64,
+    /// Background yields since the last completed batch. See
+    /// `merge_budget::merge_must_yield_after`.
+    yield_streak: u64,
 }
 
 /// Holds one merge batch's estimated working set against the RSS watermark
@@ -4049,6 +4073,21 @@ mod tests {
         assert_eq!(g.merge_pressure_cap_bytes(), 33 * MIB);
         g.note_merge_completed(33 * MIB);
         assert_eq!(g.merge_pressure_cap_bytes(), 66 * MIB);
+
+        // A streak of yields with nothing completing lets one small batch
+        // finish, so a search node at the limit still compacts. A completed
+        // batch resets the streak.
+        g.refresh(0, limit, 0);
+        assert!(g.memory_breaker_engaged());
+        g.note_merge_completed(66 * MIB);
+        for _ in 0..crate::merge_budget::MERGE_YIELD_STREAK_LIMIT {
+            assert!(g.merge_must_yield_for(false, 49 * MIB));
+            g.note_merge_yield(49 * MIB);
+        }
+        assert!(!g.merge_must_yield_for(false, 49 * MIB));
+        assert!(g.merge_must_yield_for(false, 512 * MIB));
+        g.note_merge_completed(49 * MIB);
+        assert!(g.merge_must_yield_for(false, 49 * MIB));
     }
 
     /// #2427: the 1 GB release gate released at rss=5,121MB against a

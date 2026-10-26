@@ -219,6 +219,47 @@ pub fn merge_must_yield(rss: u64, limit: u64, breaker_engaged: bool, forced: boo
     !forced && breaker_engaged && limit > 0 && rss > 0 && rss >= limit
 }
 
+/// Consecutive background yields after which a small batch stops yielding.
+/// See [`merge_must_yield_after`].
+pub const MERGE_YIELD_STREAK_LIMIT: u64 = 3;
+
+/// Largest batch input exempt from yielding once the streak is reached.
+/// The batch that took a node 5 GB past its cap was hundreds of MB. The
+/// livelocked one in the gate was 49 MB.
+pub const MERGE_YIELD_STREAK_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// [`merge_must_yield`] with a bound on how long compaction can stall.
+///
+/// On a search node, the search working set alone can hold RSS at the
+/// process limit while the breaker cycles between engaged and released.
+/// Every admitted batch then hits the limit and yields. Halving the
+/// pressure cap does not help once the batch is already at its minimum
+/// size, so the planner rebuilds the same inputs. In the Run 5 gate, one
+/// 49 MB batch yielded 68 times in 14 minutes and nothing merged. Segments
+/// piled up, and each one costs a per-segment open on every search, which
+/// holds RSS at the limit.
+///
+/// After [`MERGE_YIELD_STREAK_LIMIT`] background yields in a row with no
+/// batch completing in between, a batch of at most
+/// [`MERGE_YIELD_STREAK_MAX_INPUT_BYTES`] runs to completion. Admission
+/// already lets only one merge start while the process is at the
+/// watermark, and larger batches still yield as before.
+pub fn merge_must_yield_after(
+    rss: u64,
+    limit: u64,
+    breaker_engaged: bool,
+    forced: bool,
+    input_bytes: u64,
+    yield_streak: u64,
+) -> bool {
+    if !merge_must_yield(rss, limit, breaker_engaged, forced) {
+        return false;
+    }
+    !(yield_streak >= MERGE_YIELD_STREAK_LIMIT
+        && input_bytes > 0
+        && input_bytes <= MERGE_YIELD_STREAK_MAX_INPUT_BYTES)
+}
+
 /// The adaptive batch input cap after a batch of `input_bytes` stopped
 /// under memory pressure (#2427). `current == 0` means no adaptive cap yet.
 /// The next batch may use at most half of what did not fit. Never below 1.
@@ -280,6 +321,70 @@ mod tests {
         // Unknown limit or RSS.
         assert!(!merge_must_yield(1600 * MIB, 0, true, false));
         assert!(!merge_must_yield(0, limit, true, false));
+    }
+
+    #[test]
+    fn a_small_batch_stops_yielding_after_a_streak() {
+        const MIB: u64 = 1024 * 1024;
+        let limit = 1024 * MIB;
+        let rss = 1100 * MIB;
+        // Below the streak: identical to `merge_must_yield`.
+        for streak in 0..MERGE_YIELD_STREAK_LIMIT {
+            assert!(merge_must_yield_after(
+                rss,
+                limit,
+                true,
+                false,
+                49 * MIB,
+                streak
+            ));
+        }
+        // At the streak: a small batch runs to completion.
+        assert!(!merge_must_yield_after(
+            rss,
+            limit,
+            true,
+            false,
+            49 * MIB,
+            MERGE_YIELD_STREAK_LIMIT
+        ));
+        assert!(!merge_must_yield_after(
+            rss,
+            limit,
+            true,
+            false,
+            MERGE_YIELD_STREAK_MAX_INPUT_BYTES,
+            MERGE_YIELD_STREAK_LIMIT + 10
+        ));
+        // A large batch keeps yielding however long the streak.
+        assert!(merge_must_yield_after(
+            rss,
+            limit,
+            true,
+            false,
+            MERGE_YIELD_STREAK_MAX_INPUT_BYTES + 1,
+            MERGE_YIELD_STREAK_LIMIT + 10
+        ));
+        // Unknown size keeps the old rule.
+        assert!(merge_must_yield_after(rss, limit, true, false, 0, 99));
+        // Nothing yields that `merge_must_yield` would not yield.
+        assert!(!merge_must_yield_after(
+            1000 * MIB,
+            limit,
+            true,
+            false,
+            49 * MIB,
+            0
+        ));
+        assert!(!merge_must_yield_after(
+            rss,
+            limit,
+            false,
+            false,
+            49 * MIB,
+            0
+        ));
+        assert!(!merge_must_yield_after(rss, limit, true, true, 99 * MIB, 0));
     }
 
     #[test]

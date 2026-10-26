@@ -14367,7 +14367,7 @@ impl Index {
                 let Some(governor) = crate::governor::global() else {
                     return false;
                 };
-                if !governor.merge_must_yield(forced_for_task) {
+                if !governor.merge_must_yield_for(forced_for_task, input_bytes_for_task) {
                     return false;
                 }
                 let cap = governor.note_merge_yield(input_bytes_for_task);
