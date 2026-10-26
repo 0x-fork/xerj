@@ -344,6 +344,83 @@ pub(crate) fn replay_windowed<T: Sync>(
     hooks: &mut dyn ReplayHooks<T>,
     apply: &(dyn Fn(&T) -> Result<()> + Sync),
 ) -> Result<()> {
+    replay_windowed_with(
+        &xerj_common::thread_spawn::StdSpawn,
+        xerj_common::thread_spawn::spawn_allowed,
+        items,
+        width,
+        hooks,
+        apply,
+    )
+}
+
+/// How many times a refused worker spawn is retried before the run
+/// continues with the workers it already has (#2428).
+pub(crate) const WORKER_SPAWN_ATTEMPTS: u32 = 3;
+/// First pause after a refused worker spawn; doubled on each retry.
+pub(crate) const WORKER_SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Start `f` on a scoped helper thread, retrying a refused spawn (`EAGAIN`
+/// from `pthread_create`, or the spawn gate saying no) up to `attempts`
+/// times with a doubling `backoff` (#2428). A refused spawn is a transient
+/// thread or memory limit, not a reason to lose the run: `Err` after the
+/// last attempt means `f` never ran and the caller carries on with the
+/// threads it has, or does the work itself.
+pub(crate) fn spawn_scoped_with_backoff<'scope, 'env, S, G, F>(
+    scope: &xerj_common::thread_spawn::Scope<'scope, 'env>,
+    spawner: &S,
+    gate: G,
+    name: &str,
+    attempts: u32,
+    backoff: std::time::Duration,
+    f: F,
+) -> std::io::Result<()>
+where
+    S: xerj_common::thread_spawn::Spawn + ?Sized,
+    G: Fn() -> bool,
+    F: FnOnce() + Send + Copy + 'scope,
+{
+    let attempts = attempts.max(1);
+    let mut delay = backoff;
+    let mut attempt = 1;
+    loop {
+        match scope.spawn_with(spawner, gate(), name, f) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt >= attempts => return Err(error),
+            Err(_) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// [`replay_windowed`] with an explicit spawner and spawn gate, so the
+/// spawn-failure paths are testable without exhausting a real machine.
+///
+/// #2428: the window used to start one thread per *operation*. A corpus
+/// replay is hundreds of thousands of operations, so a long run made
+/// hundreds of thousands of `pthread_create` calls, and under memory or
+/// thread pressure one of them eventually got `EAGAIN`. Now at most
+/// `width` workers are started once per replay and reused for every item.
+/// A refused worker spawn is retried with backoff; if it is still refused
+/// the replay continues on the workers that did start, and if none did,
+/// every item is applied on the calling thread. Ordering and failure
+/// semantics are unchanged.
+pub(crate) fn replay_windowed_with<T, S, G>(
+    spawner: &S,
+    gate: G,
+    items: &[T],
+    width: usize,
+    hooks: &mut dyn ReplayHooks<T>,
+    apply: &(dyn Fn(&T) -> Result<()> + Sync),
+) -> Result<()>
+where
+    T: Sync,
+    S: xerj_common::thread_spawn::Spawn + ?Sized,
+    G: Fn() -> bool,
+{
     if items.is_empty() {
         return Ok(());
     }
@@ -355,19 +432,68 @@ pub(crate) fn replay_windowed<T: Sync>(
         }
         return Ok(());
     }
-    /// One dispatched operation: on its own thread, or — when that thread
-    /// could not be started (#1122) — already applied inline.
-    enum Dispatched<'scope> {
-        Thread(xerj_common::thread_spawn::ScopedJoinHandle<'scope, Result<()>>),
+    /// One dispatched operation: queued to a worker, or — when no worker
+    /// could be started (#1122, #2428) — already applied inline.
+    enum Dispatched {
+        Worker(std::sync::mpsc::Receiver<Result<()>>),
         Inline(Result<()>),
     }
+    type Job<'a, T> = (&'a T, std::sync::mpsc::Sender<Result<()>>);
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job<'_, T>>();
+    let job_rx = std::sync::Mutex::new(job_rx);
+    let job_rx = &job_rx;
+    // A worker takes queued items until the sender is dropped. A panic in
+    // `apply` (unwind builds) becomes that item's error and the worker
+    // keeps serving the queue.
+    let worker = move || loop {
+        let job = {
+            let rx = job_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            rx.recv()
+        };
+        let Ok((item, reply)) = job else { break };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(item)))
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "replay apply panicked: {}",
+                    panic_message(panic)
+                ))
+            });
+        // The scheduler may have stopped listening after a `begin` error.
+        let _ = reply.send(outcome);
+    };
     // #1122: `Builder::spawn_scoped` can abort the process after returning
     // `Ok`, when the child cannot map its alternate signal stack. This
-    // scope uses `pthread_create`. A refusal applies the item on this
-    // thread; the closure that would have run it is dropped unrun.
+    // scope uses `pthread_create`.
     let failure = xerj_common::thread_spawn::scope(|scope| -> Result<Option<anyhow::Error>> {
+        let wanted = width.min(items.len());
+        let mut workers = 0usize;
+        while workers < wanted {
+            match spawn_scoped_with_backoff(
+                scope,
+                spawner,
+                &gate,
+                "xerj-sync-apply",
+                WORKER_SPAWN_ATTEMPTS,
+                WORKER_SPAWN_BACKOFF,
+                worker,
+            ) {
+                Ok(()) => workers += 1,
+                Err(error) => {
+                    eprintln!(
+                        "autoindex: could not start replay worker {} of {wanted} ({error}); \
+                         continuing with {} (#2428)",
+                        workers + 1,
+                        workers.max(1)
+                    );
+                    break;
+                }
+            }
+        }
+        let job_tx = job_tx;
         let mut next = items.iter();
-        let mut in_flight: std::collections::VecDeque<(&T, Dispatched<'_>)> =
+        let mut in_flight: std::collections::VecDeque<(&T, Dispatched)> =
             std::collections::VecDeque::new();
         let mut failure: Option<anyhow::Error> = None;
         loop {
@@ -377,11 +503,15 @@ pub(crate) fn replay_windowed<T: Sync>(
                 // was never dispatched is also never recorded as begun.
                 let Some(item) = next.next() else { break };
                 hooks.begin(item)?;
-                let dispatched = item;
-                let slot = match scope.spawn_returning("xerj-sync-apply", move || apply(dispatched))
-                {
-                    Ok(handle) => Dispatched::Thread(handle),
-                    Err(_) => Dispatched::Inline(apply(item)),
+                let slot = if workers > 0 {
+                    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                    match job_tx.send((item, reply_tx)) {
+                        Ok(()) => Dispatched::Worker(reply_rx),
+                        // Unreachable while `job_rx` lives; apply inline.
+                        Err(_) => Dispatched::Inline(apply(item)),
+                    }
+                } else {
+                    Dispatched::Inline(apply(item))
                 };
                 in_flight.push_back((item, slot));
             }
@@ -389,11 +519,8 @@ pub(crate) fn replay_windowed<T: Sync>(
                 break;
             };
             let outcome = match slot {
-                Dispatched::Thread(handle) => handle.join().unwrap_or_else(|panic| {
-                    Err(anyhow::anyhow!(
-                        "replay apply panicked: {}",
-                        panic_message(panic)
-                    ))
+                Dispatched::Worker(reply) => reply.recv().unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("replay worker exited before applying"))
                 }),
                 Dispatched::Inline(outcome) => outcome,
             };
@@ -403,6 +530,7 @@ pub(crate) fn replay_windowed<T: Sync>(
                 failure = Some(error);
             }
         }
+        // Dropping `job_tx` here ends the workers; the scope joins them.
         Ok(failure)
     })?;
     match failure {
@@ -5610,6 +5738,176 @@ mod tests {
             vec![(0, false), (1, true), (2, true), (3, true)],
             "the drain still reports the applies that did land"
         );
+    }
+
+    /// A spawner that refuses its first `refuse` calls with `EAGAIN`, as
+    /// `pthread_create` does under thread or memory pressure, then starts
+    /// real threads. Counts every call (#2428).
+    struct FlakySpawn {
+        refuse: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakySpawn {
+        fn refusing(refuse: usize) -> Self {
+            FlakySpawn {
+                refuse,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                started: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl xerj_common::thread_spawn::Spawn for FlakySpawn {
+        fn spawn(
+            &self,
+            name: &str,
+            job: xerj_common::thread_spawn::BoxedJob,
+        ) -> std::io::Result<xerj_common::thread_spawn::SpawnedThread> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < self.refuse {
+                return Err(std::io::Error::from_raw_os_error(11));
+            }
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            xerj_common::thread_spawn::StdSpawn.spawn(name, job)
+        }
+    }
+
+    #[test]
+    fn replay_windowed_reuses_at_most_width_workers_for_a_long_replay() {
+        // #2428: one thread per operation was hundreds of thousands of
+        // `pthread_create` calls over a corpus replay. The window must start
+        // at most `width` workers once and reuse them.
+        let items: Vec<usize> = (0..500).collect();
+        let spawner = FlakySpawn::refusing(0);
+        let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+        let apply = |_item: &usize| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            Ok(())
+        };
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(hooks.applied.len(), items.len());
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        let spawned = spawner.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            spawned <= 4,
+            "500 operations at width 4 must start at most 4 threads, started {spawned}"
+        );
+        assert!(threads.lock().unwrap().len() <= 4);
+    }
+
+    #[test]
+    fn replay_windowed_completes_inline_when_every_worker_spawn_is_refused() {
+        // #2428: EAGAIN on every spawn is a slower replay, not a lost run.
+        let items: Vec<usize> = (0..20).collect();
+        let spawner = FlakySpawn::refusing(usize::MAX);
+        let caller = std::thread::current().id();
+        let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+        let apply = |_item: &usize| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            Ok(())
+        };
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            items,
+            "every item applied and reported in dispatch order"
+        );
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        assert_eq!(
+            *threads.lock().unwrap(),
+            std::collections::HashSet::from([caller]),
+            "with no worker, every apply runs on the calling thread"
+        );
+        assert_eq!(spawner.started.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            spawner.calls.load(std::sync::atomic::Ordering::SeqCst),
+            WORKER_SPAWN_ATTEMPTS as usize,
+            "the first worker is retried with backoff, then the replay goes inline"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_retries_a_transient_spawn_refusal() {
+        // Two EAGAINs, then the OS has threads again: the retry gets the
+        // worker instead of giving up on it.
+        let items: Vec<usize> = (0..50).collect();
+        let spawner = FlakySpawn::refusing(2);
+        let apply = |_item: &usize| Ok(());
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 3, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.applied.len(), items.len());
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        assert_eq!(
+            spawner.started.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all three workers started after the transient refusals"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_continues_on_the_workers_that_started() {
+        // Spawn succeeds once, then EAGAIN forever: the replay finishes on
+        // that one worker.
+        struct OneThenRefuse(std::sync::atomic::AtomicUsize);
+        impl xerj_common::thread_spawn::Spawn for OneThenRefuse {
+            fn spawn(
+                &self,
+                name: &str,
+                job: xerj_common::thread_spawn::BoxedJob,
+            ) -> std::io::Result<xerj_common::thread_spawn::SpawnedThread> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    xerj_common::thread_spawn::StdSpawn.spawn(name, job)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(11))
+                }
+            }
+        }
+        let items: Vec<usize> = (0..40).collect();
+        let spawner = OneThenRefuse(std::sync::atomic::AtomicUsize::new(0));
+        let apply = |_item: &usize| Ok(());
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            items
+        );
+    }
+
+    #[test]
+    fn spawn_scoped_with_backoff_gives_up_after_the_attempts_without_running_the_job() {
+        let spawner = FlakySpawn::refusing(usize::MAX);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let ran_ref = &ran;
+        let result = xerj_common::thread_spawn::scope(|scope| {
+            spawn_scoped_with_backoff(
+                scope,
+                &spawner,
+                || true,
+                "test-worker",
+                3,
+                std::time::Duration::from_millis(1),
+                move || ran_ref.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(spawner.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A backend whose Nth `apply` is the server still answering 429 after

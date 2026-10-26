@@ -11368,10 +11368,20 @@ fn run_index_report_inner(
     // an error: workers that did start share the queue, the pipe stops
     // counting the ones that never did, and if none started this thread
     // works the queue itself. The failed closure is dropped unrun.
+    // #2428: a refused spawn is retried with backoff first; a transient
+    // `EAGAIN` must not cost the run a worker, let alone the run.
     xerj_common::thread_spawn::scope(|scope| {
         let mut started = 0usize;
         for _ in 0..worker_count {
-            match scope.spawn("autoindex-worker", worker) {
+            match crate::sync_executor::spawn_scoped_with_backoff(
+                scope,
+                &xerj_common::thread_spawn::StdSpawn,
+                xerj_common::thread_spawn::spawn_allowed,
+                "autoindex-worker",
+                crate::sync_executor::WORKER_SPAWN_ATTEMPTS,
+                crate::sync_executor::WORKER_SPAWN_BACKOFF,
+                worker,
+            ) {
                 Ok(_) => started += 1,
                 Err(error) => {
                     pr.note(&format!(

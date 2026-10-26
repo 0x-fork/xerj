@@ -79,6 +79,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj autoindex` no longer aborts a long run with `Resource temporarily
+  unavailable (os error 11)` when the machine refuses to start a thread. The
+  sync replay used to start a new thread for every operation (hundreds of
+  thousands on a large folder); it now starts at most the window width of
+  workers once per replay and reuses them. Starting a replay worker or an
+  indexing worker now retries with a short backoff when thread creation is
+  refused, and the replay finishes on the calling thread if no worker can be
+  started, so a refusal is no longer fatal (#2428).
 - `xerj autoindex` no longer runs out of memory while planning a large folder.
   It used to keep the sampled values of every file in memory at once before
   grouping them into datasets, and kept them all until the end of the run;
