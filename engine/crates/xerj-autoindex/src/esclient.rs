@@ -2294,13 +2294,25 @@ impl Es {
     }
 
     fn search_raw(&self, index: &str, body: &Value) -> Result<(reqwest::StatusCode, Value)> {
+        self.search_raw_at(index, "", body)
+    }
+
+    fn search_raw_at(
+        &self,
+        index: &str,
+        query_string: &str,
+        body: &Value,
+    ) -> Result<(reqwest::StatusCode, Value)> {
         self.with_retry(
             "search",
             || {
-                self.req(reqwest::Method::POST, &format!("/{index}/_search"))
-                    .json(body)
-                    .send()
-                    .map_err(|e| anyhow!("search: {e}"))
+                self.req(
+                    reqwest::Method::POST,
+                    &format!("/{index}/_search{query_string}"),
+                )
+                .json(body)
+                .send()
+                .map_err(|e| anyhow!("search: {e}"))
             },
             |resp| {
                 let status = resp.status();
@@ -2312,6 +2324,19 @@ impl Es {
 
     pub fn search(&self, index: &str, body: &Value) -> Result<Value> {
         let (status, v) = self.search_raw(index, body)?;
+        if !status.is_success() {
+            return Err(anyhow!("search /{index} HTTP {status}: {v}"));
+        }
+        Ok(v)
+    }
+
+    /// [`Es::search`] for a caller that never reads the node's `_savings`
+    /// statistic (`xerj search`). Measuring what a `_source` filter withheld
+    /// needs the whole stored document, so asking for it forces the node to
+    /// decode every column of every hit even when the body names the few
+    /// fields it prints (#2422/#2423).
+    pub fn search_without_savings(&self, index: &str, body: &Value) -> Result<Value> {
+        let (status, v) = self.search_raw_at(index, "?savings=false", body)?;
         if !status.is_success() {
             return Err(anyhow!("search /{index} HTTP {status}: {v}"));
         }

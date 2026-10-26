@@ -90,6 +90,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   long path (for example a Go module path) is over the 255-character index name
   limit. Names longer than 128 characters are shortened and end in a short
   hash, so they stay the same on every run and never clash (part of #1122).
+- The first searches after a restart, or after a segment left the cache,
+  no longer read every stored document to return a page of hits. When the
+  request names its `_source` fields (as `xerj search` does), only the
+  winning rows and only the needed fields are read, and the full document
+  cache is filled in the background. On a 344 MB autoindexed corpus the
+  first `xerj search` after a restart went from about 2.6 s to about 1.4 s.
+  `fields: ["_passage"]` no longer makes a filtered `_source` load the whole
+  document. (#2422, #2423)
+
+- `autoindex` no longer turns a large nested array of mostly numbers, such
+  as a flight trace or a coordinate matrix, into one long text field. The
+  record keeps a `<field>_count` number instead. Such text fields were up to
+  64 KB per record, made every search hit slower to load, and matched
+  queries on stray digits. Re-index to drop them from existing indices.
+  (#2423)
 
 - Server startup now reports the resolved data directory, its configuration
   source and whether this launch created it. New-directory guidance points

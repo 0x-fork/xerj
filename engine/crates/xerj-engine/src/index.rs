@@ -1836,6 +1836,193 @@ mod flush_publication_recovery_tests {
         assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
     }
 
+    fn topk_projection_schema() -> Schema {
+        let mut schema = Schema::empty();
+        for f in ["title", "body", "blob"] {
+            schema
+                .add_field(FieldConfig::new(f, FieldType::Text))
+                .unwrap();
+        }
+        schema
+    }
+
+    /// #2422/#2423: on a cold segment (after a restart, or evicted under the
+    /// cache budget) a top-k query that names its `_source` fields must read
+    /// only the winning rows and only the needed columns. Before the fix the
+    /// first query decoded the whole stored section — every column of every
+    /// document, ~3.2 s on a 300 MB corpus — to return 5 hits. The answer
+    /// must equal the full-decode answer, and the full stored caches must
+    /// stay cold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_topk_with_source_includes_reads_only_winning_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("topk-cold", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("topk-cold").unwrap();
+        idx.abort_background_tasks();
+        let blob = "0.125 33.9 -118.4 ".repeat(200);
+        for i in 0..4096u64 {
+            let body = if i % 97 == 0 {
+                format!("needle report {i} needle")
+            } else {
+                format!("hay stack {i}")
+            };
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({"title": format!("title {i}"), "body": body, "blob": blob}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(engine);
+
+        let reopen = || {
+            let mut c = Config::default();
+            c.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(c).unwrap();
+            let idx = engine.get_index("topk-cold").unwrap();
+            idx.abort_background_tasks();
+            (engine, idx)
+        };
+        let all_cold = |idx: &Index| {
+            let snapshot = idx.store.snapshot();
+            let segs: Vec<_> = snapshot.segments.clone();
+            drop(snapshot);
+            assert!(!segs.is_empty());
+            segs.iter().all(|s| {
+                !idx.stored_slices_cache.contains_key(&s.id)
+                    && !idx.decoded_stored_cache.contains_key(&s.id)
+            })
+        };
+
+        let projected = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "needle"}},
+            "size": 5,
+            "_source": ["title"]
+        }))
+        .unwrap();
+        assert_eq!(projected.savings, xerj_query::ast::SavingsMode::Off);
+        assert!(
+            fts_row_hydration_keep(&projected, &projected.query).is_some(),
+            "the request shape must be eligible for column projection"
+        );
+
+        let (engine, idx) = reopen();
+        assert!(
+            all_cold(&idx),
+            "precondition: stored caches cold after restart"
+        );
+        // Hold the background warm back so the query is observed alone.
+        let held: Vec<String> = {
+            let snapshot = idx.store.snapshot();
+            snapshot.segments.iter().map(|s| s.id.to_string()).collect()
+        };
+        for id in &held {
+            idx.cold_stored_warms.insert(id.clone(), ());
+        }
+        let cold = idx.search(&projected).await.unwrap();
+        assert!(
+            all_cold(&idx),
+            "a 5-hit query must not decode the whole stored section"
+        );
+        assert!(idx.cold_row_hydrations.load(Ordering::Relaxed) > 0);
+        // Released, the next cold visit warms the segment off the query path,
+        // so later queries with other winners read the warm cache.
+        idx.cold_stored_warms.clear();
+        let other = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "report"}},
+            "size": 5,
+            "_source": ["title"]
+        }))
+        .unwrap();
+        let again = idx.search(&other).await.unwrap();
+        assert_eq!(again.hits.len(), 5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while all_cold(&idx) || !idx.cold_stored_warms.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background warm never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(cold.hits.len(), 5);
+        for h in &cold.hits {
+            let n: u64 = h.id.trim_start_matches("doc-").parse().unwrap();
+            assert_eq!(n % 97, 0, "hit {} does not match the query", h.id);
+            assert_eq!(h.source, json!({"title": format!("title {n}")}));
+        }
+        drop(idx);
+        drop(engine);
+
+        // Same query, every column, warm full decode: same ids, order and
+        // scores.
+        let full = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "needle"}},
+            "size": 5
+        }))
+        .unwrap();
+        let (_engine, idx) = reopen();
+        let warm_full = idx.search(&full).await.unwrap();
+        let warm_projected = idx.search(&projected).await.unwrap();
+        let key = |r: &xerj_query::executor::SearchResult| {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), (h.score * 1e4).round() as i64))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&cold), key(&warm_full));
+        assert_eq!(key(&cold), key(&warm_projected));
+        for (c, w) in cold.hits.iter().zip(&warm_full.hits) {
+            assert_eq!(c.source["title"], w.source["title"]);
+            assert_eq!(w.source["blob"], json!(blob));
+        }
+    }
+
+    #[test]
+    fn row_projection_keep_set_covers_query_and_include_fields() {
+        let req = xerj_query::parse_request(&json!({
+            "query": {"bool": {
+                "must": [{"multi_match": {"query": "x", "fields": ["title^2", "body"]}}],
+                "filter": [{"term": {"kind": "a"}}]
+            }},
+            "_source": ["path"]
+        }))
+        .unwrap();
+        let keep = fts_row_hydration_keep(&req, &req.query).unwrap();
+        for f in ["body", "kind", "path", "title"] {
+            assert!(keep.iter().any(|k| k == f), "{f} missing from {keep:?}");
+        }
+        // A wildcard query field cannot be resolved to columns: no projection.
+        let wild = xerj_query::parse_request(&json!({
+            "query": {"multi_match": {"query": "x", "fields": ["*"]}},
+            "_source": ["path"]
+        }))
+        .unwrap();
+        assert!(fts_row_hydration_keep(&wild, &wild.query).is_none());
+        // `_savings` measures withheld bytes from the whole document.
+        let mut measured = req.clone();
+        measured.savings = xerj_query::ast::SavingsMode::Sampled;
+        assert!(fts_row_hydration_keep(&measured, &measured.query).is_none());
+        // No includes: the whole source is returned anyway.
+        let whole = xerj_query::parse_request(&json!({"query": {"match": {"body": "x"}}})).unwrap();
+        assert!(fts_row_hydration_keep(&whole, &whole.query).is_none());
+
+        let keep = vec!["meta".to_string(), "a.b".to_string(), "pre*".to_string()];
+        assert!(row_projection_keeps_column(&keep, "meta"));
+        assert!(row_projection_keeps_column(&keep, "meta.x"));
+        assert!(row_projection_keeps_column(&keep, "a"));
+        assert!(row_projection_keeps_column(&keep, "a.b"));
+        assert!(row_projection_keeps_column(&keep, "prefix"));
+        assert!(!row_projection_keeps_column(&keep, "metadata"));
+        assert!(!row_projection_keeps_column(&keep, "ab"));
+    }
+
     /// #950: building the id→position map must NOT materialise the full
     /// stored section.  Before the fix, `id_pos_map_for` ran the complete
     /// `stored_slices_for` decode — every column of every stored document
@@ -9798,6 +9985,15 @@ pub struct Index {
     /// decompress — one 30 ms decode became a ~1 s, 64-query stall
     /// episode at every flush/merge publish the warm hadn't reached yet.
     stored_slices_build_locks: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<()>>>>,
+    /// #2422/#2423: a weak handle to this index, so a query that answered a
+    /// cold segment from its winning rows alone can warm that segment's
+    /// stored slices off the query path (see `schedule_cold_stored_warm`).
+    self_ref: std::sync::OnceLock<std::sync::Weak<Index>>,
+    /// Segments with a background stored-slices warm queued or running.
+    cold_stored_warms: dashmap::DashMap<String, ()>,
+    /// Cold segments answered by row-selective hydration (observability and
+    /// tests).
+    cold_row_hydrations: AtomicU64,
     /// Per-(segment, field, bounds) Range pre-filter position sets.
     /// `build_range_prefilter_cached` was cached in name only — it re-ran
     /// the O(matches) `range_doc_ids` walk + HashSet build per query per
@@ -10491,7 +10687,11 @@ impl Index {
             merge_fts_reanalysed_docs: Arc::new(AtomicU64::new(0)),
             merge_batches_deferred: std::sync::atomic::AtomicBool::new(false),
             schema_persist_failures: AtomicU64::new(0),
+            self_ref: std::sync::OnceLock::new(),
+            cold_stored_warms: dashmap::DashMap::new(),
+            cold_row_hydrations: AtomicU64::new(0),
         });
+        let _ = index.self_ref.set(Arc::downgrade(&index));
         // #871 — event-driven merge scheduling: the store fires this hook on
         // every segment-set change (flush publication, merge application,
         // tombstone-only segment, orphan recovery) and the debounced check
@@ -10952,7 +11152,11 @@ impl Index {
             merge_fts_reanalysed_docs: Arc::new(AtomicU64::new(0)),
             merge_batches_deferred: std::sync::atomic::AtomicBool::new(false),
             schema_persist_failures: AtomicU64::new(0),
+            self_ref: std::sync::OnceLock::new(),
+            cold_stored_warms: dashmap::DashMap::new(),
+            cold_row_hydrations: AtomicU64::new(0),
         });
+        let _ = index.self_ref.set(Arc::downgrade(&index));
         // #871 — event-driven merge scheduling (see `Index::create` and
         // `request_merge_check`): wire the store's segments-changed hook.
         let merge_hook_index = Arc::downgrade(&index);
@@ -17017,6 +17221,97 @@ impl Index {
                 .collect()
         })
         .await
+    }
+
+    /// #2422/#2423: `{"_id", "_source"}` docs for the scored FTS walk of a
+    /// segment whose stored offset index is NOT resident, decoded
+    /// row-selectively for `positions` only — and, when `keep` names the
+    /// source fields the request can observe, only those columns.
+    ///
+    /// The legacy cold path (`stored_slices_for`) decompressed and
+    /// brace-walked the WHOLE stored section to read the top-k: a size-45
+    /// query on a 30k-doc autoindex segment spent ~3 s there, and on a
+    /// flight-trace index whose rows carry a ~72 KB `trace` field, 650 ms for
+    /// five hits. Segments are immutable, so a row decode of the same
+    /// positions yields the same document; `None` (legacy LZ4 layout,
+    /// unsupported column shape, open/decode error, a missing row) sends the
+    /// caller back to the full decode, so nothing is lost.
+    /// Warm a segment's full stored slices on the blocking pool after a query
+    /// answered it from its winning rows (#2422/#2423). Later queries with
+    /// other winners then read the warm cache instead of each paying a
+    /// projected decode, and the query that found the segment cold no longer
+    /// waits for the whole-section decompress. One warm per segment at a
+    /// time; `stored_slices_for` keeps its single-flight, budget and
+    /// retirement rules.
+    fn schedule_cold_stored_warm(&self, segment_id: &str, doc_count: u64) {
+        let Some(index) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if crate::governor::global().is_some_and(|g| g.memory_breaker_engaged()) {
+            return;
+        }
+        if self
+            .cold_stored_warms
+            .insert(segment_id.to_string(), ())
+            .is_some()
+        {
+            return;
+        }
+        let segment_id = segment_id.to_string();
+        runtime.spawn_blocking(move || {
+            if !index.stored_slices_cache.contains_key(segment_id.as_str()) {
+                let _ = index.stored_slices_for(&segment_id, doc_count);
+            }
+            index.cold_stored_warms.remove(segment_id.as_str());
+        });
+    }
+
+    fn hydrate_fts_rows_cold(
+        &self,
+        segment_id: &str,
+        positions: &[u32],
+        keep: Option<&[String]>,
+    ) -> Option<HashMap<u32, Value>> {
+        use xerj_storage::stored_codec::{
+            decode_stored_v2_rows, decode_stored_v2_rows_projected, stored_v2_source_column_names,
+            StoredV2RowHydrationResult,
+        };
+        let reader = self.store.open_segment_arc(segment_id).ok()?;
+        let bytes = reader.section(SectionType::Stored).ok()??;
+        let ordinals: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        let hydrated = match keep {
+            Some(keep) => {
+                let names = stored_v2_source_column_names(bytes).ok()??;
+                let include: Vec<&str> = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|column| row_projection_keeps_column(keep, column))
+                    .collect();
+                decode_stored_v2_rows_projected(bytes, &ordinals, &include).ok()?
+            }
+            None => decode_stored_v2_rows(bytes, &ordinals).ok()?,
+        };
+        let StoredV2RowHydrationResult::Hydrated { rows, .. } = hydrated else {
+            return None;
+        };
+        let mut out: HashMap<u32, Value> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id.as_str()?.to_string();
+            let mut doc = serde_json::Map::with_capacity(2);
+            doc.insert("_id".to_string(), Value::String(id));
+            doc.insert("_source".to_string(), Value::Object(row.source));
+            out.insert(u32::try_from(row.ordinal).ok()?, Value::Object(doc));
+        }
+        // Every requested position must come back; a short answer means the
+        // section and the FTS doc ids disagree, which the full decode path
+        // already knows how to handle.
+        if positions.iter().any(|p| !out.contains_key(p)) {
+            return None;
+        }
+        Some(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -23758,6 +24053,12 @@ impl Index {
         // different `_id`s and different `_score`s.  The merge now selects the
         // global top-k by score (see the FTS admission below), so the cap
         // controls only how much work is done, never which hits win.
+        // #2422/#2423 — the source columns a cold scored FTS page needs.
+        let fts_row_keep: Option<Vec<String>> = fts_row_hydration_keep(request, query);
+        // Hits whose `_source` came back column-projected, by id → (segment,
+        // position), so the one post-page reader that looks at the WHOLE
+        // document (the TF-IDF fallback below) can restore it.
+        let mut row_projected: HashMap<String, (String, u32)> = HashMap::new();
         let materialisation_limit: usize = if mem_doc_count == 0
             && !deletes_present
             && size > 0
@@ -24717,8 +25018,79 @@ impl Index {
                                     // to simd_json here (the M7 raw-bytes
                                     // payload corruption noted below still
                                     // applies).
-                                    let slices_opt =
-                                        self.stored_slices_for(seg_id.as_str(), meta.doc_count);
+                                    //
+                                    // #2422/#2423 — but only when that offset
+                                    // index is already RESIDENT. Building it
+                                    // cold decompresses and brace-walks the
+                                    // whole section (every row, every column)
+                                    // to read the page, which is what a
+                                    // freshly started node, or one whose cache
+                                    // budget evicted the segment, paid on
+                                    // every query: seconds on a 30k-doc
+                                    // autoindex segment. Cold, decode only
+                                    // the rows the walk below can visit — the
+                                    // score-ordered prefix not already beaten
+                                    // by the page's entry worst (the walk's
+                                    // threshold only tightens, so this is a
+                                    // superset) — and only the columns the
+                                    // request can observe.
+                                    let cold_rows: Option<HashMap<u32, Value>> = if self
+                                        .stored_slices_cache
+                                        .contains_key(seg_id.as_str())
+                                        || self.decoded_stored_cache.contains_key(seg_id.as_str())
+                                    {
+                                        None
+                                    } else {
+                                        let entry_worst = if sort_topk.is_none() {
+                                            page_worst.as_ref().map(|worst| worst.0)
+                                        } else {
+                                            None
+                                        };
+                                        let candidates: Vec<u32> = seg_hits
+                                            .iter()
+                                            .take_while(|sh| {
+                                                entry_worst.is_none_or(|worst| sh.score >= worst)
+                                            })
+                                            .map(|sh| sh.doc_id)
+                                            .collect();
+                                        let bounded = candidates.len()
+                                            <= materialisation_limit.saturating_mul(4).max(256);
+                                        // Only with a column projection: the
+                                        // stored columns are whole-stream
+                                        // zstd, so an unprojected row decode
+                                        // decompresses every column anyway —
+                                        // the full cost — without leaving the
+                                        // offset index behind, and the
+                                        // background warm then pays it a
+                                        // second time (measured: a `_savings`
+                                        // request's first cold query went
+                                        // 2.3 s -> 6.6 s). The full decode
+                                        // below caches for the next query.
+                                        let worth_it = fts_row_keep.is_some();
+                                        if bounded && worth_it && !candidates.is_empty() {
+                                            let rows = self.hydrate_fts_rows_cold(
+                                                seg_id.as_str(),
+                                                &candidates,
+                                                fts_row_keep.as_deref(),
+                                            );
+                                            if rows.is_some() {
+                                                self.cold_row_hydrations
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                self.schedule_cold_stored_warm(
+                                                    seg_id.as_str(),
+                                                    meta.doc_count,
+                                                );
+                                            }
+                                            rows
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    let slices_opt = if cold_rows.is_some() {
+                                        None
+                                    } else {
+                                        self.stored_slices_for(seg_id.as_str(), meta.doc_count)
+                                    };
                                     // Legacy whole-section fallback ONLY when the
                                     // offset index can't be built (open/decode
                                     // failure or a malformed/incomplete section).
@@ -24729,6 +25101,7 @@ impl Index {
                                     // guaranteed present, so an open error is
                                     // real corruption.
                                     let whole_fallback: Option<Vec<Value>> = if slices_opt.is_some()
+                                        || cold_rows.is_some()
                                     {
                                         None
                                     } else {
@@ -24751,14 +25124,19 @@ impl Index {
                                             _ => None,
                                         }
                                     };
-                                    if slices_opt.is_some() || whole_fallback.is_some() {
+                                    if cold_rows.is_some()
+                                        || slices_opt.is_some()
+                                        || whole_fallback.is_some()
+                                    {
                                         // Owned parsed doc for a stored position,
                                         // shared by both source layouts.  The
                                         // slice arm parses one object on demand;
                                         // the fallback clones from the fully
                                         // decoded Vec.
                                         let fetch_doc = |pos: u32| -> Option<Value> {
-                                            if let Some(slices) = slices_opt.as_deref() {
+                                            if let Some(rows) = cold_rows.as_ref() {
+                                                rows.get(&pos).cloned()
+                                            } else if let Some(slices) = slices_opt.as_deref() {
                                                 let &(start, end) =
                                                     slices.offsets.get(pos as usize)?;
                                                 let slice = slices
@@ -24896,6 +25274,12 @@ impl Index {
                                             let source =
                                                 doc.get("_source").cloned().unwrap_or(Value::Null);
                                             seen_ids.insert(id.clone());
+                                            if cold_rows.is_some() && fts_row_keep.is_some() {
+                                                row_projected.insert(
+                                                    id.clone(),
+                                                    (seg_id.to_string(), sh.doc_id),
+                                                );
+                                            }
                                             let hit = Hit {
                                                 id,
                                                 score: sh.score,
@@ -25932,6 +26316,23 @@ impl Index {
                     })
                     .unwrap_or_default();
                 if !query_terms.is_empty() {
+                    // This heuristic reads the whole serialized document, so
+                    // a column-projected cold hit gets its full source back
+                    // first (#2422/#2423); rare path, a handful of rows.
+                    if !row_projected.is_empty() {
+                        for hit in final_hits.iter_mut() {
+                            let Some((seg, pos)) = row_projected.get(&hit.id) else {
+                                continue;
+                            };
+                            if let Some(source) = self
+                                .hydrate_fts_rows_cold(seg, &[*pos], None)
+                                .and_then(|mut rows| rows.remove(pos))
+                                .and_then(|mut doc| doc.get_mut("_source").map(Value::take))
+                            {
+                                hit.source = source;
+                            }
+                        }
+                    }
                     let n_docs = final_hits.len() as f32;
                     // Pre-compute lowercased source strings to avoid double-borrowing.
                     let src_strings: Vec<String> = final_hits
@@ -42514,6 +42915,147 @@ fn choose_passage_winner(best: &mut Option<(f32, u32)>, score: f32, ordinal: u32
     if best.is_none_or(|(current, _)| score > current) {
         *best = Some((score, ordinal));
     }
+}
+
+/// Source fields the lexical `_passage` builder reads beyond the query's own
+/// fields: the autoindex code-document signature
+/// ([`is_autoindex_code_document`], [`refine_code_passage`]) and the PDF page
+/// identity ([`passage_page_from_source`]).
+const ROW_PROJECTION_PASSAGE_FIELDS: &[&str] = &[
+    "symbol_count",
+    "name",
+    "kind",
+    "code",
+    "language",
+    "line",
+    "body",
+    "page",
+    "page_number",
+    "metadata",
+];
+
+/// #2422/#2423: the source fields a scored FTS page can observe, when the
+/// request makes that set knowable — `None` means "every column".
+///
+/// A narrowing `_source` include list is the caller saying which fields it
+/// wants back; the engine itself still reads the query's fields for the
+/// heuristic IDF rescore and for `_passage`. Everything else on the request
+/// that can read an arbitrary source field (aggs, sort, scripts, collapse,
+/// rescore, explain, highlight, `fields` other than `_passage`, the
+/// `_savings` measurement that counts the bytes a filter withheld, a query
+/// clause this walker does not know) keeps the whole document.
+fn fts_row_hydration_keep(request: &SearchRequest, query: &QueryNode) -> Option<Vec<String>> {
+    let includes = match &request.source {
+        SourceFilter::Includes(includes) => includes,
+        SourceFilter::Fields { includes, .. } => includes,
+        // `Enabled(false)` still needs the raw source: the response layer
+        // resolves `fields` from it and suppresses it later.
+        SourceFilter::Default | SourceFilter::Enabled(_) => return None,
+    };
+    if includes.is_empty()
+        || request.aggs.is_some()
+        || !request.sort.is_empty()
+        || request.script_fields.is_some()
+        || request.collapse.is_some()
+        || !request.rescore.is_empty()
+        || request.explain
+        || request.highlight.is_some()
+        || request.leaf_ts_field.is_some()
+        || !matches!(request.savings, xerj_query::ast::SavingsMode::Off)
+        || request
+            .fields
+            .iter()
+            .any(|field| field != PASSAGE_RESPONSE_FIELD)
+    {
+        return None;
+    }
+    let mut keep: Vec<String> = includes.clone();
+    if !collect_row_projection_query_fields(query, &mut keep) {
+        return None;
+    }
+    if passage_requested(request) {
+        keep.extend(
+            ROW_PROJECTION_PASSAGE_FIELDS
+                .iter()
+                .map(|f| (*f).to_string()),
+        );
+    }
+    keep.sort();
+    keep.dedup();
+    Some(keep)
+}
+
+/// Push every field `query` reads; `false` for a clause whose source reads
+/// are not knowable from the tree (scripts, field-less `multi_match`,
+/// `query_string` syntax, vectors, nested, …).
+fn collect_row_projection_query_fields(query: &QueryNode, out: &mut Vec<String>) -> bool {
+    let mut push = |field: &str| {
+        let (name, _boost) = parse_field_boost(field);
+        out.push(name.to_string());
+    };
+    match query {
+        QueryNode::MatchAll | QueryNode::MatchNone | QueryNode::Ids { .. } => true,
+        QueryNode::Match { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::Range { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Exists { field } => {
+            if field.contains('*') {
+                return false;
+            }
+            push(field);
+            true
+        }
+        QueryNode::MultiMatch { fields, .. } => {
+            if fields.is_empty() || fields.iter().any(|f| f.contains('*')) {
+                return false;
+            }
+            for field in fields {
+                push(field);
+            }
+            true
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .all(|q| collect_row_projection_query_fields(q, out)),
+        QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => {
+            collect_row_projection_query_fields(query, out)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the stored top-level `column` can hold a value of one of the
+/// `keep` field paths (`keep` entries may be dotted paths or `prefix*`
+/// patterns; a column may itself be a flattened dotted key).
+fn row_projection_keeps_column(keep: &[String], column: &str) -> bool {
+    keep.iter().any(|field| {
+        if let Some(prefix) = field.strip_suffix('*') {
+            if prefix.contains('*') {
+                return true;
+            }
+            return column.starts_with(prefix)
+                || prefix.starts_with(column) && prefix[column.len()..].starts_with('.');
+        }
+        if field.contains('*') {
+            return true;
+        }
+        column == field
+            || field.starts_with(column) && field[column.len()..].starts_with('.')
+            || column.starts_with(field.as_str()) && column[field.len()..].starts_with('.')
+    })
 }
 
 fn passage_requested(request: &SearchRequest) -> bool {

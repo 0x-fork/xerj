@@ -924,7 +924,7 @@ pub fn run_search_cli() -> i32 {
     if code_corpus && k > 0 {
         body["size"] = json!(search_fetch_size(k));
     }
-    let mut resp = match es.search(&pattern, &body) {
+    let mut resp = match es.search_without_savings(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}", query_failure_message("search", &url, &pattern, e));

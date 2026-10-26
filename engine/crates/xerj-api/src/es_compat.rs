@@ -8676,6 +8676,12 @@ fn value_bearing_field_names(body: &EsSearchBody, fields: &[String]) -> Vec<Stri
         _ => names.extend(fields.iter().cloned()),
     }
     push_names(body.docvalue_fields.as_ref(), &mut names);
+    // `_passage` is computed by the engine into `hit.passage`, never read
+    // out of `_source`, so it cannot be dropped by a source filter. Counting
+    // it made every `fields: ["_passage"]` request with `_source` includes
+    // (the `xerj search` body) re-ask the engine for the whole document
+    // (#2422/#2423).
+    names.retain(|name| name != xerj_query::executor::PASSAGE_RESPONSE_FIELD);
     names
 }
 
