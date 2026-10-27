@@ -219,6 +219,53 @@ pub fn merge_must_yield(rss: u64, limit: u64, breaker_engaged: bool, forced: boo
     !forced && breaker_engaged && limit > 0 && rss > 0 && rss >= limit
 }
 
+/// Docs between two governor yield checks inside a merge batch's survivor
+/// scan and drain (#2427).
+///
+/// The checks used to run once per input segment and every 8,192 drained
+/// docs. On the 1 GB gate a pg-docs batch (7 inputs, about 90k docs) took
+/// the ingest node from the watermark (2,918 MB) to 3,100-3,440 MB between
+/// two checks. A check is one atomic load and one `/proc/self/statm` read.
+pub const MERGE_YIELD_CHECKPOINT_DOCS: u64 = 1024;
+
+/// Longest a lone background merge waits for RSS to come back under the
+/// merge-pool ceiling before it starts anyway (#2427). See
+/// [`lone_merge_waits_for_headroom`].
+pub const MERGE_HEADROOM_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a background merge that would run alone must wait for headroom
+/// before it starts (#2427 ingest overshoot).
+///
+/// [`decide_merge_admission`] always starts a lone merge unless the breaker
+/// is engaged, so merging makes progress. On the 1 GB gate the ingest node
+/// launched the next pg-docs batch the moment the previous one finished,
+/// with RSS at 2,400-2,900 MB, just under the 2,918 MB watermark. Each batch
+/// grew RSS by 400-900 MB, and every one of the run's over-cap samples
+/// (3,100-3,502 MB against 3,072 MB) is one of those batches.
+///
+/// A lone background batch now waits while `observed_rss` is at or above
+/// `ceiling` (the merge-pool ceiling), so it starts after the drain, with
+/// the batch's growth room under the cap. The wait is bounded by `max_wait`
+/// (`waited` is how long lone merges have been held back), so a node whose
+/// live set sits above the ceiling still compacts. `_forcemerge`, a merge
+/// beside others (already checked against the ledger), and an unknown RSS
+/// or ceiling never wait.
+pub fn lone_merge_waits_for_headroom(
+    observed_rss: u64,
+    ceiling: u64,
+    in_flight: u64,
+    forced: bool,
+    waited: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> bool {
+    !forced
+        && in_flight == 0
+        && ceiling > 0
+        && observed_rss > 0
+        && observed_rss >= ceiling
+        && waited < max_wait
+}
+
 /// Consecutive background yields after which a small batch stops yielding.
 /// See [`merge_must_yield_after`].
 pub const MERGE_YIELD_STREAK_LIMIT: u64 = 3;
@@ -580,6 +627,84 @@ mod tests {
             true,
             4_000 * MIB,
             false
+        ));
+    }
+
+    #[test]
+    fn a_lone_background_merge_waits_for_headroom_under_the_ceiling() {
+        use std::time::Duration;
+        let ceiling = 2_458 * MIB;
+        let max = MERGE_HEADROOM_MAX_WAIT;
+        // The gate's case: the next batch right after the last one, at
+        // 2,700 MB, with nothing else merging. It waits.
+        assert!(lone_merge_waits_for_headroom(
+            2_700 * MIB,
+            ceiling,
+            0,
+            false,
+            Duration::ZERO,
+            max
+        ));
+        assert!(lone_merge_waits_for_headroom(
+            ceiling,
+            ceiling,
+            0,
+            false,
+            max - Duration::from_millis(1),
+            max
+        ));
+        // After the drain it starts.
+        assert!(!lone_merge_waits_for_headroom(
+            ceiling - 1,
+            ceiling,
+            0,
+            false,
+            Duration::ZERO,
+            max
+        ));
+        // The wait is bounded, so a node whose live set sits above the
+        // ceiling still compacts.
+        assert!(!lone_merge_waits_for_headroom(
+            2_700 * MIB,
+            ceiling,
+            0,
+            false,
+            max,
+            max
+        ));
+        // `_forcemerge`, a merge beside others (the ledger check covers it),
+        // and unknown RSS or ceiling never wait here.
+        assert!(!lone_merge_waits_for_headroom(
+            2_700 * MIB,
+            ceiling,
+            0,
+            true,
+            Duration::ZERO,
+            max
+        ));
+        assert!(!lone_merge_waits_for_headroom(
+            2_700 * MIB,
+            ceiling,
+            1,
+            false,
+            Duration::ZERO,
+            max
+        ));
+        assert!(!lone_merge_waits_for_headroom(
+            0,
+            ceiling,
+            0,
+            false,
+            Duration::ZERO,
+            max
+        ));
+        assert!(!lone_merge_waits_for_headroom(
+            2_700 * MIB,
+            0,
+            0,
+            false,
+            Duration::ZERO,
+            max
         ));
     }
 

@@ -14400,7 +14400,7 @@ impl Index {
                     rss_mb = governor.observed_rss_bytes() / (1024 * 1024),
                     limit_mb = governor.process_memory_limit_bytes() / (1024 * 1024),
                     next_batch_cap_mb = cap / (1024 * 1024),
-                    "merge batch yielded: breaker engaged with RSS at the process limit; \
+                    "merge batch yielded: memory pressure with RSS at the merge-pool ceiling; \
                      inputs kept, later batches narrowed"
                 );
                 true
@@ -14850,6 +14850,19 @@ impl Index {
                         ordinals.resize(raw_docs.len(), None);
                         doc_maps[source_index] = ordinals;
                         for (source_ordinal, raw) in raw_docs.iter().enumerate() {
+                            // #2427 — the survivor scan copies each input's
+                            // live docs, so a batch can grow hundreds of MB
+                            // inside one input. Check the governor every
+                            // `MERGE_YIELD_CHECKPOINT_DOCS` docs, not only
+                            // between inputs.
+                            if source_ordinal > 0
+                                && (source_ordinal as u64)
+                                    .is_multiple_of(crate::merge_budget::MERGE_YIELD_CHECKPOINT_DOCS)
+                                && must_yield()
+                            {
+                                yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                                return None;
+                            }
                             let raw_str = raw.get();
                             let id_seq: IdSeq = match serde_json::from_str(raw_str) {
                                 Ok(v) => v,
@@ -15008,11 +15021,18 @@ impl Index {
                         // `fts_input` grow, so the crossover IS the batch's
                         // stored-side peak.
                         drain_checkpoint += 1;
+                        // #2427 — the yield check runs every
+                        // `MERGE_YIELD_CHECKPOINT_DOCS` docs. At 8192 a pg-docs
+                        // batch on the 1 GB gate grew RSS 300+ MB past the
+                        // watermark between two checks.
+                        if drain_checkpoint
+                            .is_multiple_of(crate::merge_budget::MERGE_YIELD_CHECKPOINT_DOCS)
+                            && must_yield()
+                        {
+                            yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
                         if drain_checkpoint.is_multiple_of(8192) {
-                            if must_yield() {
-                                yielded_for_task.fetch_add(1, Ordering::Relaxed);
-                                return None;
-                            }
                             crate::ingest_memory::observe_checkpoint(
                                 crate::ingest_memory::Category::MergeJsonBuffer,
                                 merged_json_buf.len(),
