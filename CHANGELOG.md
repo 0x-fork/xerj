@@ -49,6 +49,13 @@ continues in #2427 and #1122, which stay open.
 
 ### Added
 
+- `scripts/bench/neural-bulk-ab.sh CONTROL_SHA CANDIDATE_SHA [N]` is an
+  interleaved A/B harness for neural-embedding `_bulk` ingest. It builds each
+  SHA in a worktree, runs the real `xerj autoindex` client against a frozen
+  Okta corpus on a CPU-capped throwaway node, and reports median, p95 and the
+  control arm's spread per metric. It measures the harness only; no
+  performance claim is made. See `benchmarks/ingest-neural-bulk/README.md`.
+
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
   prepares an explicit Claude Code JSONL transcript for ordinary `autoindex`.
   It emits text-bearing user/assistant records through the existing native
