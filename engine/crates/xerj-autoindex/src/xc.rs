@@ -762,6 +762,18 @@ enum XerjignoreCarry {
 /// symlink-to-a-dataset into the clone.
 const XERJIGNORE_CARRY_MAX_BYTES: u64 = 1024 * 1024;
 
+/// Repo directory name for a plain-URL or local-path source: its last path
+/// segment without `.git`. #2472: a Windows path (`F:\Projects\Foo`) has
+/// `\`-separated segments, so both separators split.
+fn repo_name_from_source(url: &str) -> String {
+    url.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
 /// Filesystem root of a local checkout named by `url`, if `url` is one.
 ///
 /// `git clone` of a filesystem path or a `file://` URL checks out committed
@@ -1105,21 +1117,12 @@ fn run_corpus_add(args: &[String]) -> i32 {
         (
             resolved,
             urls.iter()
-                .map(|u| {
-                    let repo = u
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches(".git")
-                        .to_string();
-                    CorpusSource {
-                        repo,
-                        url: u.clone(),
-                        sha: String::new(),
-                        declared: String::new(),
-                        paths: Vec::new(),
-                    }
+                .map(|u| CorpusSource {
+                    repo: repo_name_from_source(u),
+                    url: u.clone(),
+                    sha: String::new(),
+                    declared: String::new(),
+                    paths: Vec::new(),
                 })
                 .collect(),
         )
@@ -5411,6 +5414,29 @@ precedence = ["a", "b"]
             Some(dir.path())
         );
         assert!(local_checkout_root("file://localhost/no/such/xerj-path-2199").is_none());
+    }
+
+    /// #2472: a Windows drive or UNC path names its repo by the last
+    /// `\`-separated segment, as a URL or a Unix path does by its last `/` one.
+    #[test]
+    fn repo_name_from_source_splits_windows_paths() {
+        for (source, repo) in [
+            (r"F:\Projects\Roblox\LunarGame", "LunarGame"),
+            (r"F:\Projects\Roblox\LunarGame\", "LunarGame"),
+            (r"F:\src\widget.git", "widget"),
+            (r"\\server\share\widget", "widget"),
+            ("C:/src/widget/", "widget"),
+            ("/home/me/widget", "widget"),
+            ("https://github.com/xerj-org/xerj.git", "xerj"),
+            ("git@github.com:xerj-org/xerj.git", "xerj"),
+        ] {
+            let name = repo_name_from_source(source);
+            assert_eq!(name, repo, "{source}");
+            assert!(
+                xccode::pathgate::valid_repo_name(&name).is_ok(),
+                "{source} -> {name}"
+            );
+        }
     }
 
     /// #2339: `--own` is explicit. A local path with no LICENSE is not marked
