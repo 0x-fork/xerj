@@ -481,8 +481,10 @@ jobs:
     # against the old 50-min cap (setup + ~36-min step 5 + ~2.3-min step 6 +
     # cache-save) — too thin a margin on a loaded runner — so this was bumped to
     # 60 min. Neither cap is what fixed #751 — the engine deadlock was; they
-    # bound the blast radius of the next one.
-    timeout-minutes: 60
+    # bound the blast radius of the next one. By Oct 2026 cold builds took
+    # ~46-55 min, so healthy runs kept hitting 60 and were cancelled; bumped
+    # to 90 min.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
