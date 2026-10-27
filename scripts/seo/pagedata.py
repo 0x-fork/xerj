@@ -233,6 +233,18 @@ PAGES: dict[str, dict[str, str]] = {
     # Tag census: 97 v1.0.0-rc.* tags through rc.98 (rc.79 never tagged),
     # so rc.99 is the 98th tagged release. The post says "just over 100
     # days since rc.1" and does not print a day count taken from the tag date.
+    # Performance post, 2026-10-26: a standalone post (not a release post).
+    # Owner asked for positive, improvement-first framing. Numbers are measured
+    # (gate Run 6 vs rc.99 on the 1 GB corpus, and each fix's PR); the post
+    # describes the gate and does not claim a release passed it.
+    "blog/autoindex-search-performance-improvements.html": dict(
+        label="Performance", kind="article",
+        title="How your field reports made XERJ autoindex faster",
+        description="Index size per indexed byte fell from 3.50x to 1.80x of source: what we improved in autoindex and search, how the performance gate works, and who helped.",
+        published="2026-10-26", updated="2026-10-26",
+        og_image="og/blog-autoindex-search-performance-improvements.png",
+        og_image_alt="Cover: “Faster autoindex” in display type beside the post’s square-matrix art, labelled 28 people + 217 agent reports, 454 indices, 32, and ES 9.05 · Lucene 25.4 MiB/s. The art: 28 filled squares and 217 small empty rings scattered on grid paper, the filled ones joined by hairlines to a wide block of 454 empty cells, beside 32 yellow cells at the same pitch, then a gate of ink posts around two grey-blue columns and one empty yellow cell at its base",
+    ),
     "blog/rc99-smart-autoindex-harness-tools.html": dict(
         label="rc.99", kind="article",
         title="rc.99: smart, resource-aware autoindex and more harness tools",
@@ -252,8 +264,8 @@ PAGES: dict[str, dict[str, str]] = {
     "blog/index.html": dict(
         label="Blog", kind="collection",
         title="XERJ.ai — Blog: the engineering log",
-        description="The rc.99 launch post: smart, resource-aware autoindex and more harness tools. Also Corpus Hub v2, the exploit hub, and the rc.80 gates.",
-        updated="2026-10-24",
+        description="Faster autoindex and leaner indexes: the performance post, with each improvement explained. Also the rc.99 launch, Corpus Hub v2 and the exploit hub.",
+        updated="2026-10-26",
     ),
     "demo/index.html": dict(
         label="Real-data demo", kind="software",
