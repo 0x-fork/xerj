@@ -106,7 +106,10 @@ fn symbol_spans(src: &Value) -> Vec<(String, String, i64, Option<i64>)> {
 /// name contains every query term — `addReplyNull` still returns
 /// addReplyNull. A multi-term question must not let a generic one-word name
 /// (`type Token`) outrank the span that covers the rest of the question
-/// (#2327). Truncation keeps the label so the truncation is visible.
+/// (#2327). Truncation keeps the label so the truncation is visible. A
+/// definition longer than `width` shows its densest [`best_window`], not its
+/// head: the match can sit far below the signature (#2464). When that window
+/// is the head, the output is the plain truncation it always was.
 pub fn symbol_passage(
     body: &str,
     src: &Value,
@@ -157,10 +160,25 @@ pub fn symbol_passage(
     }
     let (_, _, name, kind, start, mut text) = best?;
     if py_len(&text) > width {
-        text = format!(
-            "{}\n    ... [{kind} {name} truncated at {width} chars]",
-            take_chars(&text, width)
-        );
+        let (window, offset, total) = best_window(&text, query, width);
+        text = if offset == 0 {
+            format!(
+                "{}\n    ... [{kind} {name} truncated at {width} chars]",
+                take_chars(&text, width)
+            )
+        } else {
+            // The offset is into the definition, so the label's start line
+            // (and every citation built from it) is unchanged. The marker
+            // trails the window, as the truncation marker does, so a budget
+            // that cuts from the end drops the marker before any code.
+            format!(
+                "{window}\n    ... [{kind} {name}: showing {} of {} chars from offset {}, \
+                 window centred on the match]",
+                commaus(py_len(&window)),
+                commaus(total),
+                commaus(offset)
+            )
+        };
     }
     Some((text, format!("{kind} {name} @ line {start}")))
 }
@@ -816,6 +834,90 @@ mod tests {
         // No symbols / no matching term -> None (caller falls back).
         assert!(symbol_passage(body, &json!({}), "addReplyNull", 800).is_none());
         assert!(symbol_passage(body, &src, "zzzzz", 800).is_none());
+    }
+
+    /// #2464: a definition longer than `width` whose match sits below its
+    /// signature shows the matching window of THAT definition, with the
+    /// offset into the definition; the label (and so the citation) keeps the
+    /// definition's start line.
+    #[test]
+    fn long_definition_shows_the_matching_window_not_its_head() {
+        let filler: Vec<String> = (0..30)
+            .map(|i| format!("    Filler line {i}: unrelated parameters and options."))
+            .collect();
+        let def = format!(
+            "def long_function(arg):\n    \"\"\"\n    Do many things.\n\n{}\n\n    \
+             Localize a naive timestamp to a timezone first, then convert it.\n    \
+             \"\"\"\n    return arg",
+            filler.join("\n")
+        );
+        let body = format!("def short_helper(x):\n    return x\n{def}");
+        let src = json!({
+            "symbols": [
+                { "name": "short_helper", "kind": "function", "line": 1, "end_line": 2 },
+                { "name": "long_function", "kind": "function", "line": 3 }
+            ]
+        });
+        let (text, label) =
+            symbol_passage(&body, &src, "localize naive timestamp timezone", 300).unwrap();
+        assert_eq!(label, "function long_function @ line 3");
+        assert!(text.contains("Localize a naive timestamp"), "{text}");
+        assert!(!text.contains("def long_function"), "not the head: {text}");
+        let (window, marker) = text.rsplit_once('\n').unwrap();
+        // The window comes first, so a cut from the end loses the marker
+        // before the match.
+        assert!(
+            take_chars(&text, 300).contains("Localize a naive timestamp"),
+            "{text}"
+        );
+        let prefix = "    ... [function long_function: showing ";
+        assert!(marker.starts_with(prefix), "{marker}");
+        assert!(
+            marker.ends_with(", window centred on the match]"),
+            "{marker}"
+        );
+        // The offset is into the definition, not into the file body.
+        let offset: usize = marker
+            .split_once(" from offset ")
+            .and_then(|(_, r)| r.split_once(", window"))
+            .map(|(n, _)| n.replace(',', ""))
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert!(offset > 0);
+        let from_offset: String = def.chars().skip(offset).collect();
+        assert!(from_offset.starts_with(window), "offset {offset}: {window}");
+        assert!(window.chars().count() <= 300);
+        assert!(marker.contains(&format!(" of {} chars", commaus(def.chars().count()))));
+    }
+
+    /// When the densest window is the head, the output is byte-for-byte the
+    /// plain truncation it was before #2464; a short definition is untouched.
+    #[test]
+    fn head_window_and_short_definition_are_unchanged() {
+        let def = format!(
+            "fn needle_here() {{\n    // needle needle\n{}}}",
+            "    let unrelated = 0;\n".repeat(40)
+        );
+        let src = json!({
+            "symbols": [{ "name": "needle_here", "kind": "function", "line": 1 }]
+        });
+        let (text, label) = symbol_passage(&def, &src, "needle", 120).unwrap();
+        assert_eq!(label, "function needle_here @ line 1");
+        assert_eq!(
+            text,
+            format!(
+                "{}\n    ... [function needle_here truncated at 120 chars]",
+                take_chars(&def, 120)
+            )
+        );
+
+        let short = "fn needle() {\n    needle_call();\n}";
+        let src = json!({
+            "symbols": [{ "name": "needle", "kind": "function", "line": 1 }]
+        });
+        let (text, label) = symbol_passage(short, &src, "needle", 800).unwrap();
+        assert_eq!(label, "function needle @ line 1");
+        assert_eq!(text, short);
     }
 
     /// #2327: a multi-term question must not prefer a one-word type whose

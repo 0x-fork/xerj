@@ -112,6 +112,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj code` shows the part of a long definition that matched the query,
+  not its first `--full` characters (#2464). The matching text could sit
+  thousands of characters below the signature, so a hit named the right
+  function but showed none of the query terms. Such passages now end with
+  `... [function name: showing N of M chars from offset O, window centred on the match]`;
+  the `@ line N` label and citations are unchanged, and a definition whose
+  head is already the best window still ends `truncated at N chars`. Hub ask
+  passages (`xerj ask`) and hub search API hits change the same way.
+
 - A segment merge's output-write step (doc-values build, stored encode, FTS
   side-car build) is now charged to the merge budget before it starts, and a
   background batch yields instead of starting it when it would take RSS to
