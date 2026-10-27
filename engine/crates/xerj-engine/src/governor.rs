@@ -152,6 +152,32 @@ pub const MEMORY_RSS_NOISE_BYTES: u64 = 4 * 1024 * 1024;
 /// `XERJ_MEMORY_BREAKER_RELEASE_PCT` overrides it (50..=99).
 pub const DEFAULT_MEMORY_RELEASE_PERCENT: u8 = 85;
 
+/// Share of the process memory limit held back for searches, in percent
+/// (#2427 read-budget isolation).
+///
+/// Background merges and their output writes are charged to a merge pool
+/// whose ceiling is the limit minus this share (or the watermark, if that is
+/// lower). They are refused, and an in-flight batch yields, once process
+/// memory reaches that ceiling. Searches are only rejected at the full limit,
+/// so the top of the budget stays free for reads instead of being the first
+/// thing a merge takes. On the 1 GB gate (3,072 MB cap) the merge pool stops
+/// at about 2,458 MB and reads keep the last 614 MB.
+pub const SEARCH_READ_RESERVE_PERCENT: u64 = 20;
+
+/// How long a search that arrives with process memory at or above the hard
+/// limit waits for the breaker's drain before it is rejected with a 429
+/// (#2427 read-budget isolation).
+///
+/// The drain (flush, cache release, allocator purge) takes RSS from the limit
+/// back to the live set in one to two seconds. In the 1 GB gate the raw and
+/// MCP searches arrived within 300 ms of a heavy search and were all
+/// rejected in 4-14 ms, although RSS was back to about 1.5 GB a second later.
+pub const SEARCH_HEADROOM_WAIT: Duration = Duration::from_secs(3);
+
+/// Poll interval while a search waits for headroom. The sampler writes RSS
+/// every 100 ms, so polling faster only re-reads the same sample.
+const SEARCH_HEADROOM_POLL: Duration = Duration::from_millis(25);
+
 /// Lowest accepted `XERJ_MEMORY_BREAKER_RELEASE_PCT`. Below this, a footprint
 /// whose live set is over half the watermark could never release.
 pub const MIN_MEMORY_RELEASE_PERCENT: u8 = 50;
@@ -350,6 +376,9 @@ pub struct ResourceGovernor {
     /// also holds this, so searches run one at a time instead of
     /// `max_concurrent_searches` wide.
     search_pressure: Arc<Semaphore>,
+    /// How long a search over the hard limit waits for the drain (#2427).
+    /// [`SEARCH_HEADROOM_WAIT`] in production; tests shorten it.
+    search_headroom_wait: Duration,
 
     // ── item 2b: global bulk pool (concurrent bulk parse cap) ─────────
     /// Global bulk-concurrency permits. Caps the number of concurrent
@@ -659,8 +688,17 @@ impl ResourceGovernor {
             .in_flight
     }
 
+    /// Ceiling of the merge pool (#2427 read-budget isolation): the process
+    /// limit minus [`SEARCH_READ_RESERVE_PERCENT`], or the watermark if that
+    /// is lower. Merge admission, the merge yield check and the merge
+    /// output-write check stop at this line, so the reserve above it stays
+    /// for searches. `0` when no watermark is live.
+    pub fn merge_pool_ceiling_bytes(&self) -> u64 {
+        merge_pool_ceiling(self.memory_watermark_bytes(), self.memory_limit_bytes)
+    }
+
     /// Reserve the estimated working set of one merge batch whose inputs
-    /// total `input_bytes` against the RSS watermark (#2427).
+    /// total `input_bytes` against the merge pool (#2427).
     ///
     /// Before this, every index started its first merge batch whatever the
     /// process footprint, and each batch was checked against an RSS snapshot
@@ -689,7 +727,9 @@ impl ResourceGovernor {
         forced: bool,
     ) -> Option<MergeReservation> {
         let bytes = crate::merge_budget::merge_reservation_bytes(input_bytes, on_disk_bytes);
-        let watermark = self.memory_watermark_bytes();
+        // Concurrent merges are admitted against the merge pool, not the
+        // watermark: the read reserve above it is never handed to a merge.
+        let watermark = self.merge_pool_ceiling_bytes();
         let observed = self.observed_process_memory();
         let engaged = self.memory_breaker_engaged();
         let mut ledger = self.merge_ledger.lock().unwrap_or_else(|e| e.into_inner());
@@ -717,7 +757,7 @@ impl ResourceGovernor {
     pub fn merge_must_yield(&self, forced: bool) -> bool {
         crate::merge_budget::merge_must_yield(
             self.observed_process_memory(),
-            self.memory_limit_bytes,
+            self.merge_pool_ceiling_bytes(),
             self.memory_breaker_engaged(),
             forced,
         )
@@ -734,7 +774,7 @@ impl ResourceGovernor {
             .yield_streak;
         crate::merge_budget::merge_must_yield_after(
             self.observed_process_memory(),
-            self.memory_limit_bytes,
+            self.merge_pool_ceiling_bytes(),
             self.memory_breaker_engaged(),
             forced,
             input_bytes,
@@ -810,7 +850,7 @@ impl ResourceGovernor {
         let observed = self.observed_process_memory();
         if !crate::merge_budget::decide_merge_write(
             observed,
-            self.memory_limit_bytes,
+            self.merge_pool_ceiling_bytes(),
             extra,
             forced,
             exempt,
@@ -1007,20 +1047,28 @@ impl ResourceGovernor {
     /// While the breaker is engaged each search also takes the single
     /// `search_pressure` permit, so they run one at a time. At or above the
     /// hard process limit a new search is rejected with a 429
-    /// `circuit_breaking_exception` instead of queueing.
+    /// `circuit_breaking_exception` once the drain has had
+    /// [`SEARCH_HEADROOM_WAIT`] to bring RSS back under it.
+    ///
+    /// Read-budget isolation (#2427): bytes held by in-flight merge
+    /// reservations do not count against a search (see
+    /// [`Self::search_admission_rss`]); those merges yield at the merge-pool
+    /// ceiling, below the limit. A search that still finds process memory at
+    /// or above the limit waits up to [`SEARCH_HEADROOM_WAIT`] for the drain
+    /// before it is rejected, instead of failing in milliseconds against a
+    /// transient peak.
     pub async fn acquire_search(&self) -> Result<SearchPermit, XerjError> {
-        self.check_search_hard_limit()?;
         let permit = Arc::clone(&self.search_pool)
             .acquire_owned()
             .await
             .map_err(|_| XerjError::internal("global search pool closed — shutting down"))?;
-        let pressure = if self.memory_breaker_engaged() {
+        let pressure = if self.memory_breaker_engaged() || self.check_search_hard_limit().is_err() {
             let p = Arc::clone(&self.search_pressure)
                 .acquire_owned()
                 .await
                 .map_err(|_| XerjError::internal("search pressure gate closed — shutting down"))?;
             // RSS may have crossed the hard limit while this search queued.
-            self.check_search_hard_limit()?;
+            self.wait_for_search_headroom().await?;
             Some(p)
         } else {
             None
@@ -1032,6 +1080,30 @@ impl ResourceGovernor {
             _pressure: pressure,
             inflight: Arc::clone(&self.search_inflight),
         })
+    }
+
+    /// Wait, holding the `search_pressure` permit, until the hard-limit check
+    /// passes or [`Self::search_headroom_wait`] runs out (#2427). The sampler
+    /// drains rebuildable state while the breaker is engaged; this gives that
+    /// drain time to work before the search is turned away.
+    async fn wait_for_search_headroom(&self) -> Result<(), XerjError> {
+        let deadline = tokio::time::Instant::now() + self.search_headroom_wait;
+        loop {
+            match self.check_search_hard_limit() {
+                Ok(()) => return Ok(()),
+                Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+                Err(_) => tokio::time::sleep(SEARCH_HEADROOM_POLL).await,
+            }
+        }
+    }
+
+    /// Process memory a search is admitted against (#2427): the last RSS
+    /// sample less the bytes in-flight merges hold in the merge ledger. Those
+    /// merges must yield at the merge-pool ceiling, so their bytes are
+    /// already on their way out and are not the read path's to pay for.
+    fn search_admission_rss(&self) -> u64 {
+        let rss = self.rss_bytes.load(Ordering::Relaxed);
+        rss.saturating_sub(self.merge_reserved_bytes())
     }
 
     /// RSS line at which new searches are rejected (#2427): the process
@@ -1047,10 +1119,10 @@ impl ResourceGovernor {
 
     fn check_search_hard_limit(&self) -> Result<(), XerjError> {
         let limit = self.search_hard_limit_bytes();
-        let rss = self.rss_bytes.load(Ordering::Relaxed);
+        let rss = self.search_admission_rss();
         if limit != 0 && rss >= limit {
             return Err(XerjError::circuit_breaking(format!(
-                "[parent] Data too large: process memory [{rss}/{}] is at or above the memory limit [{limit}/{}]; search rejected until the memory breaker drains",
+                "[parent] Data too large: process memory [{rss}/{}] is at or above the memory limit [{limit}/{}] after waiting for the memory breaker to drain; search rejected",
                 human_bytes(rss),
                 human_bytes(limit)
             )));
@@ -1923,6 +1995,7 @@ fn build(config: &Config) -> ResourceGovernor {
         search_inflight: Arc::new(AtomicU64::new(0)),
         search_inflight_peak: Arc::new(AtomicU64::new(0)),
         search_pressure: Arc::new(Semaphore::new(1)),
+        search_headroom_wait: SEARCH_HEADROOM_WAIT,
         bulk_pool: Arc::new(Semaphore::new(max_concurrent_bulks)),
         max_concurrent_bulks,
         disk_flood_pct_default: limits.disk_flood_stage_percent.min(100),
@@ -1957,6 +2030,17 @@ fn build(config: &Config) -> ResourceGovernor {
 /// the watermark was dead on macOS however much memory the process took.
 pub fn current_rss_bytes() -> u64 {
     xerj_common::resource::current_rss_bytes().unwrap_or(0)
+}
+
+/// Merge-pool ceiling for a `watermark` and process `limit` (#2427): the
+/// limit less [`SEARCH_READ_RESERVE_PERCENT`], never above the watermark.
+/// `0` when the watermark is off; the watermark alone when no limit is known.
+fn merge_pool_ceiling(watermark: u64, limit: u64) -> u64 {
+    if watermark == 0 || limit == 0 {
+        return watermark;
+    }
+    let reserve = (limit as u128 * SEARCH_READ_RESERVE_PERCENT as u128 / 100) as u64;
+    watermark.min(limit.saturating_sub(reserve)).max(1)
 }
 
 /// Bytes the memory breaker compares to the watermark.
@@ -3775,8 +3859,9 @@ mod tests {
     }
 
     /// #2427 (b): at or above the hard process limit a new search is a 429,
-    /// not another allocation on a node the kernel is about to kill.
-    #[tokio::test]
+    /// not another allocation on a node the kernel is about to kill. It is
+    /// rejected only after the drain had [`SEARCH_HEADROOM_WAIT`] to work.
+    #[tokio::test(start_paused = true)]
     async fn search_is_rejected_at_the_hard_memory_limit() {
         let mut cfg = Config::default();
         cfg.limits.max_total_memtable_mb = 0;
@@ -3786,10 +3871,15 @@ mod tests {
         assert!(limit > 0, "this test needs a live memory limit");
 
         g.refresh(0, limit, 0);
+        let started = tokio::time::Instant::now();
         let err = match g.acquire_search().await {
             Ok(_) => panic!("a search at the hard limit must be rejected"),
             Err(e) => e,
         };
+        assert!(
+            started.elapsed() >= SEARCH_HEADROOM_WAIT,
+            "the search waits for the drain before it is rejected"
+        );
         assert_eq!(err.http_status(), 429, "{err}");
         assert_eq!(g.search_inflight(), 0, "a rejected search holds no permit");
 
@@ -3798,6 +3888,169 @@ mod tests {
             g.acquire_search().await.is_ok(),
             "just under the hard limit is admitted (serialized)"
         );
+    }
+
+    /// #2427 read-budget isolation: a search that arrives at a transient
+    /// peak over the hard limit is served once the drain brings RSS back,
+    /// instead of failing in milliseconds. The 1 GB gate's raw and MCP
+    /// searches all got 429s within 300 ms of a heavy search while RSS fell
+    /// back to about 1.5 GB a second later.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_over_the_limit_waits_for_the_drain_and_is_admitted() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = Arc::new(build(&cfg));
+        let limit = g.search_hard_limit_bytes();
+        assert!(limit > 0, "this test needs a live memory limit");
+
+        g.refresh(0, limit + limit / 4, 0);
+        assert!(g.memory_breaker_engaged());
+        let drainer = Arc::clone(&g);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            drainer.refresh(0, limit / 2, 0);
+        });
+        let started = tokio::time::Instant::now();
+        let permit = g
+            .acquire_search()
+            .await
+            .expect("the drain frees headroom inside the wait, so the search is admitted");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(1_200), "{waited:?}");
+        assert!(waited < SEARCH_HEADROOM_WAIT, "{waited:?}");
+        assert_eq!(g.search_inflight(), 1);
+        drop(permit);
+        assert_eq!(g.search_inflight(), 0);
+    }
+
+    /// #2427 read-budget isolation: a large background merge in flight that
+    /// holds the merge budget does not take the read budget. With process
+    /// memory over the hard limit only because of the merge's reservation, a
+    /// search is admitted at once (no drain wait), and it runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_merge_in_flight_does_not_starve_searches() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = Arc::new(build(&cfg));
+        let limit = g.search_hard_limit_bytes();
+        let ceiling = g.merge_pool_ceiling_bytes();
+        assert!(
+            limit > 0 && ceiling > 0,
+            "this test needs a live memory limit"
+        );
+        assert!(
+            ceiling <= limit - limit / 100 * SEARCH_READ_RESERVE_PERCENT,
+            "the merge pool stops below the read reserve"
+        );
+
+        // A big merge starts on a quiet node and reserves about half the
+        // limit: the merge budget is held.
+        let base = limit / 2;
+        g.refresh(0, base, 0);
+        let input = (limit / 2) / crate::merge_budget::MERGE_WORKING_SET_NUMERATOR;
+        let merge = g
+            .try_reserve_merge(input, false)
+            .expect("a lone merge starts");
+        let held = g.merge_reserved_bytes();
+        assert_eq!(held, merge.bytes());
+        assert!(held >= limit / 2 - crate::merge_budget::MERGE_WORKING_SET_NUMERATOR);
+        // No second merge fits in what is left of the merge pool.
+        assert!(g.try_reserve_merge(input / 4, false).is_none());
+
+        // The merge allocates its working set: RSS goes past the hard limit.
+        // Its working set plus a little other growth takes RSS past the hard
+        // limit, while the non-merge part stays well under it.
+        let other = limit / 16;
+        g.refresh(0, base + held + other, 0);
+        assert!(base + held + other >= limit);
+        assert!(g.memory_breaker_engaged());
+        // The merge itself is the one that must give way.
+        assert!(
+            g.merge_must_yield(false),
+            "a merge past the merge pool yields"
+        );
+
+        let started = tokio::time::Instant::now();
+        let permit = g
+            .acquire_search()
+            .await
+            .expect("a search is admitted while the merge holds the merge budget");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "admitted without waiting"
+        );
+        assert_eq!(g.search_inflight(), 1);
+        // A second concurrent search queues behind the engaged breaker's
+        // single pressure permit and is served when the first one finishes.
+        let g2 = Arc::clone(&g);
+        let second = tokio::spawn(async move { g2.acquire_search().await.map(|_p| ()) });
+        tokio::task::yield_now().await;
+        drop(permit);
+        second
+            .await
+            .expect("task")
+            .expect("the next search is served too");
+
+        // Once the merge ends, admission is against plain RSS again.
+        drop(merge);
+        assert_eq!(g.merge_reserved_bytes(), 0);
+        assert!(
+            g.acquire_search().await.is_err(),
+            "no merge bytes to discount"
+        );
+    }
+
+    /// #2427 read-budget isolation: concurrent merges stop at the merge-pool
+    /// ceiling, below the 95% watermark, and an in-flight batch yields once
+    /// RSS enters the read reserve, before searches would be rejected.
+    #[test]
+    fn merges_stop_at_the_merge_pool_ceiling_below_the_read_reserve() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes();
+        let limit = g.process_memory_limit_bytes();
+        let ceiling = g.merge_pool_ceiling_bytes();
+        assert!(wm > 0 && limit > wm, "this test needs a live RSS watermark");
+        assert_eq!(ceiling, merge_pool_ceiling(wm, limit));
+        assert!(
+            ceiling < wm,
+            "a 20% read reserve sits under a 95% watermark"
+        );
+
+        // RSS at half the ceiling; one merge running.
+        g.refresh(0, ceiling / 2, 0);
+        let first = g.try_reserve_merge(1, false).expect("first merge starts");
+        // A second merge that would end between the ceiling and the
+        // watermark used to be admitted; it is refused now.
+        let gap = (ceiling + wm) / 2 - ceiling / 2 - first.bytes();
+        let input = gap / crate::merge_budget::MERGE_WORKING_SET_NUMERATOR;
+        assert!(
+            ceiling / 2 + first.bytes() + input * crate::merge_budget::MERGE_WORKING_SET_NUMERATOR
+                < wm
+        );
+        assert!(g.try_reserve_merge(input, false).is_none());
+
+        // The output write of a batch may not take RSS into the reserve.
+        assert!(!g.admit_merge_write(None, 0, ceiling - ceiling / 2, false, false));
+        assert!(g.admit_merge_write(None, 0, ceiling / 4, false, false));
+
+        // Engaged with RSS inside the read reserve (under the limit): a
+        // background batch yields, `_forcemerge` does not.
+        g.refresh(0, wm, 0);
+        assert!(g.memory_breaker_engaged());
+        assert!(wm < limit);
+        assert!(g.merge_must_yield(false));
+        assert!(!g.merge_must_yield(true));
+        drop(first);
+
+        assert_eq!(merge_pool_ceiling(0, limit), 0, "watermark off");
+        assert_eq!(merge_pool_ceiling(wm, 0), wm, "no known limit");
+        assert_eq!(merge_pool_ceiling(3_000, 3_072), 3_072 - 614);
     }
 
     #[test]
@@ -4101,9 +4354,10 @@ mod tests {
 
     /// #2427: on the 1 GB gate an admitted merge batch grew a 3,072 MB node
     /// to 8,122 MB while the breaker was engaged. A background batch yields
-    /// once RSS reaches the process limit with the breaker engaged, never in
-    /// the watermark band, never when forced; the yield narrows later batches
-    /// and completed batches widen them back.
+    /// once the breaker is engaged with RSS at the merge-pool ceiling (below
+    /// the watermark since read-budget isolation), never when the breaker is
+    /// released, never when forced; the yield narrows later batches and
+    /// completed batches widen them back.
     #[test]
     fn a_background_merge_yields_at_the_limit_and_narrows_later_batches() {
         const MIB: u64 = 1024 * 1024;
@@ -4115,11 +4369,18 @@ mod tests {
         let limit = g.process_memory_limit_bytes();
         assert!(wm > 0 && limit > wm, "this test needs a live RSS watermark");
 
-        // Engaged inside the watermark band: keep merging.
+        // Not engaged: keep merging, whatever the RSS under the watermark.
+        g.refresh(0, wm - 1, 0);
+        assert!(!g.memory_breaker_engaged());
+        assert!(!g.merge_must_yield(false));
+        // Engaged at the watermark: that is already past the merge-pool
+        // ceiling, so a background batch yields; a forced one does not.
         g.refresh(0, wm, 0);
         assert!(g.memory_breaker_engaged());
-        assert!(!g.merge_must_yield(false));
-        // Engaged at the limit: a background batch yields, a forced one not.
+        assert!(wm >= g.merge_pool_ceiling_bytes());
+        assert!(g.merge_must_yield(false));
+        assert!(!g.merge_must_yield(true));
+        // Engaged at the limit: the same.
         g.refresh(0, limit, 0);
         assert!(g.memory_breaker_engaged());
         assert!(g.merge_must_yield(false));
